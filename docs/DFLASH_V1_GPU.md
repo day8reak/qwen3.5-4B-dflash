@@ -83,7 +83,7 @@ PY
 ```
 
 GPU 报告验证的是 HF/PyTorch V1 流程、特征旁路和严格 greedy token 等价。它不证明 HIAI
-源码 patch、receiver 状态隔离、310P 自定义算子、310P 无 fallback 或性能收益。
+直接源码集成、receiver 状态隔离、310P 自定义算子、310P 无 fallback 或性能收益。
 
 ## CUDA 环境快速检查
 

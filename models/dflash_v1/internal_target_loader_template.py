@@ -62,7 +62,7 @@ ISOLATION_HOOK_ATTRIBUTE = "prepare_dflash_full_prefix_call"
 ISOLATION_EVIDENCE_ATTRIBUTE = "dflash_full_prefix_isolation_evidence"
 FEATURE_SOURCE_ATTRIBUTE = "dflash_feature_source"
 FEATURE_CAPTURE_POINT_ATTRIBUTE = "dflash_feature_capture_point"
-FEATURE_PATCH_SHA256_ATTRIBUTE = "dflash_feature_patch_sha256"
+FEATURE_SOURCE_SHA256_ATTRIBUTE = "dflash_feature_source_sha256"
 FEATURE_CONTRACT_ID_ATTRIBUTE = "dflash_feature_contract_id"
 FULL_PREFIX_EXECUTION_MODE_ATTRIBUTE = "dflash_full_prefix_execution_mode"
 PREFILL_CHUNK_SIZE_ATTRIBUTE = "dflash_prefill_chunk_size"
@@ -242,8 +242,8 @@ def create_internal_target(
 
     1. construct/load the existing internal Qwen3.5-4B target on ``device``;
        for the formal HIAI source route this must be the exact package-local
-       ``modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM`` class patched by the
-       source patcher (the CPU/HF golden may still use the top-level conditional
+       directly integrated ``modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM``
+       class (the CPU/HF golden may still use the top-level conditional
        generation wrapper);
     2. keep its five installed target operators inside that model runtime;
     3. expose DFlash features either through the packaged hook bridge, with an
@@ -258,7 +258,7 @@ def create_internal_target(
        ``receiver_owned:modeling_qwen3_5_hiai_nd.py``,
        ``dflash_feature_capture_point`` as
        ``decoder_post_layer_pre_final_norm``, and
-       ``dflash_feature_patch_sha256`` as the modified source-file hash.
+       ``dflash_feature_source_sha256`` as the integrated source-file hash.
     7. declare ``dflash_full_prefix_execution_mode='fresh_prefill'`` plus the
        observed receiver settings ``dflash_prefill_chunk_size=64`` and
        ``dflash_decode_chunk_size=1``.  The prepare hook must select a fresh
@@ -305,7 +305,7 @@ def create_internal_target(
         wrapped.dflash_full_prefix_isolation_mode = "receiver_reset_hook"
         wrapped.prepare_dflash_full_prefix_call = receiver_reset_full_prefix
         # Eager hooks are CPU/debug fallback only.  Formal NPU execution must
-        # instead return the source-patched HIAI model with the three feature
+        # instead return the directly integrated HIAI model with the three feature
         # provenance attributes described above.
         return wrapped
 
@@ -405,9 +405,9 @@ class InternalTargetFacade(nn.Module):
                 f"internal target {FEATURE_CONTRACT_ID_ATTRIBUTE!r} must be str"
             )
         self._feature_contract_id = feature_contract_id
-        self._feature_patch_sha256 = _normalize_optional_sha256(
-            getattr(target, FEATURE_PATCH_SHA256_ATTRIBUTE, None),
-            attribute=FEATURE_PATCH_SHA256_ATTRIBUTE,
+        self._feature_source_sha256 = _normalize_optional_sha256(
+            getattr(target, FEATURE_SOURCE_SHA256_ATTRIBUTE, None),
+            attribute=FEATURE_SOURCE_SHA256_ATTRIBUTE,
         )
         self._validate_feature_provenance(formal_npu=self._formal_npu)
         execution_mode = getattr(
@@ -525,8 +525,8 @@ class InternalTargetFacade(nn.Module):
         return self._feature_capture_point
 
     @property
-    def dflash_feature_patch_sha256(self) -> str | None:
-        return self._feature_patch_sha256
+    def dflash_feature_source_sha256(self) -> str | None:
+        return self._feature_source_sha256
 
     @property
     def dflash_feature_contract_id(self) -> str | None:
@@ -537,7 +537,7 @@ class InternalTargetFacade(nn.Module):
             return
         if self._feature_source != _FORMAL_HIAI_FEATURE_SOURCE:
             raise RuntimeError(
-                "formal NPU target must use the source-patched "
+                "formal NPU target must use the directly integrated "
                 "modeling_qwen3_5_hiai_nd.py feature route"
             )
         if self._feature_capture_point != _FORMAL_HIAI_CAPTURE_POINT:
@@ -548,13 +548,13 @@ class InternalTargetFacade(nn.Module):
             raise RuntimeError(
                 "formal NPU target has the wrong DFlash feature contract id"
             )
-        if self._feature_patch_sha256 is None:
+        if self._feature_source_sha256 is None:
             raise RuntimeError(
-                "formal NPU target must declare dflash_feature_patch_sha256"
+                "formal NPU target must declare dflash_feature_source_sha256"
             )
 
     def _validate_feature_provenance_for(self, target: nn.Module) -> None:
-        """Require a fresh target to carry the same source-patch identity."""
+        """Require a fresh target to carry the same direct-source identity."""
 
         if not self._formal_npu:
             return
@@ -562,18 +562,18 @@ class InternalTargetFacade(nn.Module):
         point = getattr(target, FEATURE_CAPTURE_POINT_ATTRIBUTE, None)
         contract_id = getattr(target, FEATURE_CONTRACT_ID_ATTRIBUTE, None)
         digest = _normalize_optional_sha256(
-            getattr(target, FEATURE_PATCH_SHA256_ATTRIBUTE, None),
-            attribute=FEATURE_PATCH_SHA256_ATTRIBUTE,
+            getattr(target, FEATURE_SOURCE_SHA256_ATTRIBUTE, None),
+            attribute=FEATURE_SOURCE_SHA256_ATTRIBUTE,
         )
         if (
             source != self._feature_source
             or point != self._feature_capture_point
             or contract_id != self._feature_contract_id
-            or digest != self._feature_patch_sha256
+            or digest != self._feature_source_sha256
         ):
             raise RuntimeError(
                 "fresh internal target differs from the controller's HIAI "
-                "feature-patch identity"
+                "direct feature-source identity"
             )
 
     def get_input_embeddings(self) -> nn.Module:

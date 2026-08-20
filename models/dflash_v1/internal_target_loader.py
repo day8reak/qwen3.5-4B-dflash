@@ -33,7 +33,7 @@ from torch import nn
 from .internal_target_loader_template import (
     FEATURE_CAPTURE_POINT_ATTRIBUTE,
     FEATURE_CONTRACT_ID_ATTRIBUTE,
-    FEATURE_PATCH_SHA256_ATTRIBUTE,
+    FEATURE_SOURCE_SHA256_ATTRIBUTE,
     FEATURE_SOURCE_ATTRIBUTE,
     FULL_PREFIX_EXECUTION_MODE_ATTRIBUTE,
     InternalTargetFacade,
@@ -109,9 +109,9 @@ def _prepare_target_contract(target: nn.Module) -> nn.Module:
         actual = getattr(target, name, None)
         if actual != expected:
             raise RuntimeError(
-                f"patched HIAI target must declare {name}={expected!r}; got {actual!r}"
+                f"direct HIAI target must declare {name}={expected!r}; got {actual!r}"
             )
-    setattr(target, FEATURE_PATCH_SHA256_ATTRIBUTE, _sha256_file(source))
+    setattr(target, FEATURE_SOURCE_SHA256_ATTRIBUTE, _sha256_file(source))
 
     existing_hook = getattr(target, ISOLATION_HOOK_ATTRIBUTE, None)
     existing_mode = getattr(target, ISOLATION_MODE_ATTRIBUTE, None)

@@ -1,128 +1,104 @@
-# 内部服务器目录与 NPU 运行流程
+# 内部服务器 NPU 直接运行流程
 
-本流程适用于以下前提：内部 inference 已能使用
-`modeling_qwen3_5_hiai_nd.py` 在 NPU 上正常生成文本。DFlash 不替换这份 target，也不改动
-其中已有的 ChunkGatedDeltaRule、CacheUpdate 或其他自定义算子；只增加 feature 旁路，并在
-每次 V1 完整前缀调用前复用接收工程自己的“新请求”状态初始化。
+本流程假定内部 inference 已能用 `modeling_qwen3_5_hiai_nd.py` 在 NPU 正常生成文本，
+并且该文件已经直接集成 DFlash feature route。本版本不再 patch、生成或覆盖 modeling 源码。
 
-## 1. 推荐目录
+## 1. 三个路径变量
 
-把本仓库的 `models/dflash_v1` 整个目录放入原 inference 的 `models` 包中。原模型继续留在
-根目录：
-
-```text
-internal-inference/
-├── models/
-│   ├── __init__.py
-│   ├── modeling_qwen3_5_hiai_nd.py
-│   ├── configuration_qwen3_5.py
-│   ├── internal_dflash_bridge.py       # 接收工程自有的加载/重置薄适配
-│   ├── 原工程的其他模型和自定义算子文件
-│   └── dflash_v1/
-│       ├── __init__.py
-│       ├── run_npu.py
-│       ├── dflash_qwen_adapter_v1.py
-│       ├── dflash_reference_decode_v1.py
-│       ├── modeling_dflash.py
-│       ├── dflash_weights.py
-│       ├── dflash_ops.py
-│       ├── dflash_ascend310p_ops.py
-│       ├── dflash_target_features.py
-│       ├── dflash_hiai_feature_runtime.py
-│       ├── dflash_hiai_feature_patch.py
-│       ├── internal_target_loader.py
-│       └── 其余同目录运行文件
-└── 原 inference 启动文件
+```bash
+export DFLASH_REPO=/path/to/qwen3.5-4B-dflash
+export INTERNAL_ROOT=/path/to/internal-inference
+export MODEL_PYTHON=/path/to/internal-inference环境/bin/python
 ```
 
-运行时只把 `internal-inference/` 加入 `PYTHONPATH`。不要把 DFlash 文件扁平复制到
-`models/`，也不要用 `modeling_qwen3_5_dflash.py` 覆盖 HIAI target。
+- `DFLASH_REPO`：克隆本 GitHub 仓库后的根目录，下面应有 `models/dflash_v1/`。
+- `INTERNAL_ROOT`：原 inference 工程根目录，下面应有 `models/modeling_qwen3_5_hiai_nd.py`。
+- `MODEL_PYTHON`：原 inference 实际启动时使用的 Python。激活环境后可用
+  `command -v python` 查看；不要另建一套 Python。
 
-第一次部署可以直接复制完整子目录；不要覆盖内部工程自己的 `models/__init__.py`：
+先核对，不要凭路径名猜：
 
 ```bash
 set -euo pipefail
-
-export DFLASH_REPO=/path/to/qwen3.5-4B-dflash
-export INTERNAL_ROOT=/path/to/internal-inference
-
+test -f "$DFLASH_REPO/models/dflash_v1/run_npu.py"
 test -f "$INTERNAL_ROOT/models/modeling_qwen3_5_hiai_nd.py"
-test -d "$DFLASH_REPO/models/dflash_v1"
+test -x "$MODEL_PYTHON"
+"$MODEL_PYTHON" -V
+```
+
+## 2. 目录放法
+
+原 HIAI 模型留在 `models/` 根目录，DFlash 放到它的子包中：
+
+```text
+internal-inference/
+└── models/
+    ├── __init__.py
+    ├── modeling_qwen3_5_hiai_nd.py   # 已直接集成 feature route
+    ├── configuration_qwen3_5.py
+    ├── internal_dflash_bridge.py     # 仅在需要适配现有加载/重置函数时使用
+    ├── 原工程其他 HIAI 文件
+    └── dflash_v1/                    # 复制本仓库的整个目录
+```
+
+首次部署：
+
+```bash
+set -euo pipefail
 test ! -e "$INTERNAL_ROOT/models/dflash_v1"
 cp -a "$DFLASH_REPO/models/dflash_v1" "$INTERNAL_ROOT/models/dflash_v1"
 ```
 
-更新版本时，先按内部策略保存或移走旧的 `models/dflash_v1`，再整体复制新目录；不要把两版
-文件逐个混合覆盖。
+更新时不要把两版文件逐个混合覆盖；按内部策略移走旧 `dflash_v1` 后，再整体复制新目录。
+不要覆盖内部工程自己的 `models/__init__.py`、`configuration_qwen3_5.py` 或 HIAI modeling。
 
-## 2. 自动增加 HIAI feature 旁路
+## 3. 只读检查直接集成的 modeling
 
-以下命令先只读检查真实源码是否满足已知 decoder-loop 锚点：
+以下命令不会修改任何文件：
 
 ```bash
 set -euo pipefail
-
-export INTERNAL_ROOT=/path/to/internal-inference
-export MODEL_PYTHON=/path/to/internal/python
-export HIAI_SOURCE="$INTERNAL_ROOT/models/modeling_qwen3_5_hiai_nd.py"
 export PYTHONPATH="$INTERNAL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export HIAI_SOURCE="$INTERNAL_ROOT/models/modeling_qwen3_5_hiai_nd.py"
 
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B -m py_compile "$HIAI_SOURCE"
 PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
-  -m models.dflash_v1.dflash_hiai_feature_patch \
-  --source "$HIAI_SOURCE" \
-  --dry-run
+  -m models.dflash_v1.dflash_hiai_feature_check \
+  --source "$HIAI_SOURCE"
 ```
 
-`status` 正常后再执行自动修改。工具会额外留下一个非 Python 后缀的本地回退副本：
+通过时状态为 `PASS_DIRECT_SOURCE_CONTRACT`。检查项包括：
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
-  -m models.dflash_v1.dflash_hiai_feature_patch \
-  --source "$HIAI_SOURCE" \
-  --in-place \
-  --backup-suffix .pre-dflash-v1
+- `Qwen3_5TextModel.forward` 和 `Qwen3_5ForCausalLM.forward` 显式接收
+  `output_dflash_features=False`；
+- 层 `1,5,9,13,17,21,25,29` 的输出由 collector 聚合；
+- feature 宽度为 `20480`；
+- CausalLM 显式透传 feature 开关并返回 feature sidecar；
+- modeling 不导入已删除的 patch 工具。
 
-PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
-  -m models.dflash_v1.dflash_hiai_feature_patch \
-  --source "$HIAI_SOURCE" \
-  --check
-```
+## 4. 复用现有 target 加载和状态重置
 
-修改后的 HIAI 文件会显式导入：
-
-```python
-from .dflash_v1.dflash_target_features import (
-    DFlashFeatureCollector,
-    QWEN35_4B_DFLASH_TARGET_FEATURES,
-)
-from .dflash_v1.dflash_hiai_feature_runtime import attach_dflash_features
-```
-
-feature 关闭时保持原返回 ABI；开启时捕获 decoder 层
-`1,5,9,13,17,21,25,29` 的 post-layer/pre-final-norm hidden，并返回
-`dflash_features: [1,S,20480]`。
-
-## 3. 复用现有 inference 的两个接点
-
-### Target factory
-
-推荐把接收工程自有的两个薄适配放在
-`models/internal_dflash_bridge.py`。`--target-factory` 指向已经跑通的模型加载函数，接口必须是：
+`run_npu` 需要一个已经存在的 target factory：
 
 ```python
 def load_qwen35_target(target_dir: str, *, device, dtype):
-    # 复用现有内部 inference 的加载逻辑。
-    # 返回原始 models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM。
+    # 直接复用原 inference 已跑通的加载函数。
+    # 返回 models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM。
     ...
 ```
 
-返回对象必须已经把权重放在请求的 NPU 和 dtype 上。不要返回 tokenizer、pipeline 或另一层
-业务 wrapper。
+V1 每次 target 调用都重算完整前缀。内部 HIAI target 即使收到 `use_cache=False`，仍可能更新
+KV、GDN conv/recurrent state 和请求计数，因此每次调用前还必须进入一个全新 prefill 请求。
 
-### 完整前缀状态重置
+如果 target 本身已经提供：
 
-如果原 target 已经暴露
-`prepare_dflash_full_prefix_call(...)`，可以省略 `--reset-hook`。否则提供一个薄适配函数：
+```python
+prepare_dflash_full_prefix_call(
+    *, input_ids, sequence_length, output_dflash_features, logits_to_keep, call_index
+)
+```
+
+则不传 `--reset-hook`。否则在原工程中提供一个薄适配：
 
 ```python
 def reset_qwen35_full_prefix(
@@ -134,28 +110,47 @@ def reset_qwen35_full_prefix(
     logits_to_keep: int,
     call_index: int,
 ):
-    # 调用现有 inference “开始一个全新请求/重新 prefill”的代码。
-    # 必须处理其 KV、GDN conv/recurrent state 以及请求计数状态。
-    # 不要在这里猜内部状态的 dtype、shape 或初始值。
-    existing_inference_reset_for_new_request(target, sequence_length)
+    existing_inference_start_fresh_prefill(target, sequence_length)
     return None
 ```
 
-V1 会在普通 baseline、feature gate、bootstrap 和每轮 verify 前调用该函数。它不是性能优化；
-它用于保证每次完整前缀计算不会继承上一次 HIAI 请求的可变状态。
+这两个函数可以放在 `models/internal_dflash_bridge.py`。只需要把其中调用替换为内部 inference
+已有的真实加载/新请求入口；不要在桥里重写 attention/GDN，也不要猜内部 state 的 shape、
+dtype 或初始值。
 
-## 4. 最小 NPU smoke
+例如实际 import 名为：
 
-先使用两个新 token、一个 draft proposal：
+```text
+--target-factory models.internal_dflash_bridge:load_qwen35_target
+--reset-hook models.internal_dflash_bridge:reset_qwen35_full_prefix
+```
+
+## 5. 自定义算子环境检查
+
+先用原 inference 跑一次普通文本生成，确认 `torch_npu`、内部算子注册和权重路径仍正常。
+DFlash 不替换 target 内已有的 ChunkGatedDeltaRule、CacheUpdate、attention 或其他 HIAI 算子。
+它只在草稿侧选择 package-local NPU backend；其余受支持的 PyTorch 运算按 tensor device
+分派到 NPU。
+
+如果要运行仓库提供的静态接口审计：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  "$DFLASH_REPO/tools/audit_internal_custom_ops.py" \
+  --vendors-root /path/to/opp/vendors \
+  --nm "$(command -v nm)" \
+  --pretty
+```
+
+静态审计通过不等于真机执行通过；最终仍以运行 trace 和输出对齐为准。
+
+## 6. 最小 NPU smoke
 
 ```bash
 set -euo pipefail
 
-export INTERNAL_ROOT=/path/to/internal-inference
-export MODEL_PYTHON=/path/to/internal/python
-export RUN_DIR=/path/to/run
 export PYTHONPATH="$INTERNAL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-
+export RUN_DIR=/path/to/dflash-run
 mkdir -p "$RUN_DIR"
 
 PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
@@ -172,20 +167,16 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   2>&1 | tee "$RUN_DIR/dflash-v1-npu-smoke.log"
 ```
 
-`run_npu` 会自动设置：
+如果 target 自己实现了标准 prepare 方法，删除 `--reset-hook` 那一行。`run_npu` 自动固定：
 
 - `dtype=float16`；
-- `eos_token_id=248044`；
-- `npu_layout=embedded`；
-- package-local `internal_target_loader`；
-- 根目录中的 `modeling_qwen3_5_hiai_nd.py`；
+- EOS token `248044`；
 - package-local `dflash_ascend310p_ops`；
-- 禁止 CPU fallback 和外部 ops backend。
+- `max_draft_tokens` 范围 `1..15`；
+- 禁止 CPU fallback 和外部 ops backend；
+- modeling 与 DFlash 源码只读检查，并在运行前后复核文件哈希。
 
-它还会在推理前后重新检查当前 HIAI feature source 和 DFlash 运行文件；不需要生成或传入
-overlay JSON。
-
-## 5. Smoke 通过条件
+## 7. Smoke 通过条件
 
 报告至少应满足：
 
@@ -201,17 +192,19 @@ target verify calls > 0
 operator_fallback_enabled = false
 device = npu:0
 dtype = torch.float16
+runtime_preflight.source_integration = direct
+runtime_preflight.source_modified_by_runtime = false
 ```
 
-如果 `P → Q → P` 重复前缀门禁失败，先修接收工程的 reset hook，不要继续调接受率。
+如果 `P → Q → P` 重复前缀门禁失败，先修 reset hook。不要继续统计接受率。
 
-## 6. 扩大到正式 V1 block
+## 8. 扩大到正式 V1 block
 
-最小 smoke 通过后，把参数改为：
+最小 smoke 通过后，改为：
 
-```bash
+```text
 --max-new-tokens 32 --max-draft-tokens 15
 ```
 
-此时再统计真实 NPU 接受率、无 CPU fallback 和性能。CPU/GPU 接受率只能作为参考；NPU
-最终输出必须与同一个 NPU target 的普通 greedy 完全一致。
+再记录真实 NPU 接受率、无 CPU fallback、显存和性能。CPU/GPU 结果只验证 framework/draft；
+NPU 最终输出必须与同一个 NPU target 的普通 greedy 完全一致。

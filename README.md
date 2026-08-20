@@ -1,7 +1,7 @@
 # Qwen3.5-4B DFlash V1
 
 这是 Qwen3.5-4B 的 DFlash V1 PyTorch 实现，包含完整前缀重算调度、六层草稿模型、
-CPU/CUDA 后端，以及接入内部 Ascend 310P/HIAI 主模型所需的源码 patch 和 loader 模板。
+CPU/CUDA 后端，以及直接接入内部 Ascend 310P/HIAI 主模型所需的只读检查和 loader。
 
 仓库只保留可运行源码、部署工具、许可证和中文使用说明。测试日志、验证报告、发布清单和
 模型权重不放在 GitHub 仓库中。
@@ -28,7 +28,9 @@ CPU/CUDA 后端，以及接入内部 Ascend 310P/HIAI 主模型所需的源码 p
 ```
 
 不要用 CPU/GPU 的 `modeling_qwen3_5_dflash.py` 覆盖 HIAI modeling。NPU 继续执行原
-HIAI target 和其中已有的自定义算子；源码 patch 只增加可选的八层 feature 输出。
+HIAI target 和其中已有的自定义算子；内部 modeling 应已直接包含可选的八层 feature 输出。
+这份内部文件不在本仓库中，部署时保留服务器上已经改好的版本；DFlash runner 只读校验，
+不会再次修改它。
 
 ## 环境
 
@@ -72,9 +74,9 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
 
 ## 内部 NPU 快速入口
 
-先按 [内部服务器目录与 NPU 运行流程](docs/NPU_INTERNAL_LAYOUT.md) 给根目录中的
-`modeling_qwen3_5_hiai_nd.py` 增加 feature 旁路，然后复用现有 inference 的 target factory
-和“开始一个全新 prefill 请求”的状态重置函数：
+先按 [内部服务器目录与 NPU 运行流程](docs/NPU_INTERNAL_LAYOUT.md) 只读确认根目录中的
+`modeling_qwen3_5_hiai_nd.py` 已直接集成 feature 旁路，然后复用现有 inference 的 target
+factory 和“开始一个全新 prefill 请求”的状态重置函数：
 
 ```bash
 export PYTHONPATH=/path/to/internal/inference

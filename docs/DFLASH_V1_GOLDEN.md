@@ -56,7 +56,7 @@ models/
     └── 本仓库 DFlash V1 实现
 ```
 
-完整 patch、factory/reset 接口及命令见
+完整直接源码检查、factory/reset 接口及命令见
 [NPU_INTERNAL_LAYOUT.md](NPU_INTERNAL_LAYOUT.md)。NPU 日常运行不需要 overlay JSON：
 
 ```bash
@@ -98,7 +98,9 @@ assert report["ordinary"]["stop_reason"] == report["dflash"]["stop_reason"]
 preflight = report["runtime_preflight"]
 assert preflight["status"] == "PASS_EMBEDDED_RUNTIME_PREFLIGHT"
 assert preflight["layout"] == "embedded"
-assert preflight["patch_contract_id"] == "qwen3.5-4b-dflash-hiai-feature-source-v1"
+assert preflight["feature_contract_id"] == "qwen3.5-4b-dflash-hiai-feature-source-v1"
+assert preflight["source_integration"] == "direct"
+assert preflight["source_modified_by_runtime"] is False
 
 isolation = report["target_integration"]["isolation"]
 assert isolation["formal_npu"] is True

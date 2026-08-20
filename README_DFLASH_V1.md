@@ -32,8 +32,9 @@ DFlash V1 scheduler
 decoder 层 `1,5,9,13,17,21,25,29` 的层后、最终 norm 前输出
 `dflash_features: [B,S,20480]`。
 
-NPU feature patch 不替换 HIAI attention、GDN、CacheUpdate 或其他自定义算子。它只增加
-`output_dflash_features=False` 的显式开关和 opt-in 输出，默认生成路径保持不变。
+NPU modeling 已直接集成 feature route；运行时不再 patch。该 route 不替换 HIAI attention、
+GDN、CacheUpdate 或其他自定义算子，只增加 `output_dflash_features=False` 的显式开关和
+opt-in 输出，默认生成路径保持不变。
 
 ## NPU 状态边界
 

@@ -39,6 +39,7 @@ import torch
 from torch import Tensor, nn
 
 from .dflash_config import audit_official_4b_dflash_config
+from .dflash_hiai_feature_check import verify_direct_source_file
 from .dflash_ops import ModuleDFlashOps, TorchDFlashOps
 from .dflash_reference_decode_v1 import (
     ReplayDecodeResult,
@@ -100,7 +101,7 @@ _EMBEDDED_RUNTIME_FILES = frozenset(
     {
         "dflash_ascend310p_ops.py",
         "dflash_config.py",
-        "dflash_hiai_feature_patch.py",
+        "dflash_hiai_feature_check.py",
         "dflash_hiai_feature_runtime.py",
         "dflash_ops.py",
         "dflash_qwen_adapter_v1.py",
@@ -457,7 +458,7 @@ class Qwen35DFlashFullPrefixAdapter:
         if features is None:
             raise TypeError(
                 "feature-enabled target output does not expose Tensor "
-                "dflash_features; use the patched modeling_qwen3_5_dflash target"
+                "dflash_features; use a feature-enabled target modeling"
             )
         expected = (1, context_length, int(self.draft.config.feature_size))
         if tuple(features.shape) != expected:
@@ -1039,21 +1040,12 @@ def _bind_formal_hiai_source(
             "formal HIAI source must match the selected NPU layout's "
             "modeling_qwen3_5_hiai_nd.py"
         )
-    patcher_module_name = (
-        loader_module_name.rsplit(".", 1)[0] + ".dflash_hiai_feature_patch"
-    )
-    patcher = importlib.import_module(patcher_module_name)
-    verify_source = getattr(patcher, "verify_source", None)
-    if not callable(verify_source):
-        raise RuntimeError("receiver package lacks callable HIAI source verifier")
-    verification = verify_source(source.read_text(encoding="utf-8"))
-    if not isinstance(verification, Mapping):
-        raise TypeError("HIAI source verifier must return a mapping")
+    verification = verify_direct_source_file(source)
     actual_sha256 = _sha256_file(source)
-    declared_sha256 = getattr(target, "dflash_feature_patch_sha256", None)
+    declared_sha256 = getattr(target, "dflash_feature_source_sha256", None)
     if (
-        verification.get("status") != "verified"
-        or verification.get("patch_contract_id") != _HIAI_FEATURE_CONTRACT_ID
+        verification.get("status") != "PASS_DIRECT_SOURCE_CONTRACT"
+        or verification.get("contract_id") != _HIAI_FEATURE_CONTRACT_ID
         or verification.get("source_sha256") != actual_sha256
         or declared_sha256 != actual_sha256
     ):
@@ -1092,10 +1084,11 @@ def _bind_formal_hiai_source(
         "status": "PASS_ACTUAL_PACKAGE_SOURCE",
         "path": str(source),
         "source_sha256": actual_sha256,
-        "patch_contract_id": verification["patch_contract_id"],
+        "contract_id": verification["contract_id"],
         "feature_source": verification["feature_source"],
         "capture_point": verification["capture_point"],
-        "custom_operators_modified": verification["custom_operators_modified"],
+        "source_integration": "direct",
+        "source_modified_by_runtime": False,
         "raw_target_fqcn": raw_target_identity.get("fqcn"),
         "raw_target_class_object_bound": True,
     }
@@ -1222,7 +1215,7 @@ def _target_integration_audit(
 
     CPU package-default execution remains a framework golden.  A formal NPU
     run must use the receiver facade, prepare every full-prefix call, and
-    declare the source-level HIAI feature patch.  Receiver declarations are
+    declare the directly integrated HIAI feature route.  Receiver declarations are
     recorded as declarations; the later zero-impact and token gates remain the
     behavioral evidence.
     """
@@ -1291,22 +1284,23 @@ def _target_integration_audit(
     feature_source = getattr(target, "dflash_feature_source", None)
     capture_point = getattr(target, "dflash_feature_capture_point", None)
     feature_contract_id = getattr(target, "dflash_feature_contract_id", None)
-    patch_sha256 = getattr(target, "dflash_feature_patch_sha256", None)
+    source_sha256 = getattr(target, "dflash_feature_source_sha256", None)
     actual_source_identity = getattr(target, "_dflash_hiai_source_identity", None)
-    if patch_sha256 is not None:
-        if not isinstance(patch_sha256, str) or len(patch_sha256) != 64:
-            raise TypeError("dflash_feature_patch_sha256 must be a 64-character string")
+    if source_sha256 is not None:
+        if not isinstance(source_sha256, str) or len(source_sha256) != 64:
+            raise TypeError("HIAI feature source SHA-256 must be a 64-character string")
         try:
-            int(patch_sha256, 16)
+            int(source_sha256, 16)
         except ValueError as error:
-            raise TypeError("dflash_feature_patch_sha256 must be hexadecimal") from error
-        patch_sha256 = patch_sha256.lower()
+            raise TypeError("HIAI feature source SHA-256 must be hexadecimal") from error
+        source_sha256 = source_sha256.lower()
 
     feature = {
         "source": feature_source,
         "capture_point": capture_point,
         "contract_id": feature_contract_id,
-        "patched_source_sha256": patch_sha256,
+        "source_sha256": source_sha256,
+        "integration_mode": "direct_source",
         "evidence_authority": "receiver_declared",
         "actual_package_source": (
             dict(actual_source_identity)
@@ -1314,11 +1308,11 @@ def _target_integration_audit(
             else None
         ),
         "status": (
-            "PASS_DECLARED_SOURCE_PATCH"
+            "PASS_DECLARED_DIRECT_SOURCE"
             if feature_source == _HIAI_FEATURE_SOURCE
             and capture_point == _HIAI_CAPTURE_POINT
             and feature_contract_id == _HIAI_FEATURE_CONTRACT_ID
-            and patch_sha256 is not None
+            and source_sha256 is not None
             else "UNVERIFIED_FRAMEWORK_GOLDEN"
         ),
     }
@@ -1370,15 +1364,15 @@ def _target_integration_audit(
             )
         if isolation.get("prepare_failures") != 0:
             raise RuntimeError("target full-prefix isolation reported prepare failures")
-        if feature["status"] != "PASS_DECLARED_SOURCE_PATCH":
+        if feature["status"] != "PASS_DECLARED_DIRECT_SOURCE":
             raise RuntimeError(
-                "formal NPU target must declare the locked source-level "
+                "formal NPU target must declare the directly integrated "
                 "modeling_qwen3_5_hiai_nd.py feature contract and source hash"
             )
         if not isinstance(actual_source_identity, Mapping) or (
             actual_source_identity.get("status") != "PASS_ACTUAL_PACKAGE_SOURCE"
-            or actual_source_identity.get("source_sha256") != patch_sha256
-            or actual_source_identity.get("patch_contract_id")
+            or actual_source_identity.get("source_sha256") != source_sha256
+            or actual_source_identity.get("contract_id")
             != _HIAI_FEATURE_CONTRACT_ID
         ):
             raise RuntimeError(
@@ -1897,12 +1891,10 @@ def _validate_embedded_runtime(
             "embedded DFlash framework requires transformers==5.14.1; got "
             f"{transformers.__version__}"
         )
-    from .dflash_hiai_feature_patch import verify_source
-
-    verification = verify_source(hiai_source.read_text(encoding="utf-8"))
+    verification = verify_direct_source_file(hiai_source)
     if (
-        verification.get("status") != "verified"
-        or verification.get("patch_contract_id") != _HIAI_FEATURE_CONTRACT_ID
+        verification.get("status") != "PASS_DIRECT_SOURCE_CONTRACT"
+        or verification.get("contract_id") != _HIAI_FEATURE_CONTRACT_ID
     ):
         raise RuntimeError("embedded HIAI source does not satisfy the feature contract")
     runtime_hashes: dict[str, str] = {}
@@ -1920,7 +1912,9 @@ def _validate_embedded_runtime(
         "runtime_file_sha256": runtime_hashes,
         "hiai_source": str(hiai_source),
         "hiai_source_sha256": _sha256_file(hiai_source),
-        "patch_contract_id": verification["patch_contract_id"],
+        "feature_contract_id": verification["contract_id"],
+        "source_integration": "direct",
+        "source_modified_by_runtime": False,
         "receiver_loader_sha256": _sha256_file(loader_path),
     }
 

@@ -33,7 +33,7 @@ def _parser() -> argparse.ArgumentParser:
         "--target-factory",
         required=True,
         help=(
-            "existing inference MODULE:FUNCTION returning the raw patched "
+            "existing inference MODULE:FUNCTION returning the directly integrated "
             "models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM"
         ),
     )

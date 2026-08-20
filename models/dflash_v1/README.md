@@ -21,7 +21,7 @@
 - `modeling_qwen3_5_dflash.py`：CPU/CUDA 使用的 Transformers 5.14.1 target。
 - `configuration_qwen3_5.py`：CPU/CUDA target 配置。
 - `dflash_target_features.py`：八层 feature collector 和输出类型。
-- `dflash_hiai_feature_patch.py`：自动修改父目录 HIAI target 的 AST patch/check 工具。
+- `dflash_hiai_feature_check.py`：只读检查父目录 HIAI target 已直接集成 feature route。
 - `dflash_hiai_feature_runtime.py`：保留内部输出字段的 feature sidecar。
 - `internal_target_loader.py`：通过命令行指定的内部 factory/reset hook 连接 HIAI target。
 - `internal_target_loader_template.py`：facade 合同及自定义 loader 参考。

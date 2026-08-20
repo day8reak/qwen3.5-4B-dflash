@@ -54,7 +54,7 @@ class DFlashTargetFeatureSpec:
 # Keep the target-side feature helper independent of the draft implementation.
 # These values are the frozen Qwen3.5-4B DFlash feature contract and are checked
 # against ``models.dflash_v1.dflash_config`` by downstream checks.  A receiving
-# target package therefore needs only this helper plus the patched modeling
+# target package therefore needs only this helper plus the directly integrated modeling
 # sibling; it must not need the draft-only ``dflash_config.py`` module.
 QWEN35_4B_DFLASH_TARGET_FEATURES = DFlashTargetFeatureSpec(
     layer_ids=(1, 5, 9, 13, 17, 21, 25, 29),

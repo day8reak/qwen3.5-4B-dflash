@@ -1,6 +1,6 @@
 # DFlash V1 Ascend NPU 接入说明
 
-本页说明代码边界和真机验证要求；实际目录、patch 和命令以
+本页说明代码边界和真机验证要求；实际目录、直接源码检查和命令以
 [NPU_INTERNAL_LAYOUT.md](NPU_INTERNAL_LAYOUT.md) 为准。
 
 ## 实现结构
@@ -16,7 +16,8 @@
 ```
 
 内部 NPU target 继续执行原 inference 中已有的自定义算子。DFlash 不用 PyTorch hook
-全局替换它们，也不从 Python 直接调用原始 ACLNN C API。HIAI source patch 只增加：
+全局替换它们，也不从 Python 直接调用原始 ACLNN C API。直接集成的 HIAI feature route
+只增加：
 
 - `output_dflash_features=False` 显式参数；
 - decoder 层 `1,5,9,13,17,21,25,29` 的层后捕获；
