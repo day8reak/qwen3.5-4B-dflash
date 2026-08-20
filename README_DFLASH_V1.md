@@ -2,8 +2,8 @@
 
 本实现依赖 `transformers==5.14.1`。CPU/CUDA 使用完整的
 `models/dflash_v1/modeling_qwen3_5_dflash.py`；NPU 使用
-部署时从批准的资产存储取回的 `models/modeling_qwen3_5_hiai_nd.py`，DFlash 代码整体放在
-它旁边的 `models/dflash_v1/`。该 NPU 文件不随 Git 仓库分发。
+本仓库直接提供的 `models/modeling_qwen3_5_hiai_nd.py`，DFlash 代码整体放在它旁边的
+`models/dflash_v1/`。
 
 先阅读：
 
@@ -33,7 +33,7 @@ DFlash V1 scheduler
 decoder 层 `1,5,9,13,17,21,25,29` 的层后、最终 norm 前输出
 `dflash_features: [B,S,20480]`。
 
-部署输入 `models/modeling_qwen3_5_hiai_nd.py` 已直接集成 feature route；运行时不再 patch。
+`models/modeling_qwen3_5_hiai_nd.py` 已直接集成 feature route；运行时不再 patch。
 该 route 不替换 attention、GDN、CacheUpdate 或其他自定义算子，只增加
 `output_dflash_features=False` 的显式开关。默认仍返回 logits Tensor；仅开启时返回
 `(logits, dflash_features)`。

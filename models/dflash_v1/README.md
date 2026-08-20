@@ -1,8 +1,8 @@
 # DFlash V1 源码索引
 
-本目录整体放在目标工程的 `models/dflash_v1/`。NPU modeling 文件不随 Git 仓库分发；
-从批准的资产存储取回 `modeling_qwen3_5_hiai_nd.py` 后，将它放到父目录同名位置。不要用
-CPU/CUDA target 覆盖它。
+本目录整体放在目标工程的 `models/dflash_v1/`。仓库根目录直接提供
+`models/modeling_qwen3_5_hiai_nd.py`；部署时将它放到父目录同名位置。不要用 CPU/CUDA
+target 覆盖它。
 
 ## 运行与调度
 

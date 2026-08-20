@@ -9,8 +9,8 @@ CPU/CUDA 后端，以及 Ascend NPU/HIAI target 所需的检查和 loader。
 ## 目录
 
 - `models/dflash_v1/`：DFlash 调度器、草稿模型、CPU/CUDA/NPU backend 和运行入口。
-- `models/modeling_qwen3_5_hiai_nd.py`：NPU 部署输入，不随 Git 仓库分发；从批准的资产存储
-  取回后放到该位置。它应包含八层 feature collector，并保持默认 forward 返回不变。
+- `models/modeling_qwen3_5_hiai_nd.py`：NPU target 的直接集成版本，包含八层 feature
+  collector，并保持默认 forward 返回不变。
 - `models/internal_dflash_bridge.py`：复用现有 HIAI wrapper，并为每次完整前缀调用创建
   全新的 hybrid KV/GDN state。
 - `models/dflash_qwen_adapter_v1.py`：旧命令兼容入口。
@@ -24,16 +24,16 @@ NPU 部署采用“target 在父包、DFlash 放子目录”的结构：
 ```text
 qwen35-runtime/
 └── models/
-    ├── modeling_qwen3_5_hiai_nd.py   # 从批准的资产存储取回
+    ├── modeling_qwen3_5_hiai_nd.py   # 本仓库直接提供
     ├── configuration_qwen3_5.py      # 已有配置文件
     ├── internal_dflash_bridge.py     # 本仓库已实现，无需手写
     ├── 其他运行文件
     └── dflash_v1/                    # 本仓库的 models/dflash_v1 整目录
 ```
 
-不要用 CPU/GPU 的 `modeling_qwen3_5_dflash.py` 覆盖 NPU modeling。NPU 部署时先从批准的
-资产存储取回 `modeling_qwen3_5_hiai_nd.py`，再将它整体复制到目标工程同名位置。runner
-只读校验它的 feature ABI，不会在运行时 patch 或修改它。
+不要用 CPU/GPU 的 `modeling_qwen3_5_dflash.py` 覆盖 NPU modeling。部署时将本仓库的
+`models/modeling_qwen3_5_hiai_nd.py` 整体复制到目标工程同名位置。runner 只读校验它的
+feature ABI，不会在运行时 patch 或修改它。
 
 ## 环境
 
@@ -77,7 +77,7 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
 
 ## NPU 快速入口
 
-先按 [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md) 从资产存储取回并部署
+先按 [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md) 部署仓库中的
 `modeling_qwen3_5_hiai_nd.py`。bridge 会复用现有
 `Qwen3_5ForCausalLMWrapper`，并按模型配置的 hybrid-cache shape 在每次 target 调用时
 新建状态，因此不再需要手写 factory/reset：

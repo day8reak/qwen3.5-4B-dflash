@@ -6,13 +6,11 @@
 
 ```bash
 export DFLASH_REPO=/path/to/qwen3.5-4B-dflash
-export HIAI_SOURCE=/path/to/retrieved/modeling_qwen3_5_hiai_nd.py
 export DEPLOY_ROOT=/path/to/qwen35-runtime
 export MODEL_PYTHON=/path/to/python
 ```
 
 - `DFLASH_REPO`：本仓库根目录。
-- `HIAI_SOURCE`：从批准的资产存储取回的完整 NPU modeling 文件。
 - `DEPLOY_ROOT`：运行工程根目录，下面已有 `models/` 和模型 wrapper。
 - `MODEL_PYTHON`：该工程实际使用的 Python 3.10。
 
@@ -20,7 +18,7 @@ export MODEL_PYTHON=/path/to/python
 
 ```bash
 set -euo pipefail
-test -f "$HIAI_SOURCE"
+test -f "$DFLASH_REPO/models/modeling_qwen3_5_hiai_nd.py"
 test -f "$DFLASH_REPO/models/dflash_v1/run_npu.py"
 test -f "$DEPLOY_ROOT/models/configuration_qwen3_5.py"
 test -f "$DEPLOY_ROOT/models/export_model_wrapper_qwen3_5.py"
@@ -61,7 +59,7 @@ mv "$DEPLOY_ROOT/models/dflash_v1.r10.new" \
 
 install -m 0644 "$DFLASH_REPO/models/internal_dflash_bridge.py" \
   "$DEPLOY_ROOT/models/internal_dflash_bridge.py"
-install -m 0644 "$HIAI_SOURCE" \
+install -m 0644 "$DFLASH_REPO/models/modeling_qwen3_5_hiai_nd.py" \
   "$DEPLOY_ROOT/models/modeling_qwen3_5_hiai_nd.py"
 ```
 

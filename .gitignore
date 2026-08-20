@@ -12,9 +12,6 @@ reports/
 runs/
 evidence/
 
-# Deployment-only target source; retrieve it from the approved asset store.
-/models/modeling_qwen3_5_hiai_nd.py
-
 # Release-audit files belong to the cold-storage delivery package.
 MANIFEST.sha256
 VALIDATION.json
