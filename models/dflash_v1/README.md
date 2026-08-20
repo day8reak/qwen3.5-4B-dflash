@@ -23,7 +23,8 @@
 - `dflash_target_features.py`：八层 feature collector 和输出类型。
 - `dflash_hiai_feature_check.py`：只读检查父目录 HIAI target 已直接集成 feature route。
 - `dflash_hiai_feature_runtime.py`：保留内部输出字段的 feature sidecar。
-- `internal_target_loader.py`：通过命令行指定的内部 factory/reset hook 连接 HIAI target。
+- `../internal_dflash_bridge.py`：复用现有 wrapper，并为每次调用新建 hybrid state。
+- `internal_target_loader.py`：把已实现的 bridge 包装成 DFlash target facade。
 - `internal_target_loader_template.py`：facade 合同及自定义 loader 参考。
 - `dflash_target_hook_bridge.py`：仅供 eager/CPU 调试的 hook 方案。
 

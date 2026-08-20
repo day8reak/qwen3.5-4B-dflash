@@ -1056,11 +1056,17 @@ def _bind_formal_hiai_source(
     hiai_module_name = hiai_package + ".modeling_qwen3_5_hiai_nd"
     hiai_module = importlib.import_module(hiai_module_name)
     expected_target_class = getattr(hiai_module, "Qwen3_5ForCausalLM", None)
-    raw_target = getattr(target, "target", None)
+    target_controller = getattr(target, "target", None)
+    raw_target = getattr(
+        target_controller,
+        "dflash_execution_model",
+        target_controller,
+    )
     if not isinstance(expected_target_class, type) or type(raw_target) is not expected_target_class:
         raise RuntimeError(
-            "formal facade must wrap the exact package-local "
-            "Qwen3_5ForCausalLM class exported by modeling_qwen3_5_hiai_nd"
+            "formal facade must execute the exact package-local "
+            "Qwen3_5ForCausalLM class exported by modeling_qwen3_5_hiai_nd, "
+            "directly or through internal_dflash_bridge"
         )
     isolation_audit = getattr(target, "dflash_full_prefix_isolation_audit", None)
     raw_target_identity = (
@@ -1831,6 +1837,7 @@ def _validate_report_destination(
             {
                 Path(args.hiai_source).expanduser().resolve(),
                 (package_dir / "internal_target_loader.py").resolve(),
+                (package_dir.parent / "internal_dflash_bridge.py").resolve(),
             }
         )
     prompt_json = getattr(args, "prompt_json", None)
@@ -1897,6 +1904,11 @@ def _validate_embedded_runtime(
         or verification.get("contract_id") != _HIAI_FEATURE_CONTRACT_ID
     ):
         raise RuntimeError("embedded HIAI source does not satisfy the feature contract")
+    bridge_path = package_dir.parent / "internal_dflash_bridge.py"
+    if bridge_path.is_symlink() or not bridge_path.is_file():
+        raise RuntimeError(
+            "embedded NPU layout requires models/internal_dflash_bridge.py"
+        )
     runtime_hashes: dict[str, str] = {}
     for name in sorted(_EMBEDDED_RUNTIME_FILES):
         path = package_dir / name
@@ -1916,6 +1928,7 @@ def _validate_embedded_runtime(
         "source_integration": "direct",
         "source_modified_by_runtime": False,
         "receiver_loader_sha256": _sha256_file(loader_path),
+        "internal_bridge_sha256": _sha256_file(bridge_path),
     }
 
 

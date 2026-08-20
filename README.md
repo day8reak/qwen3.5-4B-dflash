@@ -9,6 +9,8 @@ CPU/CUDA 后端，以及直接接入内部 Ascend 310P/HIAI 主模型所需的�
 ## 目录
 
 - `models/dflash_v1/`：DFlash 调度器、草稿模型、CPU/CUDA/NPU backend 和运行入口。
+- `models/internal_dflash_bridge.py`：复用现有 HIAI wrapper，并为每次完整前缀调用创建
+  全新的 hybrid KV/GDN state。
 - `models/dflash_qwen_adapter_v1.py`：旧命令兼容入口。
 - `tools/`：内部自定义算子静态预检工具。
 - `config/`：预检工具使用的内部算子接口合同。
@@ -22,7 +24,7 @@ CPU/CUDA 后端，以及直接接入内部 Ascend 310P/HIAI 主模型所需的�
 └── models/
     ├── modeling_qwen3_5_hiai_nd.py   # 已能在 NPU 吐字的原 HIAI target
     ├── configuration_qwen3_5.py      # 原工程文件
-    ├── internal_dflash_bridge.py     # 接收工程自有的加载/状态重置薄适配
+    ├── internal_dflash_bridge.py     # 本仓库已实现，无需手写
     ├── 其他原 HIAI 文件
     └── dflash_v1/                    # 本仓库的 models/dflash_v1 整目录
 ```
@@ -75,8 +77,9 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
 ## 内部 NPU 快速入口
 
 先按 [内部服务器目录与 NPU 运行流程](docs/NPU_INTERNAL_LAYOUT.md) 只读确认根目录中的
-`modeling_qwen3_5_hiai_nd.py` 已直接集成 feature 旁路，然后复用现有 inference 的 target
-factory 和“开始一个全新 prefill 请求”的状态重置函数：
+`modeling_qwen3_5_hiai_nd.py` 已直接集成 feature 旁路。bridge 会复用现有
+`Qwen3_5ForCausalLMWrapper`，并按照原 inference 的 hybrid-cache shape 在每次 target 调用时
+新建状态，因此不再需要手写 factory/reset：
 
 ```bash
 export PYTHONPATH=/path/to/internal/inference
@@ -84,8 +87,7 @@ export PYTHONPATH=/path/to/internal/inference
 python -B -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --target-factory models.internal_dflash_bridge:load_qwen35_target \
-  --reset-hook models.internal_dflash_bridge:reset_qwen35_full_prefix \
+  --kv-cache-max-len 4096 \
   --prompt-ids 151644,872,198 \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
@@ -93,8 +95,8 @@ python -B -m models.dflash_v1.run_npu \
   --report /path/to/run/dflash-v1-npu-smoke.json
 ```
 
-这里的两个内部函数名是接口示例，替换成服务器上已经存在的实际 import 名；不需要修改
-DFlash 包源码。`run_npu` 会自动固定 FP16、EOS `248044`、内嵌目录、package-local NPU
+把 `4096` 替换成原 inference YAML 中 `config_data['kv_cache_max_len']` 的真实值。
+不需要修改 bridge 源码。`run_npu` 会自动固定 FP16、EOS `248044`、内嵌目录、package-local NPU
 backend 和 HIAI source，不再要求 overlay JSON。
 
 仓库不包含 Qwen3.5-4B 或 DFlash 权重。真实 CUDA 和 Ascend 310P 结果需要在对应服务器上

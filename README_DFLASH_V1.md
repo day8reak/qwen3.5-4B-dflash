@@ -38,15 +38,17 @@ opt-in 输出，默认生成路径保持不变。
 
 ## NPU 状态边界
 
-`use_cache=False` 不能自动清除 HIAI 内部的 block-table KV、GDN conv/recurrent state 或请求
-计数器。V1 每次完整前缀调用前必须：
+`use_cache=False` 不能自动清除 HIAI 内部的 block-table KV、GDN conv/recurrent state。
+本仓库的 `models/internal_dflash_bridge.py` 已直接复用你提供的 inference 初始化逻辑：
 
-1. 进入一次全新的 prefill 请求；
-2. 复用原 inference 的 KV/GDN/request 初始化代码；
-3. 保证 `P → Q → P` 中两次 `P` 的 logits/features 一致。
+1. 每次调用都按 `layer_types` 新建 32 层 hybrid state；
+2. linear 层新建 `(conv_state, recurrent_state)`，full-attention 层新建 block-table `(K,V)`；
+3. 用完整前缀执行一次 fresh prefill；
+4. 只把 logits 和可选 features 返回 DFlash，不跨调用返回 state；
+5. 保证 `P → Q → P` 中两次 `P` 的 logits/features 一致。
 
-`models.dflash_v1.run_npu` 通过 `--target-factory` 复用现有模型加载函数，并通过
-`--reset-hook` 复用现有“开始新请求”函数。DFlash 包不猜内部状态的 shape、dtype 或初始值。
+shape/dtype 来自现有 inference 实现和模型 config。`run_npu` 默认使用已经实现好的 bridge；
+只需传原 YAML 中同一个 `kv_cache_max_len`。
 
 ## Draft backend
 
@@ -66,8 +68,7 @@ export PYTHONPATH=/path/to/internal-inference
 python -B -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --target-factory models.internal_dflash_bridge:load_qwen35_target \
-  --reset-hook models.internal_dflash_bridge:reset_qwen35_full_prefix \
+  --kv-cache-max-len 4096 \
   --prompt-ids 151644,872,198 \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
@@ -75,8 +76,8 @@ python -B -m models.dflash_v1.run_npu \
   --report /path/to/run/dflash-v1-npu-smoke.json
 ```
 
-两个内部函数名是示例，替换成服务器真实 import。若 target 自己已经提供
-`prepare_dflash_full_prefix_call`，可以省略 `--reset-hook`。
+把 `4096` 换成原 inference YAML 的实际值。默认 bridge 固定导入
+`models.export_model_wrapper_qwen3_5.Qwen3_5ForCausalLMWrapper`，与你提供的 inference 一致。
 
 ## 验证边界
 

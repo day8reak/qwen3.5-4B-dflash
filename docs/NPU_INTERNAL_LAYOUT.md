@@ -36,7 +36,7 @@ internal-inference/
     ├── __init__.py
     ├── modeling_qwen3_5_hiai_nd.py   # 已直接集成 feature route
     ├── configuration_qwen3_5.py
-    ├── internal_dflash_bridge.py     # 仅在需要适配现有加载/重置函数时使用
+    ├── internal_dflash_bridge.py     # 本仓库已实现，直接复用现有 wrapper
     ├── 原工程其他 HIAI 文件
     └── dflash_v1/                    # 复制本仓库的整个目录
 ```
@@ -46,7 +46,10 @@ internal-inference/
 ```bash
 set -euo pipefail
 test ! -e "$INTERNAL_ROOT/models/dflash_v1"
+test ! -e "$INTERNAL_ROOT/models/internal_dflash_bridge.py"
 cp -a "$DFLASH_REPO/models/dflash_v1" "$INTERNAL_ROOT/models/dflash_v1"
+cp "$DFLASH_REPO/models/internal_dflash_bridge.py" \
+  "$INTERNAL_ROOT/models/internal_dflash_bridge.py"
 ```
 
 更新时不要把两版文件逐个混合覆盖；按内部策略移走旧 `dflash_v1` 后，再整体复制新目录。
@@ -76,54 +79,38 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 - CausalLM 显式透传 feature 开关并返回 feature sidecar；
 - modeling 不导入已删除的 patch 工具。
 
-## 4. 复用现有 target 加载和状态重置
+## 4. Bridge 已直接实现
 
-`run_npu` 需要一个已经存在的 target factory：
-
-```python
-def load_qwen35_target(target_dir: str, *, device, dtype):
-    # 直接复用原 inference 已跑通的加载函数。
-    # 返回 models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM。
-    ...
-```
-
-V1 每次 target 调用都重算完整前缀。内部 HIAI target 即使收到 `use_cache=False`，仍可能更新
-KV、GDN conv/recurrent state 和请求计数，因此每次调用前还必须进入一个全新 prefill 请求。
-
-如果 target 本身已经提供：
+根据现有 inference，仓库中的 `models/internal_dflash_bridge.py` 已经固定复用：
 
 ```python
-prepare_dflash_full_prefix_call(
-    *, input_ids, sequence_length, output_dflash_features, logits_to_keep, call_index
-)
+from models.export_model_wrapper_qwen3_5 import Qwen3_5ForCausalLMWrapper
 ```
 
-则不传 `--reset-hook`。否则在原工程中提供一个薄适配：
+它采用与原 `qwen3_5_inference_loop()` 相同的状态布局：
 
-```python
-def reset_qwen35_full_prefix(
-    target,
-    *,
-    input_ids,
-    sequence_length: int,
-    output_dflash_features: bool,
-    logits_to_keep: int,
-    call_index: int,
-):
-    existing_inference_start_fresh_prefill(target, sequence_length)
-    return None
-```
+- linear-attention：`(past_conv_state, past_recurrent_state)`；
+- full-attention：`(past_key_in, past_value_in)`；
+- KV block size：`64`；
+- embedding 从 `model_wrapper.model.get_input_embeddings()` 获取；
+- 每次 DFlash target 调用都新建完整 state，并从位置 0 做 full-prefix prefill。
 
-这两个函数可以放在 `models/internal_dflash_bridge.py`。只需要把其中调用替换为内部 inference
-已有的真实加载/新请求入口；不要在桥里重写 attention/GDN，也不要猜内部 state 的 shape、
-dtype 或初始值。
+因此不需要手写 factory，也不需要 reset hook。Bridge 不改 attention/GDN/CacheUpdate，
+这些仍由 `model_wrapper.model` 中原来的 HIAI 自定义算子执行。
 
-例如实际 import 名为：
+Bridge 会在加载后核对 `model_wrapper.model` 的真实类型必须是
+`models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM`。若这里报错，说明
+`export_model_wrapper_qwen3_5.py` 仍导入了另一份 modeling；先让原 wrapper 指向已经能在
+NPU 吐字的这份 HIAI 类，不能同时加载两份 target 实现。
+
+运行前只需从原 inference YAML 读取：
 
 ```text
---target-factory models.internal_dflash_bridge:load_qwen35_target
---reset-hook models.internal_dflash_bridge:reset_qwen35_full_prefix
+config_data['kv_cache_max_len']
 ```
+
+并作为 `--kv-cache-max-len` 传入。当前 bridge 只支持原 inference 的
+`quant_mode=disable` / FP16 路线。
 
 ## 5. 自定义算子环境检查
 
@@ -157,8 +144,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --target-factory models.internal_dflash_bridge:load_qwen35_target \
-  --reset-hook models.internal_dflash_bridge:reset_qwen35_full_prefix \
+  --kv-cache-max-len 4096 \
   --prompt-ids 151644,872,198 \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
@@ -167,7 +153,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   2>&1 | tee "$RUN_DIR/dflash-v1-npu-smoke.log"
 ```
 
-如果 target 自己实现了标准 prepare 方法，删除 `--reset-hook` 那一行。`run_npu` 自动固定：
+将 `4096` 替换为原 inference YAML 的实际值。`run_npu` 自动固定：
 
 - `dtype=float16`；
 - EOS token `248044`；
@@ -196,7 +182,8 @@ runtime_preflight.source_integration = direct
 runtime_preflight.source_modified_by_runtime = false
 ```
 
-如果 `P → Q → P` 重复前缀门禁失败，先修 reset hook。不要继续统计接受率。
+如果 `P → Q → P` 重复前缀门禁失败，先检查 bridge 的 fresh state shape、
+`kv_cache_max_len` 和 full-prefix prefill。不要继续统计接受率。
 
 ## 8. 扩大到正式 V1 block
 

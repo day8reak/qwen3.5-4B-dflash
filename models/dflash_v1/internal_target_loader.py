@@ -2,15 +2,16 @@
 
 The internal server keeps ``modeling_qwen3_5_hiai_nd.py`` in the parent
 ``models`` package and installs this DFlash package as ``models.dflash_v1``.
-This loader deliberately does not know how the private inference framework
-constructs or resets a model.  The NPU runner supplies two reviewed callables:
+The default receiver bridge reuses ``Qwen3_5ForCausalLMWrapper`` and allocates
+fresh external hybrid state for every complete-prefix target call.  The NPU
+runner supplies its reviewed factory through one callable:
 
 ``DFLASH_HIAI_TARGET_FACTORY``
-    ``MODULE:FUNCTION`` returning the already supported raw
-    ``models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM`` instance.
+    ``MODULE:FUNCTION`` returning either the packaged ``InternalDFlashTarget``
+    bridge or another reviewed target facade.
 
 ``DFLASH_HIAI_RESET_HOOK``
-    Optional ``MODULE:FUNCTION`` used when the raw target does not already
+    Optional advanced ``MODULE:FUNCTION`` used when a custom target does not
     expose ``prepare_dflash_full_prefix_call``.  It resets the receiver-owned
     KV/GDN/request state before every complete-prefix target call.
 
@@ -180,7 +181,7 @@ def create_internal_target(
     device: torch.device,
     dtype: torch.dtype,
 ) -> nn.Module:
-    """Call the existing inference factory and prepare its DFlash contract."""
+    """Call the existing inference/bridge factory and prepare its contract."""
 
     specification = os.environ.get(TARGET_FACTORY_ENV)
     if not specification:

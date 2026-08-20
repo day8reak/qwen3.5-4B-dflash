@@ -203,6 +203,15 @@ def _target_type_identity(target: nn.Module) -> dict[str, object]:
     return identity
 
 
+def _execution_model(target: nn.Module) -> nn.Module:
+    """Resolve the HIAI module that executes target math behind a bridge."""
+
+    execution_model = getattr(target, "dflash_execution_model", target)
+    if not isinstance(execution_model, nn.Module):
+        raise TypeError("dflash_execution_model must be torch.nn.Module")
+    return execution_model
+
+
 def _prepare_device_backend(device: str | torch.device) -> None:
     """Import ``torch_npu`` and select the card before target construction."""
 
@@ -344,7 +353,7 @@ class InternalTargetFacade(nn.Module):
         if not torch.empty((), dtype=dtype).is_floating_point():
             raise TypeError("internal target dtype must be floating point")
         self.target = target
-        self._raw_target_identity = _target_type_identity(target)
+        self._raw_target_identity = _target_type_identity(_execution_model(target))
         self.requested_device = torch.device(device)
         self.requested_dtype = dtype
         self.expected_vocab_size = int(expected_vocab_size)
@@ -698,7 +707,7 @@ class InternalTargetFacade(nn.Module):
                     label="fresh internal target",
                 )
                 self._validate_feature_provenance_for(prepared)
-                prepared_identity = _target_type_identity(prepared)
+                prepared_identity = _target_type_identity(_execution_model(prepared))
                 if (
                     prepared_identity.get("fqcn")
                     != self._raw_target_identity.get("fqcn")

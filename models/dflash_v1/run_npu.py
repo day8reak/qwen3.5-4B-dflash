@@ -20,6 +20,10 @@ from .internal_target_loader import (
 )
 
 
+DEFAULT_TARGET_FACTORY = "models.internal_dflash_bridge:load_qwen35_target"
+KV_CACHE_MAX_LEN_ENV = "DFLASH_HIAI_KV_CACHE_MAX_LEN"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -31,18 +35,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--draft-dir", required=True)
     parser.add_argument(
         "--target-factory",
-        required=True,
+        default=DEFAULT_TARGET_FACTORY,
         help=(
-            "existing inference MODULE:FUNCTION returning the directly integrated "
-            "models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM"
+            "advanced override; default models.internal_dflash_bridge:"
+            "load_qwen35_target reuses Qwen3_5ForCausalLMWrapper and builds "
+            "fresh hybrid state for every target call"
         ),
     )
     parser.add_argument(
         "--reset-hook",
         help=(
-            "MODULE:FUNCTION resetting receiver KV/GDN/request state before "
-            "each full-prefix call; omit only when the target already exposes "
-            "prepare_dflash_full_prefix_call"
+            "advanced override for a custom target factory; the packaged "
+            "internal_dflash_bridge does not need a reset hook"
         ),
     )
     prompt = parser.add_mutually_exclusive_group(required=True)
@@ -51,6 +55,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--max-draft-tokens", type=int, default=1)
     parser.add_argument("--device", default="npu:0")
+    parser.add_argument(
+        "--kv-cache-max-len",
+        type=int,
+        required=True,
+        help="same kv_cache_max_len used by the existing HIAI inference YAML",
+    )
     parser.add_argument("--prefill-chunk-size", type=int, default=64)
     parser.add_argument("--decode-chunk-size", type=int, default=1)
     parser.add_argument("--report")
@@ -71,6 +81,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not 1 <= args.max_draft_tokens <= 15:
         raise ValueError("--max-draft-tokens must be between 1 and 15")
     for name, value in (
+        ("--kv-cache-max-len", args.kv_cache_max_len),
         ("--prefill-chunk-size", args.prefill_chunk_size),
         ("--decode-chunk-size", args.decode_chunk_size),
     ):
@@ -85,6 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     os.environ[PREFILL_CHUNK_SIZE_ENV] = str(args.prefill_chunk_size)
     os.environ[DECODE_CHUNK_SIZE_ENV] = str(args.decode_chunk_size)
+    os.environ[KV_CACHE_MAX_LEN_ENV] = str(args.kv_cache_max_len)
 
     adapter_args = [
         "--target-dir",

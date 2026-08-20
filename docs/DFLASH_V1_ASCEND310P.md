@@ -37,40 +37,23 @@ CPU/CUDA framework target 在 `use_cache=False` 下进行完整前缀计算。�
 - `token_count`；
 - `export_flag`。
 
-因此 NPU 必须把现有 inference 的“开始一个全新请求/重新 prefill”代码接到
-`--reset-hook`。DFlash 包不会猜这些字段的类型、shape 或初始值。
+本仓库现在直接包含 `models/internal_dflash_bridge.py`。它复用了现有
+`Qwen3_5ForCausalLMWrapper` 的加载方式，并按现有 inference 代码中的 shape，在每次
+完整前缀调用时重新创建上述 state；不再需要用户手写 `--reset-hook`。
 
-## 两个内部接口
+## 已实现的内部 bridge
 
-建议把这两个接收工程自有函数放在 `models/internal_dflash_bridge.py`；DFlash 包本身无需改动。
+`models/internal_dflash_bridge.py` 已实现：
 
-模型 factory：
+- 用 `Qwen3_5ForCausalLMWrapper(model_path=..., device="npu", dtype=float16)` 加载权重；
+- 从 `.model.config` 读取 32 层 hybrid 结构；
+- linear-attention state 使用现有 inference 的 conv/recurrent shape；
+- full-attention state 使用 `[max_len/64, kv_heads*head_dim/16, 64, 16]`；
+- 每次调用从位置 0 对完整前缀执行 fresh prefill；
+- 将 HIAI Tensor/tuple/feature-sidecar 输出统一为 `logits + dflash_features`。
 
-```python
-def load_qwen35_target(target_dir: str, *, device, dtype):
-    """返回原始 HIAI Qwen3_5ForCausalLM，权重已在指定 device/dtype。"""
-    ...
-```
-
-状态 reset：
-
-```python
-def reset_qwen35_full_prefix(
-    target,
-    *,
-    input_ids,
-    sequence_length,
-    output_dflash_features,
-    logits_to_keep,
-    call_index,
-):
-    """把下一次 target forward 配置成全新请求的 prefill。"""
-    ...
-    return None
-```
-
-如果 raw target 已经实现 `prepare_dflash_full_prefix_call` 并声明
-`dflash_full_prefix_isolation_mode="receiver_reset_hook"`，运行时可不传 `--reset-hook`。
+用户不需要修改这个文件，也不需要实现 reset 函数。唯一新增的运行参数
+`--kv-cache-max-len` 必须与原 inference YAML 完全相同。
 
 ## 最小运行
 
@@ -88,8 +71,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --target-factory models.internal_dflash_bridge:load_qwen35_target \
-  --reset-hook models.internal_dflash_bridge:reset_qwen35_full_prefix \
+  --kv-cache-max-len 4096 \
   --prompt-ids 151644,872,198 \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
@@ -98,7 +80,8 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   2>&1 | tee "$RUN_DIR/dflash-v1-npu-smoke.log"
 ```
 
-这个入口自动固定：FP16、EOS `248044`、内嵌目录、根 HIAI source、package-local loader 和
+把 `4096` 替换为原 inference YAML 的 `kv_cache_max_len`。这个入口自动固定：
+FP16、EOS `248044`、内嵌目录、根 HIAI source、package-local loader 和
 NPU backend。它会直接检查当前内嵌源码树，不需要额外生成 overlay 预检文件。
 
 ## 正确性门禁
@@ -111,7 +94,7 @@ NPU backend。它会直接检查当前内嵌源码树，不需要额外生成 ov
 6. 至少执行一个 draft、一个 feature forward 和一个 target verify。
 7. 无 CPU fallback。
 
-第 4 项失败说明 reset hook 没有真正恢复完整前缀 prefill 状态；不要继续测接受率。
+第 4 项失败说明 fresh hybrid state 或完整前缀 prefill 不等价；不要继续测接受率。
 
 ## 接受率和性能
 

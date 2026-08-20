@@ -56,15 +56,14 @@ models/
     └── 本仓库 DFlash V1 实现
 ```
 
-完整直接源码检查、factory/reset 接口及命令见
+完整直接源码检查、已实现 bridge 及命令见
 [NPU_INTERNAL_LAYOUT.md](NPU_INTERNAL_LAYOUT.md)。NPU 日常运行不需要 overlay JSON：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -B -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --target-factory models.internal_dflash_bridge:load_qwen35_target \
-  --reset-hook models.internal_dflash_bridge:reset_qwen35_full_prefix \
+  --kv-cache-max-len 4096 \
   --prompt-ids 151644,872,198 \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
