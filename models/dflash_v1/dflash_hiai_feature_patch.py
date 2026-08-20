@@ -5,9 +5,11 @@ this delivery.  This module validates semantic AST anchors and then inserts a
 small, opt-in DFlash feature route without replacing attention, GDN, cache, or
 custom-operator calls.  Unknown or ambiguous source layouts are rejected.
 
-The patched runtime imports :mod:`.dflash_target_features` and
-:mod:`.dflash_hiai_feature_runtime`; both helpers must be installed beside the
-receiver-owned modeling file.
+The receiver-owned modeling file lives in the parent ``models`` package while
+the DFlash implementation stays below ``models.dflash_v1``.  The patched
+runtime therefore imports :mod:`.dflash_v1.dflash_target_features` and
+:mod:`.dflash_v1.dflash_hiai_feature_runtime`.  This keeps the already working
+HIAI model in its original package and avoids flattening the DFlash package.
 """
 
 from __future__ import annotations
@@ -52,8 +54,8 @@ _PATCH_OWNED_LOCALS = frozenset(
     )
 )
 _CANONICAL_HELPER_IMPORTS = (
-    ("dflash_target_features", _IMPORT_SYMBOLS),
-    ("dflash_hiai_feature_runtime", _RUNTIME_IMPORT_SYMBOLS),
+    ("dflash_v1.dflash_target_features", _IMPORT_SYMBOLS),
+    ("dflash_v1.dflash_hiai_feature_runtime", _RUNTIME_IMPORT_SYMBOLS),
 )
 
 _MARKERS = (
@@ -551,11 +553,11 @@ def _build_insertions(
             import_line,
             "feature helper import",
             "\n# DFLASH_HIAI_V1:IMPORT_BEGIN\n"
-            "from .dflash_target_features import (\n"
+            "from .dflash_v1.dflash_target_features import (\n"
             "    DFlashFeatureCollector,\n"
             "    QWEN35_4B_DFLASH_TARGET_FEATURES,\n"
             ")\n"
-            "from .dflash_hiai_feature_runtime import attach_dflash_features\n"
+            "from .dflash_v1.dflash_hiai_feature_runtime import attach_dflash_features\n"
             "# DFLASH_HIAI_V1:IMPORT_END\n",
         ),
         _Insertion(
@@ -1290,8 +1292,8 @@ def verify_source(source: str) -> dict[str, object]:
         "kwargs_leak_blocked": True,
         "custom_operators_modified": False,
         "runtime_relative_imports": [
-            ".dflash_target_features",
-            ".dflash_hiai_feature_runtime",
+            ".dflash_v1.dflash_target_features",
+            ".dflash_v1.dflash_hiai_feature_runtime",
         ],
         "anchors": {
             "decoder_loop_line": text.loop.lineno,

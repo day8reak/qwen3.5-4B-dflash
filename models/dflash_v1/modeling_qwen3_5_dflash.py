@@ -5,7 +5,7 @@
 #                          modular_qwen3_5.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 # Modified for this distribution: adds opt-in DFlash V1 target-feature capture
-# and portable sibling-overlay imports while preserving the default output ABI.
+# and portable package imports while preserving the default output ABI.
 # Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

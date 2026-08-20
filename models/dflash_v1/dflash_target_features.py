@@ -51,7 +51,7 @@ class DFlashTargetFeatureSpec:
         )
 
 
-# Keep the target-side overlay independent of the draft implementation package.
+# Keep the target-side feature helper independent of the draft implementation.
 # These values are the frozen Qwen3.5-4B DFlash feature contract and are checked
 # against ``models.dflash_v1.dflash_config`` by downstream checks.  A receiving
 # target package therefore needs only this helper plus the patched modeling

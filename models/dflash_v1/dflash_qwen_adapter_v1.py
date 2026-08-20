@@ -20,7 +20,6 @@ checkpoint's block size 16 exposes at most 15 proposal tokens per round.
 from __future__ import annotations
 
 import argparse
-import ast
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 import hashlib
@@ -94,7 +93,10 @@ _HIAI_CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 _HIAI_FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
 _FACADE_CONTRACT_ID = "qwen3.5-4b-dflash-v1-full-prefix-isolation-r6"
 _FORMAL_EOS_TOKEN_ID = 248044
-_FORMAL_RUNTIME_COPY_FILES = frozenset(
+_NPU_LAYOUT_EMBEDDED = "embedded"
+_TARGET_FACTORY_ENV = "DFLASH_HIAI_TARGET_FACTORY"
+_RESET_HOOK_ENV = "DFLASH_HIAI_RESET_HOOK"
+_EMBEDDED_RUNTIME_FILES = frozenset(
     {
         "dflash_ascend310p_ops.py",
         "dflash_config.py",
@@ -107,8 +109,10 @@ _FORMAL_RUNTIME_COPY_FILES = frozenset(
         "dflash_target_hook_bridge.py",
         "dflash_weights.py",
         "internal_target_loader_template.py",
+        "internal_target_loader.py",
         "modeling_dflash.py",
         "modeling_qwen3_5_dflash.py",
+        "run_npu.py",
     }
 )
 _TARGET_STATE_OUTPUT_FIELDS = (
@@ -977,7 +981,6 @@ def _require_receiver_facade_type(
     target: nn.Module,
     *,
     target_loader: str,
-    loader_function: object | None = None,
 ) -> dict[str, object]:
     """Bind formal NPU execution to the facade class exported by its loader.
 
@@ -1007,20 +1010,6 @@ def _require_receiver_facade_type(
     )
     if not isinstance(facade_identity.get("source_sha256"), str):
         raise RuntimeError("formal NPU facade class lacks source-file identity")
-    if loader_function is not None:
-        loader_identity = _callable_source_identity(
-            loader_function,
-            specification=target_loader,
-        )
-        if (
-            loader_identity.get("source_file") != facade_identity.get("source_file")
-            or loader_identity.get("source_sha256")
-            != facade_identity.get("source_sha256")
-        ):
-            raise RuntimeError(
-                "formal NPU loader function and InternalTargetFacade must be "
-                "defined by the same locked source file"
-            )
     return facade_identity
 
 
@@ -1044,10 +1033,10 @@ def _bind_formal_hiai_source(
     if raw_source.is_symlink():
         raise RuntimeError("formal HIAI source must not be a symlink")
     source = raw_source.resolve()
-    expected = (package_dir / "modeling_qwen3_5_hiai_nd.py").resolve()
+    expected = (package_dir.parent / "modeling_qwen3_5_hiai_nd.py").resolve()
     if source != expected or not source.is_file():
         raise RuntimeError(
-            "formal HIAI source must be the target-loader package-local "
+            "formal HIAI source must match the selected NPU layout's "
             "modeling_qwen3_5_hiai_nd.py"
         )
     patcher_module_name = (
@@ -1071,9 +1060,8 @@ def _bind_formal_hiai_source(
         raise RuntimeError(
             "formal HIAI source hash/contract does not match target provenance"
         )
-    hiai_module_name = (
-        loader_module_name.rsplit(".", 1)[0] + ".modeling_qwen3_5_hiai_nd"
-    )
+    hiai_package = loader_module_name.rsplit(".", 2)[0]
+    hiai_module_name = hiai_package + ".modeling_qwen3_5_hiai_nd"
     hiai_module = importlib.import_module(hiai_module_name)
     expected_target_class = getattr(hiai_module, "Qwen3_5ForCausalLM", None)
     raw_target = getattr(target, "target", None)
@@ -1113,7 +1101,9 @@ def _bind_formal_hiai_source(
     }
 
 
-def _require_formal_target_loader_spec(target_loader: str) -> Path:
+def _require_formal_target_loader_spec(
+    target_loader: str,
+) -> Path:
     """Require the receiver loader to be the adapter's package-local sibling."""
 
     expected_spec = f"{__package__}.internal_target_loader:load_target"
@@ -1127,74 +1117,7 @@ def _require_formal_target_loader_spec(target_loader: str) -> Path:
         raise RuntimeError(
             "formal NPU package lacks a real sibling internal_target_loader.py"
         )
-    template_path = Path(__file__).resolve().with_name(
-        "internal_target_loader_template.py"
-    )
-    if not template_path.is_file() or template_path.is_symlink():
-        raise RuntimeError("formal NPU package lacks the immutable loader template")
-    if _loader_contract_ast(loader_path) != _loader_contract_ast(template_path):
-        raise RuntimeError(
-            "receiver internal_target_loader.py differs from the delivered "
-            "template outside create_internal_target() body"
-        )
-    _require_implemented_receiver_factory(loader_path)
     return loader_path.resolve()
-
-
-def _loader_contract_tree(path: Path) -> tuple[ast.Module, ast.FunctionDef | ast.AsyncFunctionDef]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    factories = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "create_internal_target"
-    ]
-    if len(factories) != 1:
-        raise RuntimeError(
-            f"{path.name} must contain exactly one create_internal_target function"
-        )
-    protected = {"InternalTargetFacade", "load_target"}
-    referenced = sorted(
-        {
-            node.id
-            for node in ast.walk(factories[0])
-            if isinstance(node, ast.Name) and node.id in protected
-        }
-    )
-    if referenced:
-        raise RuntimeError(
-            "create_internal_target must not reference protected facade/loader "
-            "symbols: " + ", ".join(referenced)
-        )
-    return tree, factories[0]
-
-
-def _require_implemented_receiver_factory(path: Path) -> None:
-    _tree, factory = _loader_contract_tree(path)
-    raises_not_implemented = any(
-        isinstance(node, ast.Raise)
-        and isinstance(node.exc, ast.Call)
-        and isinstance(node.exc.func, ast.Name)
-        and node.exc.func.id == "NotImplementedError"
-        for node in ast.walk(factory)
-    )
-    has_value_return = any(
-        isinstance(node, ast.Return) and node.value is not None
-        for node in ast.walk(factory)
-    )
-    if raises_not_implemented or not has_value_return:
-        raise RuntimeError(
-            "receiver create_internal_target() is still the delivered "
-            "placeholder; implement it before formal NPU validation"
-        )
-
-
-def _loader_contract_ast(path: Path) -> str:
-    """Return an AST with only the receiver factory body intentionally erased."""
-
-    tree, factory = _loader_contract_tree(path)
-    factory.body = [ast.Pass()]
-    return ast.dump(tree, annotate_fields=True, include_attributes=False)
 
 
 def _load_target(
@@ -1250,7 +1173,7 @@ def _load_target(
         except (ImportError, AttributeError) as error:
             raise RuntimeError(
                 "could not import the packaged feature-enabled Qwen3.5 target; "
-                "place this overlay in the existing Qwen3.5 project or pass "
+                "keep the complete models/dflash_v1 package or pass "
                 "--target-loader MODULE:FUNCTION"
             ) from error
 
@@ -1275,7 +1198,6 @@ def _load_target(
         facade_identity = _require_receiver_facade_type(
             target,
             target_loader=target_loader,
-            loader_function=loader_function,
         )
         loader_identity["facade_source_file"] = facade_identity["source_file"]
         loader_identity["facade_source_sha256"] = facade_identity["source_sha256"]
@@ -1412,7 +1334,9 @@ def _target_integration_audit(
                 "or fresh_instance; the HIAI route has known in-place KV/GDN state"
             )
         if isolation.get("facade_contract_id") != _FACADE_CONTRACT_ID:
-            raise RuntimeError("formal NPU target does not declare the r6 facade contract")
+            raise RuntimeError(
+                "formal NPU target does not declare the required facade contract"
+            )
         raw_target_identity = isolation.get("raw_target_identity")
         if not isinstance(raw_target_identity, Mapping) or not isinstance(
             raw_target_identity.get("source_sha256"), str
@@ -1570,8 +1494,8 @@ def _dflash_execution_gate(
 def _validate_ops_backend_request(device: str, ops_backend: str | None) -> None:
     if str(device).split(":", 1)[0].lower() == "npu" and ops_backend is not None:
         raise ValueError(
-            "formal NPU r6 forbids an external --ops-backend; use the "
-            "manifest-locked package-local dflash_ascend310p_ops backend"
+            "formal NPU execution forbids an external --ops-backend; use the "
+            "package-local dflash_ascend310p_ops backend"
         )
 
 
@@ -1599,7 +1523,7 @@ def _select_draft_ops(
         # This package-local backend deliberately decomposes attention into
         # matmul/mask/FP32-softmax/matmul, stays on the NPU, and has no hidden
         # CPU or SDPA fallback.  This exact package-local module is part of the
-        # formal r6 overlay identity; external backends remain a CPU-only
+        # formal embedded-runtime identity; external backends remain a CPU-only
         # development option until they have their own oracle/provenance gate.
         module_name = f"{__package__}.dflash_ascend310p_ops"
         return ModuleDFlashOps.from_name(module_name, strict=True), module_name
@@ -1723,15 +1647,13 @@ def _request_payload(
         ),
         "prompt_source": "inline_token_ids" if args.prompt_ids is not None else "json_file",
         "target_loader": args.target_loader or "package_default",
+        "npu_layout": getattr(args, "npu_layout", None),
+        "target_factory": getattr(args, "target_factory", None),
+        "reset_hook": getattr(args, "reset_hook", None),
         "hiai_source": (
             None
-            if args.hiai_source is None
+            if getattr(args, "hiai_source", None) is None
             else str(Path(args.hiai_source).expanduser().resolve())
-        ),
-        "overlay_preflight_report": (
-            None
-            if getattr(args, "overlay_preflight_report", None) is None
-            else str(Path(args.overlay_preflight_report).expanduser().resolve())
         ),
         "allow_download": bool(args.allow_download),
         "trust_remote_code": bool(args.trust_remote_code),
@@ -1826,17 +1748,34 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--npu-layout",
+        choices=(_NPU_LAYOUT_EMBEDDED,),
+        default=_NPU_LAYOUT_EMBEDDED,
+        help=(
+            "embedded keeps modeling_qwen3_5_hiai_nd.py in the parent models "
+            "package and DFlash below models.dflash_v1"
+        ),
+    )
+    parser.add_argument(
+        "--target-factory",
+        help=(
+            "embedded NPU only: existing inference MODULE:FUNCTION returning "
+            "the raw HIAI Qwen3.5 target"
+        ),
+    )
+    parser.add_argument(
+        "--reset-hook",
+        help=(
+            "embedded NPU only: MODULE:FUNCTION resetting KV/GDN/request state "
+            "before each complete-prefix target call; optional when the target "
+            "already exposes prepare_dflash_full_prefix_call"
+        ),
+    )
+    parser.add_argument(
         "--hiai-source",
         help=(
             "receiver package-local modeling_qwen3_5_hiai_nd.py; required on "
             "NPU and hash-bound to target provenance"
-        ),
-    )
-    parser.add_argument(
-        "--overlay-preflight-report",
-        help=(
-            "JSON emitted by the package-local v1-cli overlay validator; "
-            "required on NPU and rechecked before and after inference"
         ),
     )
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -1851,7 +1790,7 @@ def _parser() -> argparse.ArgumentParser:
             "module exporting the six dflash_ops functions; default is the "
             "PyTorch oracle on CPU/CUDA and the package-local decomposed "
             "310P backend on NPU; external modules are non-formal "
-            "development routes in r6"
+            "development routes outside the formal NPU flow"
         ),
     )
     parser.add_argument(
@@ -1867,100 +1806,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--report", help="optional JSON report path")
     return parser
-
-
-def _validate_overlay_preflight_report(
-    report_path: str,
-    *,
-    package_dir: Path,
-    hiai_source: Path,
-    loader_path: Path,
-) -> dict[str, object]:
-    """Bind one validator report to the files the formal CLI will execute."""
-
-    package_dir = Path(package_dir)
-    hiai_source = Path(hiai_source)
-    loader_path = Path(loader_path)
-    raw_report = Path(report_path).expanduser()
-    if raw_report.is_symlink() or not raw_report.is_file():
-        raise RuntimeError("overlay preflight report must be a real JSON file")
-    resolved_report = raw_report.resolve()
-    try:
-        payload = json.loads(resolved_report.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"cannot read overlay preflight report: {error}") from error
-    if not isinstance(payload, Mapping):
-        raise RuntimeError("overlay preflight report must be a JSON object")
-    if payload.get("status") != "PASS" or payload.get("scope") != "v1-cli":
-        raise RuntimeError("overlay preflight report is not a PASS v1-cli report")
-    import transformers
-
-    if payload.get("package") != __package__:
-        raise RuntimeError("overlay preflight report belongs to another package namespace")
-    if (
-        payload.get("transformers_version") != "5.14.1"
-        or transformers.__version__ != "5.14.1"
-    ):
-        raise RuntimeError(
-            "formal overlay and runtime must both use Transformers 5.14.1"
-        )
-    reported_package_dir = payload.get("package_dir")
-    if (
-        not isinstance(reported_package_dir, str)
-        or Path(reported_package_dir).resolve() != package_dir.resolve()
-    ):
-        raise RuntimeError("overlay preflight report belongs to another package")
-
-    copied = payload.get("copied_file_sha256")
-    if not isinstance(copied, Mapping) or set(copied) != _FORMAL_RUNTIME_COPY_FILES:
-        raise RuntimeError("overlay preflight report does not lock all 13 runtime files")
-    current_hashes: dict[str, str] = {}
-    for name in sorted(_FORMAL_RUNTIME_COPY_FILES):
-        expected = copied.get(name)
-        path = package_dir / name
-        if (
-            not isinstance(expected, str)
-            or len(expected) != 64
-            or path.is_symlink()
-            or not path.is_file()
-        ):
-            raise RuntimeError(f"invalid overlay preflight identity for {name}")
-        actual = _sha256_file(path)
-        if actual != expected:
-            raise RuntimeError(f"runtime file changed after overlay preflight: {name}")
-        current_hashes[name] = actual
-
-    hiai_report = payload.get("formal_hiai_source_patch")
-    if not isinstance(hiai_report, Mapping):
-        raise RuntimeError("overlay preflight report lacks HIAI source identity")
-    actual_hiai_sha = _sha256_file(hiai_source)
-    if (
-        hiai_report.get("status") != "PASS"
-        or hiai_report.get("source_sha256") != actual_hiai_sha
-        or hiai_report.get("patch_contract_id") != _HIAI_FEATURE_CONTRACT_ID
-    ):
-        raise RuntimeError("HIAI source changed after overlay preflight")
-
-    loader_report = payload.get("receiver_owned_runtime_loader")
-    actual_loader_sha = _sha256_file(loader_path)
-    if (
-        not isinstance(loader_report, Mapping)
-        or loader_report.get("factory_static_status") != "PASS_NON_PLACEHOLDER"
-        or loader_report.get("sha256") != actual_loader_sha
-    ):
-        raise RuntimeError("receiver loader changed after overlay preflight")
-
-    return {
-        "status": "PASS_CURRENT_MATCH",
-        "report_path": str(resolved_report),
-        "report_sha256": _sha256_file(resolved_report),
-        "package_dir": str(package_dir.resolve()),
-        "package": __package__,
-        "transformers_version": transformers.__version__,
-        "copied_file_sha256": current_hashes,
-        "hiai_source_sha256": actual_hiai_sha,
-        "receiver_loader_sha256": actual_loader_sha,
-    }
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -1990,7 +1835,6 @@ def _validate_report_destination(
     if formal_npu:
         protected_files.update(
             {
-                Path(args.overlay_preflight_report).expanduser().resolve(),
                 Path(args.hiai_source).expanduser().resolve(),
                 (package_dir / "internal_target_loader.py").resolve(),
             }
@@ -2012,6 +1856,75 @@ def _validate_report_destination(
         )
 
 
+def _configure_embedded_npu_inputs(args: argparse.Namespace) -> None:
+    """Derive the internal layout so daily NPU runs need no overlay arguments."""
+
+    if str(args.device).split(":", 1)[0].lower() != "npu":
+        return
+    package_dir = Path(__file__).resolve().parent
+    expected_loader = f"{__package__}.internal_target_loader:load_target"
+    expected_source = package_dir.parent / "modeling_qwen3_5_hiai_nd.py"
+    if args.target_loader is None:
+        args.target_loader = expected_loader
+    if args.hiai_source is None:
+        args.hiai_source = str(expected_source)
+    if args.target_factory is None:
+        raise ValueError(
+            "embedded NPU layout requires --target-factory MODULE:FUNCTION"
+        )
+    os.environ[_TARGET_FACTORY_ENV] = args.target_factory
+    if args.reset_hook is not None:
+        os.environ[_RESET_HOOK_ENV] = args.reset_hook
+    else:
+        # Do not accidentally reuse a reset function left by an earlier run in
+        # the same Python process.  Omitting the option means the raw target
+        # itself must expose prepare_dflash_full_prefix_call.
+        os.environ.pop(_RESET_HOOK_ENV, None)
+
+
+def _validate_embedded_runtime(
+    *,
+    package_dir: Path,
+    hiai_source: Path,
+    loader_path: Path,
+) -> dict[str, object]:
+    """Validate the colocated source tree without a generated overlay report."""
+
+    import transformers
+
+    if transformers.__version__ != "5.14.1":
+        raise RuntimeError(
+            "embedded DFlash framework requires transformers==5.14.1; got "
+            f"{transformers.__version__}"
+        )
+    from .dflash_hiai_feature_patch import verify_source
+
+    verification = verify_source(hiai_source.read_text(encoding="utf-8"))
+    if (
+        verification.get("status") != "verified"
+        or verification.get("patch_contract_id") != _HIAI_FEATURE_CONTRACT_ID
+    ):
+        raise RuntimeError("embedded HIAI source does not satisfy the feature contract")
+    runtime_hashes: dict[str, str] = {}
+    for name in sorted(_EMBEDDED_RUNTIME_FILES):
+        path = package_dir / name
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"embedded DFlash runtime file is missing: {name}")
+        runtime_hashes[name] = _sha256_file(path)
+    return {
+        "status": "PASS_EMBEDDED_RUNTIME_PREFLIGHT",
+        "layout": _NPU_LAYOUT_EMBEDDED,
+        "package": __package__,
+        "package_dir": str(package_dir),
+        "transformers_version": transformers.__version__,
+        "runtime_file_sha256": runtime_hashes,
+        "hiai_source": str(hiai_source),
+        "hiai_source_sha256": _sha256_file(hiai_source),
+        "patch_contract_id": verification["patch_contract_id"],
+        "receiver_loader_sha256": _sha256_file(loader_path),
+    }
+
+
 def _validate_formal_cli_inputs(args: argparse.Namespace) -> dict[str, object] | None:
     """Fail before the 1.27 GB draft hash when formal receiver inputs are absent."""
 
@@ -2028,16 +1941,17 @@ def _validate_formal_cli_inputs(args: argparse.Namespace) -> dict[str, object] |
         raise ValueError("formal NPU V1 requires --hiai-source")
     package_dir = Path(__file__).resolve().parent
     raw_hiai_source = Path(args.hiai_source).expanduser()
-    expected_hiai_source = package_dir / "modeling_qwen3_5_hiai_nd.py"
+    expected_hiai_source = package_dir.parent / "modeling_qwen3_5_hiai_nd.py"
     if (
         raw_hiai_source.is_symlink()
         or raw_hiai_source.resolve() != expected_hiai_source.resolve()
         or not raw_hiai_source.is_file()
     ):
         raise ValueError(
-            "--hiai-source must be the adapter package-local "
+            "--hiai-source does not match the selected NPU layout's "
             "modeling_qwen3_5_hiai_nd.py"
         )
+    _validate_report_destination(args, package_dir=package_dir, formal_npu=True)
     if os.environ.get("PYTHONPYCACHEPREFIX") or sys.pycache_prefix is not None:
         raise RuntimeError("formal NPU V1 forbids PYTHONPYCACHEPREFIX")
     bytecode = list(package_dir.glob("*.pyc"))
@@ -2046,12 +1960,7 @@ def _validate_formal_cli_inputs(args: argparse.Namespace) -> dict[str, object] |
         bytecode.extend(cache_dir.glob("*.pyc"))
     if bytecode:
         raise RuntimeError("formal NPU V1 package contains precompiled bytecode")
-    overlay_report = getattr(args, "overlay_preflight_report", None)
-    if overlay_report is None:
-        raise ValueError("formal NPU V1 requires --overlay-preflight-report")
-    _validate_report_destination(args, package_dir=package_dir, formal_npu=True)
-    return _validate_overlay_preflight_report(
-        overlay_report,
+    return _validate_embedded_runtime(
         package_dir=package_dir,
         hiai_source=expected_hiai_source,
         loader_path=package_dir / "internal_target_loader.py",
@@ -2062,6 +1971,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     device_type = str(args.device).split(":", 1)[0].lower()
     formal_npu = device_type == "npu"
+    _configure_embedded_npu_inputs(args)
     _validate_ops_backend_request(args.device, args.ops_backend)
     if not formal_npu:
         _validate_report_destination(
@@ -2069,7 +1979,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             package_dir=Path(__file__).resolve().parent,
             formal_npu=False,
         )
-    initial_overlay_preflight = _validate_formal_cli_inputs(args)
+    initial_runtime_preflight = _validate_formal_cli_inputs(args)
     if args.allow_op_fallback and not str(args.device).startswith("cpu"):
         raise ValueError("operator fallback is allowed only for CPU simulation")
     if device_type in {"npu", "cuda"} and args.max_new_tokens < 2:
@@ -2192,9 +2102,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             formal_npu=formal_npu,
         )
     )
-    final_overlay_preflight = _validate_formal_cli_inputs(args)
-    if formal_npu and final_overlay_preflight != initial_overlay_preflight:
-        raise RuntimeError("formal overlay identity changed during validation")
+    final_runtime_preflight = _validate_formal_cli_inputs(args)
+    if formal_npu and final_runtime_preflight != initial_runtime_preflight:
+        raise RuntimeError("embedded runtime identity changed during validation")
     if formal_npu:
         state_policy = (
             "the receiver declares that each full-prefix call starts from a "
@@ -2203,7 +2113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "no speculative state commit or rollback"
         )
         target_operator_policy = (
-            "the r6 receiver contract changes only the target model source to "
+            "the receiver contract changes only the target model source to "
             "add an opt-in DFlash feature side output; it does not modify the "
             "receiver-owned ChunkGatedDeltaRule or CacheUpdate implementations; "
             "actual device operator trace remains pending"
@@ -2247,9 +2157,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "dtype": str(adapter.dtype),
         "runtime_identity": _runtime_identity(adapter.device),
         "ops_backend": backend,
+        "npu_layout": args.npu_layout if formal_npu else None,
         "target_operator_policy": target_operator_policy,
         "target_integration": final_target_integration,
-        "overlay_preflight": final_overlay_preflight,
+        "runtime_preflight": final_runtime_preflight,
         "dflash_execution_gate": dflash_execution,
         "known_internal_interface_use": known_internal_interface_use,
         "operator_fallback_enabled": bool(args.allow_op_fallback),
@@ -2281,10 +2192,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError("temporary report path already exists")
         try:
             temporary_report.write_text(serialized + "\n", encoding="utf-8")
-            postwrite_overlay_preflight = _validate_formal_cli_inputs(args)
-            if formal_npu and postwrite_overlay_preflight != initial_overlay_preflight:
+            postwrite_runtime_preflight = _validate_formal_cli_inputs(args)
+            if formal_npu and postwrite_runtime_preflight != initial_runtime_preflight:
                 raise RuntimeError(
-                    "formal overlay identity changed while writing the report"
+                    "embedded runtime identity changed while writing the report"
                 )
             os.replace(temporary_report, destination)
         finally:

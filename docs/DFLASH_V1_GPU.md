@@ -42,7 +42,7 @@ export PYTHONPATH="$PWD"
   2>&1 | tee "$RUN_DIR/dflash-v1-gpu-smoke.log"
 ```
 
-GPU 路线不要传 `--target-loader`、`--hiai-source`、`--overlay-preflight-report`、
+GPU 路线不要传 `--target-loader`、`--hiai-source`、`--target-factory`、`--reset-hook`、
 `--ops-backend` 或 `--allow-op-fallback`。默认 target 使用包内 feature-enabled HF 实现，默认
 draft backend 报告为 `torch_cuda`。CUDA 不可用时会在 1.27 GB 草稿权重哈希之前失败。
 
@@ -78,7 +78,7 @@ assert report["dflash_execution_gate"]["draft_round_executed"] is True
 assert report["dflash_execution_gate"]["draft_calls"] > 0
 assert report["dflash_execution_gate"]["target_feature_calls"] > 0
 assert report["dflash_execution_gate"]["target_verify_calls"] > 0
-print("DFLASH_V1_R6_CUDA_FRAMEWORK_REPORT_GATE_PASS")
+print("DFLASH_V1_CUDA_FRAMEWORK_REPORT_GATE_PASS")
 PY
 ```
 

@@ -1,0 +1,122 @@
+"""Simple NPU entry point for the embedded internal-server layout.
+
+This command derives the HIAI source and DFlash loader from the colocated
+``models`` package.  It intentionally exposes only the controls needed for a
+V1 strict-greedy smoke or validation run.  The colocated source tree is
+validated directly; no generated overlay report is needed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import Sequence
+
+from .dflash_qwen_adapter_v1 import main as _adapter_main
+from .internal_target_loader import (
+    DECODE_CHUNK_SIZE_ENV,
+    PREFILL_CHUNK_SIZE_ENV,
+)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run Qwen3.5-4B DFlash V1 with the original HIAI model in "
+            "models/ and DFlash in models/dflash_v1/"
+        )
+    )
+    parser.add_argument("--target-dir", required=True)
+    parser.add_argument("--draft-dir", required=True)
+    parser.add_argument(
+        "--target-factory",
+        required=True,
+        help=(
+            "existing inference MODULE:FUNCTION returning the raw patched "
+            "models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM"
+        ),
+    )
+    parser.add_argument(
+        "--reset-hook",
+        help=(
+            "MODULE:FUNCTION resetting receiver KV/GDN/request state before "
+            "each full-prefix call; omit only when the target already exposes "
+            "prepare_dflash_full_prefix_call"
+        ),
+    )
+    prompt = parser.add_mutually_exclusive_group(required=True)
+    prompt.add_argument("--prompt-ids", help="comma-separated token IDs")
+    prompt.add_argument("--prompt-json", help="JSON token list or input_ids object")
+    parser.add_argument("--max-new-tokens", type=int, default=2)
+    parser.add_argument("--max-draft-tokens", type=int, default=1)
+    parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--prefill-chunk-size", type=int, default=64)
+    parser.add_argument("--decode-chunk-size", type=int, default=1)
+    parser.add_argument("--report")
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if not str(args.device).startswith("npu"):
+        raise ValueError("run_npu requires --device npu or npu:N")
+    if args.max_new_tokens < 2:
+        raise ValueError("NPU DFlash smoke requires --max-new-tokens >= 2")
+    if not 1 <= args.max_draft_tokens <= 15:
+        raise ValueError("--max-draft-tokens must be between 1 and 15")
+    for name, value in (
+        ("--prefill-chunk-size", args.prefill_chunk_size),
+        ("--decode-chunk-size", args.decode_chunk_size),
+    ):
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+
+    package_dir = Path(__file__).resolve().parent
+    hiai_source = package_dir.parent / "modeling_qwen3_5_hiai_nd.py"
+    if hiai_source.is_symlink() or not hiai_source.is_file():
+        raise FileNotFoundError(
+            "expected original HIAI source at models/modeling_qwen3_5_hiai_nd.py"
+        )
+    os.environ[PREFILL_CHUNK_SIZE_ENV] = str(args.prefill_chunk_size)
+    os.environ[DECODE_CHUNK_SIZE_ENV] = str(args.decode_chunk_size)
+
+    adapter_args = [
+        "--target-dir",
+        args.target_dir,
+        "--draft-dir",
+        args.draft_dir,
+        "--target-factory",
+        args.target_factory,
+        "--npu-layout",
+        "embedded",
+        "--device",
+        args.device,
+        "--dtype",
+        "float16",
+        "--eos-token-id",
+        "248044",
+        "--max-new-tokens",
+        str(args.max_new_tokens),
+        "--max-draft-tokens",
+        str(args.max_draft_tokens),
+    ]
+    if args.reset_hook is not None:
+        adapter_args.extend(["--reset-hook", args.reset_hook])
+    if args.prompt_ids is not None:
+        adapter_args.extend(["--prompt-ids", args.prompt_ids])
+    else:
+        adapter_args.extend(["--prompt-json", args.prompt_json])
+    if args.report is not None:
+        adapter_args.extend(["--report", args.report])
+    adapter_args.append("--progress" if args.progress else "--no-progress")
+    return _adapter_main(adapter_args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

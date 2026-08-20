@@ -243,7 +243,7 @@ def create_internal_target(
     1. construct/load the existing internal Qwen3.5-4B target on ``device``;
        for the formal HIAI source route this must be the exact package-local
        ``modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM`` class patched by the
-       r6 tool (the CPU/HF golden may still use the top-level conditional
+       source patcher (the CPU/HF golden may still use the top-level conditional
        generation wrapper);
     2. keep its five installed target operators inside that model runtime;
     3. expose DFlash features either through the packaged hook bridge, with an
