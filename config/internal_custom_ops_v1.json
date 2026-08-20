@@ -1,0 +1,235 @@
+{
+  "schema_version": 1,
+  "contract_id": "qwen3.5-4b-dflash-v1-r6-internal-custom-ops",
+  "scope": "static_filesystem_audit_only",
+  "target": {
+    "soc": "ascend310p",
+    "ops_info_directory_component": "ascend310p"
+  },
+  "route": {
+    "name": "qwen3.5-4b-dflash-v1-full-prefix-replay",
+    "target_cache": "receiver interface declares call-local block-table updates; bounded isolation gate required; actual device state trace pending",
+    "gdn_state_transaction": "no speculative commit or rollback; receiver must prepare fresh call-local conv_state/recurrent_state; actual device state trace pending",
+    "controller_direct_custom_operator_dependencies": [],
+    "required_receiver_target_static_packages": [
+      "ChunkGatedDeltaRule",
+      "CacheUpdate"
+    ],
+    "not_called_directly_by_dflash_controller_or_draft": [
+      "DynamicQuant",
+      "CacheUpdate",
+      "QuantBatchMatmulV4444",
+      "GroupedMatmul",
+      "MoeGatingTopKSoftmax"
+    ],
+    "binding": {
+      "kind": "aclnn_two_stage_c_api",
+      "is_torch_ops_namespace": false,
+      "requires_receiver_owned_cpp_or_framework_adapter": true,
+      "audit_loads_shared_libraries": false,
+      "audit_executes_operators": false
+    }
+  },
+  "packages": [
+    {
+      "op_type": "DynamicQuant",
+      "provider": "customize_dynamic",
+      "required_for_environment_inventory": true,
+      "required_for_v1_route": false,
+      "required_aclnn_symbols": [
+        "aclnnDynamicQuantGetWorkspaceSize",
+        "aclnnDynamicQuant"
+      ]
+    },
+    {
+      "op_type": "CacheUpdate",
+      "provider": "customize_scatter",
+      "required_for_environment_inventory": true,
+      "required_for_v1_route": true,
+      "required_aclnn_symbols": [
+        "aclnnCacheUpdateGetWorkspaceSize",
+        "aclnnCacheUpdate"
+      ]
+    },
+    {
+      "op_type": "QuantBatchMatmulV4444",
+      "provider": "customize_quantMatmul",
+      "required_for_environment_inventory": true,
+      "required_for_v1_route": false,
+      "required_aclnn_symbols": [
+        "aclnnQuantMatmulV4GetWorkspaceSize",
+        "aclnnQuantMatmulV4",
+        "aclnnQuantMatmulWeightNzGetWorkspaceSize",
+        "aclnnQuantMatmulWeightNz"
+      ]
+    },
+    {
+      "op_type": "GroupedMatmul",
+      "provider": "customize_grouped",
+      "required_for_environment_inventory": true,
+      "required_for_v1_route": false,
+      "required_aclnn_symbols": [
+        "aclnnGroupedMatmulV3GetWorkspaceSize",
+        "aclnnGroupedMatmulV3",
+        "aclnnGroupedMatmulV4GetWorkspaceSize",
+        "aclnnGroupedMatmulV4",
+        "aclnnGroupedMatmulV5GetWorkspaceSize",
+        "aclnnGroupedMatmulV5"
+      ]
+    },
+    {
+      "op_type": "ChunkGatedDeltaRule",
+      "provider": "customize_linearAttention",
+      "required_for_environment_inventory": true,
+      "required_for_v1_route": true,
+      "required_aclnn_symbols": [
+        "aclnnChunkGatedDeltaRuleGetWorkspaceSize",
+        "aclnnChunkGatedDeltaRule"
+      ]
+    },
+    {
+      "op_type": "MoeGatingTopKSoftmax",
+      "provider": "customize_moeGatingTopkSoftmax",
+      "required_for_environment_inventory": false,
+      "required_for_v1_route": false,
+      "required_aclnn_symbols": [
+        "aclnnMoeGatingTopKSoftmaxGetWorkspaceSize",
+        "aclnnMoeGatingTopKSoftmax"
+      ]
+    }
+  ],
+  "known_aclnn_abi": {
+    "aclnnChunkGatedDeltaRuleGetWorkspaceSize": [
+      {
+        "name": "query",
+        "c_type": "const aclTensor*"
+      },
+      {
+        "name": "key",
+        "c_type": "const aclTensor*"
+      },
+      {
+        "name": "value",
+        "c_type": "const aclTensor*"
+      },
+      {
+        "name": "g",
+        "c_type": "const aclTensor*"
+      },
+      {
+        "name": "beta",
+        "c_type": "const aclTensor*"
+      },
+      {
+        "name": "initialStateOptional",
+        "c_type": "const aclTensor*"
+      },
+      {
+        "name": "chunkSize",
+        "c_type": "int64_t"
+      },
+      {
+        "name": "outputFinalState",
+        "c_type": "bool"
+      },
+      {
+        "name": "useQkL2normInKernel",
+        "c_type": "bool"
+      },
+      {
+        "name": "coreAttnOut",
+        "c_type": "const aclTensor*"
+      },
+      {
+        "name": "lastRecurrentStateOutOptional",
+        "c_type": "const aclTensor*"
+      },
+      {
+        "name": "workspaceSize",
+        "c_type": "uint64_t*"
+      },
+      {
+        "name": "executor",
+        "c_type": "aclOpExecutor**"
+      }
+    ],
+    "aclnnChunkGatedDeltaRule": [
+      {
+        "name": "workspace",
+        "c_type": "void*"
+      },
+      {
+        "name": "workspaceSize",
+        "c_type": "uint64_t"
+      },
+      {
+        "name": "executor",
+        "c_type": "aclOpExecutor*"
+      },
+      {
+        "name": "stream",
+        "c_type": "aclrtStream"
+      }
+    ]
+  },
+  "known_aclnn_return_types": {
+    "aclnnChunkGatedDeltaRuleGetWorkspaceSize": "aclnnStatus",
+    "aclnnChunkGatedDeltaRule": "aclnnStatus"
+  },
+  "known_conflicts": {
+    "CacheUpdate": {
+      "selected_provider": "customize_scatter",
+      "same_symbol_provider": "customize",
+      "discriminator_parameters": {
+        "customize_scatter": {
+          "targetBlock": "const aclTensor*",
+          "offsetInBlock": "const aclTensor*"
+        },
+        "customize": {
+          "targetBlock": "int64_t",
+          "offsetInBlock": "int64_t"
+        }
+      },
+      "rule": "Never compile with one provider's header and resolve the other provider's shared object. The DFlash controller/draft do not call CacheUpdate directly. The receiver interface description declares call-local block-table KV updates, so the selected provider is a V1 receiver-route dependency; actual device invocation remains pending trace evidence."
+    }
+  },
+  "tensor_contracts": {
+    "ChunkGatedDeltaRule": {
+      "status": "unknown_must_be_observed_on_receiver",
+      "shape": null,
+      "dtype": null,
+      "format": null,
+      "optionality_and_contiguity": null,
+      "required_evidence": [
+        "selected provider's ascend310p ops-info entry",
+        "selected provider's op_proto declaration or original operator tests"
+      ],
+      "execution_authorized_by_this_contract": false
+    },
+    "CacheUpdate": {
+      "status": "unknown_must_be_observed_on_receiver",
+      "shape": null,
+      "dtype": null,
+      "format": null,
+      "optionality_and_contiguity": null,
+      "required_evidence": [
+        "selected provider's ascend310p ops-info entry",
+        "selected provider's op_proto declaration or original operator tests",
+        "receiver trace binding the selected scalar-index or tensor-index ABI"
+      ],
+      "execution_authorized_by_this_contract": false
+    }
+  },
+  "audit_policy": {
+    "provider_names_are_relative_to_vendors_root": true,
+    "required_pair": [
+      "ascend310p ops-info declaration",
+      "ACLNN header declarations",
+      "op_api shared object"
+    ],
+    "nm_is_optional_and_never_loads_the_library": true,
+    "selected_provider_is_authoritative": true,
+    "shadow_provider_conflicts_are_reported": true,
+    "unknown_tensor_constraints_must_not_be_inferred": true
+  }
+}

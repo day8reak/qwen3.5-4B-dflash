@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local models and generated reports are never committed.
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.log
+reports/
+runs/
+evidence/
+
+# Release-audit files belong to the cold-storage delivery package.
+MANIFEST.sha256
+VALIDATION.json
