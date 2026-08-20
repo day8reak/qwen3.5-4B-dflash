@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only, fail-closed audit for the receiver's internal ACLNN packages.
+"""Read-only, fail-closed audit for deployed ACLNN packages.
 
 This program deliberately has no framework Python binding or dynamic-loader
 path, does not source a vendor setup script, and does not execute an operator.
@@ -835,7 +835,7 @@ def audit(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Statically audit internal Ascend custom-operator packages."
+        description="Statically audit deployed Ascend custom-operator packages."
     )
     parser.add_argument(
         "--vendors-root",

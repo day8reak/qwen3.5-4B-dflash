@@ -21,7 +21,7 @@ V1 不实现 KV/GDN 投机状态提交或回退；每次 target 调用都从干�
 |---|---|
 | CPU framework | 调度、权重、shape、feature 和严格 greedy 参考 |
 | CUDA framework | 相同 PyTorch 路线的 GPU 分派验证 |
-| NPU ordinary | 内部 HIAI target 的设备本地权威 baseline |
+| NPU ordinary | HIAI target 的设备本地权威 baseline |
 | NPU DFlash | 必须逐 token 匹配同一个 NPU ordinary baseline |
 
 CPU/GPU 接受率可以诊断 draft，但不能替代真实 NPU 接受率。NPU target features、FP16、自定义
@@ -43,7 +43,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -B \
   --report /path/to/run/dflash-v1-cpu.json
 ```
 
-CPU 使用 `models.dflash_v1.modeling_qwen3_5_dflash`，不需要内部 HIAI 文件。启动时会验证
+CPU 使用 `models.dflash_v1.modeling_qwen3_5_dflash`，不需要 HIAI 文件。启动时会验证
 官方草稿 config、69 个 BF16 tensor、shape、文件大小和完整 safetensors SHA-256。
 
 ## NPU 内嵌布局
@@ -57,7 +57,7 @@ models/
 ```
 
 完整直接源码检查、已实现 bridge 及命令见
-[NPU_INTERNAL_LAYOUT.md](NPU_INTERNAL_LAYOUT.md)。NPU 日常运行不需要 overlay JSON：
+[NPU_DEPLOYMENT.md](NPU_DEPLOYMENT.md)。NPU 日常运行不需要 overlay JSON：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -B -m models.dflash_v1.run_npu \

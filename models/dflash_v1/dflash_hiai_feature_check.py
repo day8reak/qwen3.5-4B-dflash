@@ -1,7 +1,7 @@
 """Validate a directly integrated HIAI DFlash feature route.
 
 This module is deliberately read-only.  It never rewrites
-``modeling_qwen3_5_hiai_nd.py`` and has no patch/apply operation.  The internal
+``modeling_qwen3_5_hiai_nd.py`` and has no patch/apply operation.  The target
 model source is expected to contain the feature collector already; this check
 only rejects common deployment mistakes before model weights are loaded.
 """
@@ -17,7 +17,7 @@ from typing import Any, Sequence
 
 
 FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
-FEATURE_SOURCE = "receiver_owned:modeling_qwen3_5_hiai_nd.py"
+FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
 CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 FEATURE_WIDTH = 20480
 EXPECTED_SOURCE_BASENAME = "modeling_qwen3_5_hiai_nd.py"
@@ -139,7 +139,6 @@ def _calls(function: ast.FunctionDef, name: str) -> list[ast.Call]:
 
 def _require_imports(module: ast.Module) -> None:
     target_symbols: set[str] = set()
-    runtime_symbols: set[str] = set()
     for node in module.body:
         if not isinstance(node, ast.ImportFrom) or node.level != 1:
             continue
@@ -148,8 +147,9 @@ def _require_imports(module: ast.Module) -> None:
                 alias.name for alias in node.names if alias.asname is None
             )
         elif node.module == "dflash_v1.dflash_hiai_feature_runtime":
-            runtime_symbols.update(
-                alias.name for alias in node.names if alias.asname is None
+            raise HiaiFeatureContractError(
+                "Tensor-returning HIAI source must not use the retired "
+                "ModelOutput sidecar runtime"
             )
         elif node.module == "dflash_v1.dflash_hiai_feature_patch":
             raise HiaiFeatureContractError(
@@ -164,19 +164,160 @@ def _require_imports(module: ast.Module) -> None:
         raise HiaiFeatureContractError(
             "HIAI source is missing direct feature imports: " + ", ".join(missing)
         )
-    if "attach_dflash_features" not in runtime_symbols:
+
+
+def _is_name(node: ast.AST | None, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
+
+
+def _is_name_tuple(node: ast.AST | None, names: tuple[str, ...]) -> bool:
+    return (
+        isinstance(node, ast.Tuple)
+        and len(node.elts) == len(names)
+        and all(_is_name(item, name) for item, name in zip(node.elts, names))
+    )
+
+
+def _assigned_call(
+    function: ast.FunctionDef,
+    *,
+    target_name: str,
+    call_name: str,
+) -> list[ast.Assign]:
+    result: list[ast.Assign] = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        if not _is_name(node.targets[0], target_name):
+            continue
+        if not isinstance(node.value, ast.Call):
+            continue
+        if (
+            isinstance(node.value.func, ast.Name)
+            and node.value.func.id == call_name
+        ) or (
+            isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == call_name
+        ):
+            result.append(node)
+    return result
+
+
+def _require_collector_constructor(function: ast.FunctionDef) -> None:
+    calls = _calls(function, "DFlashFeatureCollector")
+    if len(calls) != 1:
         raise HiaiFeatureContractError(
-            "HIAI source must directly import attach_dflash_features"
+            "Qwen3_5TextModel.forward must construct one DFlashFeatureCollector"
+        )
+    call = calls[0]
+    if not call.args or not _is_name(
+        call.args[0], "QWEN35_4B_DFLASH_TARGET_FEATURES"
+    ):
+        raise HiaiFeatureContractError(
+            "DFlashFeatureCollector must use QWEN35_4B_DFLASH_TARGET_FEATURES"
+        )
+    expected_keywords = {"enabled": True, "detach": True, "clone": True}
+    actual: dict[str, object] = {}
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            raise HiaiFeatureContractError(
+                "DFlashFeatureCollector must not receive expanded keyword arguments"
+            )
+        if keyword.arg in expected_keywords:
+            try:
+                actual[keyword.arg] = ast.literal_eval(keyword.value)
+            except (TypeError, ValueError) as error:
+                raise HiaiFeatureContractError(
+                    f"DFlashFeatureCollector.{keyword.arg} must be a bool literal"
+                ) from error
+    if actual != expected_keywords:
+        raise HiaiFeatureContractError(
+            "DFlashFeatureCollector must set enabled=True, detach=True, clone=True"
+        )
+
+
+def _require_capture_position(function: ast.FunctionDef) -> None:
+    capture_calls = _calls(function, "capture")
+    if len(capture_calls) != 1:
+        raise HiaiFeatureContractError(
+            "Qwen3_5TextModel.forward must capture exactly once in the decoder loop"
+        )
+    capture = capture_calls[0]
+    if len(capture.args) != 2 or not _is_name(capture.args[0], "idx") or not _is_name(
+        capture.args[1], "hidden_states"
+    ):
+        raise HiaiFeatureContractError(
+            "collector.capture must receive (idx, hidden_states)"
+        )
+
+    decoder_assignments: list[ast.Assign] = []
+    decoder_loops: list[ast.For] = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.For):
+            continue
+        assignments = [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Assign)
+            and len(child.targets) == 1
+            and _is_name(child.targets[0], "hidden_states")
+            and isinstance(child.value, ast.Subscript)
+            and _is_name(child.value.value, "layer_outputs")
+        ]
+        if assignments and capture in set(ast.walk(node)):
+            decoder_loops.append(node)
+            decoder_assignments.extend(assignments)
+    if len(decoder_loops) != 1 or len(decoder_assignments) != 1:
+        raise HiaiFeatureContractError(
+            "capture must follow exactly one hidden_states = layer_outputs[0] "
+            "assignment in the decoder loop"
+        )
+    decoder_assignment = decoder_assignments[0]
+    if capture.lineno <= decoder_assignment.lineno:
+        raise HiaiFeatureContractError(
+            "DFlash capture must occur after the decoder layer output assignment"
+        )
+
+    norm_assignments = _assigned_call(
+        function,
+        target_name="hidden_states",
+        call_name="norm",
+    )
+    if len(norm_assignments) != 1 or capture.lineno >= norm_assignments[0].lineno:
+        raise HiaiFeatureContractError(
+            "DFlash capture must occur before the one final target norm"
+        )
+
+
+def _require_tensor_tuple_returns(
+    function: ast.FunctionDef,
+    *,
+    ordinary_name: str,
+    feature_names: tuple[str, str],
+) -> None:
+    ordinary = 0
+    feature = 0
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Return):
+            continue
+        if _is_name(node.value, ordinary_name):
+            ordinary += 1
+        elif _is_name_tuple(node.value, feature_names):
+            feature += 1
+    if ordinary != 1 or feature != 1:
+        raise HiaiFeatureContractError(
+            f"{function.name} must have one ordinary Tensor return and one "
+            "feature-enabled two-Tensor return"
         )
 
 
 def _require_text_route(function: ast.FunctionDef) -> None:
     _require_disabled_default(function)
+    _require_collector_constructor(function)
     expected_counts = {
-        "DFlashFeatureCollector": 1,
         "capture": 1,
         "finalize": 1,
-        "attach_dflash_features": 1,
+        "attach_dflash_features": 0,
     }
     for name, expected in expected_counts.items():
         actual = len(_calls(function, name))
@@ -185,20 +326,28 @@ def _require_text_route(function: ast.FunctionDef) -> None:
                 f"Qwen3_5TextModel.forward must call {name} exactly {expected} "
                 f"time(s), found {actual}"
             )
-    if not any(
-        isinstance(node, ast.Constant) and node.value == FEATURE_WIDTH
-        for node in ast.walk(function)
-    ):
+    _require_capture_position(function)
+    finalizers = _assigned_call(
+        function,
+        target_name="dflash_features",
+        call_name="finalize",
+    )
+    if len(finalizers) != 1:
         raise HiaiFeatureContractError(
-            f"text feature route must validate width {FEATURE_WIDTH}"
+            "collector.finalize() must be assigned once to dflash_features"
         )
+    _require_tensor_tuple_returns(
+        function,
+        ordinary_name="hidden_states",
+        feature_names=("hidden_states", "dflash_features"),
+    )
 
 
 def _require_causal_route(function: ast.FunctionDef) -> None:
     _require_disabled_default(function)
-    if len(_calls(function, "attach_dflash_features")) != 1:
+    if _calls(function, "attach_dflash_features"):
         raise HiaiFeatureContractError(
-            "Qwen3_5ForCausalLM.forward must attach features exactly once"
+            "Tensor-returning Qwen3_5ForCausalLM must not attach a sidecar"
         )
     forwarded = False
     for call in ast.walk(function):
@@ -215,6 +364,11 @@ def _require_causal_route(function: ast.FunctionDef) -> None:
         raise HiaiFeatureContractError(
             "causal forward must pass output_dflash_features explicitly"
         )
+    _require_tensor_tuple_returns(
+        function,
+        ordinary_name="logits",
+        feature_names=("logits", "dflash_features"),
+    )
 
 
 def verify_direct_source(source: str, *, source_sha256: str | None = None) -> dict[str, Any]:
@@ -238,6 +392,7 @@ def verify_direct_source(source: str, *, source_sha256: str | None = None) -> di
         "feature_source": FEATURE_SOURCE,
         "capture_point": CAPTURE_POINT,
         "feature_width": FEATURE_WIDTH,
+        "output_abi": "Tensor | tuple[Tensor, Tensor]",
         "source_sha256": digest,
         "source_modified": False,
     }

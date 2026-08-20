@@ -69,7 +69,7 @@ PREFILL_CHUNK_SIZE_ATTRIBUTE = "dflash_prefill_chunk_size"
 DECODE_CHUNK_SIZE_ATTRIBUTE = "dflash_decode_chunk_size"
 FACADE_CONTRACT_ID = "qwen3.5-4b-dflash-v1-full-prefix-isolation-r6"
 
-_FORMAL_HIAI_FEATURE_SOURCE = "receiver_owned:modeling_qwen3_5_hiai_nd.py"
+_FORMAL_HIAI_FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
 _FORMAL_HIAI_CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 _FORMAL_HIAI_FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
 _FORMAL_FULL_PREFIX_EXECUTION_MODE = "fresh_prefill"
@@ -264,7 +264,7 @@ def create_internal_target(
     5. declare ``dflash_full_prefix_isolation_mode`` and expose a callable
        ``prepare_dflash_full_prefix_call`` on the returned module;
     6. for formal NPU execution, declare ``dflash_feature_source`` as
-       ``receiver_owned:modeling_qwen3_5_hiai_nd.py``,
+       ``package_local:modeling_qwen3_5_hiai_nd.py``,
        ``dflash_feature_capture_point`` as
        ``decoder_post_layer_pre_final_norm``, and
        ``dflash_feature_source_sha256`` as the integrated source-file hash.

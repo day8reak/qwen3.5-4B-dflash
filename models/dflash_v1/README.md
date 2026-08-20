@@ -1,8 +1,8 @@
 # DFlash V1 源码索引
 
-本目录整体放在内部 inference 的 `models/dflash_v1/`。内部已经跑通的
-`models/modeling_qwen3_5_hiai_nd.py` 保持在父目录；不再把 DFlash 文件扁平复制到原模型
-包，也不覆盖 HIAI target。
+本目录整体放在目标工程的 `models/dflash_v1/`。NPU modeling 文件不随 Git 仓库分发；
+从批准的资产存储取回 `modeling_qwen3_5_hiai_nd.py` 后，将它放到父目录同名位置。不要用
+CPU/CUDA target 覆盖它。
 
 ## 运行与调度
 
@@ -22,7 +22,8 @@
 - `configuration_qwen3_5.py`：CPU/CUDA target 配置。
 - `dflash_target_features.py`：八层 feature collector 和输出类型。
 - `dflash_hiai_feature_check.py`：只读检查父目录 HIAI target 已直接集成 feature route。
-- `dflash_hiai_feature_runtime.py`：保留内部输出字段的 feature sidecar。
+- `dflash_hiai_feature_runtime.py`：旧 ModelOutput sidecar 兼容代码；本次 HIAI Tensor/tuple
+  主路线不导入它。
 - `../internal_dflash_bridge.py`：复用现有 wrapper，并为每次调用新建 hybrid state。
 - `internal_target_loader.py`：把已实现的 bridge 包装成 DFlash target facade。
 - `internal_target_loader_template.py`：facade 合同及自定义 loader 参考。
@@ -32,7 +33,7 @@
 
 - `dflash_ops.py`：六个草稿原语的统一 Python ABI。
 - `dflash_ascend310p_ops.py`：Ascend/NPU 的分解 PyTorch backend。
-- `dflash_custom_ops_template.py`：接入内部 fused/custom op 的模板。
+- `dflash_custom_ops_template.py`：接入 fused/custom op 的模板。
 
 ## 入口
 
@@ -41,4 +42,4 @@ python -m models.dflash_v1.run_npu --help
 python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
 ```
 
-完整内网部署流程见 [NPU_INTERNAL_LAYOUT.md](../../docs/NPU_INTERNAL_LAYOUT.md)。
+完整 NPU 部署流程见 [NPU_DEPLOYMENT.md](../../docs/NPU_DEPLOYMENT.md)。

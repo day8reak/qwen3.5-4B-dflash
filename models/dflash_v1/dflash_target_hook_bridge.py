@@ -1,9 +1,9 @@
-"""Eager target-feature bridge that leaves an internal Qwen3.5 target intact.
+"""Eager target-feature bridge that leaves a Qwen3.5 target intact.
 
 This bridge is for the correctness-first V1 route.  It registers temporary
 forward hooks on the selected decoder layers, consumes
 ``output_dflash_features`` itself, and delegates every other argument to the
-unchanged target.  The internal attention, GDN, cache and custom-operator
+unchanged target.  The attention, GDN, cache and custom-operator
 calls are therefore not replaced by this module.
 
 The bridge is intentionally eager and serializes forwards while hooks are

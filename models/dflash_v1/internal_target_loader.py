@@ -1,6 +1,6 @@
-"""Embedded loader for an existing internal HIAI Qwen3.5 target.
+"""Embedded loader for a HIAI Qwen3.5 target.
 
-The internal server keeps ``modeling_qwen3_5_hiai_nd.py`` in the parent
+The deployment package keeps ``modeling_qwen3_5_hiai_nd.py`` in the parent
 ``models`` package and installs this DFlash package as ``models.dflash_v1``.
 The default receiver bridge reuses ``Qwen3_5ForCausalLMWrapper`` and allocates
 fresh external hybrid state for every complete-prefix target call.  The NPU
@@ -56,7 +56,7 @@ RESET_EVIDENCE_ENV = "DFLASH_HIAI_RESET_EVIDENCE"
 PREFILL_CHUNK_SIZE_ENV = "DFLASH_HIAI_PREFILL_CHUNK_SIZE"
 DECODE_CHUNK_SIZE_ENV = "DFLASH_HIAI_DECODE_CHUNK_SIZE"
 
-_FEATURE_SOURCE = "receiver_owned:modeling_qwen3_5_hiai_nd.py"
+_FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
 _CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 _FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
 

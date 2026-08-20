@@ -1,7 +1,7 @@
 # Qwen3.5-4B DFlash V1
 
 这是 Qwen3.5-4B 的 DFlash V1 PyTorch 实现，包含完整前缀重算调度、六层草稿模型、
-CPU/CUDA 后端，以及直接接入内部 Ascend 310P/HIAI 主模型所需的只读检查和 loader。
+CPU/CUDA 后端，以及 Ascend NPU/HIAI target 所需的检查和 loader。
 
 仓库只保留可运行源码、部署工具、许可证和中文使用说明。测试日志、验证报告、发布清单和
 模型权重不放在 GitHub 仓库中。
@@ -9,30 +9,31 @@ CPU/CUDA 后端，以及直接接入内部 Ascend 310P/HIAI 主模型所需的�
 ## 目录
 
 - `models/dflash_v1/`：DFlash 调度器、草稿模型、CPU/CUDA/NPU backend 和运行入口。
+- `models/modeling_qwen3_5_hiai_nd.py`：NPU 部署输入，不随 Git 仓库分发；从批准的资产存储
+  取回后放到该位置。它应包含八层 feature collector，并保持默认 forward 返回不变。
 - `models/internal_dflash_bridge.py`：复用现有 HIAI wrapper，并为每次完整前缀调用创建
   全新的 hybrid KV/GDN state。
 - `models/dflash_qwen_adapter_v1.py`：旧命令兼容入口。
-- `tools/`：内部自定义算子静态预检工具。
-- `config/`：预检工具使用的内部算子接口合同。
+- `tools/`：自定义算子静态预检工具。
+- `config/`：预检工具使用的算子接口合同。
 - `docs/`：CPU、CUDA 和 Ascend NPU 使用说明。
 - `SOURCE_LOCK.json`：framework 启动和草稿 checkpoint 身份检查所需的精简运行合同。
 
-内部 NPU 服务器采用“原模型不搬家、DFlash 放子目录”的结构：
+NPU 部署采用“target 在父包、DFlash 放子目录”的结构：
 
 ```text
-内部 inference 工程/
+qwen35-runtime/
 └── models/
-    ├── modeling_qwen3_5_hiai_nd.py   # 已能在 NPU 吐字的原 HIAI target
-    ├── configuration_qwen3_5.py      # 原工程文件
+    ├── modeling_qwen3_5_hiai_nd.py   # 从批准的资产存储取回
+    ├── configuration_qwen3_5.py      # 已有配置文件
     ├── internal_dflash_bridge.py     # 本仓库已实现，无需手写
-    ├── 其他原 HIAI 文件
+    ├── 其他运行文件
     └── dflash_v1/                    # 本仓库的 models/dflash_v1 整目录
 ```
 
-不要用 CPU/GPU 的 `modeling_qwen3_5_dflash.py` 覆盖 HIAI modeling。NPU 继续执行原
-HIAI target 和其中已有的自定义算子；内部 modeling 应已直接包含可选的八层 feature 输出。
-这份内部文件不在本仓库中，部署时保留服务器上已经改好的版本；DFlash runner 只读校验，
-不会再次修改它。
+不要用 CPU/GPU 的 `modeling_qwen3_5_dflash.py` 覆盖 NPU modeling。NPU 部署时先从批准的
+资产存储取回 `modeling_qwen3_5_hiai_nd.py`，再将它整体复制到目标工程同名位置。runner
+只读校验它的 feature ABI，不会在运行时 patch 或修改它。
 
 ## 环境
 
@@ -40,7 +41,7 @@ HIAI target 和其中已有的自定义算子；内部 modeling 应已直接包�
 
 - CPU：官方 CPU PyTorch；
 - CUDA：对应 CUDA 版本的 PyTorch；
-- NPU：内部服务器声明的 PyTorch、`torch_npu` 和自定义算子环境。
+- NPU：与目标设备匹配的 PyTorch、`torch_npu` 和自定义算子环境。
 
 然后安装通用依赖：
 
@@ -72,17 +73,17 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
 - [CPU/Golden 使用说明](docs/DFLASH_V1_GOLDEN.md)
 - [CUDA GPU 使用说明](docs/DFLASH_V1_GPU.md)
 - [Ascend 310P 接入说明](docs/DFLASH_V1_ASCEND310P.md)
-- [内部服务器目录与 NPU 运行流程](docs/NPU_INTERNAL_LAYOUT.md)
+- [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
 
-## 内部 NPU 快速入口
+## NPU 快速入口
 
-先按 [内部服务器目录与 NPU 运行流程](docs/NPU_INTERNAL_LAYOUT.md) 只读确认根目录中的
-`modeling_qwen3_5_hiai_nd.py` 已直接集成 feature 旁路。bridge 会复用现有
-`Qwen3_5ForCausalLMWrapper`，并按照原 inference 的 hybrid-cache shape 在每次 target 调用时
+先按 [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md) 从资产存储取回并部署
+`modeling_qwen3_5_hiai_nd.py`。bridge 会复用现有
+`Qwen3_5ForCausalLMWrapper`，并按模型配置的 hybrid-cache shape 在每次 target 调用时
 新建状态，因此不再需要手写 factory/reset：
 
 ```bash
-export PYTHONPATH=/path/to/internal/inference
+export PYTHONPATH=/path/to/qwen35-runtime
 
 python -B -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
@@ -95,7 +96,7 @@ python -B -m models.dflash_v1.run_npu \
   --report /path/to/run/dflash-v1-npu-smoke.json
 ```
 
-把 `4096` 替换成原 inference YAML 中 `config_data['kv_cache_max_len']` 的真实值。
+把 `4096` 替换成部署配置中 `kv_cache_max_len` 的真实值。
 不需要修改 bridge 源码。`run_npu` 会自动固定 FP16、EOS `248044`、内嵌目录、package-local NPU
 backend 和 HIAI source，不再要求 overlay JSON。
 

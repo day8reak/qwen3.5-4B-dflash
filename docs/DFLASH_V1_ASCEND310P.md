@@ -1,7 +1,7 @@
 # DFlash V1 Ascend NPU 接入说明
 
 本页说明代码边界和真机验证要求；实际目录、直接源码检查和命令以
-[NPU_INTERNAL_LAYOUT.md](NPU_INTERNAL_LAYOUT.md) 为准。
+[NPU_DEPLOYMENT.md](NPU_DEPLOYMENT.md) 为准。
 
 ## 实现结构
 
@@ -15,7 +15,7 @@
     └── NPU：models.dflash_v1.dflash_ascend310p_ops
 ```
 
-内部 NPU target 继续执行原 inference 中已有的自定义算子。DFlash 不用 PyTorch hook
+NPU target 继续执行 HIAI modeling 中已有的自定义算子。DFlash 不用 PyTorch hook
 全局替换它们，也不从 Python 直接调用原始 ACLNN C API。直接集成的 HIAI feature route
 只增加：
 
@@ -24,9 +24,12 @@
 - `[B,S,20480]` feature 输出；
 - feature flag 在 TextModel/ForCausalLM 之间的显式透传。
 
+默认路径仍返回原 `logits: Tensor`；只有 `output_dflash_features=True` 时返回
+`(logits, dflash_features)`。这条 HIAI 主路线不使用 HF ModelOutput sidecar。
+
 ## NPU 与 CPU/CUDA 不同的地方
 
-CPU/CUDA framework target 在 `use_cache=False` 下进行完整前缀计算。内部 HIAI target 即使
+CPU/CUDA framework target 在 `use_cache=False` 下进行完整前缀计算。HIAI target 即使
 收到同样参数，底层算子仍可能原位维护：
 
 - block-table KV；
@@ -37,33 +40,33 @@ CPU/CUDA framework target 在 `use_cache=False` 下进行完整前缀计算。�
 - `token_count`；
 - `export_flag`。
 
-本仓库现在直接包含 `models/internal_dflash_bridge.py`。它复用了现有
-`Qwen3_5ForCausalLMWrapper` 的加载方式，并按现有 inference 代码中的 shape，在每次
-完整前缀调用时重新创建上述 state；不再需要用户手写 `--reset-hook`。
+本仓库直接包含 `models/internal_dflash_bridge.py`。它使用
+`Qwen3_5ForCausalLMWrapper`，并按模型配置的 shape，在每次
+完整前缀调用时重新创建上述 state；不再需要手写 `--reset-hook`。
 
-## 已实现的内部 bridge
+## 已实现的 HIAI bridge
 
 `models/internal_dflash_bridge.py` 已实现：
 
 - 用 `Qwen3_5ForCausalLMWrapper(model_path=..., device="npu", dtype=float16)` 加载权重；
 - 从 `.model.config` 读取 32 层 hybrid 结构；
-- linear-attention state 使用现有 inference 的 conv/recurrent shape；
+- linear-attention state 使用固定的 conv/recurrent shape 合同；
 - full-attention state 使用 `[max_len/64, kv_heads*head_dim/16, 64, 16]`；
 - 每次调用从位置 0 对完整前缀执行 fresh prefill；
-- 将 HIAI Tensor/tuple/feature-sidecar 输出统一为 `logits + dflash_features`。
+- 将 HIAI Tensor/tuple 输出统一为 `logits + dflash_features`。
 
-用户不需要修改这个文件，也不需要实现 reset 函数。唯一新增的运行参数
-`--kv-cache-max-len` 必须与原 inference YAML 完全相同。
+无需修改这个文件，也无需实现 reset 函数。唯一新增的运行参数
+`--kv-cache-max-len` 必须与部署配置完全相同。
 
 ## 最小运行
 
 ```bash
 set -euo pipefail
 
-export INTERNAL_ROOT=/path/to/internal-inference
-export MODEL_PYTHON=/path/to/internal/python
+export DEPLOY_ROOT=/path/to/qwen35-runtime
+export MODEL_PYTHON=/path/to/python
 export RUN_DIR=/path/to/run
-export PYTHONPATH="$INTERNAL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$DEPLOY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 mkdir -p "$RUN_DIR"
 
@@ -80,7 +83,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   2>&1 | tee "$RUN_DIR/dflash-v1-npu-smoke.log"
 ```
 
-把 `4096` 替换为原 inference YAML 的 `kv_cache_max_len`。这个入口自动固定：
+把 `4096` 替换为部署配置的 `kv_cache_max_len`。这个入口自动固定：
 FP16、EOS `248044`、内嵌目录、根 HIAI source、package-local loader 和
 NPU backend。它会直接检查当前内嵌源码树，不需要额外生成 overlay 预检文件。
 

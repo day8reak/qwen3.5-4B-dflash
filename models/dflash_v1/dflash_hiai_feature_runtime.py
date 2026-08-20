@@ -1,4 +1,4 @@
-"""Runtime sidecar for receiver-owned HIAI DFlash feature outputs.
+"""Legacy runtime sidecar for HIAI DFlash feature outputs.
 
 Feature-enabled forwards need one extra tensor without discarding private HIAI
 output fields.  This proxy delegates every existing field/index operation to
@@ -127,7 +127,7 @@ def attach_dflash_features(
     *,
     required_fields: Sequence[str] = (),
 ) -> DFlashPassthroughOutput:
-    """Attach the feature tensor while retaining every receiver-owned field."""
+    """Attach the feature tensor while retaining every target output field."""
 
     return DFlashPassthroughOutput(
         base_output,

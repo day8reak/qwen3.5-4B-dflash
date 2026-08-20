@@ -1,12 +1,13 @@
 # DFlash V1 — 实现与设备接入说明
 
 本实现依赖 `transformers==5.14.1`。CPU/CUDA 使用完整的
-`models/dflash_v1/modeling_qwen3_5_dflash.py`；内部 NPU 继续使用原工程已经能吐字的
-`models/modeling_qwen3_5_hiai_nd.py`，DFlash 代码整体放在它旁边的 `models/dflash_v1/`。
+`models/dflash_v1/modeling_qwen3_5_dflash.py`；NPU 使用
+部署时从批准的资产存储取回的 `models/modeling_qwen3_5_hiai_nd.py`，DFlash 代码整体放在
+它旁边的 `models/dflash_v1/`。该 NPU 文件不随 Git 仓库分发。
 
 先阅读：
 
-- [内部服务器目录与 NPU 运行流程](docs/NPU_INTERNAL_LAYOUT.md)
+- [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
 - [CPU/Golden 指南](docs/DFLASH_V1_GOLDEN.md)
 - [CUDA GPU 指南](docs/DFLASH_V1_GPU.md)
 - [Ascend 接口与验证边界](docs/DFLASH_V1_ASCEND310P.md)
@@ -32,14 +33,15 @@ DFlash V1 scheduler
 decoder 层 `1,5,9,13,17,21,25,29` 的层后、最终 norm 前输出
 `dflash_features: [B,S,20480]`。
 
-NPU modeling 已直接集成 feature route；运行时不再 patch。该 route 不替换 HIAI attention、
-GDN、CacheUpdate 或其他自定义算子，只增加 `output_dflash_features=False` 的显式开关和
-opt-in 输出，默认生成路径保持不变。
+部署输入 `models/modeling_qwen3_5_hiai_nd.py` 已直接集成 feature route；运行时不再 patch。
+该 route 不替换 attention、GDN、CacheUpdate 或其他自定义算子，只增加
+`output_dflash_features=False` 的显式开关。默认仍返回 logits Tensor；仅开启时返回
+`(logits, dflash_features)`。
 
 ## NPU 状态边界
 
-`use_cache=False` 不能自动清除 HIAI 内部的 block-table KV、GDN conv/recurrent state。
-本仓库的 `models/internal_dflash_bridge.py` 已直接复用你提供的 inference 初始化逻辑：
+`use_cache=False` 不能自动清除 HIAI target 的 block-table KV、GDN conv/recurrent state。
+本仓库的 `models/internal_dflash_bridge.py` 按模型配置构造调用级状态：
 
 1. 每次调用都按 `layer_types` 新建 32 层 hybrid state；
 2. linear 层新建 `(conv_state, recurrent_state)`，full-attention 层新建 block-table `(K,V)`；
@@ -47,8 +49,8 @@ opt-in 输出，默认生成路径保持不变。
 4. 只把 logits 和可选 features 返回 DFlash，不跨调用返回 state；
 5. 保证 `P → Q → P` 中两次 `P` 的 logits/features 一致。
 
-shape/dtype 来自现有 inference 实现和模型 config。`run_npu` 默认使用已经实现好的 bridge；
-只需传原 YAML 中同一个 `kv_cache_max_len`。
+shape/dtype 来自模型配置和固定 ABI。`run_npu` 默认使用已经实现好的 bridge；
+只需传部署配置中的 `kv_cache_max_len`。
 
 ## Draft backend
 
@@ -57,13 +59,13 @@ CPU/CUDA：TorchDFlashOps
 NPU：dflash_ascend310p_ops
 ```
 
-普通受支持 PyTorch 算子由 tensor device 分派；内部 target 自定义算子仍由原 HIAI modeling
+普通受支持 PyTorch 算子由 tensor device 分派；target 自定义算子仍由 HIAI modeling
 显式调用。这里没有全局 monkey patch。
 
 ## NPU 最小命令
 
 ```bash
-export PYTHONPATH=/path/to/internal-inference
+export PYTHONPATH=/path/to/qwen35-runtime
 
 python -B -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
@@ -76,8 +78,8 @@ python -B -m models.dflash_v1.run_npu \
   --report /path/to/run/dflash-v1-npu-smoke.json
 ```
 
-把 `4096` 换成原 inference YAML 的实际值。默认 bridge 固定导入
-`models.export_model_wrapper_qwen3_5.Qwen3_5ForCausalLMWrapper`，与你提供的 inference 一致。
+把 `4096` 换成部署配置的实际值。默认 bridge 固定导入
+`models.export_model_wrapper_qwen3_5.Qwen3_5ForCausalLMWrapper`。
 
 ## 验证边界
 

@@ -89,7 +89,7 @@ _RESERVED_TARGET_KWARGS = frozenset(
 _FORMAL_ISOLATION_MODES = frozenset(
     {"receiver_reset_hook", "fresh_instance"}
 )
-_HIAI_FEATURE_SOURCE = "receiver_owned:modeling_qwen3_5_hiai_nd.py"
+_HIAI_FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
 _HIAI_CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 _HIAI_FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
 _FACADE_CONTRACT_ID = "qwen3.5-4b-dflash-v1-full-prefix-isolation-r6"

@@ -1,12 +1,12 @@
-"""Bridge the existing Qwen3.5 HIAI wrapper to DFlash V1.
+"""Bridge a Qwen3.5 HIAI wrapper to DFlash V1.
 
-The receiver inference already owns model loading and all HIAI custom
+The HIAI target owns model loading and its custom
 operators.  DFlash V1, however, asks the target to evaluate a complete prefix
 on every call and does not carry target cache state across calls.  This module
 adapts those two interfaces without replacing attention, GDN, CacheUpdate, or
 any other target operator.
 
-Each call builds a fresh hybrid cache matching the receiver inference:
+Each call builds a fresh hybrid cache from the model configuration:
 
 * linear-attention layers receive ``(conv_state, recurrent_state)``;
 * full-attention layers receive block-table ``(key_cache, value_cache)``;
@@ -34,7 +34,7 @@ BLOCK_SIZE = 64
 FEATURE_WIDTH = 20_480
 VOCAB_SIZE = 248_320
 
-_FEATURE_SOURCE = "receiver_owned:modeling_qwen3_5_hiai_nd.py"
+_FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
 _CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 _FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
 

@@ -1,4 +1,4 @@
-"""Simple NPU entry point for the embedded internal-server layout.
+"""Simple NPU entry point for the embedded HIAI layout.
 
 This command derives the HIAI source and DFlash loader from the colocated
 ``models`` package.  It intentionally exposes only the controls needed for a
