@@ -94,9 +94,10 @@ def _copy_entries(contract: dict[str, Any]) -> tuple[str, ...]:
         if not isinstance(raw_entry, str):
             raise OverlayValidationError("required_copy_files must contain strings")
         path = Path(raw_entry)
-        if path.parts != ("models", path.name) or path.suffix != ".py":
+        if path.parts != ("models", "dflash_v1", path.name) or path.suffix != ".py":
             raise OverlayValidationError(
-                f"overlay copy entry must be models/<module>.py: {raw_entry!r}"
+                "overlay copy entry must be "
+                f"models/dflash_v1/<module>.py: {raw_entry!r}"
             )
         entries.append(raw_entry)
     if len(entries) != len(set(entries)):
@@ -628,14 +629,15 @@ def validate_overlay(
     package_dir = package_dir.resolve()
     if not package_dir.is_dir():
         raise OverlayValidationError(f"receiver package directory is missing: {package_dir}")
-    trusted_source_models_dir = (PACKAGE_ROOT / "models").resolve()
+    trusted_source_models_dir = (PACKAGE_ROOT / "models" / "dflash_v1").resolve()
     if (
         source_models_dir is not None
         and source_models_dir.resolve() != trusted_source_models_dir
     ):
         raise OverlayValidationError(
-            "--source-models-dir must be the models directory beside this "
-            "delivered validator; arbitrary comparison roots are forbidden"
+            "--source-models-dir must be the models/dflash_v1 directory "
+            "beside this delivered validator; arbitrary comparison roots "
+            "are forbidden"
         )
     source_models_dir = trusted_source_models_dir
     contract_path = MINIMAL_CONTRACT if scope == "target" else FULL_CONTRACT
@@ -844,7 +846,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--source-models-dir",
         type=Path,
-        help="packaged models directory used for byte-for-byte copy verification",
+        help=(
+            "packaged models/dflash_v1 directory used for byte-for-byte "
+            "copy verification"
+        ),
     )
     parser.add_argument(
         "--hiai-source",

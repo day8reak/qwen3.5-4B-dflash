@@ -46,11 +46,11 @@ export GOLDEN_ROOT=/path/to/extracted/qwen3_5
 export TARGET_QWEN_DIR=/path/to/transformer/model/qwen3_5
 export HIAI_SOURCE="$TARGET_QWEN_DIR/modeling_qwen3_5_hiai_nd.py"
 
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_hiai_feature_patch \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" --dry-run --show-diff
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_hiai_feature_patch \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" --in-place
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_hiai_feature_patch \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" --check
 ```
 
@@ -60,7 +60,15 @@ prefill、64/1 chunk 以及所选状态隔离方式，详见 310P 指南。
 
 ## 完整 singular CLI 闭包
 
-`TARGET_OVERLAY_FULL.json` 定义 **13 个运行文件**，供 overlay 检查工具读取：
+仓库源码集中在 `models/dflash_v1/`；其中的
+[README](models/dflash_v1/README.md) 按运行调度、草稿模型、target、设备 backend 和 HIAI
+接入解释各文件。旧的 `python -m models.dflash_qwen_adapter_v1` 命令仍可用，但新代码推荐：
+
+```bash
+python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
+```
+
+`TARGET_OVERLAY_FULL.json` 定义 **13 个运行文件**，供 overlay 检查工具从上述目录读取：
 
 ```text
 dflash_ascend310p_ops.py
@@ -87,7 +95,7 @@ modeling_qwen3_5_dflash.py
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -B "$GOLDEN_ROOT/tools/validate_target_overlay.py" \
   --scope v1-cli \
-  --source-models-dir "$GOLDEN_ROOT/models" \
+  --source-models-dir "$GOLDEN_ROOT/models/dflash_v1" \
   --package-dir /path/to/transformer/model/qwen3_5 \
   --package-name transformer.model.qwen3_5 \
   --hiai-source /path/to/transformer/model/qwen3_5/modeling_qwen3_5_hiai_nd.py \

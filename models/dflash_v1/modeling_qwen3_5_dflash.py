@@ -53,6 +53,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, torch_compilable_check
+from transformers.utils.auto_docstring import HARDCODED_CONFIG_FOR_MODELS as _AUTO_DOCSTRING_CONFIGS
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import (
     accepts_precomputed_kwargs,
@@ -68,6 +69,14 @@ from transformers.vision_utils import (
     get_vision_position_ids,
 )
 from transformers.models.auto.modeling_auto import AutoModel
+
+
+# ``auto_docstring`` derives a model key from the package directory.  The
+# layered source package is named ``dflash_v1`` while the copied receiver
+# module remains under ``qwen3_5``.  Register this documentation-only alias
+# before importing the local configuration and feature modules.
+_AUTO_DOCSTRING_CONFIGS.setdefault("dflash-v1", "Qwen3_5Config")
+
 from .configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 
 from .dflash_target_features import (

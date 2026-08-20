@@ -19,7 +19,8 @@ patch 的真机证据。
 ## 完整交付闭包
 
 若要在内部 singular 包中直接运行 V1 CLI，应严格复制 `TARGET_OVERLAY_FULL.json` 中定义的
-13 个运行文件：
+13 个运行文件。它们在 GitHub 仓库中位于 `models/dflash_v1/`，复制时按 basename 放到
+receiver 的平级包目录，因此内部包的扁平相对 import ABI 不变：
 
 ```text
 dflash_ascend310p_ops.py
@@ -88,7 +89,7 @@ set -euo pipefail
   "${TARGET_QWEN_DIR:?请设置接收方 qwen3_5 包目录}"
 HIAI_SOURCE="$TARGET_QWEN_DIR/modeling_qwen3_5_hiai_nd.py"
 
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_hiai_feature_patch \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" --dry-run --show-diff
 ```
 
@@ -97,9 +98,9 @@ return 锚点。确认 diff 后再 apply；`--in-place` 会先保存
 `modeling_qwen3_5_hiai_nd.py.pre-dflash-v1`：
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_hiai_feature_patch \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" --in-place
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_hiai_feature_patch \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" --check
 sha256sum "$HIAI_SOURCE"
 ```
@@ -107,7 +108,7 @@ sha256sum "$HIAI_SOURCE"
 若不希望直接改接收目录，可把第二条改成：
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_hiai_feature_patch \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$GOLDEN_ROOT" python -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" \
   --output /path/to/review/modeling_qwen3_5_hiai_nd.py
 ```
@@ -121,7 +122,7 @@ attention、GDN、cache 或任何自定义算子。
 复制模板后只实现其中 `create_internal_target()`：
 
 ```bash
-cp "$GOLDEN_ROOT/models/internal_target_loader_template.py" \
+cp "$GOLDEN_ROOT/models/dflash_v1/internal_target_loader_template.py" \
    "$TARGET_QWEN_DIR/internal_target_loader.py"
 ```
 
@@ -156,7 +157,7 @@ dflash_decode_chunk_size = 1
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -B "$GOLDEN_ROOT/tools/validate_target_overlay.py" \
   --scope v1-cli \
-  --source-models-dir "$GOLDEN_ROOT/models" \
+  --source-models-dir "$GOLDEN_ROOT/models/dflash_v1" \
   --package-dir "$TARGET_QWEN_DIR" \
   --package-name transformer.model.qwen3_5 \
   --hiai-source "$HIAI_SOURCE" \

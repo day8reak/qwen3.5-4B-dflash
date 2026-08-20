@@ -92,7 +92,7 @@ SHA-256，但不由仓库文件覆盖。
 CPU 只验证 framework 流程，不替代 CUDA/NPU 设备验证。进入仓库根目录后运行小参数流程：
 
 ```bash
-PYTHONPATH=. python -m models.dflash_qwen_adapter_v1 \
+PYTHONPATH=. python -m models.dflash_v1.dflash_qwen_adapter_v1 \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --prompt-ids 151644,872,198 \

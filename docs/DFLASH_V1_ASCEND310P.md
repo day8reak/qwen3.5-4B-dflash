@@ -91,7 +91,8 @@ mkdir -p "$RUN_DIR"
 package 内；CPU 和 NPU CLI 都会拒绝让 `--report` 覆盖 prompt、权重或运行源码，NPU 还会
 额外保护 preflight、HIAI source 和 loader。
 
-按 `TARGET_OVERLAY_FULL.json` 原子复制 13 个运行文件。它们是：
+按 `TARGET_OVERLAY_FULL.json` 从 `models/dflash_v1/` 逐文件原子复制 13 个运行文件；目标文件
+仍按 basename 放在 receiver 的平级包目录。它们是：
 
 ```text
 dflash_ascend310p_ops.py
@@ -149,7 +150,7 @@ PY
 set -euo pipefail
 HIAI_SOURCE="$TARGET_QWEN_DIR/modeling_qwen3_5_hiai_nd.py"
 
-PYTHONPATH="$GOLDEN_ROOT" "$MODEL_PYTHON" -B -m models.dflash_hiai_feature_patch \
+PYTHONPATH="$GOLDEN_ROOT" "$MODEL_PYTHON" -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" --dry-run --show-diff \
   > "$RUN_DIR/hiai-patch-dry-run.json"
 ```
@@ -158,11 +159,11 @@ PYTHONPATH="$GOLDEN_ROOT" "$MODEL_PYTHON" -B -m models.dflash_hiai_feature_patch
 
 ```bash
 set -euo pipefail
-PYTHONPATH="$GOLDEN_ROOT" "$MODEL_PYTHON" -B -m models.dflash_hiai_feature_patch \
+PYTHONPATH="$GOLDEN_ROOT" "$MODEL_PYTHON" -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" --in-place \
   | tee "$RUN_DIR/hiai-patch-apply.json"
 
-PYTHONPATH="$GOLDEN_ROOT" "$MODEL_PYTHON" -B -m models.dflash_hiai_feature_patch \
+PYTHONPATH="$GOLDEN_ROOT" "$MODEL_PYTHON" -B -m models.dflash_v1.dflash_hiai_feature_patch \
   --source "$HIAI_SOURCE" --check \
   | tee "$RUN_DIR/hiai-patch-check.json"
 
@@ -175,7 +176,7 @@ sha256sum "$HIAI_SOURCE" | tee "$RUN_DIR/hiai-patched-source.sha256"
 ## 第三步：实现 receiver loader 和隔离 hook
 
 ```bash
-cp "$GOLDEN_ROOT/models/internal_target_loader_template.py" \
+cp "$GOLDEN_ROOT/models/dflash_v1/internal_target_loader_template.py" \
    "$TARGET_QWEN_DIR/internal_target_loader.py"
 ```
 
@@ -243,7 +244,7 @@ set -euo pipefail
 PYTHONPATH="$PACKAGE_PYTHON_ROOT" "$MODEL_PYTHON" -B \
   "$GOLDEN_ROOT/tools/validate_target_overlay.py" \
   --scope v1-cli \
-  --source-models-dir "$GOLDEN_ROOT/models" \
+  --source-models-dir "$GOLDEN_ROOT/models/dflash_v1" \
   --package-dir "$TARGET_QWEN_DIR" \
   --package-name transformer.model.qwen3_5 \
   --hiai-source "$HIAI_SOURCE" \

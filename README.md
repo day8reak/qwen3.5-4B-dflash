@@ -8,7 +8,8 @@ CPU/CUDA 后端，以及接入内部 Ascend 310P/HIAI 主模型所需的源码 p
 
 ## 目录
 
-- `models/`：主模型 feature 旁路、DFlash 草稿模型、解码调度和设备 backend。
+- `models/dflash_v1/`：完整实现；目录内 README 按 target、draft、backend 和 runtime 分类。
+- `models/dflash_qwen_adapter_v1.py`：旧命令兼容入口。
 - `tools/`：310P overlay 与内部自定义算子静态预检工具。
 - `config/`：预检工具运行时读取的内部算子接口合同。
 - `docs/`：CPU、CUDA 和 Ascend 310P 使用说明。
@@ -35,7 +36,7 @@ python -m pip install "transformers==5.14.1" safetensors huggingface-hub
 
 ```bash
 export PYTHONPATH="$PWD"
-python -B -m models.dflash_qwen_adapter_v1 \
+python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --prompt-ids 151644,872,198 \

@@ -2,18 +2,28 @@
   "schema_version": 1,
   "purpose": "runtime identity contract required by CPU/CUDA framework and checkpoint validation",
   "route_version": "dflash-v1-full-prefix-replay-r6",
+  "package_layout": {
+    "version": 1,
+    "canonical_package": "models.dflash_v1",
+    "canonical_source_directory": "models/dflash_v1",
+    "namespace_compatibility_file": "models/__init__.py",
+    "namespace_compatibility_sha256": "9bf3e37aed93d372ca13b17b9c6dae32efa47f805f32b48628fb5316eae34b6d",
+    "compatibility_entry_file": "models/dflash_qwen_adapter_v1.py",
+    "compatibility_entry_sha256": "e3953f3dc2952480b4bc28b58519508653842f88c5212bafc4e0335f670a3611",
+    "receiver_overlay_policy": "copy listed nested sources by basename into the flat receiver package"
+  },
   "target_modeling": {
     "repository": "huggingface/transformers",
     "tag": "v5.14.1",
     "commit": "a08ace4bbd97e721c98751deec37d87b026acadc",
     "upstream_modeling_sha256": "0e2cd8dc50885b2701d26b116c585eedcdc62a24080ec34345af55b963126ded",
     "upstream_configuration_sha256": "3c01b3cdcff8d77cbafac9841bc48c41e5a5b38637231f1bde3d843cd198dbaf",
-    "delivered_configuration_file": "models/configuration_qwen3_5.py",
+    "delivered_configuration_file": "models/dflash_v1/configuration_qwen3_5.py",
     "delivered_configuration_sha256": "0c2e030bb2194dfbcb39d491e830cf2bdac1578ebed9209532e1511545a770cc",
-    "delivered_modeling_file": "models/modeling_qwen3_5_dflash.py",
-    "delivered_modeling_sha256": "e468047531a3a1103b67ea1ed0344c901e31f1728a793cf9e4d9150c7baabe3f",
-    "feature_helper_file": "models/dflash_target_features.py",
-    "feature_helper_sha256": "86a942811b72f791a6c4ffc054eff6dbc9b3ad6750dfb391c4e0d3bc07435a1d"
+    "delivered_modeling_file": "models/dflash_v1/modeling_qwen3_5_dflash.py",
+    "delivered_modeling_sha256": "fe5571417253119478d5584f65cdd5b80787c8e458778c94a96b6ef25ca07d45",
+    "feature_helper_file": "models/dflash_v1/dflash_target_features.py",
+    "feature_helper_sha256": "bc6e2e0880bc8fc1ddf345ca35534d237e7b1f6af7d588622a8655415f7764b4"
   },
   "runtime_validation": {
     "python": "3.10",
@@ -43,24 +53,24 @@
     "model_card_license": "Apache-2.0"
   },
   "v1_runtime": {
-    "config_file": "models/dflash_config.py",
+    "config_file": "models/dflash_v1/dflash_config.py",
     "config_sha256": "c2aa18c34217f0b41c1f940a678c404e5970da0ac39892329a6fa7d7a1e1a808",
-    "ops_file": "models/dflash_ops.py",
+    "ops_file": "models/dflash_v1/dflash_ops.py",
     "ops_sha256": "595a73d68565a009cc7bd9f8523f94e846accff41a9926a9fe3d8e24400fcb94",
-    "adapter_file": "models/dflash_qwen_adapter_v1.py",
+    "adapter_file": "models/dflash_v1/dflash_qwen_adapter_v1.py",
     "adapter_sha256": "0b7e404632eb3e013a69ac642738d1a73f43f2719a2c4c038062f291af83a018",
-    "scheduler_file": "models/dflash_reference_decode_v1.py",
+    "scheduler_file": "models/dflash_v1/dflash_reference_decode_v1.py",
     "scheduler_sha256": "4e40f1943d69f61c6df103c4a584cd0a31c6e0370818c584fd9a555b757bba70",
-    "draft_model_file": "models/modeling_dflash.py",
+    "draft_model_file": "models/dflash_v1/modeling_dflash.py",
     "draft_model_sha256": "ba672dae81b07adc0193a41bf586e8eaa63b5bf0741558941098588d7a1067ce",
-    "weight_loader_file": "models/dflash_weights.py",
+    "weight_loader_file": "models/dflash_v1/dflash_weights.py",
     "weight_loader_sha256": "c85bcc22620c9108d430e0f23e55b7dd08207e6a7884615e508370644bd653b2"
   },
   "target_overlay": {
     "minimal_contract_file": "TARGET_OVERLAY.json",
-    "minimal_contract_sha256": "751f7ff0ac16ad1f02eaf7d076ae54dca2e58358678b67203a718411ad9f7be2",
+    "minimal_contract_sha256": "71145ef34aa9ed448d1e3f1aa8f6bef9ca1a7c5acd11299aae12b3cb3f4f5674",
     "full_contract_file": "TARGET_OVERLAY_FULL.json",
-    "full_contract_sha256": "11ab1424239d91eb03a62c2c4193c2c87f4f91e9c6016e238a652f6c2dcfea11"
+    "full_contract_sha256": "66fa987e32dcb9bdfecf0fac208cd10f9a11587210ae0549cdf6cc09c52bdd95"
   },
   "privacy": {
     "contains_user_conversation_urls": false,

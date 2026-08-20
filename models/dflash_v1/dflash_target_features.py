@@ -53,7 +53,7 @@ class DFlashTargetFeatureSpec:
 
 # Keep the target-side overlay independent of the draft implementation package.
 # These values are the frozen Qwen3.5-4B DFlash feature contract and are checked
-# against ``models.dflash_config`` by the package regression tests.  A receiving
+# against ``models.dflash_v1.dflash_config`` by downstream checks.  A receiving
 # target package therefore needs only this helper plus the patched modeling
 # sibling; it must not need the draft-only ``dflash_config.py`` module.
 QWEN35_4B_DFLASH_TARGET_FEATURES = DFlashTargetFeatureSpec(

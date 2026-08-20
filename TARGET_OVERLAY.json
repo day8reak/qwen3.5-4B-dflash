@@ -3,11 +3,11 @@
   "contract_id": "qwen3.5-4b-dflash-target-overlay-tf5.14.1",
   "receiver_package_example": "transformer.model.qwen3_5",
   "required_copy_files": [
-    "models/modeling_qwen3_5_dflash.py",
-    "models/dflash_target_features.py"
+    "models/dflash_v1/modeling_qwen3_5_dflash.py",
+    "models/dflash_v1/dflash_target_features.py"
   ],
   "receiver_owned_dependency": "configuration_qwen3_5.py",
-  "portable_configuration_fallback": "models/configuration_qwen3_5.py",
+  "portable_configuration_fallback": "models/dflash_v1/configuration_qwen3_5.py",
   "draft_only_modules_not_required_by_target_overlay": [
     "dflash_config.py",
     "dflash_ops.py",

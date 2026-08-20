@@ -29,7 +29,7 @@ export PYTHONDONTWRITEBYTECODE=1
 unset PYTHONPYCACHEPREFIX
 export PYTHONPATH="$PWD"
 
-"$MODEL_PYTHON" -B -m models.dflash_qwen_adapter_v1 \
+"$MODEL_PYTHON" -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
   --target-dir "$TARGET_DIR" \
   --draft-dir "$DRAFT_DIR" \
   --prompt-ids 151644,872,198 \

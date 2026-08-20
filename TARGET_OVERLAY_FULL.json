@@ -4,19 +4,19 @@
   "scope": "v1_cli_complete_runtime_copy_closure",
   "receiver_package": "transformer.model.qwen3_5",
   "required_copy_files": [
-    "models/dflash_ascend310p_ops.py",
-    "models/dflash_config.py",
-    "models/dflash_hiai_feature_patch.py",
-    "models/dflash_hiai_feature_runtime.py",
-    "models/dflash_ops.py",
-    "models/dflash_qwen_adapter_v1.py",
-    "models/dflash_reference_decode_v1.py",
-    "models/dflash_target_features.py",
-    "models/dflash_target_hook_bridge.py",
-    "models/dflash_weights.py",
-    "models/internal_target_loader_template.py",
-    "models/modeling_dflash.py",
-    "models/modeling_qwen3_5_dflash.py"
+    "models/dflash_v1/dflash_ascend310p_ops.py",
+    "models/dflash_v1/dflash_config.py",
+    "models/dflash_v1/dflash_hiai_feature_patch.py",
+    "models/dflash_v1/dflash_hiai_feature_runtime.py",
+    "models/dflash_v1/dflash_ops.py",
+    "models/dflash_v1/dflash_qwen_adapter_v1.py",
+    "models/dflash_v1/dflash_reference_decode_v1.py",
+    "models/dflash_v1/dflash_target_features.py",
+    "models/dflash_v1/dflash_target_hook_bridge.py",
+    "models/dflash_v1/dflash_weights.py",
+    "models/dflash_v1/internal_target_loader_template.py",
+    "models/dflash_v1/modeling_dflash.py",
+    "models/dflash_v1/modeling_qwen3_5_dflash.py"
   ],
   "receiver_owned_dependency": "configuration_qwen3_5.py",
   "receiver_owned_runtime_loader": {
@@ -43,7 +43,7 @@
       "dflash_target_features",
       "dflash_hiai_feature_runtime"
     ],
-    "verification_tool": "models/dflash_hiai_feature_patch.py --check"
+    "verification_tool": "models/dflash_v1/dflash_hiai_feature_patch.py --check"
   },
   "required_import_modules": [
     "dflash_ascend310p_ops",
@@ -94,7 +94,7 @@
     ]
   },
   "optional_not_in_runtime_import_closure": [
-    "models/dflash_custom_ops_template.py"
+    "models/dflash_v1/dflash_custom_ops_template.py"
   ],
   "cli_probe": "python -m transformer.model.qwen3_5.dflash_qwen_adapter_v1 --help",
   "dependency_policy": {
