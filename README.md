@@ -100,5 +100,11 @@ python -B -m models.dflash_v1.run_npu \
 不需要修改 bridge 源码。`run_npu` 会自动固定 FP16、EOS `248044`、内嵌目录、package-local NPU
 backend 和 HIAI source，不再要求 overlay JSON。
 
+如果已经能生成但接受率偏低，按
+[NPU 接受率分层诊断](docs/NPU_DEPLOYMENT.md#7-接受率低时的分层诊断) 运行
+`models.dflash_v1.diagnose_acceptance`。它会先判定正常增量 Target 与 DFlash fresh
+full-prefix Target 是否等价，再统计 K=1/3/7/15，避免用一条自洽但不等价的 Target 路径误判
+草稿模型。
+
 仓库不包含 Qwen3.5-4B 或 DFlash 权重。真实 CUDA 和 Ascend 310P 结果需要在对应服务器上
 执行上述流程确认，CPU 结果不能替代设备验证。

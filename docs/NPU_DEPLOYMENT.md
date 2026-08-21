@@ -159,3 +159,79 @@ full-prefix prefill，不要继续统计接受率。
 ```
 
 真实 NPU 接受率、无 fallback、显存和性能只能由目标设备运行确认。
+
+## 7. 接受率低时的分层诊断
+
+不要先根据 `accepted / proposed` 百分比修改草稿模型。第一步应确认两条 Target 路径对同一
+前缀是否等价：
+
+- 正常增量路径：prompt prefill 一次，随后复用 KV/GDN state 单 token decode；
+- DFlash V1 路径：每次都用 fresh state 重算完整前缀。
+
+仓库提供只读诊断入口。它不会修改权重或部署源码，默认也不会在终端或 JSON 中写出
+prompt、生成 token ID：
+
+```bash
+set -euo pipefail
+
+export PYTHONPATH="$DEPLOY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export RUN_DIR=/path/to/dflash-run
+mkdir -p "$RUN_DIR"
+
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.diagnose_acceptance \
+  --target-dir /path/to/Qwen3.5-4B \
+  --draft-dir /path/to/Qwen3.5-4B-DFlash \
+  --kv-cache-max-len 4096 \
+  --prompt-ids 151644,872,198 \
+  --device npu:0 \
+  --eos-token-id 248044 \
+  --target-parity-decode-steps 4 \
+  --acceptance-rounds 16 \
+  --proposal-counts 1,3,7,15 \
+  --report "$RUN_DIR/dflash-v1-acceptance-diagnosis.json" \
+  2>&1 | tee "$RUN_DIR/dflash-v1-acceptance-diagnosis.log"
+```
+
+把 `4096` 替换为正常推理配置的真实 `kv_cache_max_len`。诊断默认校验完整草稿权重
+SHA-256；只有临时缩短排查时间时才使用 `--no-verify-draft-sha256`，正式结论仍应打开校验。
+
+### 为什么是 K=1、3、7、15
+
+这里的 `K` 只表示草稿 token 数。DFlash block 还包含 1 个已经由 Target 确认的 anchor：
+
+```text
+总 block size = 1 个 anchor + K 个 proposal
+2 / 4 / 8 / 16 = 1+1 / 1+3 / 1+7 / 1+15
+```
+
+因此 K=1、3、7、15 对应总 block size=2、4、8、16；不是把 4、8、16 少算了一个。
+
+### 结果怎么读
+
+先看 `Target 增量 vs full-prefix`：
+
+- `FAIL_TOP1_DIVERGENCE`：先停止解释接受率。说明 fresh full-prefix bridge 和正常增量推理
+  已经产生不同的 Target token；优先核对 fresh KV/GDN state、position、cache position、
+  `allQLen` 和 causal mask。
+- `PASS_TOP1_WITH_NUMERIC_DIFFERENCE`：token 相同但数值不完全相同。查看 JSON 中最早异常
+  的 `feature_layers`；它按层 `1,5,9,13,17,21,25,29` 分开给出 max/mean error、RMSE 和
+  cosine。
+- `PASS_BITWISE_EQUAL`：两条 Target 路径在本次有限前缀上逐 bit 相等，可以继续解释
+  draft 接受率。
+
+再看每个 K：
+
+- `first_proposal_accuracy`：每轮第一个草稿 token 的命中率；K=1 也很低时，优先查
+  feature、草稿权重和 FP16 draft backend，而不是长 block 调度。
+- `mean_accepted_draft_tokens`：每轮平均接受的草稿 token 数。
+- `mean_theoretical_emitted_per_verify`：接受 token 加一个 Target correction/bonus，较接近
+  每次 verify 能推进多少 token 的口径。
+- `full_block_accept_rate`：整块全部接受的轮次比例。
+
+需要进一步区分草稿 backend 时，加 `--shadow-torch-ops`。它在同一 NPU、同一组输入和
+同一份权重上，把当前分解 backend 与 `TorchDFlashOps` 做一次 shadow 比较；如果该环境的
+NPU SDPA 不支持，会明确显示 `SKIPPED_TORCH_OPS_UNSUPPORTED`，不会伪装成通过。
+
+诊断只覆盖有限轮次，不能单独证明整网性能或所有长度下的状态正确性。建议先用 16 轮定位，
+再把 `--acceptance-rounds` 提高到 64 或更多确认趋势。

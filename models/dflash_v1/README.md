@@ -7,6 +7,8 @@ target 覆盖它。
 ## 运行与调度
 
 - `run_npu.py`：内嵌目录的一键 NPU 入口，自动派生 HIAI source、loader、FP16 和 EOS。
+- `diagnose_acceptance.py`：对比增量/fresh-full-prefix Target，并在相同 greedy 前缀上扫描
+  K=1/3/7/15 的接受率；默认不输出 token ID。
 - `dflash_qwen_adapter_v1.py`：CPU/CUDA/NPU 完整入口和严格 greedy 验证流程。
 - `dflash_reference_decode_v1.py`：无 cache 的完整前缀 DFlash 调度 golden。
 
@@ -39,6 +41,7 @@ target 覆盖它。
 
 ```bash
 python -m models.dflash_v1.run_npu --help
+python -m models.dflash_v1.diagnose_acceptance --help
 python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
 ```
 
