@@ -1,8 +1,10 @@
 """Correctness-first DFlash decoding with full-prefix target replay.
 
 This module deliberately has no KV-cache or recurrent-state commit/rollback
-path.  At every round the target callback receives the complete committed
-prefix followed by the current draft block.  This is slow, but it gives the
+path.  At every round the target callback receives a complete prefix.  The
+correctness route verifies each proposal against its own isolated prefix,
+instead of assuming that earlier logits are invariant when an unaccepted
+suffix is appended to the same target call.  This is slow, but it gives the
 portable golden a small and auditable strict-greedy acceptance rule.
 
 The target callback (or ``forward_logits`` adapter method) must return logits
@@ -322,6 +324,7 @@ def dflash_full_prefix_greedy(
     max_draft_tokens: int,
     eos_token_ids: Iterable[int] = (),
     input_device: str | torch.device | None = None,
+    verification_mode: str = "sequential",
 ) -> ReplayDecodeResult:
     """Run strict-greedy DFlash verification without scheduler-owned cache.
 
@@ -330,16 +333,25 @@ def dflash_full_prefix_greedy(
     not reset or validate receiver-specific state; the formal 310P route adds
     those gates in the Qwen adapter/facade layer.
 
-    If ``d[0:k]`` is the draft block, target row ``prefix_length - 1 + i``
-    verifies ``d[i]``.  Only the longest contiguous matching prefix is
-    accepted.  The next target Top-1 token is then emitted as the correction
-    (on mismatch) or bonus token (when every proposal matches), subject to EOS
-    and ``max_new_tokens``.  Consequently every emitted token is target-greedy.
+    In the default ``sequential`` mode, proposal ``d[i]`` is verified by a
+    fresh target call on ``committed + d[:i]``.  This avoids relying on a
+    vectorized target's prefix-invariance across different input lengths and
+    kernel choices.  ``vectorized`` retains the one-call diagnostic route in
+    which target row ``prefix_length - 1 + i`` verifies ``d[i]``.
+
+    Only the longest contiguous matching prefix is accepted.  The next target
+    Top-1 token is then emitted as the correction (on mismatch) or bonus token
+    (when every proposal matches), subject to EOS and ``max_new_tokens``.
+    Consequently every emitted token is target-greedy in sequential mode.
     """
 
     prompt, device = _normalize_prompt(prompt_token_ids, input_device)
     maximum = _non_negative_count(max_new_tokens, name="max_new_tokens")
     block_size = _positive_count(max_draft_tokens, name="max_draft_tokens")
+    if verification_mode not in {"sequential", "vectorized"}:
+        raise ValueError(
+            "verification_mode must be 'sequential' or 'vectorized'"
+        )
     eos = _normalize_eos(eos_token_ids)
     committed = list(prompt)
     generated: list[int] = []
@@ -365,25 +377,63 @@ def dflash_full_prefix_greedy(
         stats.drafted_tokens += len(proposals)
 
         if proposals:
-            verification_input = [*committed, *proposals]
-            first_row = prefix_length - 1
-            target_tokens = _target_top1(
-                target,
-                verification_input,
-                list(range(first_row, first_row + len(proposals) + 1)),
-                device=device,
-                stats=stats,
-                verification=True,
-            )
-            mismatch = next(
-                (
-                    index
-                    for index, proposal in enumerate(proposals)
-                    if proposal != target_tokens[index]
-                ),
-                None,
-            )
-            accepted_count = len(proposals) if mismatch is None else mismatch
+            if verification_mode == "vectorized":
+                verification_input = [*committed, *proposals]
+                first_row = prefix_length - 1
+                target_tokens = _target_top1(
+                    target,
+                    verification_input,
+                    list(range(first_row, first_row + len(proposals) + 1)),
+                    device=device,
+                    stats=stats,
+                    verification=True,
+                )
+                mismatch = next(
+                    (
+                        index
+                        for index, proposal in enumerate(proposals)
+                        if proposal != target_tokens[index]
+                    ),
+                    None,
+                )
+                accepted_count = (
+                    len(proposals) if mismatch is None else mismatch
+                )
+            else:
+                # Verify only committed/accepted tokens.  In particular, a
+                # mismatching proposal never becomes target context merely
+                # because it occupied an earlier row in a vectorized call.
+                target_tokens = []
+                accepted_count = 0
+                for proposal_index, proposal in enumerate(proposals):
+                    verification_prefix = [
+                        *committed,
+                        *proposals[:proposal_index],
+                    ]
+                    target_token = _target_top1(
+                        target,
+                        verification_prefix,
+                        [len(verification_prefix) - 1],
+                        device=device,
+                        stats=stats,
+                        verification=True,
+                    )[0]
+                    target_tokens.append(target_token)
+                    if proposal != target_token:
+                        break
+                    accepted_count += 1
+                if accepted_count == len(proposals):
+                    bonus_prefix = [*committed, *proposals]
+                    target_tokens.extend(
+                        _target_top1(
+                            target,
+                            bonus_prefix,
+                            [len(bonus_prefix) - 1],
+                            device=device,
+                            stats=stats,
+                            verification=True,
+                        )
+                    )
         else:
             target_tokens = _target_top1(
                 target,
@@ -438,7 +488,7 @@ def dflash_full_prefix_greedy(
         )
 
     return ReplayDecodeResult(
-        mode="dflash-full-prefix-strict-greedy",
+        mode=f"dflash-full-prefix-{verification_mode}-strict-greedy",
         prompt_token_ids=tuple(prompt),
         generated_token_ids=tuple(generated),
         reached_eos=reached_eos,

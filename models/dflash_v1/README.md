@@ -12,7 +12,8 @@ target 覆盖它。
   FP16/BF16 A/B、早中后段接受率、逐轮层级指纹、跨报告首个分叉和单轮 oracle tensor
   bundle，默认不输出 token ID。
 - `dflash_qwen_adapter_v1.py`：CPU/CUDA/NPU 完整入口和严格 greedy 验证流程。
-- `dflash_reference_decode_v1.py`：无 cache 的完整前缀 DFlash 调度 golden。
+- `dflash_reference_decode_v1.py`：无 cache 的完整前缀 DFlash 调度 golden；默认逐 proposal
+  独立验证，vectorized 整块验证仅保留为诊断模式。
 
 ## 草稿模型
 
@@ -52,7 +53,8 @@ python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
 ```
 
 三个入口都接受 `--prompt "文本"` 或 `--prompt-file /path/to/prompt.txt`。默认
-`--prompt-mode chat` 使用本地主模型 tokenizer 的 chat template，并输出解码后的 ordinary
-Target 与 DFlash 文本；`raw` 模式只做普通 tokenizer 编码。
+`--prompt-mode chat` 使用本地主模型 tokenizer 的 chat template，默认启用 thinking，并输出
+解码后的 ordinary Target 与 DFlash 文本；`--no-enable-thinking` 可复现非 thinking workload，
+`raw` 模式只做普通 tokenizer 编码。
 
 完整 NPU 部署流程见 [NPU_DEPLOYMENT.md](../../docs/NPU_DEPLOYMENT.md)。

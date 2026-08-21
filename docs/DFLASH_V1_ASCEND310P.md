@@ -52,6 +52,7 @@ CPU/CUDA framework target 在 `use_cache=False` 下进行完整前缀计算。HI
 - 从 `.model.config` 读取 32 层 hybrid 结构；
 - linear-attention state 使用固定的 conv/recurrent shape 合同；
 - full-attention state 使用 `[max_len/64, kv_heads*head_dim/16, 64, 16]`；
+- 把 `config.kv_cache_max_len` 写入模型后重建并校验每个 full-attention block table；
 - 每次调用从位置 0 对完整前缀执行 fresh prefill；
 - 将 HIAI Tensor/tuple 输出统一为 `logits + dflash_features`。
 
@@ -77,6 +78,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --kv-cache-max-len 4096 \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --prompt-mode chat \
+  --enable-thinking \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -91,14 +93,15 @@ NPU backend。它会直接检查当前内嵌源码树，不需要额外生成 ov
 ## 正确性门禁
 
 1. 原始 HIAI 普通生成在修改前后 token 不变。
-2. 同一个 prefix 的 feature=False/True logits 完全一致。
+2. 同一个 prefix 的 feature=False/True logits Top-1 一致且在 dtype 容差内。
 3. feature shape 为 `[1,S,20480]`，dtype 为 FP16，device 为请求的 NPU。
-4. `P → Q → P` 两次 `P` 的 logits 和 features 相同。
+4. `P → P` 对照和异长 `P → Q → P` 均通过 bounded repeatability；报告保留误差指标。
 5. NPU DFlash 与同一 NPU target ordinary greedy 的 token、EOS、stop reason 完全一致。
 6. 至少执行一个 draft、一个 feature forward 和一个 target verify。
 7. 无 CPU fallback。
 
-第 4 项失败说明 fresh hybrid state 或完整前缀 prefill 不等价；不要继续测接受率。
+第 4 项若连 `P → P` 都失败，先查设备重复性；只有 `P → Q → P` 失败时，再查 fresh hybrid
+state、block table 或完整前缀 prefill。不要继续测接受率。
 
 ## 接受率和性能
 
@@ -115,7 +118,8 @@ fallback 已通过。
 
 固定 workload 推荐保存为 UTF-8 文件，并使用
 `--prompt-file /path/to/prompt.txt --prompt-mode chat`。入口会在本地套用 Qwen chat
-template，运行结束直接打印 ordinary Target 与 DFlash 两份解码文本。本包统一使用 vLLM
+template，默认启用 thinking，运行结束直接打印 ordinary Target 与 DFlash 两份解码文本。
+非 thinking 对照显式加 `--no-enable-thinking`。本包统一使用 vLLM
 proposal-count 口径，clean anchor 不计入 `max_draft_tokens`，因此最大 K 为 16；K=16 时
 draft query 共 17 行。
 

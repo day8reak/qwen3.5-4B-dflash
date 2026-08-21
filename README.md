@@ -1,4 +1,4 @@
-# Qwen3.5-4B DFlash V1
+# Qwen3.5-4B DFlash V1（r12）
 
 这是 Qwen3.5-4B 的 DFlash V1 PyTorch 实现，包含完整前缀重算调度、六层草稿模型、
 CPU/CUDA 后端，以及 Ascend NPU/HIAI target 所需的检查和 loader。
@@ -82,7 +82,8 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
 先按 [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md) 部署仓库中的
 `modeling_qwen3_5_hiai_nd.py`。bridge 会复用现有
 `Qwen3_5ForCausalLMWrapper`，并按模型配置的 hybrid-cache shape 在每次 target 调用时
-新建状态，因此不再需要手写 factory/reset：
+新建状态；同时会按 `--kv-cache-max-len` 重建所有 full-attention block table，因此不再需要
+手写 factory/reset：
 
 ```bash
 export PYTHONPATH=/path/to/qwen35-runtime
@@ -93,6 +94,7 @@ python -B -m models.dflash_v1.run_npu \
   --kv-cache-max-len 4096 \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --prompt-mode chat \
+  --enable-thinking \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -106,14 +108,21 @@ backend 和 HIAI source，不再要求 overlay JSON。
 如果已经能生成但接受率偏低，按
 [NPU 接受率分层诊断](docs/NPU_DEPLOYMENT.md#7-接受率低时的分层诊断) 运行
 `models.dflash_v1.diagnose_acceptance`。它会先判定正常增量 Target 与 DFlash fresh
-full-prefix Target 是否等价，再统计 K=1/4/8/16。新版也支持 CUDA FP16/BF16 A/B、逐轮
-无明文层级指纹和两份报告的首个分叉定位，避免只凭最终 token 或总接受率误判草稿模型。
+full-prefix Target 是否等价，再以逐 proposal 的独立前缀验证统计 K=1/4/8/16；旧的一次
+向量化 target 验证只保留为 prefix-invariance 诊断。新版也支持 CUDA FP16/BF16 A/B、逐轮
+无明文层级指纹和两份报告的首个分叉定位，避免把 kernel 随序列长度产生的舍入差异误报为
+BF16 调度错误。
 GPU 的 FP16/BF16 对照命令见 [DFlash V1 GPU 运行说明](docs/DFLASH_V1_GPU.md)。
 
 固定文本也可以放进 UTF-8 文件，然后把 `--prompt "..."` 换成
 `--prompt-file /path/to/prompt.txt`。默认 `--prompt-mode chat` 会套用本地主模型 tokenizer 的
-chat template；只有文件已经包含完整模板文本时才使用 `--prompt-mode raw`。入口会直接打印
-ordinary Target 和 DFlash 的解码结果。
+chat template，且默认开启 thinking；只有文件已经包含完整模板文本时才使用
+`--prompt-mode raw`。需要复现非 thinking workload 时显式传 `--no-enable-thinking`。入口会
+直接打印 ordinary Target 和 DFlash 的解码结果。
+
+报告中的 `accepted_draft_tokens / drafted_tokens` 不是官方 accept length。更接近官方口径的
+字段是 `mean_emitted_tokens_per_draft_round`（接受 proposal 加 correction/bonus）。接受率仍然
+强依赖 prompt、thinking 模式和生成阶段，不能用一条短文本替代多 workload 评测。
 
 仓库不包含 Qwen3.5-4B 或 DFlash 权重。真实 CUDA 和 Ascend 310P 结果需要在对应服务器上
 执行上述流程确认，CPU 结果不能替代设备验证。

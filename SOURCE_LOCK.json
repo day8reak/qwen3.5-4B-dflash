@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
   "purpose": "runtime identity contract for Qwen3.5-4B DFlash V1",
-  "package_revision": "r10",
-  "route_version": "dflash-v1-full-prefix-direct-hiai-tensor-tuple",
+  "package_revision": "r12",
+  "route_version": "dflash-v1-sequential-full-prefix-direct-hiai-tensor-tuple",
   "package_layout": {
     "version": 2,
     "canonical_package": "models.dflash_v1",
@@ -12,8 +12,8 @@
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
-    "hiai_bridge_sha256": "8a1b8cde289273b412fd925283a22a041e84bec0c215324ceaa17a696be4dc0b",
-    "hiai_bridge_policy": "loads the package wrapper and allocates fresh call-local hybrid state",
+    "hiai_bridge_sha256": "03987ca16fc92d6b9219452873488595cf9674e24279dbf6e1417da294350dd7",
+    "hiai_bridge_policy": "loads the package wrapper, rebuilds full-attention block tables for the configured KV length, and allocates fresh call-local hybrid state",
     "npu_policy": "keep the HIAI target in models/ and install the complete DFlash package in models/dflash_v1/",
     "namespace_compatibility_file": "models/__init__.py",
     "namespace_compatibility_sha256": "9bf3e37aed93d372ca13b17b9c6dae32efa47f805f32b48628fb5316eae34b6d",
@@ -46,7 +46,13 @@
   "dflash_reference": {
     "repository": "z-lab/dflash",
     "revision": "07ebd93db9f472af339b644bb70221ad8428328a",
-    "algorithm": "DFlash V1 target bootstrap plus full-prefix greedy verification"
+    "algorithm": "DFlash V1 target bootstrap plus isolated sequential full-prefix greedy verification"
+  },
+  "target_checkpoint": {
+    "repository": "Qwen/Qwen3.5-4B",
+    "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+    "config_sha256": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+    "runtime_policy": "exact pinned config preferred; semantic Qwen3.5-4B config variants are accepted and reported, while target weight identity remains external"
   },
   "dflash_checkpoint": {
     "repository": "z-lab/Qwen3.5-4B-DFlash",
@@ -68,19 +74,19 @@
     "ops_file": "models/dflash_v1/dflash_ops.py",
     "ops_sha256": "595a73d68565a009cc7bd9f8523f94e846accff41a9926a9fe3d8e24400fcb94",
     "adapter_file": "models/dflash_v1/dflash_qwen_adapter_v1.py",
-    "adapter_sha256": "13cf3b7e2b9fc072fbba8ef2049be8f5b4a2530fc348fc06e1a289add6c8da05",
+    "adapter_sha256": "5342eab450437efb5a9c32c866fd3dac9b3564dd8b8560986b1331fea40e3e20",
     "scheduler_file": "models/dflash_v1/dflash_reference_decode_v1.py",
-    "scheduler_sha256": "4e40f1943d69f61c6df103c4a584cd0a31c6e0370818c584fd9a555b757bba70",
+    "scheduler_sha256": "04099a7ae9685fb18612053825ad99604f1340d68417c566600389a024ab67eb",
     "draft_model_file": "models/dflash_v1/modeling_dflash.py",
     "draft_model_sha256": "a99268a7d6a0a41ce2657460ac4bff22a61dd4efca8c53d35e1d624728142789",
     "weight_loader_file": "models/dflash_v1/dflash_weights.py",
     "weight_loader_sha256": "c85bcc22620c9108d430e0f23e55b7dd08207e6a7884615e508370644bd653b2",
     "acceptance_diagnostic_file": "models/dflash_v1/diagnose_acceptance.py",
-    "acceptance_diagnostic_sha256": "ad4ce7883da82751ba54f6c72f8abda47bc96c27acc30b4036aed65ecd6e3707"
+    "acceptance_diagnostic_sha256": "e525b6949252cca4d6fee6666673a6e0145076e3b4cbb31821ede5566ea47398"
   },
   "npu_embedded_runtime": {
     "runner_file": "models/dflash_v1/run_npu.py",
-    "runner_sha256": "18039ef33d6f14297c9c6b1dafd6cb466e2f354d4e6453d83bacf2be768a5ed3",
+    "runner_sha256": "1adceb3bd8a5dbfb9f2d1cb69412d8b11772971dedc0c964c79f0f9e79d129f8",
     "loader_file": "models/dflash_v1/internal_target_loader.py",
     "loader_sha256": "fb8a1516d1791ad253a8d0dabbfcddae2db57dccc9e2795d938a511071efa840",
     "loader_contract_file": "models/dflash_v1/internal_target_loader_template.py",

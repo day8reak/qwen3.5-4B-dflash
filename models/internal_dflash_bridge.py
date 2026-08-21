@@ -143,6 +143,9 @@ class InternalDFlashTarget(nn.Module):
         if self.kv_cache_max_len % BLOCK_SIZE != 0:
             raise ValueError("kv_cache_max_len must be divisible by block_size=64")
         self.config.kv_cache_max_len = self.kv_cache_max_len
+        self.dflash_full_attention_block_tables_rebuilt = (
+            self._rebuild_full_attention_block_tables()
+        )
         self._prepared_call: tuple[int, bool, int, int] | None = None
 
     @property
@@ -178,6 +181,38 @@ class InternalDFlashTarget(nn.Module):
         if not isinstance(module, nn.Module):
             raise TypeError("HIAI execution model must expose its LM head")
         return module
+
+    def _rebuild_full_attention_block_tables(self) -> int:
+        """Keep per-layer block tables aligned with the bridge cache length."""
+
+        layer_types = tuple(getattr(self.config, "layer_types", ()))
+        expected = sum(item == "full_attention" for item in layer_types)
+        rebuilt = 0
+        expected_blocks = self.kv_cache_max_len // BLOCK_SIZE
+        for module in self.dflash_execution_model.modules():
+            rebuild = getattr(module, "_rebuild_block_table", None)
+            if not callable(rebuild):
+                continue
+            rebuild()
+            rebuilt += 1
+            if int(getattr(module, "kv_max_len", -1)) != self.kv_cache_max_len:
+                raise RuntimeError(
+                    "full-attention layer kept a stale kv_cache_max_len"
+                )
+            block_table = getattr(module, "block_table", None)
+            if not isinstance(block_table, Tensor) or tuple(block_table.shape) != (
+                1,
+                expected_blocks,
+            ):
+                raise RuntimeError(
+                    "full-attention layer rebuilt an invalid block_table shape"
+                )
+        if rebuilt != expected:
+            raise RuntimeError(
+                "HIAI full-attention block-table rebuild count differs from "
+                f"config.layer_types: expected {expected}, got {rebuilt}"
+            )
+        return rebuilt
 
     def prepare_dflash_full_prefix_call(
         self,

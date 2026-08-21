@@ -18,6 +18,8 @@
 - 每个 target 调用都重算完整已提交前缀。V1 不提交、分支或回退投机 KV/GDN state。
 - target 先生成 anchor，draft 最多产生 16 个 proposal，target 验证最长连续匹配前缀并给出
   correction/bonus。
+- r12 默认逐个 proposal 使用独立完整前缀校验；一次调用验证整块的 vectorized 路径只用于
+  诊断，因为不同输入长度可能选择不同 kernel，不能假定更长输入里较早 logit 行逐 bit 不变。
 - CPU、CUDA 和 NPU 共用 `dflash_reference_decode_v1.py` 与
   `Qwen35DFlashFullPrefixAdapter`。
 
@@ -46,8 +48,10 @@ decoder 层 `1,5,9,13,17,21,25,29` 的层后、最终 norm 前输出
 1. 每次调用都按 `layer_types` 新建 32 层 hybrid state；
 2. linear 层新建 `(conv_state, recurrent_state)`，full-attention 层新建 block-table `(K,V)`；
 3. 用完整前缀执行一次 fresh prefill；
-4. 只把 logits 和可选 features 返回 DFlash，不跨调用返回 state；
-5. 保证 `P → Q → P` 中两次 `P` 的 logits/features 一致。
+4. 按实际 `kv_cache_max_len` 重建每个 full-attention 层的 block table；
+5. 只把 logits 和可选 features 返回 DFlash，不跨调用返回 state；
+6. 先做 `P → P` 重复性对照，再做异长 `P → Q → P`；要求 Top-1 相同且数值在 dtype 对应
+   容差内，并把误差写入报告。
 
 shape/dtype 来自模型配置和固定 ABI。`run_npu` 默认使用已经实现好的 bridge；
 只需传部署配置中的 `kv_cache_max_len`。
@@ -73,6 +77,7 @@ python -B -m models.dflash_v1.run_npu \
   --kv-cache-max-len 4096 \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --prompt-mode chat \
+  --enable-thinking \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -84,8 +89,9 @@ python -B -m models.dflash_v1.run_npu \
 
 若要让每次运行读取同一段固定文本，把 `--prompt` 换成
 `--prompt-file /path/to/prompt.txt`；文件按 UTF-8 读取。默认 `chat` 模式会套用本地主模型
-tokenizer 的 chat template，`raw` 只适用于已经自行构造好模板的文本。运行结束会打印
-ordinary Target 与 DFlash 两份解码文本。
+tokenizer 的 chat template，并默认启用 thinking；`raw` 只适用于已经自行构造好模板的文本。
+非 thinking 测试显式传 `--no-enable-thinking`。运行结束会打印 ordinary Target 与 DFlash
+两份解码文本。
 
 ## 验证边界
 

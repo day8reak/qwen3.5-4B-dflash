@@ -48,13 +48,13 @@ qwen35-runtime/
 ```bash
 set -euo pipefail
 
-test ! -e "$DEPLOY_ROOT/models/dflash_v1.r10.new"
+test ! -e "$DEPLOY_ROOT/models/dflash_v1.r12.new"
 cp -a "$DFLASH_REPO/models/dflash_v1" \
-  "$DEPLOY_ROOT/models/dflash_v1.r10.new"
+  "$DEPLOY_ROOT/models/dflash_v1.r12.new"
 
 # 首次部署时，目标 dflash_v1 不应存在；升级时先按部署规范将旧目录改名留存。
 test ! -e "$DEPLOY_ROOT/models/dflash_v1"
-mv "$DEPLOY_ROOT/models/dflash_v1.r10.new" \
+mv "$DEPLOY_ROOT/models/dflash_v1.r12.new" \
   "$DEPLOY_ROOT/models/dflash_v1"
 
 install -m 0644 "$DFLASH_REPO/models/internal_dflash_bridge.py" \
@@ -104,7 +104,8 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 加载后立即失败，不会静默混用两份 target。
 
 `--kv-cache-max-len` 必须使用部署配置中的实际值，并且能被 64 整除。当前 bridge 仅支持
-FP16、非量化 target 路线。
+FP16、非量化 target 路线。r12 在加载后会用该值重建所有 full-attention 层的 block table；
+重建层数或 shape 不一致会在 draft 加载前失败。
 
 ## 5. 最小 NPU smoke
 
@@ -124,6 +125,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --kv-cache-max-len 4096 \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --prompt-mode chat \
+  --enable-thinking \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -132,12 +134,19 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 ```
 
 将 `4096` 替换为部署配置的真实值。入口自动固定 FP16、EOS `248044`、package-local NPU
-backend、无 CPU fallback，并在运行前后复核源码。
+backend、无 CPU fallback，并在运行前后复核源码。chat prompt 默认启用 thinking；需要复现
+非 thinking 输入时显式传 `--no-enable-thinking`。
+
+target 加载后、draft 构造前会检查当前设备可用内存。草稿参数 FP16 约需 1.18 GiB，另预留
+512 MiB 安全空间；不足时会直接报告 free/required，而不是等分配失败。这个门禁只能发现明显
+不足，正式长序列仍需为 target、feature、logits 和 workspace 留出更多空间，并使用没有其他
+进程占用的设备。
 
 ## 6. 通过条件
 
 ```text
 strict_greedy_exact_match = true
+verification_mode = sequential_isolated_prefix
 feature_capture_zero_impact = true
 bounded_full_prefix_repeatability = true
 draft_calls > 0
@@ -150,8 +159,9 @@ runtime_preflight.source_integration = direct
 runtime_preflight.source_modified_by_runtime = false
 ```
 
-如果 `P → Q → P` 重复前缀门禁失败，先检查 fresh state shape、`kv_cache_max_len` 和
-full-prefix prefill，不要继续统计接受率。
+门禁先执行 `P → P` 对照，再执行异长 `P → Q → P`。若前者失败，说明设备本身的重复性已
+超出 dtype 容差；若只有后者失败，再检查 fresh state shape、`kv_cache_max_len`、block table
+和 full-prefix prefill。两类结果的 max/mean error、Top-1 mismatch 都会写入报告。
 
 最小 smoke 通过后再使用：
 
@@ -187,11 +197,13 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --kv-cache-max-len 4096 \
   --prompt-file "$PROMPT_FILE" \
   --prompt-mode chat \
+  --enable-thinking \
   --device npu:0 \
   --dtype float16 \
   --eos-token-id 248044 \
   --target-parity-decode-steps 4 \
   --acceptance-rounds 16 \
+  --verification-mode sequential \
   --proposal-counts 1,4,8,16 \
   --trace-draft-layers \
   --report "$RUN_DIR/dflash-v1-acceptance-diagnosis.json" \
@@ -201,7 +213,8 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 把 `4096` 替换为正常推理配置的真实 `kv_cache_max_len`。诊断默认校验完整草稿权重
 SHA-256；只有临时缩短排查时间时才使用 `--no-verify-draft-sha256`，正式结论仍应打开校验。
 `PROMPT_FILE` 按 UTF-8 读取整个文件；`chat` 会套本地 Qwen chat template。文件若已经包含完整
-模板则用 `--prompt-mode raw`。终端会直接打印 Target 续写文本、最大 K 的逐轮接受长度以及
+模板则用 `--prompt-mode raw`。默认 thinking 与公开 DFlash benchmark 一致；非 thinking A/B
+显式加 `--no-enable-thinking`。终端会直接打印 Target 续写文本、最大 K 的逐轮接受长度以及
 early / middle / late 三段均值；JSON 默认仍不保存明文 token ID。
 
 ### 为什么是 K=1、4、8、16
@@ -242,7 +255,7 @@ feature 一致；报告同时给出 `max_feature_relative_rmse` 与最小 cosine
   feature、草稿权重和 FP16 draft backend，而不是长 block 调度。
 - `mean_accepted_draft_tokens`：每轮平均接受的草稿 token 数。
 - `mean_theoretical_emitted_per_verify`：接受 token 加一个 Target correction/bonus，较接近
-  每次 verify 能推进多少 token 的口径。
+  每次 verify 能推进多少 token 的口径，也是应与公开 accept length 对照的字段。
 - `full_block_accept_rate`：整块全部接受的轮次比例。
 - `phase_metrics_by_proposal_count`：把实际完成轮次等分为 early / middle / late；配合终端的
   `逐轮接受长度` 判断后段回升究竟是否稳定存在。
@@ -287,6 +300,12 @@ NPU SDPA 不支持，会明确显示 `SKIPPED_TORCH_OPS_UNSUPPORTED`，不会伪
 
 DFlash V1 每轮只有一次并行 draft forward；不要为提高接受率增加逐个 mask 替换和重复
 draft 的循环，那会改变算法。
+
+r12 的正确性决策默认是 sequential：proposal `i` 只用
+`committed_prefix + 已接受的 proposal[:i]` 调一次 fresh target。工具仍额外执行一次
+vectorized target 以记录 `vectorized_prefix_invariance`，但它不参与接受决策。若该字段为
+`FAIL_PREFIX_ROW_DIVERGENCE`，说明更长输入改变了较早行的 Target Top-1；这能解释旧版
+BF16 中途 strict-greedy mismatch，不能据此判定草稿权重错误。
 
 ### 导出单轮 oracle 输入
 

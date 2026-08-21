@@ -60,6 +60,12 @@ def _parser() -> argparse.ArgumentParser:
         default="chat",
         help="chat applies the local Qwen chat template; raw tokenizes text directly",
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable Qwen thinking in chat mode (default: enabled)",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--max-draft-tokens", type=int, default=1)
     parser.add_argument("--device", default="npu:0")
@@ -137,6 +143,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         adapter_args.extend(["--prompt-file", args.prompt_file])
     adapter_args.extend(["--prompt-mode", args.prompt_mode])
+    adapter_args.append(
+        "--enable-thinking" if args.enable_thinking else "--no-enable-thinking"
+    )
     if args.report is not None:
         adapter_args.extend(["--report", args.report])
     adapter_args.append("--progress" if args.progress else "--no-progress")

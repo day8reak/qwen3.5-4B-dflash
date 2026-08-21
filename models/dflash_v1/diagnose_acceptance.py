@@ -41,6 +41,8 @@ from torch import Tensor, nn
 from .dflash_ops import TorchDFlashOps
 from .dflash_qwen_adapter_v1 import (
     Qwen35DFlashFullPrefixAdapter,
+    _audit_target_config,
+    _draft_device_memory_preflight,
     _load_target,
     _prepare_device_backend,
     _prompt_ids,
@@ -1200,8 +1202,12 @@ def acceptance_sweep(
     include_token_ids: bool,
     trace_draft_layers: bool = False,
     oracle_capture: dict[str, Tensor] | None = None,
+    verification_mode: str = "sequential",
 ) -> dict[str, object]:
     """Evaluate all K values on the same sequence of clean target prefixes."""
+
+    if verification_mode not in {"sequential", "vectorized"}:
+        raise ValueError("verification_mode must be sequential or vectorized")
 
     clean_logits = adapter.forward_logits(prompt_ids)
     anchor = clean_logits[:, -1, :].argmax(dim=-1).to(torch.long)
@@ -1261,14 +1267,57 @@ def acceptance_sweep(
             verification_logits = adapter.forward_logits(verification_ids)
             first_row = int(prefix.shape[1]) - 1
             row_count = int(proposals.numel())
-            verification_target_tokens = verification_logits[
+            vectorized_target_tokens = verification_logits[
                 0, first_row : first_row + row_count + 1, :
             ].argmax(dim=-1)
-            if int(verification_target_tokens.numel()) != row_count + 1:
+            if int(vectorized_target_tokens.numel()) != row_count + 1:
                 raise RuntimeError("target verification did not expose the bonus row")
-            target_tokens = verification_target_tokens[:row_count]
-            accepted_count = _accepted_prefix_length(proposals, target_tokens)
-            verifier_first = int(target_tokens[0].item())
+            if verification_mode == "sequential":
+                decision_values: list[int] = []
+                accepted_count = 0
+                for proposal_index, proposal in enumerate(proposals):
+                    isolated_prefix = torch.cat(
+                        (prefix, proposals[:proposal_index].view(1, -1)),
+                        dim=1,
+                    )
+                    isolated_logits = adapter.forward_logits(isolated_prefix)
+                    isolated_token = int(
+                        isolated_logits[0, -1, :].argmax(dim=-1).item()
+                    )
+                    decision_values.append(isolated_token)
+                    if int(proposal.item()) != isolated_token:
+                        break
+                    accepted_count += 1
+                if accepted_count == row_count:
+                    isolated_bonus_input = torch.cat(
+                        (prefix, proposals.view(1, -1)),
+                        dim=1,
+                    )
+                    isolated_bonus_logits = adapter.forward_logits(
+                        isolated_bonus_input
+                    )
+                    decision_values.append(
+                        int(
+                            isolated_bonus_logits[0, -1, :]
+                            .argmax(dim=-1)
+                            .item()
+                        )
+                    )
+                verification_target_tokens = torch.tensor(
+                    decision_values,
+                    dtype=torch.long,
+                    device=proposals.device,
+                )
+            else:
+                verification_target_tokens = vectorized_target_tokens
+                accepted_count = _accepted_prefix_length(
+                    proposals,
+                    vectorized_target_tokens[:row_count],
+                )
+            target_tokens = verification_target_tokens[
+                : min(row_count, int(verification_target_tokens.numel()))
+            ]
+            verifier_first = int(verification_target_tokens[0].item())
             verifier_first_tokens[str(proposal_count)] = verifier_first
             accepted_contains_eos = bool(
                 (proposals[:accepted_count] == int(eos_token_id)).any().item()
@@ -1287,11 +1336,40 @@ def acceptance_sweep(
                 "theoretical_emitted_count": theoretical_emitted_count,
                 "first_proposal_match": bool(proposals[0] == target_tokens[0]),
                 "full_block_accepted": accepted_count == row_count,
+                "verification_mode": verification_mode,
+                "target_decision_rows_evaluated": int(
+                    verification_target_tokens.numel()
+                ),
                 "draft_input_contract": input_contract,
                 "proposal_token_fingerprint": tensor_fingerprint(proposals),
                 "target_token_fingerprint": tensor_fingerprint(target_tokens),
+                "vectorized_target_token_fingerprint": tensor_fingerprint(
+                    vectorized_target_tokens
+                ),
                 "correction_or_bonus_token_fingerprint": tensor_fingerprint(
                     verification_target_tokens[accepted_count : accepted_count + 1]
+                ),
+            }
+            compared_rows = min(
+                int(verification_target_tokens.numel()),
+                int(vectorized_target_tokens.numel()),
+            )
+            divergence = torch.nonzero(
+                verification_target_tokens[:compared_rows]
+                != vectorized_target_tokens[:compared_rows],
+                as_tuple=False,
+            )
+            record["vectorized_prefix_invariance"] = {
+                "status": (
+                    "PASS_EVALUATED_ROWS"
+                    if divergence.numel() == 0
+                    else "FAIL_PREFIX_ROW_DIVERGENCE"
+                ),
+                "evaluated_rows": compared_rows,
+                "first_divergent_row": (
+                    None
+                    if divergence.numel() == 0
+                    else int(divergence[0].item())
                 ),
             }
             if draft_trace is not None:
@@ -1299,6 +1377,9 @@ def acceptance_sweep(
             if include_token_ids:
                 record["proposal_token_ids"] = proposals.detach().cpu().tolist()
                 record["target_token_ids"] = target_tokens.detach().cpu().tolist()
+                record["vectorized_target_token_ids"] = (
+                    vectorized_target_tokens.detach().cpu().tolist()
+                )
                 record["correction_or_bonus_token_id"] = int(
                     verification_target_tokens[accepted_count].item()
                 )
@@ -1321,6 +1402,7 @@ def acceptance_sweep(
         "rounds_completed": len({int(record["round_index"]) for record in records}),
         "stopped_on_eos": stopped_on_eos,
         "proposal_counts": list(proposal_counts),
+        "verification_mode": verification_mode,
         "draft_layer_trace_enabled": bool(trace_draft_layers),
         "metrics_by_proposal_count": summarize_acceptance(records, proposal_counts),
         "phase_metrics_by_proposal_count": summarize_acceptance_phases(
@@ -1879,6 +1961,27 @@ def diagnose_next_actions(report: Mapping[str, object]) -> list[str]:
 
     sweep = report.get("acceptance_sweep")
     metrics = sweep.get("metrics_by_proposal_count") if isinstance(sweep, Mapping) else None
+    records = sweep.get("records") if isinstance(sweep, Mapping) else None
+    if isinstance(records, Sequence):
+        divergent = [
+            record
+            for record in records
+            if isinstance(record, Mapping)
+            and isinstance(record.get("vectorized_prefix_invariance"), Mapping)
+            and record["vectorized_prefix_invariance"].get("status")
+            == "FAIL_PREFIX_ROW_DIVERGENCE"
+        ]
+        if divergent:
+            first = divergent[0]
+            invariance = first["vectorized_prefix_invariance"]
+            assert isinstance(invariance, Mapping)
+            return [
+                "一次性 vectorized verify 与逐前缀隔离 verify 已出现 Top-1 分叉；不要把该异常归因于 Draft 接受率。",
+                "首个分叉位于 round="
+                f"{first.get('round_index')}, K={first.get('requested_proposal_count')}, "
+                f"row={invariance.get('first_divergent_row')}。",
+                "正式 V1 使用 sequential isolated-prefix verifier；另行检查 Target causal mask、长度相关 kernel 和 full-prefix 数值稳定性。",
+            ]
     k1 = metrics.get("1") if isinstance(metrics, Mapping) else None
     k1_accuracy = k1.get("first_proposal_accuracy") if isinstance(k1, Mapping) else None
     if isinstance(k1_accuracy, (int, float)) and k1_accuracy < 0.5:
@@ -2078,6 +2181,12 @@ def _parser() -> argparse.ArgumentParser:
         default="chat",
         help="chat applies the local Qwen chat template; raw tokenizes text directly",
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable Qwen thinking in chat mode (default: enabled)",
+    )
     parser.add_argument("--device", default="npu:0")
     parser.add_argument(
         "--dtype",
@@ -2095,6 +2204,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-factory", default=DEFAULT_TARGET_FACTORY)
     parser.add_argument("--target-parity-decode-steps", type=int, default=4)
     parser.add_argument("--acceptance-rounds", type=int, default=8)
+    parser.add_argument(
+        "--verification-mode",
+        choices=("sequential", "vectorized"),
+        default="sequential",
+        help=(
+            "sequential verifies each proposal on its isolated prefix; "
+            "vectorized retains the one-call diagnostic assumption"
+        ),
+    )
     parser.add_argument(
         "--proposal-counts",
         default="1,4,8,16",
@@ -2188,6 +2306,7 @@ def _print_summary(report: Mapping[str, object]) -> None:
         f"device={report.get('device')}",
         f"dtype={report.get('dtype')}",
         f"backend={report.get('draft_backend')}",
+        f"verify={report.get('verification_mode')}",
     )
     print(
         "Target 增量 vs full-prefix:",
@@ -2449,6 +2568,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     _prepare_device_backend(args.device)
     _validate_experiment_dtype(args.device, dtype)
+    target_checkpoint = _audit_target_config(target_root)
     checkpoint = require_official_dflash_checkpoint(
         draft_root, verify_model_hash=bool(args.verify_draft_sha256)
     )
@@ -2465,6 +2585,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         dtype=dtype,
         allow_download=False,
         trust_remote_code=False,
+    )
+    draft_memory_preflight = _draft_device_memory_preflight(
+        args.device,
+        dtype,
+        checkpoint,
     )
     ops, backend_name = _select_draft_ops(
         device=args.device, ops_backend=None, allow_op_fallback=False
@@ -2487,6 +2612,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompt_text,
             target_root=target_root,
             prompt_mode=args.prompt_mode,
+            enable_thinking=bool(args.enable_thinking),
         )
     else:
         prompt_values = _prompt_ids(args.prompt_ids, args.prompt_json)
@@ -2541,6 +2667,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         include_token_ids=bool(args.include_token_ids or capture_text_ids),
         trace_draft_layers=bool(args.trace_draft_layers),
         oracle_capture=oracle_capture,
+        verification_mode=args.verification_mode,
     )
 
     text_output: dict[str, object] | None = None
@@ -2566,6 +2693,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if isinstance(record, dict):
                         record.pop("proposal_token_ids", None)
                         record.pop("target_token_ids", None)
+                        record.pop("vectorized_target_token_ids", None)
                         record.pop("correction_or_bonus_token_id", None)
 
     shadow: dict[str, object] | None = None
@@ -2609,12 +2737,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "draft_algorithm": "single_parallel_mask_block_forward",
         "draft_layer_trace_enabled": bool(args.trace_draft_layers),
         "draft_backend": backend_name,
+        "draft_memory_preflight": draft_memory_preflight,
+        "verification_mode": args.verification_mode,
+        "enable_thinking": (
+            bool(args.enable_thinking)
+            if tokenizer is not None and args.prompt_mode == "chat"
+            else None
+        ),
         "draft_checkpoint": {
             "status": checkpoint["status"],
             "config_sha256": checkpoint["config_sha256"],
             "model_sha256": checkpoint["model_sha256"],
             "model_sha256_verified": bool(args.verify_draft_sha256),
         },
+        "target_checkpoint": target_checkpoint,
         "weight_health": weight_health,
         "feature_health": feature_health,
         "feature_collector_semantics": feature_semantics,

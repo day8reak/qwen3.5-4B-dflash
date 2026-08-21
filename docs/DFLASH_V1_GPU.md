@@ -34,6 +34,7 @@ export PYTHONPATH="$PWD"
   --draft-dir "$DRAFT_DIR" \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --prompt-mode chat \
+  --enable-thinking \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --eos-token-id 248044 \
@@ -69,6 +70,7 @@ assert report["dtype"] == "torch.float16"
 assert report["ops_backend"] == "torch_cuda"
 assert report["operator_fallback_enabled"] is False
 assert report["strict_greedy_exact_match"] is True
+assert report["verification_mode"] == "sequential_isolated_prefix"
 assert report["feature_capture_zero_impact"] is True
 assert report["bounded_full_prefix_repeatability"] is True
 assert report["ordinary"]["generated_token_ids"] == report["dflash"]["generated_token_ids"]
@@ -83,7 +85,9 @@ print("DFLASH_V1_CUDA_FRAMEWORK_REPORT_GATE_PASS")
 PY
 ```
 
-GPU 报告验证的是 HF/PyTorch V1 流程、特征旁路和严格 greedy token 等价。它不证明 HIAI
+GPU 报告验证的是 HF/PyTorch V1 流程、特征旁路和严格 greedy token 等价。r12 默认对每个
+proposal 单独执行完整前缀 target 校验；这条 correctness 路线不把“同一个更长 target 输入中
+较早 logit 行不变”当作前提。它不证明 HIAI
 直接源码集成、receiver 状态隔离、310P 自定义算子、310P 无 fallback 或性能收益。
 
 ## CUDA 环境快速检查
@@ -121,10 +125,12 @@ for DTYPE in float16 bfloat16; do
     --draft-dir "$DRAFT_DIR" \
     --prompt-file "$PROMPT_FILE" \
     --prompt-mode chat \
+    --enable-thinking \
     --device cuda:0 \
     --dtype "$DTYPE" \
     --eos-token-id 248044 \
     --acceptance-rounds 16 \
+    --verification-mode sequential \
     --proposal-counts 1,4,8,16 \
     --trace-draft-layers \
     --report "$RUN_DIR/gpu-$DTYPE-diagnosis.json" \
@@ -148,7 +154,10 @@ late 三段均值。
   --report "$RUN_DIR/gpu-bfloat16-vs-float16.json"
 ```
 
-跨 dtype 时浮点 tensor 的原始 SHA 必然不同，因此工具只比较 prefix、position、proposal、
+此前 BF16 在生成中途出现 ordinary/DFlash token mismatch 时，应先看报告里的
+`vectorized_prefix_invariance`：若它失败而 sequential 决策正常，问题是整块 target 验证对
+序列长度/kernel 选择过敏，不是 BF16 draft 本身。跨 dtype 时浮点 tensor 的原始 SHA 必然
+不同，因此工具只比较 prefix、position、proposal、
 verifier token 和接受率指标，不会把 BF16/FP16 的浮点 hash 差异误报成某层实现错误。重点看：
 
 - `K=1 first_proposal_accuracy`；
@@ -159,12 +168,16 @@ verifier token 和接受率指标，不会把 BF16/FP16 的浮点 hash 差异误
 如果 BF16 明显恢复，优先定位低精度边界；如果同 dtype GPU/NPU 的逐轮层级指纹全部相同，
 则先查共享的草稿实现、调度或评测 workload，而不是 NPU 独有算子。
 
-一条短 prompt 不能代表官方多数据集平均接受长度。定位时先用固定 prompt 找首个分叉，之后
+一条短 prompt 不能代表官方多数据集平均接受长度。官方公开口径是
+`completion_tokens / spec_verify_ct`；本包对应优先看 `mean_theoretical_emitted_per_verify` 或
+主运行报告的 `mean_emitted_tokens_per_draft_round`，而不是 `accepted / proposed`。定位时先
+用固定 prompt 找首个分叉，之后
 再用多条代表性 prompt 汇总 `emitted/verify` 分布。若 early 低而 late 高，换至少三类 prompt：
 若上升总绑定相同绝对 round，优先查首轮状态/feature；若上升跟随文本进入稳定句式，通常包含
 workload 难度因素。DFlash V1 是每轮一次并行 block 预测，不要加入逐 mask 迭代替换。
 
 最小 smoke 也可把 `--prompt` 换成 `--prompt-file "$PROMPT_FILE"`。两种文本输入默认都在
-本地套用 Qwen chat template，并在终端及 JSON 报告中输出 ordinary Target 与 DFlash 的
-解码续写；报告不会保存 prompt 明文。本包统一使用 vLLM proposal-count 口径，anchor 不计入
+本地套用 Qwen chat template，默认启用 thinking，并在终端及 JSON 报告中输出 ordinary
+Target 与 DFlash 的解码续写；非 thinking A/B 显式加 `--no-enable-thinking`。报告不会保存
+prompt 明文。本包统一使用 vLLM proposal-count 口径，anchor 不计入
 K，所以 proposal K 最大为 16，K=16 时 draft query 为 17 行。

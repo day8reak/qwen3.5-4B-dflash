@@ -95,6 +95,10 @@ _HIAI_CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 _HIAI_FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
 _FACADE_CONTRACT_ID = "qwen3.5-4b-dflash-v1-full-prefix-isolation-r6"
 _FORMAL_EOS_TOKEN_ID = 248044
+_OFFICIAL_TARGET_CONFIG_SHA256 = (
+    "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670"
+)
+_OFFICIAL_TARGET_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 _NPU_LAYOUT_EMBEDDED = "embedded"
 _TARGET_FACTORY_ENV = "DFLASH_HIAI_TARGET_FACTORY"
 _RESET_HOOK_ENV = "DFLASH_HIAI_RESET_HOOK"
@@ -167,6 +171,99 @@ def _target_weight(
     if module is None:
         raise TypeError(f"target {getter_name}() returned None")
     return _module_weight(module, name=name)
+
+
+def _synchronize_tensor_device(tensor: Tensor) -> None:
+    """Complete queued accelerator work before a repeatability snapshot."""
+
+    if tensor.device.type == "cpu":
+        return
+    backend = getattr(torch, tensor.device.type, None)
+    synchronize = getattr(backend, "synchronize", None)
+    if not callable(synchronize):
+        return
+    try:
+        synchronize(tensor.device)
+    except TypeError:
+        synchronize()
+
+
+def _repeatability_tolerances(dtype: torch.dtype) -> tuple[float, float]:
+    if dtype == torch.float16:
+        return 5e-3, 5e-3
+    if dtype == torch.bfloat16:
+        return 2e-2, 2e-2
+    return 1e-5, 1e-6
+
+
+def _compare_repeatable_tensors(
+    reference: Tensor,
+    candidate: Tensor,
+    *,
+    require_top1: bool,
+) -> dict[str, object]:
+    """Distinguish harmless accelerator rounding from semantic divergence."""
+
+    if reference.shape != candidate.shape:
+        raise ValueError("repeatability tensors have different shapes")
+    if reference.dtype != candidate.dtype or reference.device != candidate.device:
+        raise ValueError("repeatability tensors differ in dtype or device")
+    if not torch.is_floating_point(reference):
+        raise TypeError("repeatability comparison requires floating-point tensors")
+    _synchronize_tensor_device(reference)
+    _synchronize_tensor_device(candidate)
+    reference_finite = bool(torch.isfinite(reference).all().item())
+    candidate_finite = bool(torch.isfinite(candidate).all().item())
+    if reference_finite and candidate_finite:
+        difference = (reference.float() - candidate.float()).abs()
+        maximum_error = float(difference.max().item()) if difference.numel() else 0.0
+        mean_error = float(difference.mean().item()) if difference.numel() else 0.0
+    else:
+        maximum_error = float("inf")
+        mean_error = float("inf")
+    rtol, atol = _repeatability_tolerances(reference.dtype)
+    within_tolerance = bool(
+        reference_finite
+        and candidate_finite
+        and torch.allclose(reference, candidate, rtol=rtol, atol=atol)
+    )
+    top1_mismatch_count = 0
+    if require_top1 and reference_finite and candidate_finite:
+        reference_top1 = reference.float().argmax(dim=-1)
+        candidate_top1 = candidate.float().argmax(dim=-1)
+        top1_mismatch_count = int((reference_top1 != candidate_top1).sum().item())
+    top1_equal = not require_top1 or top1_mismatch_count == 0
+    return {
+        "status": (
+            "PASS_BOUNDED_REPEATABILITY"
+            if within_tolerance and top1_equal
+            else "FAIL_SEMANTIC_DIVERGENCE"
+        ),
+        "bitwise_equal": bool(torch.equal(reference, candidate)),
+        "within_tolerance": within_tolerance,
+        "rtol": rtol,
+        "atol": atol,
+        "max_abs_error": maximum_error,
+        "mean_abs_error": mean_error,
+        "top1_checked": require_top1,
+        "top1_equal": top1_equal,
+        "top1_mismatch_count": top1_mismatch_count,
+        "reference_finite": reference_finite,
+        "candidate_finite": candidate_finite,
+    }
+
+
+def _require_repeatability_pass(
+    audit: Mapping[str, object],
+    *,
+    message: str,
+) -> None:
+    if audit.get("status") != "PASS_BOUNDED_REPEATABILITY":
+        raise AssertionError(
+            f"{message}: max_abs_error={audit.get('max_abs_error')}, "
+            f"top1_mismatch_count={audit.get('top1_mismatch_count')}, "
+            f"within_tolerance={audit.get('within_tolerance')}"
+        )
 
 
 def _draft_parameter_identity(draft: nn.Module) -> tuple[torch.device, torch.dtype]:
@@ -483,8 +580,11 @@ class Qwen35DFlashFullPrefixAdapter:
         self.stats.target_feature_tokens_recomputed += context_length
         return features
 
-    def validate_feature_capture_zero_impact(self, input_ids: Tensor) -> None:
-        """Require opt-in feature capture to leave target logits bitwise unchanged."""
+    def validate_feature_capture_zero_impact(
+        self,
+        input_ids: Tensor,
+    ) -> dict[str, object]:
+        """Require feature capture to preserve target Top-1 and bounded logits."""
 
         input_ids = _validate_token_tensor(
             input_ids,
@@ -528,16 +628,15 @@ class Qwen35DFlashFullPrefixAdapter:
             or ordinary_logits.device != feature_logits.device
         ):
             raise ValueError("feature capture changed target logits dtype or device")
-        if not torch.equal(ordinary_logits, feature_logits):
-            mismatch = ordinary_logits != feature_logits
-            mismatch_count = int(mismatch.sum().item())
-            maximum_error = float(
-                (ordinary_logits.float() - feature_logits.float()).abs().max().item()
-            )
-            raise AssertionError(
-                "output_dflash_features changed target logits: "
-                f"{mismatch_count} elements differ, max_abs_error={maximum_error}"
-            )
+        logits_audit = _compare_repeatable_tensors(
+            ordinary_logits,
+            feature_logits,
+            require_top1=True,
+        )
+        _require_repeatability_pass(
+            logits_audit,
+            message="output_dflash_features changed target logits",
+        )
         features = _tensor_field(feature_output, "dflash_features")
         expected_features = (
             1,
@@ -550,14 +649,24 @@ class Qwen35DFlashFullPrefixAdapter:
                 "feature zero-impact output has an invalid dflash_features shape: "
                 f"expected {expected_features}, got {actual}"
             )
+        return {
+            "status": "PASS_BOUNDED_ZERO_IMPACT",
+            "logits": logits_audit,
+            "feature_shape": list(expected_features),
+        }
 
-    def validate_full_prefix_state_isolation(self, input_ids: Tensor) -> None:
-        """Run P→Q→P probes for ordinary and feature-enabled target calls.
+    def validate_full_prefix_state_isolation(
+        self,
+        input_ids: Tensor,
+    ) -> dict[str, object]:
+        """Run P→P controls and P→Q→P isolation probes for both target modes.
 
         Receiver declarations alone cannot prove that an in-place KV/GDN
-        state was reset.  The repeated P outputs must therefore be raw-bit
-        identical after an intervening different prefix Q.  This is a bounded
-        behavioral gate, not a replacement for a device execution trace.
+        state was reset.  First, an immediate P→P control distinguishes normal
+        accelerator repeatability from Q-dependent contamination.  Then an
+        intervening different-length Q must preserve all-row logit Top-1 and
+        bounded logits/features.  This remains a bounded behavioral gate, not
+        a replacement for a device execution trace.
         """
 
         prefix = _validate_token_tensor(
@@ -611,28 +720,104 @@ class Qwen35DFlashFullPrefixAdapter:
             )
 
         ordinary_before, _ = snapshot(prefix, features=False)
+        ordinary_immediate, _ = snapshot(prefix, features=False)
+        ordinary_control = _compare_repeatable_tensors(
+            ordinary_before,
+            ordinary_immediate,
+            require_top1=True,
+        )
+        _require_repeatability_pass(
+            ordinary_control,
+            message=(
+                "target ordinary full-prefix output is not repeatable even "
+                "without an intervening prefix"
+            ),
+        )
         snapshot(different, features=True)
         ordinary_after, _ = snapshot(prefix, features=False)
-        if not torch.equal(ordinary_before, ordinary_after):
-            raise AssertionError(
+        ordinary_isolation = _compare_repeatable_tensors(
+            ordinary_before,
+            ordinary_after,
+            require_top1=True,
+        )
+        _require_repeatability_pass(
+            ordinary_isolation,
+            message=(
                 "full-prefix state isolation failed: ordinary P logits changed "
                 "after an intervening Q feature call"
-            )
+            ),
+        )
 
         feature_logits_before, feature_before = snapshot(prefix, features=True)
+        feature_logits_immediate, feature_immediate = snapshot(prefix, features=True)
+        assert feature_before is not None and feature_immediate is not None
+        feature_logits_control = _compare_repeatable_tensors(
+            feature_logits_before,
+            feature_logits_immediate,
+            require_top1=True,
+        )
+        _require_repeatability_pass(
+            feature_logits_control,
+            message=(
+                "target feature-mode logits are not repeatable even without "
+                "an intervening prefix"
+            ),
+        )
+        feature_control = _compare_repeatable_tensors(
+            feature_before,
+            feature_immediate,
+            require_top1=False,
+        )
+        _require_repeatability_pass(
+            feature_control,
+            message=(
+                "target DFlash features are not repeatable even without an "
+                "intervening prefix"
+            ),
+        )
         snapshot(different, features=False)
         feature_logits_after, feature_after = snapshot(prefix, features=True)
-        if not torch.equal(feature_logits_before, feature_logits_after):
-            raise AssertionError(
+        feature_logits_isolation = _compare_repeatable_tensors(
+            feature_logits_before,
+            feature_logits_after,
+            require_top1=True,
+        )
+        _require_repeatability_pass(
+            feature_logits_isolation,
+            message=(
                 "full-prefix state isolation failed: feature-mode P logits "
                 "changed after an intervening Q ordinary call"
-            )
+            ),
+        )
         assert feature_before is not None and feature_after is not None
-        if not torch.equal(feature_before, feature_after):
-            raise AssertionError(
+        feature_isolation = _compare_repeatable_tensors(
+            feature_before,
+            feature_after,
+            require_top1=False,
+        )
+        _require_repeatability_pass(
+            feature_isolation,
+            message=(
                 "full-prefix state isolation failed: P features changed after "
                 "an intervening Q ordinary call"
-            )
+            ),
+        )
+        return {
+            "status": "PASS_BOUNDED_P_Q_P",
+            "prefix_length": int(prefix.shape[1]),
+            "intervening_prefix_length": int(different.shape[1]),
+            "ordinary": {
+                "immediate_p_p_control": ordinary_control,
+                "p_q_p_isolation": ordinary_isolation,
+            },
+            "feature_mode": {
+                "logits_immediate_p_p_control": feature_logits_control,
+                "features_immediate_p_p_control": feature_control,
+                "logits_p_q_p_isolation": feature_logits_isolation,
+                "features_p_q_p_isolation": feature_isolation,
+            },
+            "per_state_device_trace": "PENDING",
+        }
 
     def propose(self, prefix_ids: Tensor, max_draft_tokens: int) -> Tensor:
         """Return ``K`` DFlash Top-1 proposals for one committed prefix.
@@ -735,6 +920,9 @@ class Qwen35GoldenValidation:
     dflash_adapter_stats: Qwen35FullPrefixAdapterStats
     feature_capture_zero_impact: bool
     bounded_full_prefix_repeatability: bool
+    feature_capture_audit: Mapping[str, object]
+    full_prefix_repeatability_audit: Mapping[str, object]
+    verification_mode: str
     predecode_gate_target_calls: int
 
 
@@ -773,10 +961,12 @@ def validate_qwen35_dflash_strict_greedy(
             device=adapter.device,
         )
     notify("state_isolation_gate_begin", prompt_tokens=int(gate_ids.shape[1]))
-    adapter.validate_full_prefix_state_isolation(gate_ids)
-    notify("state_isolation_gate_pass", target_calls=6)
+    full_prefix_repeatability_audit = (
+        adapter.validate_full_prefix_state_isolation(gate_ids)
+    )
+    notify("state_isolation_gate_pass", target_calls=8)
     notify("feature_gate_begin", prompt_tokens=int(gate_ids.shape[1]))
-    adapter.validate_feature_capture_zero_impact(gate_ids)
+    feature_capture_audit = adapter.validate_feature_capture_zero_impact(gate_ids)
     notify("feature_gate_pass")
     adapter.reset_stats()
     notify("ordinary_greedy_begin", max_new_tokens=max_new_tokens)
@@ -835,6 +1025,7 @@ def validate_qwen35_dflash_strict_greedy(
             max_draft_tokens=proposal_count,
             eos_token_ids=eos_token_ids,
             input_device=adapter.device,
+            verification_mode="sequential",
         )
         notify(
             "dflash_replay_end",
@@ -887,7 +1078,7 @@ def validate_qwen35_dflash_strict_greedy(
         False if tail is None else tail.reached_eos
     )
     dflash = ReplayDecodeResult(
-        mode="qwen3.5-dflash-v1-target-bootstrap-full-prefix-replay",
+        mode="qwen3.5-dflash-v1-target-bootstrap-sequential-full-prefix-replay",
         prompt_token_ids=bootstrap.prompt_token_ids,
         generated_token_ids=generated,
         reached_eos=reached_eos,
@@ -909,7 +1100,10 @@ def validate_qwen35_dflash_strict_greedy(
         dflash_adapter_stats=dflash_stats,
         feature_capture_zero_impact=True,
         bounded_full_prefix_repeatability=True,
-        predecode_gate_target_calls=8,
+        feature_capture_audit=feature_capture_audit,
+        full_prefix_repeatability_audit=full_prefix_repeatability_audit,
+        verification_mode="sequential_isolated_prefix",
+        predecode_gate_target_calls=10,
     )
 
 
@@ -956,6 +1150,61 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _audit_target_config(target_dir: str | Path) -> dict[str, object]:
+    """Bind the draft to the intended Qwen3.5-4B target configuration."""
+
+    root = Path(target_dir).expanduser().resolve()
+    config_path = root / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"target config is missing: {config_path}")
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    text_config = raw.get("text_config")
+    if not isinstance(text_config, Mapping):
+        raise RuntimeError("target config.json lacks a Qwen3.5 text_config")
+    expected = {
+        "model_type": "qwen3_5_text",
+        "hidden_size": 2560,
+        "vocab_size": 248320,
+        "num_hidden_layers": 32,
+        "eos_token_id": _FORMAL_EOS_TOKEN_ID,
+        "full_attention_interval": 4,
+    }
+    mismatches = {
+        name: {"expected": value, "actual": text_config.get(name)}
+        for name, value in expected.items()
+        if text_config.get(name) != value
+    }
+    expected_layers = tuple(
+        "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
+        for index in range(32)
+    )
+    actual_layers = text_config.get("layer_types")
+    if not isinstance(actual_layers, list) or tuple(actual_layers) != expected_layers:
+        mismatches["layer_types"] = {
+            "expected": list(expected_layers),
+            "actual": actual_layers,
+        }
+    if mismatches:
+        raise RuntimeError(
+            "target config is not the Qwen/Qwen3.5-4B model paired with this "
+            "DFlash checkpoint: " + ", ".join(sorted(mismatches))
+        )
+    digest = _sha256_file(config_path)
+    return {
+        "status": (
+            "PASS_EXACT_PINNED_CONFIG"
+            if digest == _OFFICIAL_TARGET_CONFIG_SHA256
+            else "PASS_SEMANTIC_CONFIG_VARIANT"
+        ),
+        "repository": "Qwen/Qwen3.5-4B",
+        "pinned_revision": _OFFICIAL_TARGET_REVISION,
+        "config_sha256": digest,
+        "pinned_config_sha256": _OFFICIAL_TARGET_CONFIG_SHA256,
+        "exact_config_match": digest == _OFFICIAL_TARGET_CONFIG_SHA256,
+        "weights_identity": "PENDING_NOT_HASHED_BY_RUNTIME",
+    }
 
 
 def _callable_source_identity(
@@ -1600,6 +1849,82 @@ def _prepare_device_backend(device: str | torch.device) -> None:
     set_device(device_text)
 
 
+def _draft_device_memory_preflight(
+    device: str | torch.device,
+    dtype: torch.dtype,
+    checkpoint: Mapping[str, object],
+) -> dict[str, object]:
+    """Reject a predictably undersized accelerator before draft construction."""
+
+    requested = torch.device(device)
+    if requested.type not in {"cuda", "npu"}:
+        return {"status": "NOT_APPLICABLE_CPU"}
+    parameter_count = checkpoint.get("parameter_count")
+    if isinstance(parameter_count, bool) or not isinstance(parameter_count, int):
+        raise TypeError("draft checkpoint parameter_count must be an integer")
+    parameter_bytes = int(parameter_count) * torch.empty(
+        (), dtype=dtype
+    ).element_size()
+    safety_bytes = 512 * 1024 * 1024
+    required_free_bytes = parameter_bytes + safety_bytes
+    backend = getattr(torch, requested.type, None)
+    empty_cache = getattr(backend, "empty_cache", None)
+    if callable(empty_cache):
+        empty_cache()
+    synchronize = getattr(backend, "synchronize", None)
+    if callable(synchronize):
+        try:
+            synchronize(requested)
+        except TypeError:
+            synchronize()
+    mem_get_info = getattr(backend, "mem_get_info", None)
+    if not callable(mem_get_info):
+        return {
+            "status": "UNAVAILABLE_BACKEND_MEM_GET_INFO",
+            "draft_parameter_bytes": parameter_bytes,
+            "safety_bytes": safety_bytes,
+            "required_free_bytes": required_free_bytes,
+        }
+    try:
+        try:
+            free_bytes, total_bytes = mem_get_info(requested)
+        except TypeError:
+            if requested.index is None:
+                free_bytes, total_bytes = mem_get_info()
+            else:
+                free_bytes, total_bytes = mem_get_info(requested.index)
+    except RuntimeError as error:
+        return {
+            "status": "UNAVAILABLE_RUNTIME_QUERY",
+            "query_error_type": type(error).__name__,
+            "draft_parameter_bytes": parameter_bytes,
+            "safety_bytes": safety_bytes,
+            "required_free_bytes": required_free_bytes,
+        }
+    free_bytes = int(free_bytes)
+    total_bytes = int(total_bytes)
+    audit = {
+        "status": "PASS",
+        "free_bytes": free_bytes,
+        "total_bytes": total_bytes,
+        "draft_parameter_bytes": parameter_bytes,
+        "safety_bytes": safety_bytes,
+        "required_free_bytes": required_free_bytes,
+    }
+    if free_bytes < required_free_bytes:
+        audit["status"] = "FAIL_INSUFFICIENT_FREE_MEMORY"
+        gib = 1024**3
+        raise RuntimeError(
+            "insufficient free accelerator memory after loading the target: "
+            f"free={free_bytes / gib:.2f} GiB, "
+            f"draft_parameters={parameter_bytes / gib:.2f} GiB, "
+            f"required_with_safety={required_free_bytes / gib:.2f} GiB. "
+            "Use a clean device or stop unrelated processes before retrying; "
+            "allocator settings cannot reclaim memory owned by another process."
+        )
+    return audit
+
+
 def _prompt_ids(raw: str | None, json_path: str | None) -> list[int]:
     if (raw is None) == (json_path is None):
         raise ValueError("provide exactly one of --prompt-ids or --prompt-json")
@@ -1638,6 +1963,7 @@ def _tokenize_prompt_text(
     *,
     target_root: Path,
     prompt_mode: str,
+    enable_thinking: bool = True,
 ) -> tuple[list[int], object]:
     """Encode one UTF-8 prompt with the target's local tokenizer."""
 
@@ -1662,7 +1988,7 @@ def _tokenize_prompt_text(
             "tokenize": True,
             "add_generation_prompt": True,
             "return_tensors": "pt",
-            "enable_thinking": False,
+            "enable_thinking": bool(enable_thinking),
         }
         try:
             encoded = tokenizer.apply_chat_template(messages, **template_kwargs)
@@ -1710,6 +2036,7 @@ def _resolve_prompt(
             str(prompt_text),
             target_root=target_root,
             prompt_mode=str(getattr(args, "prompt_mode", "chat")),
+            enable_thinking=bool(getattr(args, "enable_thinking", True)),
         )
     return _prompt_ids(
         getattr(args, "prompt_ids", None),
@@ -1755,6 +2082,12 @@ def _request_payload(
             if prompt_source in {"inline_text", "text_file"}
             else None
         ),
+        "enable_thinking": (
+            bool(getattr(args, "enable_thinking", True))
+            if prompt_source in {"inline_text", "text_file"}
+            and str(getattr(args, "prompt_mode", "chat")) == "chat"
+            else None
+        ),
         "target_loader": args.target_loader or "package_default",
         "npu_layout": getattr(args, "npu_layout", None),
         "target_factory": getattr(args, "target_factory", None),
@@ -1778,6 +2111,22 @@ def _decode_payload(
 ) -> dict[str, Any]:
     payload = asdict(result)
     payload["stats"]["acceptance_rate"] = result.stats.acceptance_rate
+    draft_rounds = [
+        item for item in result.rounds if len(item.proposed_token_ids) > 0
+    ]
+    payload["stats"]["draft_round_count"] = len(draft_rounds)
+    payload["stats"]["mean_accepted_draft_tokens_per_round"] = (
+        sum(len(item.accepted_draft_token_ids) for item in draft_rounds)
+        / len(draft_rounds)
+        if draft_rounds
+        else 0.0
+    )
+    payload["stats"]["mean_emitted_tokens_per_draft_round"] = (
+        sum(len(item.emitted_token_ids) for item in draft_rounds)
+        / len(draft_rounds)
+        if draft_rounds
+        else 0.0
+    )
     if tokenizer is not None:
         # A text prompt's token IDs can be decoded back into its content.  Keep
         # only the count/hash in the request metadata and the requested model
@@ -1854,6 +2203,15 @@ def _parser() -> argparse.ArgumentParser:
         choices=("chat", "raw"),
         default="chat",
         help="chat applies the local Qwen chat template; raw tokenizes text directly",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "for chat prompts, enable Qwen thinking tokens (default: enabled, "
+            "matching the public DFlash acceptance benchmark)"
+        ),
     )
     parser.add_argument("--max-new-tokens", type=int, required=True)
     parser.add_argument(
@@ -2139,6 +2497,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _prepare_device_backend(args.device)
     _validate_experiment_dtype(args.device, dtype)
     target_root = Path(args.target_dir).expanduser().resolve()
+    target_checkpoint = _audit_target_config(target_root)
     prompt_ids, tokenizer = _resolve_prompt(args, target_root=target_root)
     _emit_progress(
         args.progress,
@@ -2186,6 +2545,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "isolation_mode": initial_target_integration["isolation"]["mode"],
             "feature_source": initial_target_integration["feature_capture"]["source"],
         },
+    )
+    _emit_progress(args.progress, "draft_memory_preflight_begin", {})
+    draft_memory_preflight = _draft_device_memory_preflight(
+        args.device,
+        dtype,
+        draft_checkpoint,
+    )
+    _emit_progress(
+        args.progress,
+        "draft_memory_preflight_end",
+        draft_memory_preflight,
     )
     ops, backend = _select_draft_ops(
         device=args.device,
@@ -2295,9 +2665,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "npu": "NPU/framework execution; complete 310P gate remains external",
         }.get(adapter.device.type, "framework device execution"),
         "strict_greedy_exact_match": True,
+        "verification_mode": result.verification_mode,
         "feature_capture_zero_impact": result.feature_capture_zero_impact,
+        "feature_capture_audit": dict(result.feature_capture_audit),
         "bounded_full_prefix_repeatability": (
             result.bounded_full_prefix_repeatability
+        ),
+        "full_prefix_repeatability_audit": dict(
+            result.full_prefix_repeatability_audit
         ),
         "state_policy": state_policy,
         "device": str(adapter.device),
@@ -2312,8 +2687,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "known_internal_interface_use": known_internal_interface_use,
         "operator_fallback_enabled": bool(args.allow_op_fallback),
         "target_dir": str(Path(args.target_dir).expanduser().resolve()),
+        "target_checkpoint": target_checkpoint,
         "draft_dir": str(Path(args.draft_dir).expanduser().resolve()),
         "draft_checkpoint": draft_checkpoint,
+        "draft_memory_preflight": draft_memory_preflight,
         "max_proposal_tokens": adapter.max_proposal_tokens,
         "request": _request_payload(
             args,

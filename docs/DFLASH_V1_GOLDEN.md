@@ -2,7 +2,8 @@
 
 V1 是 correctness-first 的完整前缀重算路线。本包按 vLLM 口径把 K 定义为 proposal token
 数，clean anchor 不计入 K，因此支持 K=16；此时 draft query 为 1 个 anchor 加 16 个 mask，
-共 17 行。同一个普通 target 验证候选块，接受最长连续匹配前缀，并产生 correction/bonus。
+共 17 行。r12 默认让同一个普通 target 按 proposal 逐次验证独立完整前缀，接受最长连续匹配
+前缀，并产生 correction/bonus；一次 target 调用验证整块仅作为 prefix-invariance 诊断。
 
 ## 不可放宽的正确性条件
 
@@ -36,6 +37,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --prompt-mode chat \
+  --enable-thinking \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --eos-token-id 248044 \
@@ -67,6 +69,7 @@ PYTHONDONTWRITEBYTECODE=1 python -B -m models.dflash_v1.run_npu \
   --kv-cache-max-len 4096 \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --prompt-mode chat \
+  --enable-thinking \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -84,6 +87,7 @@ with open(sys.argv[1], encoding="utf-8") as stream:
     report = json.load(stream)
 
 assert report["strict_greedy_exact_match"] is True
+assert report["verification_mode"] == "sequential_isolated_prefix"
 assert report["feature_capture_zero_impact"] is True
 assert report["bounded_full_prefix_repeatability"] is True
 assert report["operator_fallback_enabled"] is False
@@ -135,5 +139,6 @@ PY
 
 为了让每次运行固定输入，推荐把问题保存为 UTF-8 文本并使用
 `--prompt-file /path/to/prompt.txt --prompt-mode chat`。入口会在本地加载 Target tokenizer，
-套用 Qwen chat template，并打印 ordinary Target 与 DFlash 的解码文本。不要用来源不明的
-裸 token ID 作为接受率 workload；它可能并不对应正常对话前缀。
+套用 Qwen chat template，默认启用 thinking，并打印 ordinary Target 与 DFlash 的解码文本。
+需要非 thinking 对照时显式加 `--no-enable-thinking`。不要用来源不明的裸 token ID 作为
+接受率 workload；它可能并不对应正常对话前缀。
