@@ -125,7 +125,7 @@ for DTYPE in float16 bfloat16; do
     --dtype "$DTYPE" \
     --eos-token-id 248044 \
     --acceptance-rounds 16 \
-    --proposal-counts 1,4,8,15 \
+    --proposal-counts 1,4,8,16 \
     --trace-draft-layers \
     --report "$RUN_DIR/gpu-$DTYPE-diagnosis.json" \
     2>&1 | tee "$RUN_DIR/gpu-$DTYPE-diagnosis.log"
@@ -166,5 +166,5 @@ workload 难度因素。DFlash V1 是每轮一次并行 block 预测，不要加
 
 最小 smoke 也可把 `--prompt` 换成 `--prompt-file "$PROMPT_FILE"`。两种文本输入默认都在
 本地套用 Qwen chat template，并在终端及 JSON 报告中输出 ordinary Target 与 DFlash 的
-解码续写；报告不会保存 prompt 明文。官方 block 总共 16 行，其中 1 行是 anchor，所以
-proposal K 最大为 15。
+解码续写；报告不会保存 prompt 明文。本包统一使用 vLLM proposal-count 口径，anchor 不计入
+K，所以 proposal K 最大为 16，K=16 时 draft query 为 17 行。

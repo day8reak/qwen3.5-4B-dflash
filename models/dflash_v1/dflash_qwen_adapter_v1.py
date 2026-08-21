@@ -13,9 +13,9 @@ The adapter implements both protocols consumed by
 * ``propose(prefix_ids, K)`` builds ``[anchor, K * mask]`` and runs the
   official six-layer DFlash draft with the target embedding and LM head.
 
-The checkpoint ``block_size`` counts all draft query rows, including the clean
-anchor.  Therefore ``max_draft_tokens=K`` uses ``K+1`` rows and the official
-``block_size=16`` checkpoint supports at most 15 proposal tokens.
+This runtime follows the vLLM proposal-count convention: ``max_draft_tokens=K``
+means exactly ``K`` speculative proposal tokens.  The draft query contains one
+additional clean anchor, so ``K=16`` uses 17 query rows.
 """
 
 from __future__ import annotations
@@ -219,7 +219,7 @@ def _proposal_count(value: int, *, maximum: int) -> int:
         raise ValueError(
             "max_draft_tokens exceeds the DFlash proposal capacity: "
             f"requested {count}, maximum {maximum} "
-            "(checkpoint block_size counts K proposals plus one anchor row)"
+            "(K counts proposal tokens; the clean anchor is an extra query row)"
         )
     return count
 
@@ -328,8 +328,9 @@ class Qwen35DFlashFullPrefixAdapter:
 
     @property
     def max_proposal_tokens(self) -> int:
-        # The official checkpoint's block_size counts the clean anchor row.
-        return int(self.draft.config.block_size) - 1
+        # Match vLLM's num_speculative_tokens convention: block_size is the
+        # proposal capacity and the clean anchor is an additional query row.
+        return int(self.draft.config.block_size)
 
     def reset_stats(self) -> None:
         self.stats = Qwen35FullPrefixAdapterStats()
@@ -375,7 +376,7 @@ class Qwen35DFlashFullPrefixAdapter:
             )
         if self.max_proposal_tokens <= 0:
             raise ValueError(
-                "DFlash block_size must contain one anchor and at least one proposal"
+                "DFlash block_size must allow at least one proposal token"
             )
 
     def _target_forward(
@@ -1859,8 +1860,8 @@ def _parser() -> argparse.ArgumentParser:
         "--max-draft-tokens",
         type=int,
         help=(
-            "proposal count K; the checkpoint block has one anchor plus K "
-            "proposal rows (official maximum: 15)"
+            "proposal count K using the vLLM convention; the draft query has "
+            "one extra anchor row (official maximum K: 16)"
         ),
     )
     parser.add_argument("--eos-token-id", type=int, action="append", default=[])

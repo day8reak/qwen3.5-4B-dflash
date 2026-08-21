@@ -8,7 +8,7 @@ target 覆盖它。
 
 - `run_npu.py`：内嵌目录的一键 NPU 入口，自动派生 HIAI source、loader、FP16 和 EOS。
 - `diagnose_acceptance.py`：CPU/CUDA/NPU 都对比 cached-incremental 与 fresh-full-prefix
-  Target，并可在相同 greedy 前缀上扫描 K=1/4/8/15；支持直接传 UTF-8 prompt/txt、
+  Target，并可在相同 greedy 前缀上扫描 K=1/4/8/16；支持直接传 UTF-8 prompt/txt、
   FP16/BF16 A/B、早中后段接受率、逐轮层级指纹、跨报告首个分叉和单轮 oracle tensor
   bundle，默认不输出 token ID。
 - `dflash_qwen_adapter_v1.py`：CPU/CUDA/NPU 完整入口和严格 greedy 验证流程。
@@ -20,9 +20,9 @@ target 覆盖它。
 - `dflash_config.py`：草稿结构与 shape 合同。
 - `dflash_weights.py`：官方草稿 checkpoint 校验和加载。
 
-本包的 `max_draft_tokens=K` 是 proposal/mask 数。官方 checkpoint 的 `block_size=16`
-包含 1 个 clean anchor，因此 query 为 1 个 anchor 加至多 15 个 mask；K 的合法范围是
-1 到 15。诊断报告始终明确记录 proposal count K。
+本包统一使用 vLLM 的 proposal-count 口径：`max_draft_tokens=K` 就是 proposal/mask 数，
+clean anchor 不计入 K。官方配置值为 16，因此 K 的合法范围是 1 到 16；K=16 时 draft
+query 是 1 个 anchor 加 16 个 mask，共 17 行。诊断报告始终明确记录 proposal count K。
 
 ## Target 主模型与 feature
 

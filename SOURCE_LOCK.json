@@ -68,19 +68,19 @@
     "ops_file": "models/dflash_v1/dflash_ops.py",
     "ops_sha256": "595a73d68565a009cc7bd9f8523f94e846accff41a9926a9fe3d8e24400fcb94",
     "adapter_file": "models/dflash_v1/dflash_qwen_adapter_v1.py",
-    "adapter_sha256": "c59db1c16daa10fe6a79ca9a3d733926a344780b33041c8b33be6bc67cfa41f5",
+    "adapter_sha256": "13cf3b7e2b9fc072fbba8ef2049be8f5b4a2530fc348fc06e1a289add6c8da05",
     "scheduler_file": "models/dflash_v1/dflash_reference_decode_v1.py",
     "scheduler_sha256": "4e40f1943d69f61c6df103c4a584cd0a31c6e0370818c584fd9a555b757bba70",
     "draft_model_file": "models/dflash_v1/modeling_dflash.py",
-    "draft_model_sha256": "74ead4c20ddb3a521444a6e1232c7e6747511bd47c9c32b0540739ab14ac3cef",
+    "draft_model_sha256": "a99268a7d6a0a41ce2657460ac4bff22a61dd4efca8c53d35e1d624728142789",
     "weight_loader_file": "models/dflash_v1/dflash_weights.py",
     "weight_loader_sha256": "c85bcc22620c9108d430e0f23e55b7dd08207e6a7884615e508370644bd653b2",
     "acceptance_diagnostic_file": "models/dflash_v1/diagnose_acceptance.py",
-    "acceptance_diagnostic_sha256": "8d2a801decad8b837a8b20cef612c3f351457d15b221fd80922db6489b0fa2d7"
+    "acceptance_diagnostic_sha256": "ad4ce7883da82751ba54f6c72f8abda47bc96c27acc30b4036aed65ecd6e3707"
   },
   "npu_embedded_runtime": {
     "runner_file": "models/dflash_v1/run_npu.py",
-    "runner_sha256": "8809707ce43281725065986375b014198045c8ff97d112d29388bbf30d44d2f1",
+    "runner_sha256": "18039ef33d6f14297c9c6b1dafd6cb466e2f354d4e6453d83bacf2be768a5ed3",
     "loader_file": "models/dflash_v1/internal_target_loader.py",
     "loader_sha256": "fb8a1516d1791ad253a8d0dabbfcddae2db57dccc9e2795d938a511071efa840",
     "loader_contract_file": "models/dflash_v1/internal_target_loader_template.py",

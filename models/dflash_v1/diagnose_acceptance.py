@@ -6,7 +6,7 @@ deployed source tree.  It answers three questions in order:
 1. Does a fresh full-prefix target call produce the same last-row logits and
    DFlash features as a persistent prefill/decode path on the same device?
 2. On identical ordinary-greedy prefixes, how does acceptance change for
-   proposal counts K=1,4,8,15?
+   proposal counts K=1,4,8,16?
 3. At which measured boundary do two device/dtype reports first diverge?
 
 The first question is more fundamental.  Strict-greedy token equality alone
@@ -125,7 +125,7 @@ def _feature_fingerprints(
     }
 
 
-def parse_proposal_counts(raw: str, *, maximum: int = 15) -> tuple[int, ...]:
+def parse_proposal_counts(raw: str, *, maximum: int = 16) -> tuple[int, ...]:
     """Parse sorted, unique proposal counts from a comma-separated string."""
 
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
@@ -1948,7 +1948,7 @@ def diagnose_next_actions(report: Mapping[str, object]) -> list[str]:
         return actions
     return [
         "Target 路径未见 Top-1 分叉；扩大 --acceptance-rounds 获取稳定统计。",
-        "若 K=1 稳定而 K=8/15 明显退化，打开 --trace-draft-layers 检查 block attention、位置和低精度边界。",
+        "若 K=1 稳定而 K=8/16 明显退化，打开 --trace-draft-layers 检查 block attention、位置和低精度边界。",
         "mean_theoretical_emitted_per_verify 才接近吞吐收益口径，不要把 accepted/proposed 百分比直接当官方加速指标。",
     ]
 
@@ -2097,10 +2097,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--acceptance-rounds", type=int, default=8)
     parser.add_argument(
         "--proposal-counts",
-        default="1,4,8,15",
+        default="1,4,8,16",
         help=(
-            "K proposal/mask tokens; the official 16-row draft block also "
-            "contains one anchor, so K must be at most 15"
+            "K proposal/mask tokens using the vLLM convention; the clean "
+            "anchor is an additional query row, so K=16 uses 17 rows"
         ),
     )
     parser.add_argument("--eos-token-id", type=int, default=OFFICIAL_EOS_TOKEN_ID)

@@ -106,7 +106,7 @@ NPU backend。它会直接检查当前内嵌源码树，不需要额外生成 ov
 
 ```text
 max_new_tokens=32
-max_draft_tokens=8（稳定后再测 15）
+max_draft_tokens=8（稳定后再测 16）
 ```
 
 CPU/GPU 接受率只作为诊断参考。最终 NPU 接受率依赖 NPU target features、draft backend、
@@ -115,8 +115,9 @@ fallback 已通过。
 
 固定 workload 推荐保存为 UTF-8 文件，并使用
 `--prompt-file /path/to/prompt.txt --prompt-mode chat`。入口会在本地套用 Qwen chat
-template，运行结束直接打印 ordinary Target 与 DFlash 两份解码文本。官方 16 行 draft
-block 已包含 1 行 anchor，因此 `max_draft_tokens` 最大为 15。
+template，运行结束直接打印 ordinary Target 与 DFlash 两份解码文本。本包统一使用 vLLM
+proposal-count 口径，clean anchor 不计入 `max_draft_tokens`，因此最大 K 为 16；K=16 时
+draft query 共 17 行。
 
 ## 自定义算子说明
 

@@ -156,7 +156,7 @@ full-prefix prefill，不要继续统计接受率。
 最小 smoke 通过后再使用：
 
 ```text
---max-new-tokens 32 --max-draft-tokens 15
+--max-new-tokens 32 --max-draft-tokens 16
 ```
 
 真实 NPU 接受率、无 fallback、显存和性能只能由目标设备运行确认。
@@ -192,7 +192,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --eos-token-id 248044 \
   --target-parity-decode-steps 4 \
   --acceptance-rounds 16 \
-  --proposal-counts 1,4,8,15 \
+  --proposal-counts 1,4,8,16 \
   --trace-draft-layers \
   --report "$RUN_DIR/dflash-v1-acceptance-diagnosis.json" \
   2>&1 | tee "$RUN_DIR/dflash-v1-acceptance-diagnosis.log"
@@ -204,20 +204,20 @@ SHA-256；只有临时缩短排查时间时才使用 `--no-verify-draft-sha256`�
 模板则用 `--prompt-mode raw`。终端会直接打印 Target 续写文本、最大 K 的逐轮接受长度以及
 early / middle / late 三段均值；JSON 默认仍不保存明文 token ID。
 
-### 为什么是 K=1、4、8、15
+### 为什么是 K=1、4、8、16
 
 这里的 `K` 是草稿 proposal/mask token 数。每个 draft query 还包含 1 个已经由 Target
 确认的 anchor：
 
 ```text
 query rows = 1 个 anchor + K 个 proposal
-K=1 / 4 / 8 / 15 对应 query rows=2 / 5 / 9 / 16
+K=1 / 4 / 8 / 16 对应 query rows=2 / 5 / 9 / 17
 ```
 
-官方 checkpoint 的 `block_size=16` 计入 anchor，因此 K 的上限是 15。K=4、K=8 都是合法
-诊断点；没有要求 K 必须是 `2^n-1`。选择 1/4/8/15 是为了同时观察单 token、小 block、
-中 block 和官方最大 block。K=8 已足以排查低接受率，K 口径本身不能解释“不同设备/精度
-都只接受相近 token 数”的现象。
+本包统一采用 vLLM `num_speculative_tokens` 口径：K 只计算 proposal，anchor 是额外一行。
+因此官方配置值 16 对应最大 K=16，而不是 15。选择 1/4/8/16 可以观察单 token、小 block、
+中 block 和最大 proposal 档位，同时保持全部档位语义一致。K=8 已足以排查低接受率，K
+口径本身不能解释“不同设备/精度都只接受相近 token 数”的现象。
 
 ### 结果怎么读
 
@@ -293,7 +293,7 @@ draft 的循环，那会改变算法。
 需要把当前实现与独立官方实现逐层对照时，可额外传：
 
 ```text
---oracle-bundle "$RUN_DIR/first-round-k15.safetensors"
+--oracle-bundle "$RUN_DIR/first-round-k16.safetensors"
 ```
 
 文件包含首轮最大 K 的 `target_hidden`、noise embedding、position、projection、rotary、六层

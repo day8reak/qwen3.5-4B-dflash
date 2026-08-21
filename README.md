@@ -106,7 +106,7 @@ backend 和 HIAI source，不再要求 overlay JSON。
 如果已经能生成但接受率偏低，按
 [NPU 接受率分层诊断](docs/NPU_DEPLOYMENT.md#7-接受率低时的分层诊断) 运行
 `models.dflash_v1.diagnose_acceptance`。它会先判定正常增量 Target 与 DFlash fresh
-full-prefix Target 是否等价，再统计 K=1/4/8/15。新版也支持 CUDA FP16/BF16 A/B、逐轮
+full-prefix Target 是否等价，再统计 K=1/4/8/16。新版也支持 CUDA FP16/BF16 A/B、逐轮
 无明文层级指纹和两份报告的首个分叉定位，避免只凭最终 token 或总接受率误判草稿模型。
 GPU 的 FP16/BF16 对照命令见 [DFlash V1 GPU 运行说明](docs/DFLASH_V1_GPU.md)。
 

@@ -86,8 +86,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("run_npu requires --device npu or npu:N")
     if args.max_new_tokens < 2:
         raise ValueError("NPU DFlash smoke requires --max-new-tokens >= 2")
-    if not 1 <= args.max_draft_tokens <= 15:
-        raise ValueError("--max-draft-tokens must be between 1 and 15")
+    if not 1 <= args.max_draft_tokens <= 16:
+        raise ValueError("--max-draft-tokens must be between 1 and 16")
     for name, value in (
         ("--kv-cache-max-len", args.kv_cache_max_len),
         ("--prefill-chunk-size", args.prefill_chunk_size),

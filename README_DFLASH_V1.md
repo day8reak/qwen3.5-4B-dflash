@@ -16,7 +16,7 @@
 
 - 普通 target greedy 始终是权威结果；DFlash 的 token ID、EOS 和停止原因必须完全一致。
 - 每个 target 调用都重算完整已提交前缀。V1 不提交、分支或回退投机 KV/GDN state。
-- target 先生成 anchor，draft 最多产生 15 个 proposal，target 验证最长连续匹配前缀并给出
+- target 先生成 anchor，draft 最多产生 16 个 proposal，target 验证最长连续匹配前缀并给出
   correction/bonus。
 - CPU、CUDA 和 NPU 共用 `dflash_reference_decode_v1.py` 与
   `Qwen35DFlashFullPrefixAdapter`。
@@ -96,4 +96,4 @@ CPU/CUDA 可以验证 framework 调度与 draft 数学，但不能替代 NPU tar
 - feature 开关不改变 target logits；
 - 至少实际执行一次 draft/feature/verify round；
 - 没有 CPU fallback；
-- 小参数通过后再测 `max_draft_tokens=15` 的接受率和性能。
+- 小参数通过后再测 `max_draft_tokens=16` 的接受率和性能。

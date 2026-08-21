@@ -1,8 +1,8 @@
 # Qwen3.5-4B DFlash V1 Golden
 
-V1 是 correctness-first 的完整前缀重算路线。target 先产生 anchor；官方 checkpoint 的
-16 行 block 包含这个 anchor，因此最多提议 K=15 个 token。同一个普通 target 验证候选块，
-接受最长连续匹配前缀，并产生 correction/bonus。
+V1 是 correctness-first 的完整前缀重算路线。本包按 vLLM 口径把 K 定义为 proposal token
+数，clean anchor 不计入 K，因此支持 K=16；此时 draft query 为 1 个 anchor 加 16 个 mask，
+共 17 行。同一个普通 target 验证候选块，接受最长连续匹配前缀，并产生 correction/bonus。
 
 ## 不可放宽的正确性条件
 
@@ -128,7 +128,7 @@ PY
 最小 smoke 通过后：
 
 1. 增加 prompt 长度并覆盖 64-token prefill 分块边界；
-2. 改为 `max_new_tokens=32`、`max_draft_tokens=8`，确认稳定后再测 15；
+2. 改为 `max_new_tokens=32`、`max_draft_tokens=8`，确认稳定后再测 16；
 3. 记录每轮 proposal、接受长度和 correction；
 4. 用 profiler 确认 target、draft 和所有中间 tensor 留在 NPU；
 5. 最后才测延迟、吞吐和加速比。
