@@ -53,7 +53,9 @@ CPU/CUDA framework target 在 `use_cache=False` 下进行完整前缀计算。HI
 - linear-attention state 使用固定的 conv/recurrent shape 合同；
 - full-attention state 使用 `[max_len/64, kv_heads*head_dim/16, 64, 16]`；
 - 把 `config.kv_cache_max_len` 写入模型后重建并校验每个 full-attention block table；
-- 每次调用从位置 0 对完整前缀执行 fresh prefill；
+- 每次调用从位置 0 对完整前缀执行 fresh prefill；`S>1` 的物理输入右补齐到 64 的倍数，
+  逻辑 `allQLen` 和返回的 logits/features 仍只覆盖真实 token；
+- 返回前同步 NPU，禁止调用级 KV/GDN state 在异步 kernel 完成前被释放或复用；
 - 将 HIAI Tensor/tuple 输出统一为 `logits + dflash_features`。
 
 无需修改这个文件，也无需实现 reset 函数。唯一新增的运行参数
@@ -100,8 +102,10 @@ NPU backend。它会直接检查当前内嵌源码树，不需要额外生成 ov
 6. 至少执行一个 draft、一个 feature forward 和一个 target verify。
 7. 无 CPU fallback。
 
-第 4 项若连 `P → P` 都失败，先查设备重复性；只有 `P → Q → P` 失败时，再查 fresh hybrid
-state、block table 或完整前缀 prefill。不要继续测接受率。
+第 4 项若连 `P → P` 都失败，先确认 `bridge_runtime` 报告了 64-token alignment、每个完成
+forward 都执行了 synchronization，再看 max/mean/RMSE/relative-RMSE/cosine；不要因为
+Top-1 暂时相同就直接放宽阈值。只有 `P → Q → P` 失败时，再查 fresh hybrid state、block
+table 或完整前缀 prefill。门禁通过前不要继续解释接受率。
 
 ## 接受率和性能
 

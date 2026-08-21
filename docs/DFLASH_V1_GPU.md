@@ -85,7 +85,7 @@ print("DFLASH_V1_CUDA_FRAMEWORK_REPORT_GATE_PASS")
 PY
 ```
 
-GPU 报告验证的是 HF/PyTorch V1 流程、特征旁路和严格 greedy token 等价。r12 默认对每个
+GPU 报告验证的是 HF/PyTorch V1 流程、特征旁路和严格 greedy token 等价。r13 默认对每个
 proposal 单独执行完整前缀 target 校验；这条 correctness 路线不把“同一个更长 target 输入中
 较早 logit 行不变”当作前提。它不证明 HIAI
 直接源码集成、receiver 状态隔离、310P 自定义算子、310P 无 fallback 或性能收益。

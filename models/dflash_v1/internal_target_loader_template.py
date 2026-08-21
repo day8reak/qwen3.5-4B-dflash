@@ -488,6 +488,18 @@ class InternalTargetFacade(nn.Module):
         """Return a copy of counters suitable for run evidence/reports."""
 
         with self._full_prefix_call_lock:
+            raw_bridge_audit = getattr(
+                self.target,
+                "dflash_full_prefix_bridge_audit",
+                None,
+            )
+            if raw_bridge_audit is not None and not isinstance(
+                raw_bridge_audit,
+                Mapping,
+            ):
+                raise TypeError(
+                    "target dflash_full_prefix_bridge_audit must be a mapping"
+                )
             all_calls_prepared = (
                 self._isolation_hook_failures == 0
                 and self._isolation_hook_calls == self._isolation_hook_successes
@@ -523,6 +535,11 @@ class InternalTargetFacade(nn.Module):
                 "output_validation_failures": self._output_validation_failures,
                 "last_sequence_length": self._last_sequence_length,
                 "last_output_dflash_features": self._last_output_dflash_features,
+                "bridge_runtime": (
+                    dict(raw_bridge_audit)
+                    if isinstance(raw_bridge_audit, Mapping)
+                    else None
+                ),
             }
 
     @property

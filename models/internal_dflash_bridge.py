@@ -10,8 +10,16 @@ Each call builds a fresh hybrid cache from the model configuration:
 
 * linear-attention layers receive ``(conv_state, recurrent_state)``;
 * full-attention layers receive block-table ``(key_cache, value_cache)``;
-* the complete prefix is executed as one fresh prefill;
+* a multi-token prefix is right-padded to a complete 64-token prefill chunk;
+* the complete padded prefix is executed as one fresh prefill and sliced back
+  to the real token rows;
 * only ``logits`` and optional ``dflash_features`` cross back to DFlash.
+
+The explicit chunk alignment is important for the target GDN kernel: its
+multi-token path uses ``chunk_size=64``.  It is also important that the device
+is synchronized before the call-local KV/GDN tensors leave scope; otherwise an
+asynchronous custom operator may still be consuming storage which the caching
+allocator is free to reuse for the next full-prefix call.
 
 The public factory is :func:`load_qwen35_target`.  It is consumed by
 ``models.dflash_v1.internal_target_loader`` and needs no hand-written reset
@@ -49,6 +57,17 @@ def _positive_int(value: object, *, name: str) -> int:
     if normalized <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return normalized
+
+
+def _round_up_prefill_length(sequence_length: int) -> int:
+    """Return the execution length required by the target GDN chunk path."""
+
+    length = _positive_int(sequence_length, name="sequence_length")
+    if length == 1:
+        # The target intentionally selects its recurrent chunk_size=1 path for
+        # a single-token request.
+        return 1
+    return ((length + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
 
 
 def _tensor_field(output: object, name: str) -> Tensor | None:
@@ -109,7 +128,9 @@ class InternalDFlashTarget(nn.Module):
     dflash_feature_contract_id = _FEATURE_CONTRACT_ID
     dflash_full_prefix_isolation_mode = "receiver_reset_hook"
     dflash_full_prefix_isolation_evidence = (
-        "bridge allocates fresh external hybrid KV/GDN state for every full-prefix call"
+        "bridge allocates fresh external hybrid KV/GDN state, aligns every "
+        "multi-token prefill to 64 rows, and synchronizes before releasing "
+        "call-local state"
     )
     dflash_full_prefix_execution_mode = "fresh_prefill"
     dflash_prefill_chunk_size = 64
@@ -147,6 +168,29 @@ class InternalDFlashTarget(nn.Module):
             self._rebuild_full_attention_block_tables()
         )
         self._prepared_call: tuple[int, bool, int, int] | None = None
+        self._full_prefix_calls = 0
+        self._full_prefix_completions = 0
+        self._full_prefix_failures = 0
+        self._device_synchronizations = 0
+        self._total_padding_tokens = 0
+        self._last_requested_sequence_length: int | None = None
+        self._last_execution_sequence_length: int | None = None
+
+    @property
+    def dflash_full_prefix_bridge_audit(self) -> Mapping[str, object]:
+        """Expose bounded runtime facts without returning mutable model state."""
+
+        return {
+            "prefill_alignment": "right_pad_s_gt_1_to_multiple_of_64",
+            "call_local_state_release_barrier": True,
+            "full_prefix_calls": self._full_prefix_calls,
+            "full_prefix_completions": self._full_prefix_completions,
+            "full_prefix_failures": self._full_prefix_failures,
+            "device_synchronizations": self._device_synchronizations,
+            "total_padding_tokens": self._total_padding_tokens,
+            "last_requested_sequence_length": self._last_requested_sequence_length,
+            "last_execution_sequence_length": self._last_execution_sequence_length,
+        }
 
     @property
     def dflash_execution_model(self) -> nn.Module:
@@ -255,6 +299,56 @@ class InternalDFlashTarget(nn.Module):
             dtype=torch.float32,
         )
         return torch.where(visible, zero, negative_infinity).unsqueeze(0).unsqueeze(0)
+
+    def _execution_input_ids(self, input_ids: Tensor) -> tuple[Tensor, int]:
+        """Right-pad a real prefix so every multi-token GDN chunk is complete."""
+
+        real_length = int(input_ids.shape[1])
+        execution_length = _round_up_prefill_length(real_length)
+        if execution_length > self.kv_cache_max_len:
+            raise ValueError(
+                "64-token prefill alignment exceeds kv_cache_max_len: "
+                f"requested={real_length}, aligned={execution_length}, "
+                f"kv_cache_max_len={self.kv_cache_max_len}"
+            )
+        if execution_length == real_length:
+            return input_ids, execution_length
+
+        configured_pad = getattr(self.config, "pad_token_id", None)
+        pad_token_id = 0 if configured_pad is None else int(configured_pad)
+        vocab_size = _positive_int(
+            getattr(self.config, "vocab_size", None),
+            name="config.vocab_size",
+        )
+        if pad_token_id < 0 or pad_token_id >= vocab_size:
+            raise ValueError("config.pad_token_id is outside the target vocabulary")
+        padding = torch.full(
+            (1, execution_length - real_length),
+            pad_token_id,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        return torch.cat((input_ids, padding), dim=1), execution_length
+
+    def _synchronize_call_local_state(self) -> None:
+        """Finish opaque target kernels before fresh state tensors leave scope."""
+
+        if self.requested_device.type == "cpu":
+            # CPU is used only by the reduced-shape bridge contract tests; its
+            # operations are already synchronous.
+            return
+        backend = getattr(torch, self.requested_device.type, None)
+        synchronize = getattr(backend, "synchronize", None)
+        if not callable(synchronize):
+            raise RuntimeError(
+                f"{self.requested_device.type} backend lacks synchronize(); "
+                "cannot safely release call-local KV/GDN state"
+            )
+        try:
+            synchronize(self.requested_device)
+        except TypeError:
+            synchronize()
+        self._device_synchronizations += 1
 
     def _fresh_hybrid_cache(self, *, batch_size: int) -> list[tuple[Tensor, Tensor]]:
         config = self.config
@@ -387,70 +481,97 @@ class InternalDFlashTarget(nn.Module):
                 "prepare_dflash_full_prefix_call"
             )
 
+        self._full_prefix_calls += 1
+        self._last_requested_sequence_length = sequence_length
+        execution_input_ids, execution_length = self._execution_input_ids(input_ids)
+        self._last_execution_sequence_length = execution_length
+        self._total_padding_tokens += execution_length - sequence_length
+
         embeddings = self.get_input_embeddings()
-        inputs_embeds = embeddings(input_ids.to(embeddings.weight.device)).to(
-            self.requested_device
-        )
+        inputs_embeds = embeddings(
+            execution_input_ids.to(embeddings.weight.device)
+        ).to(self.requested_device)
         if inputs_embeds.dtype != self.requested_dtype:
             raise ValueError(
                 f"input embeddings use {inputs_embeds.dtype}, expected {self.requested_dtype}"
             )
-        attention_mask = self._fresh_attention_mask(sequence_length)
+        attention_mask = self._fresh_attention_mask(execution_length)
         position_ids = torch.arange(
-            sequence_length,
+            execution_length,
             device=self.requested_device,
         ).unsqueeze(0)
         new_kv_cache_pos = torch.arange(
-            sequence_length,
+            execution_length,
             device=self.requested_device,
         )
         past_key_values = self._fresh_hybrid_cache(batch_size=1)
 
-        with torch.inference_mode():
-            raw_output = self.dflash_execution_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                new_kv_cache_pos=new_kv_cache_pos,
-                use_cache=True,
-                output_attentions=False,
-                output_hidden_states=False,
-                inputs_embeds=inputs_embeds,
-                embed_scale=None,
-                output_pos=None,
-                allQLen=[sequence_length],
-                output_dflash_features=bool(output_dflash_features),
-            )
-        logits, features = _unwrap_logits_and_features(
-            raw_output,
-            feature_enabled=bool(output_dflash_features),
-        )
-        expected_logits = (1, sequence_length, VOCAB_SIZE)
-        if tuple(logits.shape) != expected_logits:
-            raise ValueError(
-                f"HIAI target logits shape must be {expected_logits}, got {tuple(logits.shape)}"
-            )
-        if logits.device != self.requested_device:
-            raise ValueError("HIAI target logits left the requested NPU device")
-        result: dict[str, Tensor] = {
-            "logits": logits[:, -1:, :] if int(logits_to_keep) == 1 else logits,
-        }
-        if output_dflash_features:
-            assert features is not None
-            expected_features = (1, sequence_length, FEATURE_WIDTH)
-            if tuple(features.shape) != expected_features:
-                raise ValueError(
-                    "HIAI dflash_features shape must be "
-                    f"{expected_features}, got {tuple(features.shape)}"
+        try:
+            with torch.inference_mode():
+                raw_output = self.dflash_execution_model(
+                    input_ids=execution_input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    new_kv_cache_pos=new_kv_cache_pos,
+                    use_cache=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    inputs_embeds=inputs_embeds,
+                    embed_scale=None,
+                    output_pos=None,
+                    # Keep the receiver's logical-length input identical to
+                    # its normal padded-prefill convention.  Only the tensor
+                    # rows are aligned to the physical 64-token GDN chunk.
+                    allQLen=[sequence_length],
+                    output_dflash_features=bool(output_dflash_features),
                 )
-            if features.device != self.requested_device:
-                raise ValueError("HIAI dflash_features left the requested NPU device")
-            if features.dtype != self.requested_dtype:
+            logits, features = _unwrap_logits_and_features(
+                raw_output,
+                feature_enabled=bool(output_dflash_features),
+            )
+            expected_logits = (1, execution_length, VOCAB_SIZE)
+            if tuple(logits.shape) != expected_logits:
                 raise ValueError(
-                    f"HIAI dflash_features use {features.dtype}, expected {self.requested_dtype}"
+                    "HIAI target logits shape must be "
+                    f"{expected_logits}, got {tuple(logits.shape)}"
                 )
-            result["dflash_features"] = features
+            if logits.device != self.requested_device:
+                raise ValueError("HIAI target logits left the requested NPU device")
+            real_logits = logits[:, :sequence_length, :]
+            result: dict[str, Tensor] = {
+                "logits": (
+                    real_logits[:, -1:, :]
+                    if int(logits_to_keep) == 1
+                    else real_logits
+                ),
+            }
+            if output_dflash_features:
+                assert features is not None
+                expected_features = (1, execution_length, FEATURE_WIDTH)
+                if tuple(features.shape) != expected_features:
+                    raise ValueError(
+                        "HIAI dflash_features shape must be "
+                        f"{expected_features}, got {tuple(features.shape)}"
+                    )
+                if features.device != self.requested_device:
+                    raise ValueError(
+                        "HIAI dflash_features left the requested NPU device"
+                    )
+                if features.dtype != self.requested_dtype:
+                    raise ValueError(
+                        "HIAI dflash_features use "
+                        f"{features.dtype}, expected {self.requested_dtype}"
+                    )
+                result["dflash_features"] = features[:, :sequence_length, :]
+
+            # Opaque NPU kernels may execute asynchronously.  The local cache
+            # tensors must stay alive until every target kernel is complete.
+            self._synchronize_call_local_state()
+        except Exception:
+            self._full_prefix_failures += 1
+            raise
+        self._full_prefix_completions += 1
         return result
 
 

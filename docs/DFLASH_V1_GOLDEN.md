@@ -2,7 +2,7 @@
 
 V1 是 correctness-first 的完整前缀重算路线。本包按 vLLM 口径把 K 定义为 proposal token
 数，clean anchor 不计入 K，因此支持 K=16；此时 draft query 为 1 个 anchor 加 16 个 mask，
-共 17 行。r12 默认让同一个普通 target 按 proposal 逐次验证独立完整前缀，接受最长连续匹配
+共 17 行。r13 默认让同一个普通 target 按 proposal 逐次验证独立完整前缀，接受最长连续匹配
 前缀，并产生 correction/bonus；一次 target 调用验证整块仅作为 prefix-invariance 诊断。
 
 ## 不可放宽的正确性条件
@@ -114,6 +114,12 @@ assert isolation["prepare_forward_serialized"] is True
 assert isolation["all_calls_prepared"] is True
 assert isolation["prepare_failures"] == 0
 assert isolation["full_prefix_execution_mode"] == "fresh_prefill"
+bridge = isolation["bridge_runtime"]
+assert bridge["prefill_alignment"] == "right_pad_s_gt_1_to_multiple_of_64"
+assert bridge["call_local_state_release_barrier"] is True
+assert bridge["full_prefix_failures"] == 0
+assert bridge["full_prefix_completions"] == isolation["target_forward_calls"]
+assert bridge["device_synchronizations"] == isolation["target_forward_calls"]
 
 round_gate = report["dflash_execution_gate"]
 assert round_gate["status"] == "PASS"

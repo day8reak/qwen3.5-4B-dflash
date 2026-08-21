@@ -1,4 +1,4 @@
-# Qwen3.5-4B DFlash V1（r12）
+# Qwen3.5-4B DFlash V1（r13）
 
 这是 Qwen3.5-4B 的 DFlash V1 PyTorch 实现，包含完整前缀重算调度、六层草稿模型、
 CPU/CUDA 后端，以及 Ascend NPU/HIAI target 所需的检查和 loader。
@@ -82,8 +82,9 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
 先按 [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md) 部署仓库中的
 `modeling_qwen3_5_hiai_nd.py`。bridge 会复用现有
 `Qwen3_5ForCausalLMWrapper`，并按模型配置的 hybrid-cache shape 在每次 target 调用时
-新建状态；同时会按 `--kv-cache-max-len` 重建所有 full-attention block table，因此不再需要
-手写 factory/reset：
+新建状态。r13 还会把 `S>1` 的完整前缀在 bridge 内右补齐到 64-token GDN chunk，执行后只
+截回真实 token 行，并在释放本次临时 KV/GDN state 前同步 NPU；同时会按
+`--kv-cache-max-len` 重建所有 full-attention block table，因此不再需要手写 factory/reset：
 
 ```bash
 export PYTHONPATH=/path/to/qwen35-runtime

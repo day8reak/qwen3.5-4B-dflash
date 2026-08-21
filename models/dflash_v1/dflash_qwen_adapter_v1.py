@@ -215,12 +215,43 @@ def _compare_repeatable_tensors(
     reference_finite = bool(torch.isfinite(reference).all().item())
     candidate_finite = bool(torch.isfinite(candidate).all().item())
     if reference_finite and candidate_finite:
-        difference = (reference.float() - candidate.float()).abs()
+        reference_float = reference.float()
+        candidate_float = candidate.float()
+        difference = (reference_float - candidate_float).abs()
         maximum_error = float(difference.max().item()) if difference.numel() else 0.0
         mean_error = float(difference.mean().item()) if difference.numel() else 0.0
+        rmse = (
+            float(difference.square().mean().sqrt().item())
+            if difference.numel()
+            else 0.0
+        )
+        reference_rms = (
+            float(reference_float.square().mean().sqrt().item())
+            if reference_float.numel()
+            else 0.0
+        )
+        relative_rmse = rmse / max(reference_rms, torch.finfo(torch.float32).eps)
+        if reference_float.numel():
+            reference_flat = reference_float.reshape(-1)
+            candidate_flat = candidate_float.reshape(-1)
+            reference_norm = float(torch.linalg.vector_norm(reference_flat).item())
+            candidate_norm = float(torch.linalg.vector_norm(candidate_flat).item())
+            if reference_norm == 0.0 or candidate_norm == 0.0:
+                cosine_similarity = float(reference_norm == candidate_norm)
+            else:
+                cosine_similarity = float(
+                    torch.dot(reference_flat, candidate_flat).item()
+                    / (reference_norm * candidate_norm)
+                )
+        else:
+            cosine_similarity = 1.0
     else:
         maximum_error = float("inf")
         mean_error = float("inf")
+        rmse = float("inf")
+        reference_rms = float("inf")
+        relative_rmse = float("inf")
+        cosine_similarity = float("nan")
     rtol, atol = _repeatability_tolerances(reference.dtype)
     within_tolerance = bool(
         reference_finite
@@ -245,6 +276,10 @@ def _compare_repeatable_tensors(
         "atol": atol,
         "max_abs_error": maximum_error,
         "mean_abs_error": mean_error,
+        "rmse": rmse,
+        "reference_rms": reference_rms,
+        "relative_rmse": relative_rmse,
+        "cosine_similarity": cosine_similarity,
         "top1_checked": require_top1,
         "top1_equal": top1_equal,
         "top1_mismatch_count": top1_mismatch_count,
@@ -261,6 +296,9 @@ def _require_repeatability_pass(
     if audit.get("status") != "PASS_BOUNDED_REPEATABILITY":
         raise AssertionError(
             f"{message}: max_abs_error={audit.get('max_abs_error')}, "
+            f"mean_abs_error={audit.get('mean_abs_error')}, "
+            f"relative_rmse={audit.get('relative_rmse')}, "
+            f"cosine_similarity={audit.get('cosine_similarity')}, "
             f"top1_mismatch_count={audit.get('top1_mismatch_count')}, "
             f"within_tolerance={audit.get('within_tolerance')}"
         )
@@ -1524,6 +1562,24 @@ def _target_integration_audit(
                 raise TypeError(
                     f"target isolation audit {field} must be a non-negative int"
                 )
+        bridge_runtime = isolation.get("bridge_runtime")
+        if bridge_runtime is not None:
+            if not isinstance(bridge_runtime, Mapping):
+                raise TypeError("target bridge_runtime audit must be a mapping")
+            bridge_runtime = dict(bridge_runtime)
+            for field in (
+                "full_prefix_calls",
+                "full_prefix_completions",
+                "full_prefix_failures",
+                "device_synchronizations",
+                "total_padding_tokens",
+            ):
+                value = bridge_runtime.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise TypeError(
+                        f"target bridge_runtime {field} must be a non-negative int"
+                    )
+            isolation["bridge_runtime"] = bridge_runtime
         isolation["status"] = "PASS_DECLARED_AND_INSTRUMENTED"
 
     loader_identity = getattr(target, "_dflash_target_loader_identity", None)
@@ -1652,6 +1708,31 @@ def _target_integration_audit(
                 raise RuntimeError("target forward failures were recorded")
             if isolation.get("output_validation_failures") != 0:
                 raise RuntimeError("target output validation failures were recorded")
+            bridge_runtime = isolation.get("bridge_runtime")
+            if isinstance(bridge_runtime, Mapping):
+                if (
+                    bridge_runtime.get("prefill_alignment")
+                    != "right_pad_s_gt_1_to_multiple_of_64"
+                    or bridge_runtime.get("call_local_state_release_barrier") is not True
+                ):
+                    raise RuntimeError(
+                        "packaged NPU bridge did not enforce its 64-token "
+                        "prefill alignment and state-release barrier"
+                    )
+                if bridge_runtime.get("full_prefix_calls") != forward_calls:
+                    raise RuntimeError(
+                        "packaged NPU bridge and facade forward counts differ"
+                    )
+                if bridge_runtime.get("full_prefix_completions") != forward_calls:
+                    raise RuntimeError(
+                        "one or more packaged NPU bridge calls did not complete"
+                    )
+                if bridge_runtime.get("full_prefix_failures") != 0:
+                    raise RuntimeError("packaged NPU bridge reported failed calls")
+                if bridge_runtime.get("device_synchronizations") != forward_calls:
+                    raise RuntimeError(
+                        "packaged NPU bridge did not synchronize every completed call"
+                    )
 
     return {
         "loader": target_loader or "package_default",
