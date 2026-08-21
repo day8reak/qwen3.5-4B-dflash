@@ -48,13 +48,13 @@ qwen35-runtime/
 ```bash
 set -euo pipefail
 
-test ! -e "$DEPLOY_ROOT/models/dflash_v1.r13.new"
+test ! -e "$DEPLOY_ROOT/models/dflash_v1.r1.new"
 cp -a "$DFLASH_REPO/models/dflash_v1" \
-  "$DEPLOY_ROOT/models/dflash_v1.r13.new"
+  "$DEPLOY_ROOT/models/dflash_v1.r1.new"
 
 # 首次部署时，目标 dflash_v1 不应存在；升级时先按部署规范将旧目录改名留存。
 test ! -e "$DEPLOY_ROOT/models/dflash_v1"
-mv "$DEPLOY_ROOT/models/dflash_v1.r13.new" \
+mv "$DEPLOY_ROOT/models/dflash_v1.r1.new" \
   "$DEPLOY_ROOT/models/dflash_v1"
 
 install -m 0644 "$DFLASH_REPO/models/internal_dflash_bridge.py" \
@@ -104,10 +104,10 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 加载后立即失败，不会静默混用两份 target。
 
 `--kv-cache-max-len` 必须使用部署配置中的实际值，并且能被 64 整除。当前 bridge 仅支持
-FP16、非量化 target 路线。r13 在加载后会用该值重建所有 full-attention 层的 block table；
+FP16、非量化 target 路线。`v1-r1` 在加载后会用该值重建所有 full-attention 层的 block table；
 重建层数或 shape 不一致会在 draft 加载前失败。
 
-r13 的 bridge 对 `S=1` 保持单 token 路线；对 `S>1` 则把输入张量右补齐到下一个 64-token
+`v1-r1` 的 bridge 对 `S=1` 保持单 token 路线；对 `S>1` 则把输入张量右补齐到下一个 64-token
 边界，使 GDN 的物理输入与 `chunk_size=64` 对齐。`allQLen` 仍传真实长度，返回值也在 bridge
 内截回真实 token 行，因此补齐 token 不进入 DFlash 前缀。每次 target forward 后还会同步
 NPU，等本次异步 kernel 全部完成后才释放调用级 KV/GDN state。该同步是 V1 correctness 路线
@@ -311,7 +311,7 @@ NPU SDPA 不支持，会明确显示 `SKIPPED_TORCH_OPS_UNSUPPORTED`，不会伪
 DFlash V1 每轮只有一次并行 draft forward；不要为提高接受率增加逐个 mask 替换和重复
 draft 的循环，那会改变算法。
 
-r13 的正确性决策默认是 sequential：proposal `i` 只用
+`v1-r1` 的正确性决策默认是 sequential：proposal `i` 只用
 `committed_prefix + 已接受的 proposal[:i]` 调一次 fresh target。工具仍额外执行一次
 vectorized target 以记录 `vectorized_prefix_invariance`，但它不参与接受决策。若该字段为
 `FAIL_PREFIX_ROW_DIVERGENCE`，说明更长输入改变了较早行的 Target Top-1；这能解释旧版

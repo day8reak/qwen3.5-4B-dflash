@@ -2,7 +2,7 @@
 
 V1 是 correctness-first 的完整前缀重算路线。本包按 vLLM 口径把 K 定义为 proposal token
 数，clean anchor 不计入 K，因此支持 K=16；此时 draft query 为 1 个 anchor 加 16 个 mask，
-共 17 行。r13 默认让同一个普通 target 按 proposal 逐次验证独立完整前缀，接受最长连续匹配
+共 17 行。`v1-r1` 默认让同一个普通 target 按 proposal 逐次验证独立完整前缀，接受最长连续匹配
 前缀，并产生 correction/bonus；一次 target 调用验证整块仅作为 prefix-invariance 诊断。
 
 ## 不可放宽的正确性条件

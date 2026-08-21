@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "purpose": "runtime identity contract for Qwen3.5-4B DFlash V1",
-  "package_revision": "r13",
+  "package_revision": "r1",
   "route_version": "dflash-v1-sequential-chunk-aligned-full-prefix-direct-hiai-tensor-tuple",
   "package_layout": {
     "version": 2,

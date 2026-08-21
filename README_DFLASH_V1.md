@@ -18,7 +18,7 @@
 - 每个 target 调用都重算完整已提交前缀。V1 不提交、分支或回退投机 KV/GDN state。
 - target 先生成 anchor，draft 最多产生 16 个 proposal，target 验证最长连续匹配前缀并给出
   correction/bonus。
-- r13 默认逐个 proposal 使用独立完整前缀校验；一次调用验证整块的 vectorized 路径只用于
+- `v1-r1` 默认逐个 proposal 使用独立完整前缀校验；一次调用验证整块的 vectorized 路径只用于
   诊断，因为不同输入长度可能选择不同 kernel，不能假定更长输入里较早 logit 行逐 bit 不变。
 - CPU、CUDA 和 NPU 共用 `dflash_reference_decode_v1.py` 与
   `Qwen35DFlashFullPrefixAdapter`。
