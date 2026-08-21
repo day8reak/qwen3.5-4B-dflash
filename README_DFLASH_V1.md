@@ -71,7 +71,8 @@ python -B -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --kv-cache-max-len 4096 \
-  --prompt-ids 151644,872,198 \
+  --prompt "请用一句话解释为什么天空是蓝色的。" \
+  --prompt-mode chat \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -80,6 +81,11 @@ python -B -m models.dflash_v1.run_npu \
 
 把 `4096` 换成部署配置的实际值。默认 bridge 固定导入
 `models.export_model_wrapper_qwen3_5.Qwen3_5ForCausalLMWrapper`。
+
+若要让每次运行读取同一段固定文本，把 `--prompt` 换成
+`--prompt-file /path/to/prompt.txt`；文件按 UTF-8 读取。默认 `chat` 模式会套用本地主模型
+tokenizer 的 chat template，`raw` 只适用于已经自行构造好模板的文本。运行结束会打印
+ordinary Target 与 DFlash 两份解码文本。
 
 ## 验证边界
 

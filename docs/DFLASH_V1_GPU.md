@@ -32,7 +32,8 @@ export PYTHONPATH="$PWD"
 "$MODEL_PYTHON" -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
   --target-dir "$TARGET_DIR" \
   --draft-dir "$DRAFT_DIR" \
-  --prompt-ids 151644,872,198 \
+  --prompt "请用一句话解释为什么天空是蓝色的。" \
+  --prompt-mode chat \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --eos-token-id 248044 \
@@ -107,7 +108,7 @@ GPU 和 NPU 都使用 FP16 时结果相同，只能降低设备独有问题的�
 
 ```bash
 set -euo pipefail
-: "${TARGET_DIR:?}" "${DRAFT_DIR:?}" "${RUN_DIR:?}"
+: "${TARGET_DIR:?}" "${DRAFT_DIR:?}" "${RUN_DIR:?}" "${PROMPT_FILE:?}"
 MODEL_PYTHON="${MODEL_PYTHON:-python}"
 mkdir -p "$RUN_DIR"
 export PYTHONDONTWRITEBYTECODE=1
@@ -118,12 +119,13 @@ for DTYPE in float16 bfloat16; do
   "$MODEL_PYTHON" -B -m models.dflash_v1.diagnose_acceptance \
     --target-dir "$TARGET_DIR" \
     --draft-dir "$DRAFT_DIR" \
-    --prompt-ids 151644,872,198 \
+    --prompt-file "$PROMPT_FILE" \
+    --prompt-mode chat \
     --device cuda:0 \
     --dtype "$DTYPE" \
     --eos-token-id 248044 \
     --acceptance-rounds 16 \
-    --proposal-counts 1,3,7,15 \
+    --proposal-counts 1,4,8,15 \
     --trace-draft-layers \
     --report "$RUN_DIR/gpu-$DTYPE-diagnosis.json" \
     2>&1 | tee "$RUN_DIR/gpu-$DTYPE-diagnosis.log"
@@ -131,7 +133,10 @@ done
 ```
 
 CUDA 路线不需要 `--kv-cache-max-len`，也不传 NPU loader/factory/backend 参数。BF16 不支持
-时命令会在加载大权重之前拒绝，不能把跳过 BF16 写成数值等价。
+时命令会在加载大权重之前拒绝，不能把跳过 BF16 写成数值等价。`PROMPT_FILE` 是 UTF-8
+纯文本；`chat` 会套用本地 Qwen chat template，若文件本身已经是完整模板文本则改成
+`--prompt-mode raw`。终端会打印 Target 续写文本、最大 K 的逐轮接受长度，以及 early / middle /
+late 三段均值。
 
 然后直接比较两个已有报告，不再重复加载权重：
 
@@ -155,5 +160,11 @@ verifier token 和接受率指标，不会把 BF16/FP16 的浮点 hash 差异误
 则先查共享的草稿实现、调度或评测 workload，而不是 NPU 独有算子。
 
 一条短 prompt 不能代表官方多数据集平均接受长度。定位时先用固定 prompt 找首个分叉，之后
-再用多条代表性 prompt 汇总 `emitted/verify` 分布。DFlash V1 是每轮一次并行 block 预测，
-不要加入逐 mask 迭代替换。
+再用多条代表性 prompt 汇总 `emitted/verify` 分布。若 early 低而 late 高，换至少三类 prompt：
+若上升总绑定相同绝对 round，优先查首轮状态/feature；若上升跟随文本进入稳定句式，通常包含
+workload 难度因素。DFlash V1 是每轮一次并行 block 预测，不要加入逐 mask 迭代替换。
+
+最小 smoke 也可把 `--prompt` 换成 `--prompt-file "$PROMPT_FILE"`。两种文本输入默认都在
+本地套用 Qwen chat template，并在终端及 JSON 报告中输出 ordinary Target 与 DFlash 的
+解码续写；报告不会保存 prompt 明文。官方 block 总共 16 行，其中 1 行是 anchor，所以
+proposal K 最大为 15。

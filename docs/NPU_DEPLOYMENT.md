@@ -122,7 +122,8 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --kv-cache-max-len 4096 \
-  --prompt-ids 151644,872,198 \
+  --prompt "请用一句话解释为什么天空是蓝色的。" \
+  --prompt-mode chat \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -176,6 +177,7 @@ set -euo pipefail
 
 export PYTHONPATH="$DEPLOY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export RUN_DIR=/path/to/dflash-run
+export PROMPT_FILE=/path/to/prompt.txt
 mkdir -p "$RUN_DIR"
 
 PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
@@ -183,13 +185,14 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --kv-cache-max-len 4096 \
-  --prompt-ids 151644,872,198 \
+  --prompt-file "$PROMPT_FILE" \
+  --prompt-mode chat \
   --device npu:0 \
   --dtype float16 \
   --eos-token-id 248044 \
   --target-parity-decode-steps 4 \
   --acceptance-rounds 16 \
-  --proposal-counts 1,3,7,15 \
+  --proposal-counts 1,4,8,15 \
   --trace-draft-layers \
   --report "$RUN_DIR/dflash-v1-acceptance-diagnosis.json" \
   2>&1 | tee "$RUN_DIR/dflash-v1-acceptance-diagnosis.log"
@@ -197,17 +200,24 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 
 把 `4096` 替换为正常推理配置的真实 `kv_cache_max_len`。诊断默认校验完整草稿权重
 SHA-256；只有临时缩短排查时间时才使用 `--no-verify-draft-sha256`，正式结论仍应打开校验。
+`PROMPT_FILE` 按 UTF-8 读取整个文件；`chat` 会套本地 Qwen chat template。文件若已经包含完整
+模板则用 `--prompt-mode raw`。终端会直接打印 Target 续写文本、最大 K 的逐轮接受长度以及
+early / middle / late 三段均值；JSON 默认仍不保存明文 token ID。
 
-### 为什么是 K=1、3、7、15
+### 为什么是 K=1、4、8、15
 
-这里的 `K` 只表示草稿 token 数。DFlash block 还包含 1 个已经由 Target 确认的 anchor：
+这里的 `K` 是草稿 proposal/mask token 数。每个 draft query 还包含 1 个已经由 Target
+确认的 anchor：
 
 ```text
-总 block size = 1 个 anchor + K 个 proposal
-2 / 4 / 8 / 16 = 1+1 / 1+3 / 1+7 / 1+15
+query rows = 1 个 anchor + K 个 proposal
+K=1 / 4 / 8 / 15 对应 query rows=2 / 5 / 9 / 16
 ```
 
-因此 K=1、3、7、15 对应总 block size=2、4、8、16；不是把 4、8、16 少算了一个。
+官方 checkpoint 的 `block_size=16` 计入 anchor，因此 K 的上限是 15。K=4、K=8 都是合法
+诊断点；没有要求 K 必须是 `2^n-1`。选择 1/4/8/15 是为了同时观察单 token、小 block、
+中 block 和官方最大 block。K=8 已足以排查低接受率，K 口径本身不能解释“不同设备/精度
+都只接受相近 token 数”的现象。
 
 ### 结果怎么读
 
@@ -222,6 +232,10 @@ SHA-256；只有临时缩短排查时间时才使用 `--no-verify-draft-sha256`�
 - `PASS_BITWISE_EQUAL`：两条 Target 路径在本次有限前缀上逐 bit 相等，可以继续解释
   draft 接受率。
 
+CPU/CUDA 现在也执行同一类探针：先 `use_cache=True` prefill，再只喂单 token 并复用
+DynamicCache，随后逐前缀和 `use_cache=False` 重算结果比较。这样 GPU token 一致不再被误当成
+feature 一致；报告同时给出 `max_feature_relative_rmse` 与最小 cosine。
+
 再看每个 K：
 
 - `first_proposal_accuracy`：每轮第一个草稿 token 的命中率；K=1 也很低时，优先查
@@ -230,6 +244,8 @@ SHA-256；只有临时缩短排查时间时才使用 `--no-verify-draft-sha256`�
 - `mean_theoretical_emitted_per_verify`：接受 token 加一个 Target correction/bonus，较接近
   每次 verify 能推进多少 token 的口径。
 - `full_block_accept_rate`：整块全部接受的轮次比例。
+- `phase_metrics_by_proposal_count`：把实际完成轮次等分为 early / middle / late；配合终端的
+  `逐轮接受长度` 判断后段回升究竟是否稳定存在。
 
 需要进一步区分草稿 backend 时，加 `--shadow-torch-ops`。它在同一 NPU、同一组输入和
 同一份权重上，把当前分解 backend 与 `TorchDFlashOps` 做一次 shadow 比较；如果该环境的

@@ -52,13 +52,15 @@ python -m pip install "transformers==5.14.1" safetensors huggingface-hub
 ## 最小运行
 
 准备本地主模型和官方 `z-lab/Qwen3.5-4B-DFlash` 草稿权重：
+主模型目录还必须包含完整 tokenizer 文件；文本输入全程使用本地文件，不联网下载。
 
 ```bash
 export PYTHONPATH="$PWD"
 python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --prompt-ids 151644,872,198 \
+  --prompt "请用一句话解释为什么天空是蓝色的。" \
+  --prompt-mode chat \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --eos-token-id 248044 \
@@ -89,7 +91,8 @@ python -B -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --kv-cache-max-len 4096 \
-  --prompt-ids 151644,872,198 \
+  --prompt "请用一句话解释为什么天空是蓝色的。" \
+  --prompt-mode chat \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -103,9 +106,14 @@ backend 和 HIAI source，不再要求 overlay JSON。
 如果已经能生成但接受率偏低，按
 [NPU 接受率分层诊断](docs/NPU_DEPLOYMENT.md#7-接受率低时的分层诊断) 运行
 `models.dflash_v1.diagnose_acceptance`。它会先判定正常增量 Target 与 DFlash fresh
-full-prefix Target 是否等价，再统计 K=1/3/7/15。新版也支持 CUDA FP16/BF16 A/B、逐轮
+full-prefix Target 是否等价，再统计 K=1/4/8/15。新版也支持 CUDA FP16/BF16 A/B、逐轮
 无明文层级指纹和两份报告的首个分叉定位，避免只凭最终 token 或总接受率误判草稿模型。
 GPU 的 FP16/BF16 对照命令见 [DFlash V1 GPU 运行说明](docs/DFLASH_V1_GPU.md)。
+
+固定文本也可以放进 UTF-8 文件，然后把 `--prompt "..."` 换成
+`--prompt-file /path/to/prompt.txt`。默认 `--prompt-mode chat` 会套用本地主模型 tokenizer 的
+chat template；只有文件已经包含完整模板文本时才使用 `--prompt-mode raw`。入口会直接打印
+ordinary Target 和 DFlash 的解码结果。
 
 仓库不包含 Qwen3.5-4B 或 DFlash 权重。真实 CUDA 和 Ascend 310P 结果需要在对应服务器上
 执行上述流程确认，CPU 结果不能替代设备验证。

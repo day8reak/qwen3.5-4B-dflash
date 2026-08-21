@@ -75,7 +75,8 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --kv-cache-max-len 4096 \
-  --prompt-ids 151644,872,198 \
+  --prompt "请用一句话解释为什么天空是蓝色的。" \
+  --prompt-mode chat \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -105,12 +106,17 @@ NPU backend。它会直接检查当前内嵌源码树，不需要额外生成 ov
 
 ```text
 max_new_tokens=32
-max_draft_tokens=15
+max_draft_tokens=8（稳定后再测 15）
 ```
 
 CPU/GPU 接受率只作为诊断参考。最终 NPU 接受率依赖 NPU target features、draft backend、
 FP16 数值和 target logits，必须在真实设备上测量。没有真机报告前不得声明 310P 加速比或无
 fallback 已通过。
+
+固定 workload 推荐保存为 UTF-8 文件，并使用
+`--prompt-file /path/to/prompt.txt --prompt-mode chat`。入口会在本地套用 Qwen chat
+template，运行结束直接打印 ordinary Target 与 DFlash 两份解码文本。官方 16 行 draft
+block 已包含 1 行 anchor，因此 `max_draft_tokens` 最大为 15。
 
 ## 自定义算子说明
 

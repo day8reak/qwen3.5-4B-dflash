@@ -52,6 +52,14 @@ def _parser() -> argparse.ArgumentParser:
     prompt = parser.add_mutually_exclusive_group(required=True)
     prompt.add_argument("--prompt-ids", help="comma-separated token IDs")
     prompt.add_argument("--prompt-json", help="JSON token list or input_ids object")
+    prompt.add_argument("--prompt", help="UTF-8 prompt text")
+    prompt.add_argument("--prompt-file", help="path to a UTF-8 prompt text file")
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("chat", "raw"),
+        default="chat",
+        help="chat applies the local Qwen chat template; raw tokenizes text directly",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--max-draft-tokens", type=int, default=1)
     parser.add_argument("--device", default="npu:0")
@@ -122,8 +130,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         adapter_args.extend(["--reset-hook", args.reset_hook])
     if args.prompt_ids is not None:
         adapter_args.extend(["--prompt-ids", args.prompt_ids])
-    else:
+    elif args.prompt_json is not None:
         adapter_args.extend(["--prompt-json", args.prompt_json])
+    elif args.prompt is not None:
+        adapter_args.extend(["--prompt", args.prompt])
+    else:
+        adapter_args.extend(["--prompt-file", args.prompt_file])
+    adapter_args.extend(["--prompt-mode", args.prompt_mode])
     if args.report is not None:
         adapter_args.extend(["--report", args.report])
     adapter_args.append("--progress" if args.progress else "--no-progress")

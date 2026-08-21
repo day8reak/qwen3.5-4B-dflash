@@ -1,8 +1,8 @@
 # Qwen3.5-4B DFlash V1 Golden
 
-V1 是 correctness-first 的完整前缀重算路线。target 先产生 anchor；六层 DFlash 草稿最多
-提议 15 个 token；同一个普通 target 验证候选块，接受最长连续匹配前缀，并产生
-correction/bonus。
+V1 是 correctness-first 的完整前缀重算路线。target 先产生 anchor；官方 checkpoint 的
+16 行 block 包含这个 anchor，因此最多提议 K=15 个 token。同一个普通 target 验证候选块，
+接受最长连续匹配前缀，并产生 correction/bonus。
 
 ## 不可放宽的正确性条件
 
@@ -34,7 +34,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -B \
   -m models.dflash_v1.dflash_qwen_adapter_v1 \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --prompt-ids 151644,872,198 \
+  --prompt "请用一句话解释为什么天空是蓝色的。" \
+  --prompt-mode chat \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --eos-token-id 248044 \
@@ -64,7 +65,8 @@ PYTHONDONTWRITEBYTECODE=1 python -B -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --kv-cache-max-len 4096 \
-  --prompt-ids 151644,872,198 \
+  --prompt "请用一句话解释为什么天空是蓝色的。" \
+  --prompt-mode chat \
   --max-new-tokens 2 \
   --max-draft-tokens 1 \
   --device npu:0 \
@@ -126,7 +128,12 @@ PY
 最小 smoke 通过后：
 
 1. 增加 prompt 长度并覆盖 64-token prefill 分块边界；
-2. 改为 `max_new_tokens=32`、`max_draft_tokens=15`；
+2. 改为 `max_new_tokens=32`、`max_draft_tokens=8`，确认稳定后再测 15；
 3. 记录每轮 proposal、接受长度和 correction；
 4. 用 profiler 确认 target、draft 和所有中间 tensor 留在 NPU；
 5. 最后才测延迟、吞吐和加速比。
+
+为了让每次运行固定输入，推荐把问题保存为 UTF-8 文本并使用
+`--prompt-file /path/to/prompt.txt --prompt-mode chat`。入口会在本地加载 Target tokenizer，
+套用 Qwen chat template，并打印 ordinary Target 与 DFlash 的解码文本。不要用来源不明的
+裸 token ID 作为接受率 workload；它可能并不对应正常对话前缀。

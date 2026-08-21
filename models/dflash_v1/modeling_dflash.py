@@ -147,8 +147,9 @@ class DFlashAttention(nn.Module):
             config.head_dim, config.rms_norm_eps, ops, device=device, dtype=dtype
         )
         layer_type = config.layer_types[layer_index]
-        # This intentionally matches public DFlash: sliding layers are causal;
-        # the final full-attention layer is bidirectional over the draft block.
+        # Match vLLM 0.27.1's per-layer DFlash resolver: sliding-attention
+        # layers are causal unless dflash_config.causal overrides them, while
+        # the full-attention layer is non-causal over the parallel draft block.
         self.is_causal = layer_type == "sliding_attention"
         self.sliding_window = (
             config.sliding_window
@@ -418,9 +419,13 @@ class DFlashDraftModel(nn.Module):
                 f"noise embedding width must be {self.config.hidden_size}, "
                 f"got {noise_embedding.shape[-1]}"
             )
-        if not 1 <= noise_embedding.shape[1] <= self.config.block_size:
+        # The official checkpoint block contains one clean anchor followed by
+        # proposal/mask rows.  ``block_size=16`` therefore means at most 15
+        # proposals, not 16 proposals plus an extra anchor.
+        maximum_query_rows = self.config.block_size
+        if not 1 <= noise_embedding.shape[1] <= maximum_query_rows:
             raise ValueError(
-                f"noise length must be in [1, {self.config.block_size}]"
+                f"noise length must be in [1, {maximum_query_rows}]"
             )
         expected_positions = target_hidden.shape[1] + noise_embedding.shape[1]
         if position_ids.ndim != 2 or position_ids.shape != (

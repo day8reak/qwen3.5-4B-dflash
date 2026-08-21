@@ -3,10 +3,10 @@
 This command is intentionally read-only with respect to model weights and the
 deployed source tree.  It answers three questions in order:
 
-1. On NPU, does a fresh full-prefix target call produce the same last-row
-   logits and DFlash features as the persistent prefill/decode path?
+1. Does a fresh full-prefix target call produce the same last-row logits and
+   DFlash features as a persistent prefill/decode path on the same device?
 2. On identical ordinary-greedy prefixes, how does acceptance change for
-   proposal counts K=1,3,7,15?
+   proposal counts K=1,4,8,15?
 3. At which measured boundary do two device/dtype reports first diverge?
 
 The first question is more fundamental.  Strict-greedy token equality alone
@@ -45,6 +45,7 @@ from .dflash_qwen_adapter_v1 import (
     _prepare_device_backend,
     _prompt_ids,
     _select_draft_ops,
+    _tokenize_prompt_text,
     _validate_experiment_dtype,
 )
 from .dflash_weights import require_official_dflash_checkpoint, sha256_file
@@ -197,13 +198,16 @@ def tensor_metrics(reference: Tensor, candidate: Tensor) -> dict[str, object]:
         cosine = 1.0 if bool(torch.equal(left, right)) else 0.0
     else:
         cosine = float((torch.dot(left, right) / denominator).item())
+    rmse = float(torch.sqrt(torch.mean(difference.square())).item())
+    reference_rms = float(left_rms.item())
     result.update(
         {
-            "reference_rms": float(left_rms.item()),
+            "reference_rms": reference_rms,
             "candidate_rms": float(right_rms.item()),
             "max_abs_error": float(absolute.max().item()),
             "mean_abs_error": float(absolute.mean().item()),
-            "rmse": float(torch.sqrt(torch.mean(difference.square())).item()),
+            "rmse": rmse,
+            "relative_rmse": rmse / max(reference_rms, 1.0e-12),
             "cosine_similarity": cosine,
         }
     )
@@ -256,6 +260,38 @@ def summarize_acceptance(
                 str(key): histogram[key] for key in sorted(histogram)
             },
         }
+    return result
+
+
+def summarize_acceptance_phases(
+    records: Sequence[Mapping[str, object]],
+    proposal_counts: Sequence[int],
+) -> dict[str, dict[str, dict[str, object]]]:
+    """Split completed rounds into equal early/middle/late rank buckets."""
+
+    round_indices = sorted({int(record["round_index"]) for record in records})
+    if not round_indices:
+        return {str(value): {} for value in proposal_counts}
+    phase_names = ("early", "middle", "late")
+    phase_by_round = {
+        round_index: phase_names[min(2, rank * 3 // len(round_indices))]
+        for rank, round_index in enumerate(round_indices)
+    }
+    result: dict[str, dict[str, dict[str, object]]] = {}
+    for proposal_count in proposal_counts:
+        by_phase: dict[str, dict[str, object]] = {}
+        for phase in phase_names:
+            selected = [
+                record
+                for record in records
+                if int(record["requested_proposal_count"]) == int(proposal_count)
+                and phase_by_round[int(record["round_index"])] == phase
+            ]
+            if selected:
+                by_phase[phase] = summarize_acceptance(
+                    selected, (int(proposal_count),)
+                )[str(proposal_count)]
+        result[str(proposal_count)] = by_phase
     return result
 
 
@@ -441,6 +477,85 @@ def _incremental_snapshots(
     return snapshots
 
 
+def _output_field(output: object, name: str) -> object | None:
+    """Read one field through the optional target facade output wrapper."""
+
+    candidates = (output, getattr(output, "base_output", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, Mapping):
+            value = candidate.get(name)
+        else:
+            value = getattr(candidate, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _framework_incremental_snapshots(
+    target: nn.Module,
+    prompt_ids: Tensor,
+    *,
+    decode_steps: int,
+    eos_token_id: int,
+) -> list[dict[str, object]]:
+    """Run the ordinary Transformers cache path on CPU/CUDA.
+
+    This deliberately feeds only the newly committed token after prefill.  It
+    therefore checks the same cached GDN/KV continuation boundary that a
+    serving runtime uses, instead of comparing two copies of the cache-free
+    full-prefix path.
+    """
+
+    prefix = prompt_ids.detach().clone()
+    past_key_values: object | None = None
+
+    def call(input_ids: Tensor, state: object | None) -> tuple[Tensor, Tensor, object]:
+        with torch.inference_mode():
+            output = target(
+                input_ids=input_ids,
+                past_key_values=state,
+                use_cache=True,
+                return_dict=True,
+                output_hidden_states=False,
+                output_dflash_features=True,
+                logits_to_keep=1,
+            )
+        logits, features = _unwrap_logits_features(output, require_features=True)
+        assert features is not None
+        next_state = _output_field(output, "past_key_values")
+        if next_state is None:
+            raise RuntimeError(
+                "framework target use_cache=True did not return past_key_values"
+            )
+        if logits.ndim != 3 or features.ndim != 3:
+            raise ValueError("framework incremental target must return rank-3 tensors")
+        return logits, features, next_state
+
+    logits, features, past_key_values = call(prefix, past_key_values)
+    snapshots: list[dict[str, object]] = []
+    for decode_index in range(decode_steps + 1):
+        snapshots.append(
+            {
+                "prefix": prefix.detach().clone(),
+                "incremental_logits": logits[:, -1:, :].detach().clone(),
+                "incremental_features": features[:, -1:, :].detach().clone(),
+                "source": "prefill" if decode_index == 0 else "cached_decode",
+            }
+        )
+        if decode_index == decode_steps:
+            break
+        next_token = logits[:, -1, :].argmax(dim=-1).to(torch.long)
+        if int(next_token.item()) == eos_token_id:
+            break
+        prefix = torch.cat((prefix, next_token.view(1, 1)), dim=1)
+        logits, features, past_key_values = call(
+            next_token.view(1, 1), past_key_values
+        )
+    return snapshots
+
+
 def _full_prefix_output(target: nn.Module, input_ids: Tensor) -> tuple[Tensor, Tensor]:
     with torch.inference_mode():
         output = target(
@@ -456,24 +571,122 @@ def _full_prefix_output(target: nn.Module, input_ids: Tensor) -> tuple[Tensor, T
     return logits, features
 
 
-def compare_target_paths(
+def _hidden_state_sequence(output: object) -> tuple[Tensor, ...] | None:
+    """Find a Transformers-style hidden-state tuple without assuming one wrapper."""
+
+    candidates = (output, getattr(output, "base_output", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, Mapping):
+            value = candidate.get("hidden_states")
+        else:
+            value = getattr(candidate, "hidden_states", None)
+        if isinstance(value, (tuple, list)) and value and all(
+            isinstance(item, Tensor) for item in value
+        ):
+            return tuple(value)
+    return None
+
+
+def compare_feature_collector_semantics(
     target: nn.Module,
-    prompt_ids: Tensor,
+    input_ids: Tensor,
     *,
-    decode_steps: int,
-    eos_token_id: int,
+    layer_ids: Sequence[int],
+    hidden_size: int,
+    device_type: str,
+) -> dict[str, object]:
+    """Compare the opt-in collector with the official ``hidden_states[id+1]`` rule.
+
+    The framework target can expose both paths in one forward, making this a
+    direct check of layer numbering, capture point, ordering, and concatenation.
+    The compact NPU target intentionally does not expose every intermediate
+    hidden state, so its equivalent check is a same-prompt report comparison
+    against a framework run.
+    """
+
+    if device_type == "npu":
+        return {
+            "status": "NOT_APPLICABLE_COMPACT_NPU_OUTPUT",
+            "indexing_contract": "decoder_output[layer_id] == hidden_states[layer_id + 1]",
+            "message": (
+                "compare the NPU target_feature_layer fingerprints with a same-dtype "
+                "framework report"
+            ),
+        }
+
+    try:
+        with torch.inference_mode():
+            output = target(
+                input_ids=input_ids,
+                use_cache=False,
+                return_dict=True,
+                output_hidden_states=True,
+                output_dflash_features=True,
+                logits_to_keep=1,
+            )
+    except Exception as error:
+        return {
+            "status": "FAIL_FEATURE_SEMANTICS_FORWARD",
+            "error_type": type(error).__name__,
+            "message": str(error).splitlines()[0][:300],
+        }
+
+    _logits, collected = _unwrap_logits_features(output, require_features=True)
+    assert collected is not None
+    hidden_states = _hidden_state_sequence(output)
+    if hidden_states is None:
+        return {
+            "status": "FAIL_HIDDEN_STATES_UNAVAILABLE",
+            "indexing_contract": "decoder_output[layer_id] == hidden_states[layer_id + 1]",
+        }
+    required = max(int(layer_id) for layer_id in layer_ids) + 2
+    if len(hidden_states) < required:
+        return {
+            "status": "FAIL_HIDDEN_STATE_COUNT",
+            "hidden_state_count": len(hidden_states),
+            "required_hidden_state_count": required,
+        }
+
+    selected = tuple(hidden_states[int(layer_id) + 1] for layer_id in layer_ids)
+    expected = torch.cat(selected, dim=-1)
+    if expected.shape[-1] != len(layer_ids) * hidden_size:
+        return {
+            "status": "FAIL_EXPECTED_FEATURE_WIDTH",
+            "expected_shape": list(expected.shape),
+            "required_width": len(layer_ids) * hidden_size,
+        }
+    layer_metrics: dict[str, object] = {}
+    for offset, (layer_id, hidden) in enumerate(zip(layer_ids, selected, strict=True)):
+        start = offset * hidden_size
+        layer_metrics[str(layer_id)] = tensor_metrics(
+            hidden,
+            collected[..., start : start + hidden_size],
+        )
+    combined = tensor_metrics(expected, collected)
+    exact = bool(combined.get("bitwise_equal"))
+    return {
+        "status": "PASS_BITWISE_EQUAL" if exact else "FAIL_COLLECTOR_SEMANTICS_MISMATCH",
+        "indexing_contract": "decoder_output[layer_id] == hidden_states[layer_id + 1]",
+        "layer_ids": [int(layer_id) for layer_id in layer_ids],
+        "hidden_state_count": len(hidden_states),
+        "combined": combined,
+        "layers": layer_metrics,
+    }
+
+
+def _compare_target_snapshots(
+    target: nn.Module,
+    snapshots: Sequence[Mapping[str, object]],
+    *,
     layer_ids: Sequence[int],
     hidden_size: int,
     include_token_ids: bool,
+    incremental_path: str,
 ) -> dict[str, object]:
-    """Compare persistent incremental target state with fresh full-prefix replay."""
+    """Compare captured incremental rows with independent full-prefix calls."""
 
-    snapshots = _incremental_snapshots(
-        target,
-        prompt_ids,
-        decode_steps=decode_steps,
-        eos_token_id=eos_token_id,
-    )
     records: list[dict[str, object]] = []
     for index, snapshot in enumerate(snapshots):
         prefix = snapshot["prefix"]
@@ -533,13 +746,257 @@ def compare_target_paths(
         status = "PASS_BITWISE_EQUAL"
     else:
         status = "PASS_TOP1_WITH_NUMERIC_DIFFERENCE"
+    feature_relative_rmse = [
+        float(record["features"]["relative_rmse"])
+        for record in records
+        if isinstance(record.get("features"), Mapping)
+        and isinstance(record["features"].get("relative_rmse"), (int, float))
+    ]
+    feature_cosines = [
+        float(record["features"]["cosine_similarity"])
+        for record in records
+        if isinstance(record.get("features"), Mapping)
+        and isinstance(record["features"].get("cosine_similarity"), (int, float))
+    ]
     return {
         "status": status,
+        "incremental_path": incremental_path,
         "comparisons": len(records),
         "all_top1_match": all_top1,
         "all_logits_bitwise_equal": all_logits_exact,
         "all_features_bitwise_equal": all_feature_exact,
+        "max_feature_relative_rmse": (
+            max(feature_relative_rmse) if feature_relative_rmse else None
+        ),
+        "min_feature_cosine_similarity": (
+            min(feature_cosines) if feature_cosines else None
+        ),
         "records": records,
+    }
+
+
+def compare_target_paths(
+    target: nn.Module,
+    prompt_ids: Tensor,
+    *,
+    decode_steps: int,
+    eos_token_id: int,
+    layer_ids: Sequence[int],
+    hidden_size: int,
+    include_token_ids: bool,
+) -> dict[str, object]:
+    """Compare the NPU persistent state path with fresh full-prefix replay."""
+
+    snapshots = _incremental_snapshots(
+        target,
+        prompt_ids,
+        decode_steps=decode_steps,
+        eos_token_id=eos_token_id,
+    )
+    return _compare_target_snapshots(
+        target,
+        snapshots,
+        layer_ids=layer_ids,
+        hidden_size=hidden_size,
+        include_token_ids=include_token_ids,
+        incremental_path="receiver_hiai_prefill_decode",
+    )
+
+
+def compare_framework_target_paths(
+    target: nn.Module,
+    prompt_ids: Tensor,
+    *,
+    decode_steps: int,
+    eos_token_id: int,
+    layer_ids: Sequence[int],
+    hidden_size: int,
+    include_token_ids: bool,
+) -> dict[str, object]:
+    """Compare CPU/CUDA cached decode with independent full-prefix replay."""
+
+    try:
+        snapshots = _framework_incremental_snapshots(
+            target,
+            prompt_ids,
+            decode_steps=decode_steps,
+            eos_token_id=eos_token_id,
+        )
+        return _compare_target_snapshots(
+            target,
+            snapshots,
+            layer_ids=layer_ids,
+            hidden_size=hidden_size,
+            include_token_ids=include_token_ids,
+            incremental_path="transformers_dynamic_cache_prefill_decode",
+        )
+    except Exception as error:
+        return {
+            "status": "FAIL_FRAMEWORK_INCREMENTAL_PATH",
+            "incremental_path": "transformers_dynamic_cache_prefill_decode",
+            "comparisons": 0,
+            "all_top1_match": False,
+            "all_logits_bitwise_equal": False,
+            "all_features_bitwise_equal": False,
+            "records": [],
+            "error_type": type(error).__name__,
+            "message": str(error).splitlines()[0][:300],
+        }
+
+
+def _draft_attention_contract(
+    adapter: Qwen35DFlashFullPrefixAdapter,
+    *,
+    context_length: int,
+    block_length: int,
+) -> dict[str, object]:
+    """Check each local attention mask against the vLLM 0.27.1 rule."""
+
+    key_length = context_length + block_length
+    device = adapter.device
+    query_positions = context_length + torch.arange(
+        block_length, device=device
+    ).view(block_length, 1)
+    key_positions = torch.arange(key_length, device=device).view(1, key_length)
+    records: list[dict[str, object]] = []
+    all_exact = True
+    for layer_index, layer in enumerate(adapter.draft.layers):
+        attention = layer.self_attn
+        actual = attention._attention_mask(
+            block_length,
+            context_length,
+            device=device,
+        )
+        expected_is_causal = (
+            adapter.draft.config.layer_types[layer_index] == "sliding_attention"
+        )
+        expected_window = (
+            int(adapter.draft.config.sliding_window)
+            if adapter.draft.config.layer_types[layer_index] == "sliding_attention"
+            else None
+        )
+        if expected_is_causal or expected_window is not None:
+            expected = torch.ones(
+                (block_length, key_length), dtype=torch.bool, device=device
+            )
+            if expected_is_causal:
+                expected &= key_positions <= query_positions
+            if expected_window is not None:
+                expected &= query_positions - key_positions < expected_window
+                if not expected_is_causal:
+                    expected &= key_positions - query_positions < expected_window
+            expected = expected.view(1, 1, block_length, key_length)
+            exact = isinstance(actual, Tensor) and bool(torch.equal(actual, expected))
+            block_visibility = (
+                actual[0, 0, :, context_length:]
+                if isinstance(actual, Tensor)
+                else None
+            )
+            mask_kind = (
+                "causal_sliding" if expected_is_causal else "bidirectional_sliding"
+            )
+        else:
+            exact = actual is None
+            block_visibility = torch.ones(
+                (block_length, block_length), dtype=torch.bool, device=device
+            )
+            mask_kind = "bidirectional_full"
+        exact = bool(
+            exact
+            and attention.is_causal is expected_is_causal
+            and attention.sliding_window == expected_window
+        )
+        all_exact &= exact
+        records.append(
+            {
+                "layer_index": layer_index,
+                "layer_type": adapter.draft.config.layer_types[layer_index],
+                "mask_kind": mask_kind,
+                "is_causal": bool(attention.is_causal),
+                "sliding_window": attention.sliding_window,
+                "mask_matches_pinned_rule": exact,
+                "first_query_visible_block_rows": (
+                    int(block_visibility[0].sum().item())
+                    if isinstance(block_visibility, Tensor)
+                    else None
+                ),
+                "last_query_visible_block_rows": (
+                    int(block_visibility[-1].sum().item())
+                    if isinstance(block_visibility, Tensor)
+                    else None
+                ),
+            }
+        )
+    return {
+        "status": (
+            "PASS_VLLM_0_27_1_V1_MASKS"
+            if all_exact
+            else "FAIL_ATTENTION_MASK_CONTRACT"
+        ),
+        "semantics": "causal_sliding_layers_then_noncausal_full_layer",
+        "context_length": context_length,
+        "block_length": block_length,
+        "layers": records,
+    }
+
+
+def _draft_input_contract(
+    adapter: Qwen35DFlashFullPrefixAdapter,
+    prefix_ids: Tensor,
+    target_hidden: Tensor,
+    block_ids: Tensor,
+    noise_embedding: Tensor,
+    position_ids: Tensor,
+    proposal_count: int,
+) -> dict[str, object]:
+    block_length = proposal_count + 1
+    expected_positions = torch.arange(
+        int(target_hidden.shape[1]) + block_length,
+        dtype=torch.long,
+        device=adapter.device,
+    ).unsqueeze(0)
+    checks = {
+        "context_excludes_anchor": (
+            int(target_hidden.shape[1]) == int(prefix_ids.shape[1]) - 1
+        ),
+        "block_length_is_anchor_plus_k": tuple(block_ids.shape) == (1, block_length),
+        "anchor_matches_committed_prefix_tail": bool(
+            torch.equal(block_ids[:, :1], prefix_ids[:, -1:])
+        ),
+        "proposal_rows_are_mask_token": bool(
+            torch.all(
+                block_ids[:, 1:] == int(adapter.draft.config.mask_token_id)
+            ).item()
+        ),
+        "position_ids_are_contiguous_absolute": bool(
+            torch.equal(position_ids, expected_positions)
+        ),
+        "noise_embedding_shape": tuple(noise_embedding.shape)
+        == (1, block_length, int(adapter.draft.config.hidden_size)),
+        "feature_width": int(target_hidden.shape[-1])
+        == int(adapter.draft.config.feature_size),
+        "feature_noise_dtype_match": target_hidden.dtype == noise_embedding.dtype,
+        "feature_noise_device_match": target_hidden.device == noise_embedding.device,
+    }
+    attention = _draft_attention_contract(
+        adapter,
+        context_length=int(target_hidden.shape[1]),
+        block_length=block_length,
+    )
+    passed = (
+        all(checks.values())
+        and attention["status"] == "PASS_VLLM_0_27_1_V1_MASKS"
+    )
+    return {
+        "status": "PASS_OFFICIAL_SINGLE_FORWARD_INPUT" if passed else "FAIL_DRAFT_INPUT_CONTRACT",
+        "proposal_count": proposal_count,
+        "block_length": block_length,
+        "context_length": int(target_hidden.shape[1]),
+        "mask_token_id": int(adapter.draft.config.mask_token_id),
+        "checks": checks,
+        "block_token_fingerprint": tensor_fingerprint(block_ids),
+        "position_id_fingerprint": tensor_fingerprint(position_ids),
+        "attention": attention,
     }
 
 
@@ -548,7 +1005,7 @@ def _build_draft_inputs(
     prefix_ids: Tensor,
     target_hidden: Tensor,
     proposal_count: int,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, dict[str, object]]:
     block_length = proposal_count + 1
     block_ids = torch.full(
         (1, block_length),
@@ -564,7 +1021,18 @@ def _build_draft_inputs(
     position_ids = torch.arange(
         total_positions, dtype=torch.long, device=adapter.device
     ).unsqueeze(0)
-    return noise_embedding, position_ids
+    contract = _draft_input_contract(
+        adapter,
+        prefix_ids,
+        target_hidden,
+        block_ids,
+        noise_embedding,
+        position_ids,
+        proposal_count,
+    )
+    if contract["status"] != "PASS_OFFICIAL_SINGLE_FORWARD_INPUT":
+        raise RuntimeError("DFlash draft input no longer matches the pinned V1 contract")
+    return block_ids, noise_embedding, position_ids, contract
 
 
 def _propose_with_features(
@@ -572,8 +1040,8 @@ def _propose_with_features(
     prefix_ids: Tensor,
     target_hidden: Tensor,
     proposal_count: int,
-) -> Tensor:
-    noise_embedding, position_ids = _build_draft_inputs(
+) -> tuple[Tensor, dict[str, object]]:
+    _block_ids, noise_embedding, position_ids, input_contract = _build_draft_inputs(
         adapter, prefix_ids, target_hidden, proposal_count
     )
     with torch.inference_mode():
@@ -589,7 +1057,7 @@ def _propose_with_features(
             f"DFlash returned proposals with shape {tuple(proposals.shape)}, "
             f"expected {expected}"
         )
-    return proposals.to(torch.long)
+    return proposals.to(torch.long), input_contract
 
 
 def _trace_draft_forward(
@@ -603,7 +1071,7 @@ def _trace_draft_forward(
 ) -> tuple[Tensor, dict[str, object], dict[str, Tensor]]:
     """Run the normal one-pass draft while tracing stable model boundaries."""
 
-    noise_embedding, position_ids = _build_draft_inputs(
+    block_ids, noise_embedding, position_ids, input_contract = _build_draft_inputs(
         adapter, prefix_ids, target_hidden, proposal_count
     )
     if target_trace is None:
@@ -626,11 +1094,13 @@ def _trace_draft_forward(
             "block_first": int(target_hidden.shape[1]),
             "last": int(position_ids[0, -1].item()),
         },
+        "input_contract": input_contract,
     }
     oracle: dict[str, Tensor] = {}
     if capture_tensors:
         oracle.update(
             {
+                "input.block_ids": block_ids.detach().contiguous().cpu(),
                 "input.target_hidden": target_hidden.detach().contiguous().cpu(),
                 "input.noise_embedding": noise_embedding.detach().contiguous().cpu(),
                 "input.position_ids": position_ids.detach().contiguous().cpu(),
@@ -776,8 +1246,9 @@ def acceptance_sweep(
                 if capture_oracle:
                     assert oracle_capture is not None
                     oracle_capture.update(oracle)
+                input_contract = draft_trace["input_contract"]
             else:
-                proposed = _propose_with_features(
+                proposed, input_contract = _propose_with_features(
                     adapter, prefix, context_hidden, proposal_count
                 )
             proposals = proposed.reshape(-1)
@@ -816,6 +1287,7 @@ def acceptance_sweep(
                 "theoretical_emitted_count": theoretical_emitted_count,
                 "first_proposal_match": bool(proposals[0] == target_tokens[0]),
                 "full_block_accepted": accepted_count == row_count,
+                "draft_input_contract": input_contract,
                 "proposal_token_fingerprint": tensor_fingerprint(proposals),
                 "target_token_fingerprint": tensor_fingerprint(target_tokens),
                 "correction_or_bonus_token_fingerprint": tensor_fingerprint(
@@ -851,8 +1323,20 @@ def acceptance_sweep(
         "proposal_counts": list(proposal_counts),
         "draft_layer_trace_enabled": bool(trace_draft_layers),
         "metrics_by_proposal_count": summarize_acceptance(records, proposal_counts),
+        "phase_metrics_by_proposal_count": summarize_acceptance_phases(
+            records, proposal_counts
+        ),
         "records": records,
     }
+    round_indices = sorted({int(record["round_index"]) for record in records})
+    if round_indices:
+        phase_names = ("early", "middle", "late")
+        phase_by_round = {
+            round_index: phase_names[min(2, rank * 3 // len(round_indices))]
+            for rank, round_index in enumerate(round_indices)
+        }
+        for record in records:
+            record["round_phase"] = phase_by_round[int(record["round_index"])]
     if include_token_ids:
         result["bootstrap_anchor_token_id"] = int(anchor.item())
         result["final_prefix_token_ids"] = prefix.detach().cpu().reshape(-1).tolist()
@@ -887,6 +1371,11 @@ def _fingerprint_sha(value: object) -> str | None:
 def _record_has_complete_trace(record: Mapping[str, object]) -> bool:
     trace = record.get("draft_trace")
     if not isinstance(trace, Mapping):
+        return False
+    input_contract = trace.get("input_contract")
+    if not isinstance(input_contract, Mapping) or input_contract.get(
+        "status"
+    ) != "PASS_OFFICIAL_SINGLE_FORWARD_INPUT":
         return False
     layers = trace.get("target_feature_layers")
     if not isinstance(layers, Mapping) or not layers:
@@ -1120,6 +1609,17 @@ def compare_diagnostic_reports(
         status = "DIVERGED_IN_FIRST_ROUND"
     else:
         status = "DIVERGED_AFTER_FIRST_ROUND"
+    precision_hypothesis = (
+        "DEMOTED_TOKEN_DECISIONS_UNCHANGED_ACROSS_DTYPES"
+        if not same_dtype
+        and first is None
+        and set(reference_records) == set(candidate_records)
+        else (
+            "STILL_POSSIBLE_TOKEN_DECISIONS_DIVERGED"
+            if not same_dtype and first is not None
+            else "NOT_A_CROSS_DTYPE_COMPARISON"
+        )
+    )
     return {
         "status": status,
         "comparison_mode": (
@@ -1143,6 +1643,7 @@ def compare_diagnostic_reports(
         },
         "common_records": len(common),
         "full_draft_trace_coverage": full_trace_coverage,
+        "precision_hypothesis": precision_hypothesis,
         "reference_only_records": len(set(reference_records) - set(candidate_records)),
         "candidate_only_records": len(set(candidate_records) - set(reference_records)),
         "first_divergence": first,
@@ -1201,7 +1702,7 @@ def shadow_torch_ops(
     """Compare the active NPU draft backend with Torch ops on identical tensors."""
 
     target_hidden = adapter._replay_target_features(prefix_ids[:, :-1])
-    noise_embedding, position_ids = _build_draft_inputs(
+    _block_ids, noise_embedding, position_ids, _input_contract = _build_draft_inputs(
         adapter, prefix_ids, target_hidden, proposal_count
     )
     original_ops = adapter.draft.ops
@@ -1323,7 +1824,25 @@ def diagnose_next_actions(report: Mapping[str, object]) -> list[str]:
                 "用相同 prompt 增加轮数，确认首个分叉 round 是否稳定。",
             ]
 
+    feature_semantics = report.get("feature_collector_semantics")
+    if isinstance(feature_semantics, Mapping) and str(
+        feature_semantics.get("status", "")
+    ).startswith("FAIL_"):
+        return [
+            "先修复 framework Target feature 语义：collector 与官方 hidden_states[layer_id+1] 规则不一致。",
+            "按 layers 指标找到第一个不一致的 layer_id；检查是否误取 layer 输入、final norm 后输出或 layer_id 偏移 1。",
+            "feature 语义闭合前，不用接受率判断 draft 权重或设备算子。",
+        ]
+
     parity = report.get("target_path_parity")
+    if isinstance(parity, Mapping) and parity.get("status") == (
+        "FAIL_FRAMEWORK_INCREMENTAL_PATH"
+    ):
+        return [
+            "CPU/CUDA Target 的 use_cache=True 增量探针失败，尚不能排除 full-prefix feature 路径偏差。",
+            f"错误: {parity.get('error_type')}: {parity.get('message')}",
+            "先修复/确认 packaged Target 的 DynamicCache prefill→单 token decode，再解释 Draft 接受率。",
+        ]
     if isinstance(parity, Mapping) and parity.get("all_top1_match") is False:
         return [
             "先修复 Target 路径：增量路径与 fresh full-prefix 的 Top-1 已分叉；此时接受率没有可解释性。",
@@ -1331,6 +1850,25 @@ def diagnose_next_actions(report: Mapping[str, object]) -> list[str]:
             "核对 full-prefix 的 fresh KV/GDN state、position_ids、"
             "new_kv_cache_pos、allQLen 和 causal mask。",
         ]
+    if isinstance(parity, Mapping) and parity.get("status") == (
+        "PASS_TOP1_WITH_NUMERIC_DIFFERENCE"
+    ):
+        relative_rmse = parity.get("max_feature_relative_rmse")
+        minimum_cosine = parity.get("min_feature_cosine_similarity")
+        if (
+            isinstance(relative_rmse, (int, float))
+            and float(relative_rmse) >= 1.0e-2
+        ) or (
+            isinstance(minimum_cosine, (int, float))
+            and float(minimum_cosine) < 0.999
+        ):
+            return [
+                "Target Top-1 虽一致，但增量与 full-prefix 的 8 层特征有明显漂移；Draft 消费的是特征而不是 Target Top-1。",
+                "本次 max_feature_relative_rmse="
+                f"{relative_rmse}, min_feature_cosine_similarity={minimum_cosine}；"
+                "按 records.feature_layers 找最早漂移层。",
+                "先让 Draft 分别消费同一前缀的 cached-incremental 特征和 full-prefix 特征做 A/B；若 proposal/接受长度随之恢复，就不要改 Draft 权重数学。",
+            ]
 
     health = report.get("weight_health")
     if isinstance(health, Mapping) and int(health.get("target_qlinear_module_count", 0)):
@@ -1345,29 +1883,72 @@ def diagnose_next_actions(report: Mapping[str, object]) -> list[str]:
     k1_accuracy = k1.get("first_proposal_accuracy") if isinstance(k1, Mapping) else None
     if isinstance(k1_accuracy, (int, float)) and k1_accuracy < 0.5:
         actions = [
-            "K=1 的首 token 命中率已低，优先检查 8 层 feature 数值、草稿 checkpoint 身份和 FP16 backend。",
+            "K=1 的首 token 命中率已低，问题发生在长 block 退化之前；优先检查 8 层 feature 内容和草稿实现语义。",
             "使用 --trace-draft-layers 记录 target feature、projection、position、"
             "6 层 draft 和 Top-1 的逐轮指纹。",
+            "用 --oracle-bundle 导出首轮输入和各层输出，离线逐边界检查；首个差异边界比接受率更有定位价值。",
             "增加 --acceptance-rounds 后再判断，避免少量轮次造成偶然比例。",
         ]
+        phase_metrics = (
+            sweep.get("phase_metrics_by_proposal_count")
+            if isinstance(sweep, Mapping)
+            else None
+        )
+        if isinstance(phase_metrics, Mapping):
+            count_keys = sorted(phase_metrics, key=int)
+            largest = phase_metrics.get(count_keys[-1]) if count_keys else None
+            early = largest.get("early") if isinstance(largest, Mapping) else None
+            late = largest.get("late") if isinstance(largest, Mapping) else None
+            early_mean = (
+                early.get("mean_accepted_draft_tokens")
+                if isinstance(early, Mapping)
+                else None
+            )
+            late_mean = (
+                late.get("mean_accepted_draft_tokens")
+                if isinstance(late, Mapping)
+                else None
+            )
+            if (
+                isinstance(early_mean, (int, float))
+                and isinstance(late_mean, (int, float))
+                and float(late_mean) > float(early_mean)
+            ):
+                actions.insert(
+                    0,
+                    "接受长度呈后段上升：先区分自然文本难度与早期状态构造问题。"
+                    f"当前最大 K 的 early={float(early_mean):.3f}, "
+                    f"late={float(late_mean):.3f}；换 3 个不同 prompt 重跑，"
+                    "若上升总绑定绝对轮次则查状态，若绑定句式/内容则更像正常难度分布。",
+                )
+        precision = (
+            comparison.get("precision_hypothesis")
+            if isinstance(comparison, Mapping)
+            else None
+        )
+        if precision == "DEMOTED_TOKEN_DECISIONS_UNCHANGED_ACROSS_DTYPES":
+            actions.insert(
+                0,
+                "FP16/BF16 的逐轮 proposal、verifier 和 accepted_count 决策未变；将精度从首要嫌疑降级，检查两种精度共享的 feature/输入/草稿逻辑。",
+            )
         if report.get("device_type") == "npu":
             actions.insert(
-                2,
+                3,
                 "使用 --shadow-torch-ops 比较同一 NPU tensor 上的分解 backend "
                 "与 Torch draft；若 Top-1 不同，先收敛草稿算子。",
             )
         elif report.get("device_type") == "cuda" and report.get("dtype") == str(
             torch.float16
-        ):
+        ) and precision != "DEMOTED_TOKEN_DECISIONS_UNCHANGED_ACROSS_DTYPES":
             actions.insert(
-                2,
+                3,
                 "若 CUDA 支持 BF16，用完全相同 prompt/K/轮数重跑 --dtype "
                 "bfloat16，并用 --compare-report 对比 FP16 报告。",
             )
         return actions
     return [
         "Target 路径未见 Top-1 分叉；扩大 --acceptance-rounds 获取稳定统计。",
-        "若 K=1 稳定而 K=7/15 明显退化，打开 --trace-draft-layers 检查 block attention、位置和低精度边界。",
+        "若 K=1 稳定而 K=8/15 明显退化，打开 --trace-draft-layers 检查 block attention、位置和低精度边界。",
         "mean_theoretical_emitted_per_verify 才接近吞吐收益口径，不要把 accepted/proposed 百分比直接当官方加速指标。",
     ]
 
@@ -1463,7 +2044,7 @@ def _write_oracle_bundle(
             prepared,
             temporary_name,
             metadata={
-                "schema_version": "1",
+                "schema_version": "2",
                 "diagnostic": "qwen3.5-4b-dflash-v1-first-round-oracle",
                 "device": str(device),
                 "dtype": str(dtype),
@@ -1489,6 +2070,14 @@ def _parser() -> argparse.ArgumentParser:
     prompt = parser.add_mutually_exclusive_group()
     prompt.add_argument("--prompt-ids", help="comma-separated token IDs")
     prompt.add_argument("--prompt-json", help="JSON token list or input_ids object")
+    prompt.add_argument("--prompt", help="UTF-8 text prompt")
+    prompt.add_argument("--prompt-file", help="UTF-8 text file used as the prompt")
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("chat", "raw"),
+        default="chat",
+        help="chat applies the local Qwen chat template; raw tokenizes text directly",
+    )
     parser.add_argument("--device", default="npu:0")
     parser.add_argument(
         "--dtype",
@@ -1508,8 +2097,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--acceptance-rounds", type=int, default=8)
     parser.add_argument(
         "--proposal-counts",
-        default="1,3,7,15",
-        help="K proposal tokens; 1,3,7,15 correspond to total blocks 2,4,8,16",
+        default="1,4,8,15",
+        help=(
+            "K proposal/mask tokens; the official 16-row draft block also "
+            "contains one anchor, so K must be at most 15"
+        ),
     )
     parser.add_argument("--eos-token-id", type=int, default=OFFICIAL_EOS_TOKEN_ID)
     parser.add_argument("--shadow-torch-ops", action="store_true")
@@ -1530,7 +2122,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--oracle-bundle",
-        help="opt-in first-round .safetensors inputs/outputs for an independent official oracle",
+        help="opt-in first-round .safetensors inputs/outputs for offline boundary analysis",
     )
     parser.add_argument("--include-token-ids", action="store_true")
     parser.add_argument("--report", help="optional JSON output outside source/model dirs")
@@ -1546,8 +2138,17 @@ def _parser() -> argparse.ArgumentParser:
 def _validate_args(args: argparse.Namespace) -> tuple[int, ...]:
     if args.target_dir is None or args.draft_dir is None:
         raise ValueError("diagnosis requires --target-dir and --draft-dir")
-    if (args.prompt_ids is None) == (args.prompt_json is None):
-        raise ValueError("diagnosis requires exactly one of --prompt-ids/--prompt-json")
+    prompt_inputs = (
+        args.prompt_ids,
+        args.prompt_json,
+        args.prompt,
+        args.prompt_file,
+    )
+    if sum(value is not None for value in prompt_inputs) != 1:
+        raise ValueError(
+            "diagnosis requires exactly one of --prompt-ids, --prompt-json, "
+            "--prompt, or --prompt-file"
+        )
     device_type = str(args.device).split(":", 1)[0].lower()
     if device_type not in {"cpu", "cuda", "npu"}:
         raise ValueError("--device must be cpu, cuda, cuda:N, npu, or npu:N")
@@ -1593,6 +2194,14 @@ def _print_summary(report: Mapping[str, object]) -> None:
         parity["status"],
         f"({parity['comparisons']} 个前缀)",
     )
+    print(
+        "Target 特征路径指标:",
+        f"max_relative_rmse={parity.get('max_feature_relative_rmse')}",
+        f"min_cosine={parity.get('min_feature_cosine_similarity')}",
+    )
+    feature_semantics = report.get("feature_collector_semantics")
+    if isinstance(feature_semantics, Mapping):
+        print("Feature layer_id+1 语义:", feature_semantics.get("status"))
     parity_records = parity.get("records")
     if isinstance(parity_records, Sequence):
         for record in parity_records:
@@ -1617,6 +2226,11 @@ def _print_summary(report: Mapping[str, object]) -> None:
                 if isinstance(feature_metrics, Mapping)
                 else None
             )
+            feature_relative_rmse = (
+                feature_metrics.get("relative_rmse")
+                if isinstance(feature_metrics, Mapping)
+                else None
+            )
             print(
                 "首个差异前缀:",
                 f"length={record.get('prefix_length')}",
@@ -1624,6 +2238,7 @@ def _print_summary(report: Mapping[str, object]) -> None:
                 f"top1_match={record.get('top1_match')}",
                 f"logits_max_abs={logits_max_abs}",
                 f"feature_max_abs={feature_max_abs}",
+                f"feature_relative_rmse={feature_relative_rmse}",
             )
             break
     metrics = sweep["metrics_by_proposal_count"]
@@ -1648,6 +2263,56 @@ def _print_summary(report: Mapping[str, object]) -> None:
             f"{percent(first):>9}  {number(accepted):>13}  "
             f"{number(emitted):>14}  {percent(full):>10}"
         )
+    phase_metrics = sweep.get("phase_metrics_by_proposal_count")
+    if isinstance(phase_metrics, Mapping):
+        print("\n分段 mean-accepted (early / middle / late):")
+        for proposal_count in sweep["proposal_counts"]:
+            by_phase = phase_metrics.get(str(proposal_count))
+            if not isinstance(by_phase, Mapping):
+                continue
+            values: list[str] = []
+            for phase in ("early", "middle", "late"):
+                item = by_phase.get(phase)
+                value = (
+                    item.get("mean_accepted_draft_tokens")
+                    if isinstance(item, Mapping)
+                    else None
+                )
+                values.append("n/a" if value is None else f"{float(value):.3f}")
+            print(f"K={int(proposal_count):2d}: " + " / ".join(values))
+    records = sweep.get("records")
+    if isinstance(records, Sequence) and records:
+        first_record = records[0]
+        if isinstance(first_record, Mapping):
+            input_contract = first_record.get("draft_input_contract")
+            if isinstance(input_contract, Mapping):
+                attention = input_contract.get("attention")
+                attention_status = (
+                    attention.get("status") if isinstance(attention, Mapping) else None
+                )
+                print(
+                    "首轮输入合同:",
+                    input_contract.get("status"),
+                    f"attention={attention_status}",
+                )
+        maximum_k = max(int(value) for value in sweep["proposal_counts"])
+        maximum_records = [
+            record
+            for record in records
+            if isinstance(record, Mapping)
+            and int(record.get("requested_proposal_count", -1)) == maximum_k
+        ]
+        print(
+            f"逐轮接受长度(K={maximum_k}):",
+            " ".join(
+                f"r{int(record['round_index'])}:{int(record['accepted_count'])}"
+                for record in maximum_records
+            ),
+        )
+    text_output = report.get("text_output")
+    if isinstance(text_output, Mapping):
+        print("\nTarget 续写文本:")
+        print(text_output.get("text", ""))
     comparison = report.get("report_comparison")
     if isinstance(comparison, Mapping):
         print("\n跨报告比较:", comparison.get("status"))
@@ -1755,12 +2420,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     prompt_json_path = (
         None if args.prompt_json is None else Path(args.prompt_json).expanduser().resolve()
     )
-    input_paths = {path for path in (comparison_path, prompt_json_path) if path is not None}
+    prompt_file_path = (
+        None if args.prompt_file is None else Path(args.prompt_file).expanduser().resolve()
+    )
+    input_paths = {
+        path
+        for path in (comparison_path, prompt_json_path, prompt_file_path)
+        if path is not None
+    }
     if report_path is not None and report_path in input_paths:
-        raise ValueError("--report must not overwrite --compare-report or --prompt-json")
+        raise ValueError(
+            "--report must not overwrite a comparison report or prompt input file"
+        )
     if oracle_path is not None and oracle_path in input_paths:
         raise ValueError(
-            "--oracle-bundle must not overwrite --compare-report or --prompt-json"
+            "--oracle-bundle must not overwrite a comparison report or prompt input file"
         )
     reference_report = (
         None if args.compare_report is None else _read_report(args.compare_report)
@@ -1799,7 +2473,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         draft_root, ops=ops, device=args.device, dtype=dtype
     )
     adapter = Qwen35DFlashFullPrefixAdapter(target, draft)
-    prompt_values = _prompt_ids(args.prompt_ids, args.prompt_json)
+    tokenizer: object | None = None
+    if args.prompt is not None or prompt_file_path is not None:
+        if prompt_file_path is not None:
+            if not prompt_file_path.is_file():
+                raise FileNotFoundError(
+                    f"--prompt-file is not a regular file: {prompt_file_path}"
+                )
+            prompt_text = prompt_file_path.read_text(encoding="utf-8")
+        else:
+            prompt_text = str(args.prompt)
+        prompt_values, tokenizer = _tokenize_prompt_text(
+            prompt_text,
+            target_root=target_root,
+            prompt_mode=args.prompt_mode,
+        )
+    else:
+        prompt_values = _prompt_ids(args.prompt_ids, args.prompt_json)
     if any(token < 0 or token >= adapter.vocab_size for token in prompt_values):
         raise ValueError("prompt contains a token outside the target vocabulary")
     prompt = torch.tensor(
@@ -1811,26 +2501,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if int(prompt.shape[1]) + max(proposal_counts) + args.acceptance_rounds + 1 > context_limit:
         raise ValueError("prompt plus diagnostic sweep exceeds the configured context")
 
-    if device_type == "npu":
-        target_path_parity = compare_target_paths(
-            target,
-            prompt,
-            decode_steps=args.target_parity_decode_steps,
-            eos_token_id=args.eos_token_id,
-            layer_ids=draft.config.target_layer_ids,
-            hidden_size=draft.config.hidden_size,
-            include_token_ids=args.include_token_ids,
-        )
-    else:
-        target_path_parity = {
-            "status": "NOT_APPLICABLE_FRAMEWORK_FULL_PREFIX_ONLY",
-            "comparisons": 0,
-            "records": [],
-            "message": (
-                "CPU/CUDA package target has no receiver persistent-state path; "
-                "use same-prompt report comparison for device/dtype localization"
-            ),
-        }
+    target_path_function = (
+        compare_target_paths
+        if device_type == "npu"
+        else compare_framework_target_paths
+    )
+    target_path_parity = target_path_function(
+        target,
+        prompt,
+        decode_steps=args.target_parity_decode_steps,
+        eos_token_id=args.eos_token_id,
+        layer_ids=draft.config.target_layer_ids,
+        hidden_size=draft.config.hidden_size,
+        include_token_ids=args.include_token_ids,
+    )
+    feature_semantics = compare_feature_collector_semantics(
+        target,
+        prompt,
+        layer_ids=draft.config.target_layer_ids,
+        hidden_size=draft.config.hidden_size,
+        device_type=device_type,
+    )
     first_full_logits, first_full_features = _full_prefix_output(target, prompt)
     del first_full_logits
     weight_health = _weight_health(adapter)
@@ -1840,16 +2531,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         draft.config.hidden_size,
     )
     oracle_capture: dict[str, Tensor] | None = {} if oracle_path is not None else None
+    capture_text_ids = tokenizer is not None
     sweep = acceptance_sweep(
         adapter,
         prompt,
         proposal_counts=proposal_counts,
         rounds=args.acceptance_rounds,
         eos_token_id=args.eos_token_id,
-        include_token_ids=args.include_token_ids,
+        include_token_ids=bool(args.include_token_ids or capture_text_ids),
         trace_draft_layers=bool(args.trace_draft_layers),
         oracle_capture=oracle_capture,
     )
+
+    text_output: dict[str, object] | None = None
+    if tokenizer is not None:
+        final_prefix_ids = sweep.get("final_prefix_token_ids")
+        if not isinstance(final_prefix_ids, list):
+            raise RuntimeError("text diagnosis did not retain the generated prefix")
+        continuation_ids = final_prefix_ids[len(prompt_values) :]
+        decode = getattr(tokenizer, "decode", None)
+        if not callable(decode):
+            raise TypeError("local tokenizer does not expose decode")
+        text_output = {
+            "source": "ordinary_target_greedy_prefix_sweep",
+            "generated_token_count": len(continuation_ids),
+            "text": decode(continuation_ids, skip_special_tokens=False),
+        }
+        if not args.include_token_ids:
+            sweep.pop("bootstrap_anchor_token_id", None)
+            sweep.pop("final_prefix_token_ids", None)
+            records = sweep.get("records")
+            if isinstance(records, Sequence):
+                for record in records:
+                    if isinstance(record, dict):
+                        record.pop("proposal_token_ids", None)
+                        record.pop("target_token_ids", None)
+                        record.pop("correction_or_bonus_token_id", None)
 
     shadow: dict[str, object] | None = None
     if args.shadow_torch_ops and int(sweep["rounds_completed"]) > 0:
@@ -1880,7 +2597,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
 
     report: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "diagnostic": "qwen3.5-4b-dflash-v1-acceptance",
         "device": str(args.device),
         "device_type": device_type,
@@ -1900,8 +2617,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "weight_health": weight_health,
         "feature_health": feature_health,
+        "feature_collector_semantics": feature_semantics,
         "target_path_parity": target_path_parity,
         "acceptance_sweep": sweep,
+        "text_output": text_output,
         "shadow_torch_ops": shadow,
         "oracle_bundle": oracle_identity,
     }
@@ -1931,11 +2650,13 @@ if __name__ == "__main__":
 __all__ = [
     "acceptance_sweep",
     "compare_diagnostic_reports",
+    "compare_framework_target_paths",
     "compare_target_paths",
     "diagnose_next_actions",
     "main",
     "parse_proposal_counts",
     "summarize_acceptance",
+    "summarize_acceptance_phases",
     "tensor_fingerprint",
     "tensor_metrics",
 ]

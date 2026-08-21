@@ -13,8 +13,9 @@ The adapter implements both protocols consumed by
 * ``propose(prefix_ids, K)`` builds ``[anchor, K * mask]`` and runs the
   official six-layer DFlash draft with the target embedding and LM head.
 
-``block_size`` includes the clean anchor.  Therefore the official Qwen3.5
-checkpoint's block size 16 exposes at most 15 proposal tokens per round.
+The checkpoint ``block_size`` counts all draft query rows, including the clean
+anchor.  Therefore ``max_draft_tokens=K`` uses ``K+1`` rows and the official
+``block_size=16`` checkpoint supports at most 15 proposal tokens.
 """
 
 from __future__ import annotations
@@ -218,7 +219,7 @@ def _proposal_count(value: int, *, maximum: int) -> int:
         raise ValueError(
             "max_draft_tokens exceeds the DFlash proposal capacity: "
             f"requested {count}, maximum {maximum} "
-            "(checkpoint block_size includes one clean anchor)"
+            "(checkpoint block_size counts K proposals plus one anchor row)"
         )
     return count
 
@@ -327,7 +328,7 @@ class Qwen35DFlashFullPrefixAdapter:
 
     @property
     def max_proposal_tokens(self) -> int:
-        # Official DFlash's configured block contains anchor + proposals.
+        # The official checkpoint's block_size counts the clean anchor row.
         return int(self.draft.config.block_size) - 1
 
     def reset_stats(self) -> None:
@@ -373,7 +374,9 @@ class Qwen35DFlashFullPrefixAdapter:
                 f"{self.input_embedding_weight.dtype}"
             )
         if self.max_proposal_tokens <= 0:
-            raise ValueError("DFlash block_size must leave room for a proposal")
+            raise ValueError(
+                "DFlash block_size must contain one anchor and at least one proposal"
+            )
 
     def _target_forward(
         self,
@@ -1629,14 +1632,107 @@ def _prompt_ids(raw: str | None, json_path: str | None) -> list[int]:
     return result
 
 
+def _tokenize_prompt_text(
+    text: str,
+    *,
+    target_root: Path,
+    prompt_mode: str,
+) -> tuple[list[int], object]:
+    """Encode one UTF-8 prompt with the target's local tokenizer."""
+
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("text prompt must not be empty")
+    from transformers import AutoTokenizer
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            target_root,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "text prompt input requires a complete tokenizer in --target-dir "
+            "(including tokenizer.json or the tokenizer's equivalent model files)"
+        ) from error
+    if prompt_mode == "chat":
+        messages = [{"role": "user", "content": text}]
+        template_kwargs = {
+            "tokenize": True,
+            "add_generation_prompt": True,
+            "return_tensors": "pt",
+            "enable_thinking": False,
+        }
+        try:
+            encoded = tokenizer.apply_chat_template(messages, **template_kwargs)
+        except TypeError:
+            # Older compatible tokenizer implementations may not expose the
+            # Qwen ``enable_thinking`` extension.
+            template_kwargs.pop("enable_thinking")
+            encoded = tokenizer.apply_chat_template(messages, **template_kwargs)
+        input_ids = (
+            encoded.get("input_ids") if isinstance(encoded, Mapping) else encoded
+        )
+    elif prompt_mode == "raw":
+        encoded = tokenizer(text, return_tensors="pt")
+        input_ids = encoded.get("input_ids") if isinstance(encoded, Mapping) else None
+    else:
+        raise ValueError("--prompt-mode must be chat or raw")
+    if not isinstance(input_ids, Tensor):
+        raise TypeError("local tokenizer did not return Tensor input_ids")
+    if input_ids.ndim == 1:
+        input_ids = input_ids.unsqueeze(0)
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+        raise ValueError("encoded prompt must have shape [1,S] with S > 0")
+    return [int(value) for value in input_ids[0].tolist()], tokenizer
+
+
+def _resolve_prompt(
+    args: argparse.Namespace,
+    *,
+    target_root: Path,
+) -> tuple[list[int], object | None]:
+    """Resolve token-ID or text input without putting prompt text in reports."""
+
+    prompt_file = getattr(args, "prompt_file", None)
+    prompt_text = getattr(args, "prompt", None)
+    if prompt_text is not None or prompt_file is not None:
+        if prompt_file is not None:
+            path = Path(prompt_file).expanduser()
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"--prompt-file is not a regular file: {path.resolve()}"
+                )
+            prompt_text = path.read_text(encoding="utf-8")
+        assert prompt_text is not None
+        return _tokenize_prompt_text(
+            str(prompt_text),
+            target_root=target_root,
+            prompt_mode=str(getattr(args, "prompt_mode", "chat")),
+        )
+    return _prompt_ids(
+        getattr(args, "prompt_ids", None),
+        getattr(args, "prompt_json", None),
+    ), None
+
+
 def _request_payload(
     args: argparse.Namespace,
     *,
     effective_max_draft_tokens: int,
+    prompt_token_ids: Sequence[int],
 ) -> dict[str, object]:
     """Return non-secret controls needed to reproduce one CLI validation."""
 
     formal_npu = str(getattr(args, "device", "cpu")).split(":", 1)[0].lower() == "npu"
+    if getattr(args, "prompt", None) is not None:
+        prompt_source = "inline_text"
+    elif getattr(args, "prompt_file", None) is not None:
+        prompt_source = "text_file"
+    elif getattr(args, "prompt_ids", None) is not None:
+        prompt_source = "inline_token_ids"
+    else:
+        prompt_source = "json_file"
     return {
         "max_new_tokens": int(args.max_new_tokens),
         "requested_max_draft_tokens": args.max_draft_tokens,
@@ -1645,7 +1741,19 @@ def _request_payload(
         "formal_locked_eos_token_id": (
             _FORMAL_EOS_TOKEN_ID if formal_npu else None
         ),
-        "prompt_source": "inline_token_ids" if args.prompt_ids is not None else "json_file",
+        "prompt_source": prompt_source,
+        "prompt_token_count": len(prompt_token_ids),
+        "prompt_token_sha256": hashlib.sha256(
+            json.dumps(
+                [int(token) for token in prompt_token_ids],
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "prompt_mode": (
+            str(getattr(args, "prompt_mode", "chat"))
+            if prompt_source in {"inline_text", "text_file"}
+            else None
+        ),
         "target_loader": args.target_loader or "package_default",
         "npu_layout": getattr(args, "npu_layout", None),
         "target_factory": getattr(args, "target_factory", None),
@@ -1662,9 +1770,25 @@ def _request_payload(
     }
 
 
-def _decode_payload(result: ReplayDecodeResult) -> dict[str, Any]:
+def _decode_payload(
+    result: ReplayDecodeResult,
+    *,
+    tokenizer: object | None = None,
+) -> dict[str, Any]:
     payload = asdict(result)
     payload["stats"]["acceptance_rate"] = result.stats.acceptance_rate
+    if tokenizer is not None:
+        # A text prompt's token IDs can be decoded back into its content.  Keep
+        # only the count/hash in the request metadata and the requested model
+        # continuation in this payload.
+        payload.pop("prompt_token_ids", None)
+        decode = getattr(tokenizer, "decode", None)
+        if not callable(decode):
+            raise TypeError("local tokenizer does not expose decode")
+        payload["generated_text"] = decode(
+            list(result.generated_token_ids),
+            skip_special_tokens=True,
+        )
     return payload
 
 
@@ -1722,11 +1846,22 @@ def _parser() -> argparse.ArgumentParser:
     prompt = parser.add_mutually_exclusive_group(required=True)
     prompt.add_argument("--prompt-ids", help="comma-separated token IDs")
     prompt.add_argument("--prompt-json", help="JSON token list or input_ids object")
+    prompt.add_argument("--prompt", help="UTF-8 prompt text")
+    prompt.add_argument("--prompt-file", help="path to a UTF-8 prompt text file")
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("chat", "raw"),
+        default="chat",
+        help="chat applies the local Qwen chat template; raw tokenizes text directly",
+    )
     parser.add_argument("--max-new-tokens", type=int, required=True)
     parser.add_argument(
         "--max-draft-tokens",
         type=int,
-        help="proposal count; default is checkpoint block_size minus one anchor",
+        help=(
+            "proposal count K; the checkpoint block has one anchor plus K "
+            "proposal rows (official maximum: 15)"
+        ),
     )
     parser.add_argument("--eos-token-id", type=int, action="append", default=[])
     parser.add_argument("--device", default="cpu")
@@ -1843,6 +1978,9 @@ def _validate_report_destination(
     prompt_json = getattr(args, "prompt_json", None)
     if prompt_json is not None:
         protected_files.add(Path(prompt_json).expanduser().resolve())
+    prompt_file = getattr(args, "prompt_file", None)
+    if prompt_file is not None:
+        protected_files.add(Path(prompt_file).expanduser().resolve())
     if resolved in protected_files:
         raise ValueError("--report overlaps a validated input file")
     protected_roots = {
@@ -1999,6 +2137,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # capabilities (notably BF16 on heterogeneous multi-GPU systems).
     _prepare_device_backend(args.device)
     _validate_experiment_dtype(args.device, dtype)
+    target_root = Path(args.target_dir).expanduser().resolve()
+    prompt_ids, tokenizer = _resolve_prompt(args, target_root=target_root)
     _emit_progress(
         args.progress,
         "draft_checkpoint_audit_begin",
@@ -2061,7 +2201,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     _emit_progress(args.progress, "draft_load_end", {})
     adapter = Qwen35DFlashFullPrefixAdapter(target, draft)
-    prompt_ids = _prompt_ids(args.prompt_ids, args.prompt_json)
     _emit_progress(
         args.progress,
         "validation_begin",
@@ -2182,9 +2321,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.max_draft_tokens is None
                 else args.max_draft_tokens
             ),
+            prompt_token_ids=prompt_ids,
         ),
-        "ordinary": _decode_payload(result.ordinary),
-        "dflash": _decode_payload(result.dflash),
+        "ordinary": _decode_payload(result.ordinary, tokenizer=tokenizer),
+        "dflash": _decode_payload(result.dflash, tokenizer=tokenizer),
         "ordinary_adapter_stats": asdict(result.ordinary_adapter_stats),
         "dflash_adapter_stats": asdict(result.dflash_adapter_stats),
     }
@@ -2219,6 +2359,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ]["status"],
         },
     )
+    if tokenizer is not None:
+        print("\n=== Ordinary Target 输出 ===", file=sys.stderr)
+        print(report["ordinary"]["generated_text"], file=sys.stderr)
+        print("\n=== DFlash 输出 ===", file=sys.stderr)
+        print(report["dflash"]["generated_text"], file=sys.stderr)
+        print(file=sys.stderr)
     print(serialized)
     return 0
 
