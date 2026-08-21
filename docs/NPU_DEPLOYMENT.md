@@ -185,10 +185,12 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --kv-cache-max-len 4096 \
   --prompt-ids 151644,872,198 \
   --device npu:0 \
+  --dtype float16 \
   --eos-token-id 248044 \
   --target-parity-decode-steps 4 \
   --acceptance-rounds 16 \
   --proposal-counts 1,3,7,15 \
+  --trace-draft-layers \
   --report "$RUN_DIR/dflash-v1-acceptance-diagnosis.json" \
   2>&1 | tee "$RUN_DIR/dflash-v1-acceptance-diagnosis.log"
 ```
@@ -232,6 +234,56 @@ SHA-256；只有临时缩短排查时间时才使用 `--no-verify-draft-sha256`�
 需要进一步区分草稿 backend 时，加 `--shadow-torch-ops`。它在同一 NPU、同一组输入和
 同一份权重上，把当前分解 backend 与 `TorchDFlashOps` 做一次 shadow 比较；如果该环境的
 NPU SDPA 不支持，会明确显示 `SKIPPED_TORCH_OPS_UNSUPPORTED`，不会伪装成通过。
+
+`--trace-draft-layers` 会为每个 round/K 记录无明文 SHA-256 和数值健康信息，边界依次包括：
+
+```text
+8 层 target feature
+→ fc / hidden_norm
+→ noise embedding / position / rotary
+→ draft layer 0..5
+→ final norm / draft hidden
+→ proposal / verifier Top-1
+```
+
+这会增加设备同步和 D2H 诊断开销，只用于定位，不用于性能计时。报告默认仍不含 prompt 或
+生成 token 明文。
+
+### 与 GPU FP16 报告逐轮比较
+
+必须使用同一 prompt、同一 `proposal-counts` 和同一轮数。先按 GPU 文档生成带
+`--trace-draft-layers` 的 FP16 报告，再在 NPU 命令中增加：
+
+```text
+--compare-report "$RUN_DIR/gpu-fp16-diagnosis.json"
+```
+
+结果解释：
+
+- `MATCH_ON_ALL_RECORDED_ROUNDS`：相同 dtype 下，公共 round 的输入、各层和 token 指纹均
+  一致；NPU 独有草稿算子不再是当前首要嫌疑。
+- `DIVERGED_IN_FIRST_ROUND`：首轮没有历史 draft cache，优先看报告中的
+  `first_divergence.boundary`，排查输入、feature、position、dtype 或对应草稿层。
+- `DIVERGED_AFTER_FIRST_ROUND`：首轮一致而后续分叉，优先查 committed prefix、Target
+  replay 与状态/缓存演进。
+- `*_TOKEN_LEVEL_ONLY`：至少一份报告没开层级追踪，结论只覆盖 proposal/verifier token，
+  不能定位内部首个浮点边界。
+
+DFlash V1 每轮只有一次并行 draft forward；不要为提高接受率增加逐个 mask 替换和重复
+draft 的循环，那会改变算法。
+
+### 导出单轮 oracle 输入
+
+需要把当前实现与独立官方实现逐层对照时，可额外传：
+
+```text
+--oracle-bundle "$RUN_DIR/first-round-k15.safetensors"
+```
+
+文件包含首轮最大 K 的 `target_hidden`、noise embedding、position、projection、rotary、六层
+输出、final hidden 和 Top-1，不含模型权重。它含有原始中间 tensor，可能承载输入相关信息，
+只放在受控 `RUN_DIR`，不要提交 Git。独立 oracle 必须加载同一 checkpoint 和 target
+embedding/LM head；这个 bundle 本身不是官方一致性 PASS。
 
 诊断只覆盖有限轮次，不能单独证明整网性能或所有长度下的状态正确性。建议先用 16 轮定位，
 再把 `--acceptance-rounds` 提高到 64 或更多确认趋势。

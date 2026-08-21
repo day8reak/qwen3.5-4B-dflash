@@ -99,3 +99,61 @@ PY
 ```
 
 只有 `cuda available: True` 后，前面的真实权重 smoke 才能用于判断 CUDA 路线是否跑通。
+
+## 接受率诊断：先做 FP16/BF16 A/B
+
+GPU 和 NPU 都使用 FP16 时结果相同，只能降低设备独有问题的优先级，不能排除 FP16 本身。
+在 `torch.cuda.is_bf16_supported()` 为真时，对同一 prompt、同一 K 和同一轮数分别运行：
+
+```bash
+set -euo pipefail
+: "${TARGET_DIR:?}" "${DRAFT_DIR:?}" "${RUN_DIR:?}"
+MODEL_PYTHON="${MODEL_PYTHON:-python}"
+mkdir -p "$RUN_DIR"
+export PYTHONDONTWRITEBYTECODE=1
+unset PYTHONPYCACHEPREFIX
+export PYTHONPATH="$PWD"
+
+for DTYPE in float16 bfloat16; do
+  "$MODEL_PYTHON" -B -m models.dflash_v1.diagnose_acceptance \
+    --target-dir "$TARGET_DIR" \
+    --draft-dir "$DRAFT_DIR" \
+    --prompt-ids 151644,872,198 \
+    --device cuda:0 \
+    --dtype "$DTYPE" \
+    --eos-token-id 248044 \
+    --acceptance-rounds 16 \
+    --proposal-counts 1,3,7,15 \
+    --trace-draft-layers \
+    --report "$RUN_DIR/gpu-$DTYPE-diagnosis.json" \
+    2>&1 | tee "$RUN_DIR/gpu-$DTYPE-diagnosis.log"
+done
+```
+
+CUDA 路线不需要 `--kv-cache-max-len`，也不传 NPU loader/factory/backend 参数。BF16 不支持
+时命令会在加载大权重之前拒绝，不能把跳过 BF16 写成数值等价。
+
+然后直接比较两个已有报告，不再重复加载权重：
+
+```bash
+"$MODEL_PYTHON" -B -m models.dflash_v1.diagnose_acceptance \
+  --compare-reports \
+    "$RUN_DIR/gpu-float16-diagnosis.json" \
+    "$RUN_DIR/gpu-bfloat16-diagnosis.json" \
+  --report "$RUN_DIR/gpu-bfloat16-vs-float16.json"
+```
+
+跨 dtype 时浮点 tensor 的原始 SHA 必然不同，因此工具只比较 prefix、position、proposal、
+verifier token 和接受率指标，不会把 BF16/FP16 的浮点 hash 差异误报成某层实现错误。重点看：
+
+- `K=1 first_proposal_accuracy`；
+- `mean_theoretical_emitted_per_verify`；
+- `metric_deltas_by_proposal_count`；
+- proposal 首次发生变化的 round。
+
+如果 BF16 明显恢复，优先定位低精度边界；如果同 dtype GPU/NPU 的逐轮层级指纹全部相同，
+则先查共享的草稿实现、调度或评测 workload，而不是 NPU 独有算子。
+
+一条短 prompt 不能代表官方多数据集平均接受长度。定位时先用固定 prompt 找首个分叉，之后
+再用多条代表性 prompt 汇总 `emitted/verify` 分布。DFlash V1 是每轮一次并行 block 预测，
+不要加入逐 mask 迭代替换。
