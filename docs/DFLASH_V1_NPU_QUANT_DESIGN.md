@@ -452,6 +452,19 @@ def quantize_target(model, artifact_path):
 
 ## 13. CPU/CUDA W8A8 公式仿真
 
+在取得真实 artifact 之前，可以先运行：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.validate_w8a8_cpu \
+  --report "$RUN_DIR/cpu-w8a8-formula.json"
+```
+
+这个无权重自检覆盖 Linear 的 `in_features=2560/9728`、两种 scale 粒度、零输入行和重复执行，
+并要求最终 FP16
+输出与独立 INT64 accumulator oracle 逐 bit 相同。它只验证 CPU 公式实现，不验证部署 artifact、
+input provider 或 NPU kernel。
+
 `--export-w8a8-emulation-artifact` 会从已经通过装配审计的真实量化 Target 中逐个导出
 `QLinear.W_q` 和 `QLinear.scale`。每个 Linear 单独保存为 safetensors，避免导出 4B Target 时
 额外聚合一份完整 INT8 权重到内存。manifest 同时记录 NPU 文本模型路径和 framework Target

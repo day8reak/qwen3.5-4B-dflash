@@ -46,6 +46,9 @@ query 是 1 个 anchor 加 16 个 mask，共 17 行。诊断报告始终明确�
 - `w8a8_emulation.py`：从真实量化 Target 导出的同一份 `W_q/scale` 构造 CPU/CUDA
   correctness-only Linear；严格执行 per-token INT8、INT32 accumulator 和 FP16 输出，不做
   性能声明，也不代替真实 NPU same-activation parity。
+- `validate_w8a8_cpu.py`：不需要模型权重或 NPU 的确定性 CPU 自检；覆盖 Qwen 投影常见
+  `in_features=2560/9728`、per-tensor/per-channel scale、零输入行、重复执行，并用独立 INT64
+  accumulator 对最终 FP16 输出做逐 bit 校验。
 - `internal_target_loader.py`：把已实现的 bridge 包装成 DFlash target facade。
 - `internal_target_loader_template.py`：facade 合同及自定义 loader 参考。
 - `dflash_target_hook_bridge.py`：仅供 eager/CPU 调试的 hook 方案。
@@ -61,6 +64,7 @@ query 是 1 个 anchor 加 16 个 mask，共 17 行。诊断报告始终明确�
 ```bash
 python -m models.dflash_v1.run_npu --help
 python -m models.dflash_v1.preflight_target_quant --help
+python -m models.dflash_v1.validate_w8a8_cpu --help
 python -m models.dflash_v1.diagnose_acceptance --help
 python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
 ```

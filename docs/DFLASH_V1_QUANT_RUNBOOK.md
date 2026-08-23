@@ -75,6 +75,8 @@ FP16 DFlash Draft（6 层，checkpoint 不变）
 - `models/internal_dflash_bridge.py`：调用量化器和 input provider；每次 Target forward 新建
   KV/GDN state。
 - `models/dflash_v1/w8a8_emulation.py`：CPU/CUDA 上复现 `QLinear` 的 W8A8 数学公式。
+- `models/dflash_v1/validate_w8a8_cpu.py`：无权重、无 NPU 的 CPU 公式自检；先排除本地
+  dynamic-quant、整数累加和 FP16 反量化实现错误。
 - `models/dflash_v1/dflash_qwen_adapter_v1.py`：加载 Target/Draft、执行严格 greedy 对照并生成
   报告。
 - `models/dflash_v1/diagnose_acceptance.py`：接受率、首个 proposal 分叉和分层诊断。
@@ -216,7 +218,41 @@ print("npu_available=", torch.npu.is_available())
 PY
 ```
 
-## 6. 第一步：只跑量化 Target 预检
+## 6. 第零步：先验证当前 CPU 环境里的 W8A8 公式
+
+这一步不读 Target/Draft 权重，也不需要量化 artifact 或 NPU。它使用固定随机种子运行两种
+Qwen 常见 Linear 输入维：`in_features=2560`（hidden 投影）和 `in_features=9728`（MLP down
+projection），同时覆盖
+per-output-channel/per-tensor scale、全零 token、重复执行和 INT32 溢出上界。
+
+这里的矩阵内积维有时也记作 `K`，与 DFlash 的 proposal 数 `K=1..16` 不是同一个概念。
+
+```bash
+set -euo pipefail
+
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.validate_w8a8_cpu \
+  --report "$RUN_DIR/cpu-w8a8-formula.json"
+```
+
+成功时最后状态为：
+
+```text
+PASS_CPU_W8A8_FORMULA_CONTRACT
+```
+
+每个 case 还必须是 `PASS_BITWISE_INT64_ORACLE`。这表示优化后的 CPU INT8→INT32 路径与独立
+INT64 accumulator oracle 的最终 FP16 输出逐 bit 相同，并且零输入行精确输出零。
+
+这里特意不构造完整 `[2560,248320]` LM-head 随机矩阵：输出列数不改变每个元素的整数
+累加规则，却会无意义地申请数百 MB 内存。真正的 LM head 仍由第 8 节从 NPU 导出的实际
+artifact 做整网装配验证。
+
+这个 PASS **不能**证明：量化 artifact 格式、量化 embedding/input provider、真实 NPU
+rounding、整网 token/feature 或接受率。若这一步失败，先不要加载 4B 权重；若它通过但 NPU
+单层对照失败，问题在设备公式/scale/输入，而不是 CPU accumulator。
+
+## 7. 第一步：只跑量化 Target 预检
 
 先把固定 prompt 转成一小段合法 token ID，或者直接从普通推理日志中选择同一段。假设：
 
@@ -288,7 +324,7 @@ PY
 容差判断；不要临时放宽阈值。它也**不证明**其他 QLinear、普通增量量化推理等价、完整
 DFlash token 零差异、接受率或性能。
 
-## 7. 第二步：CPU 复现同一份 W8A8 Linear
+## 8. 第二步：CPU 复现同一份 W8A8 Linear
 
 CPU 路线读取上一步导出的 `w8a8-linear-artifact`，在 framework Target 中把对应文本 Linear
 替换成公式仿真模块。它不会量化 Draft，也不会仿真量化 embedding/input provider。
@@ -350,11 +386,11 @@ PY
 这个 PASS 证明 CPU 上同一仿真 Target 的 ordinary 与 DFlash 调度自洽；它仍不能证明真实 NPU
 `npu_dynamic_quant/npu_quant_matmul` 的 rounding、scale 解释和 accumulation 与公式完全一致。
 
-## 8. 第三步：同 activation 的单层 NPU/CPU 对照
+## 9. 第三步：同 activation 的单层 NPU/CPU 对照
 
 这是区分“Linear 公式不一致”和“整网其他部分不一致”的最有效步骤。
 
-第 6 节的 `--compare-first-qlinear` 已经自动完成第一层对照：它给真实 QLinear 注册临时
+第 7 节的 `--compare-first-qlinear` 已经自动完成第一层对照：它给真实 QLinear 注册临时
 pre-hook/forward-hook，在**同一次 Target forward** 中抓取 activation 和 NPU output，Target 返回后
 立即用相同 `W_q/scale` 在 CPU 重算。报告位置：
 
@@ -390,7 +426,7 @@ same_activation_qlinear.comparisons[0].npu_output_vs_cpu_formula
   64-token padding。
 - 单层只在特定 K/N shape 分叉：查对应 QLinear artifact 的转置和 scale 长度。
 
-## 9. 第四步：普通增量量化 Target 对照 fresh full-prefix
+## 10. 第四步：普通增量量化 Target 对照 fresh full-prefix
 
 这一步验证 Bridge 不是“只和自己一致”。诊断器会用同一个量化 input provider：一边保持
 KV/GDN state 做 prefill→单 token decode，另一边每个位置重新建立 fresh state、重算完整前缀。
@@ -444,7 +480,7 @@ PY
 若 Top-1 相同但 feature 数值不同，先看每个 `records[*].feature_layers`，找到最早漂移的层。
 Draft 消费的是 feature，因此不能只看 Target Top-1。
 
-## 10. 第五步：完整量化 NPU DFlash
+## 11. 第五步：完整量化 NPU DFlash
 
 前面四步通过后，再做正式的长输出检查：
 
@@ -510,11 +546,12 @@ PY
 注意：最后这行只代表 framework/调度门禁。还需要设备 trace 证明没有 CPU fallback，才可以称为
 真实 NPU 路线通过；接受率和性能也必须单独测量。
 
-## 11. 四类比较分别回答什么
+## 12. 五类比较分别回答什么
 
 | 比较 | 回答的问题 | 不能回答的问题 |
 |---|---|---|
-| CPU 公式 vs INT64 oracle | 仿真里的整数累加是否正确 | NPU kernel 是否同公式 |
+| CPU 合成公式 vs INT64 oracle | 当前 PyTorch CPU dynamic-quant/累加/反量化实现是否自洽 | artifact、embedding、NPU kernel 或整网 |
+| 真实 artifact 的 CPU 整网 ordinary vs DFlash | 同一仿真 Target 下调度是否保持 greedy | NPU kernel、量化 embedding 或业务精度 |
 | 同 activation：NPU QLinear vs CPU 公式 | dynamic quant、scale、matmul 数值是否一致 | 整网 state/attention 是否一致 |
 | 普通增量量化 Target vs fresh full-prefix Target | Bridge 是否等价于正常量化推理 | Draft 接受率是否正常 |
 | 量化 ordinary vs 量化 DFlash | speculative 调度是否保持严格 greedy | 量化相对 FP16 的业务精度 |
@@ -522,7 +559,7 @@ PY
 不要用后一个 PASS 替代前一个。例如 ordinary 与 DFlash 使用同一条错误 full-prefix Target 路线时，
 两者仍可能互相一致，所以必须单独对照普通增量量化推理。
 
-## 12. 按报错阶段定位
+## 13. 按报错阶段定位
 
 | 报错/现象 | 最可能原因 | 先做什么 |
 |---|---|---|
@@ -541,7 +578,7 @@ PY
 | strict greedy 通过但接受率低 | Draft proposal 质量或 workload 难度 | 用 `diagnose_acceptance` 扫 K=1/4/8/16 |
 | CPU 很慢 | correctness-only 的 4B full-prefix 路线 | 先短 prompt、`max-new-tokens=2`；不要据此评性能 |
 
-## 13. 接受率低时怎么查
+## 14. 接受率低时怎么查
 
 正确性通过后再运行：
 
@@ -599,7 +636,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 如果最终 token 完全一致，只是接受率下降，这是性能/提议质量问题，不是生成正确性失败。此时应
 先比较量化前后 8 层 feature 和 Draft 每层输出，不要先修改 verifier。
 
-## 14. 提交 bug 时最小信息
+## 15. 提交 bug 时最小信息
 
 为避免泄露 prompt、路径和权重，只需要提供脱敏后的：
 
@@ -614,7 +651,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 
 不要上传模型权重、量化 artifact、prompt 明文、tokenizer 私有文件或包含凭据的环境变量。
 
-## 15. 什么情况下算完成
+## 16. 什么情况下算完成
 
 完整闭环至少需要：
 

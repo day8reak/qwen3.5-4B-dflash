@@ -103,6 +103,8 @@
     "target_quant_preflight_file": "models/dflash_v1/preflight_target_quant.py",
     "target_quant_preflight_sha256": "ff4fc6adfc6bc684327af453c9ddcb123001d8e981109fba420dfa324879dc02",
     "w8a8_emulation_file": "models/dflash_v1/w8a8_emulation.py",
-    "w8a8_emulation_sha256": "fa604b2778f9e6a5e3c623f76ce714eb028713d5afdecbc52dae46514e070c37"
+    "w8a8_emulation_sha256": "fa604b2778f9e6a5e3c623f76ce714eb028713d5afdecbc52dae46514e070c37",
+    "w8a8_cpu_validator_file": "models/dflash_v1/validate_w8a8_cpu.py",
+    "w8a8_cpu_validator_sha256": "1c968eff073cc34d53dddfc60d50354217b773e9e664ed925cab96946976214a"
   }
 }

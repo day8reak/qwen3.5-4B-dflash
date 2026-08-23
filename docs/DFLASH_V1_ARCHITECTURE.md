@@ -523,8 +523,9 @@ output_dflash_features=True
 | GDN | `torch_npu.npu_chunk_gated_delta_rule` | linear-attention 核心计算 |
 | GDN state | `copy_` 到 fresh recurrent state | 保存本次调用内的最终状态 |
 
-代码中还保留量化 `QLinear` 和 alternate attention 路线使用的其他 NPU API，但当前
-`run_npu` 正式合同是 FP16、非量化主路线，不能仅因源码存在就声称这些分支本次实际执行。
+`run_npu` 默认仍是 FP16、非量化 Target。`quant` 分支只有显式传入量化 mode、量化器、artifact
+和 input provider 时才启用 `QLinear`；报告必须记录完整 QLinear 覆盖和 provider 调用计数，不能
+仅因源码中存在量化 API 就声称本次实际执行了量化路线。
 
 ### 9.3 为什么 NPU 需要 Bridge
 
@@ -612,6 +613,57 @@ total_padding_tokens
 - 记录 prepare/forward/failure/call reconciliation 计数。
 
 Bridge 本身实现 `prepare_dflash_full_prefix_call()`，所以默认路线不需要用户再手写 reset hook。
+
+### 9.7 量化 Target 如何接入，以及怎么分层找错
+
+量化实验只替换 Target 的 Linear 执行，公共 Scheduler、sequential verifier 和 6 层 FP16 Draft
+都不改变。量化数据流如下：
+
+```mermaid
+flowchart LR
+    IDS[input_ids] --> PAD[Bridge 按 64 行补齐]
+    PAD --> IP[input provider]
+    IP --> H0[第 0 层 FP16 hidden]
+    H0 --> QT[量化 HIAI Target]
+    ART[部署量化 artifact] --> QZ[quantizer callback]
+    QZ --> QT
+    QT --> QL[QLinear: dynamic INT8 x INT8]
+    QT --> NON[attention / GDN / norm / state]
+    QL --> OUT[logits + 8 层 feature]
+    NON --> OUT
+    OUT --> DR[FP16 DFlash Draft]
+    OUT --> VR[同一个量化 Target sequential verify]
+```
+
+这里故意保留两个 callback 边界：
+
+- `quantizer` 解释部署 artifact，并建立真实 `QLinear(W_q, scale)`；
+- `input provider` 复用量化推理自己的 embedding/scale 语义，返回第 0 层真正消费的
+  `[1,S,2560]` FP16 hidden。
+
+仓库不能仅凭一个路径猜 artifact 的二进制布局，也不能猜 embedding scale 应该乘、除还是融合，
+所以这两个边界不会被一个“通用自动转换器”静默替代。正常 FP16 embedding 也要显式 provider，
+这样误接非量化输入时会直接失败。
+
+排错顺序固定为从便宜、局部到昂贵、整网：
+
+```text
+CPU 合成公式 vs INT64 oracle
+        ↓
+量化 Target 装配 + provider + P→Q→P
+        ↓
+同一次 activation：NPU QLinear vs CPU 公式
+        ↓
+普通增量量化 Target vs fresh full-prefix Target
+        ↓
+量化 ordinary greedy vs 量化 DFlash
+        ↓
+多 prompt 接受率、无 fallback trace、性能
+```
+
+第一步可直接运行 `python -B -m models.dflash_v1.validate_w8a8_cpu`，不需要权重或 NPU。它通过
+只说明 CPU 公式实现正确；完整命令、报告字段和故障判定见
+[量化版运行与排错指南](DFLASH_V1_QUANT_RUNBOOK.md)。
 
 ## 10. NPU Draft 是否使用 Target 自定义算子
 
