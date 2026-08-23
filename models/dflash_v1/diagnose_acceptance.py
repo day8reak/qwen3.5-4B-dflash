@@ -2195,6 +2195,13 @@ def _parser() -> argparse.ArgumentParser:
         help="NPU is locked to float16; CUDA BF16 is the recommended dtype A/B",
     )
     parser.add_argument(
+        "--target-w8a8-emulation-artifact",
+        help=(
+            "CPU/CUDA only: reuse exported NPU QLinear W_q/scale and replace "
+            "framework Target text linears with the exact diagnostic formula"
+        ),
+    )
+    parser.add_argument(
         "--kv-cache-max-len",
         type=int,
         help="required for the NPU incremental/full-prefix target comparison",
@@ -2293,6 +2300,18 @@ def _validate_args(args: argparse.Namespace) -> tuple[int, ...]:
         raise ValueError("--kv-cache-max-len must be positive when supplied")
     if args.shadow_torch_ops and device_type != "npu":
         raise ValueError("--shadow-torch-ops is only meaningful for the NPU backend")
+    if args.target_w8a8_emulation_artifact is not None:
+        if device_type not in {"cpu", "cuda"}:
+            raise ValueError(
+                "--target-w8a8-emulation-artifact is supported only on CPU/CUDA"
+            )
+        if args.dtype != "float16":
+            raise ValueError("strict NPU QLinear emulation requires --dtype float16")
+        artifact = Path(args.target_w8a8_emulation_artifact).expanduser()
+        if artifact.is_symlink() or not artifact.is_dir():
+            raise ValueError(
+                "--target-w8a8-emulation-artifact must be a real artifact directory"
+            )
     return parse_proposal_counts(args.proposal_counts)
 
 
@@ -2308,6 +2327,13 @@ def _print_summary(report: Mapping[str, object]) -> None:
         f"backend={report.get('draft_backend')}",
         f"verify={report.get('verification_mode')}",
     )
+    emulation = report.get("target_w8a8_emulation")
+    if isinstance(emulation, Mapping):
+        print(
+            "Target W8A8 仿真:",
+            emulation.get("status"),
+            f"qlinear={emulation.get('qlinear_count', 0)}",
+        )
     print(
         "Target 增量 vs full-prefix:",
         parity["status"],
@@ -2516,7 +2542,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not target_root.is_dir() or not draft_root.is_dir():
         raise FileNotFoundError("--target-dir and --draft-dir must be existing directories")
 
-    protected_roots = (package_dir.parent.parent, target_root, draft_root)
+    emulation_artifact = (
+        None
+        if args.target_w8a8_emulation_artifact is None
+        else Path(args.target_w8a8_emulation_artifact).expanduser().resolve()
+    )
+    protected_roots = tuple(
+        path
+        for path in (
+            package_dir.parent.parent,
+            target_root,
+            draft_root,
+            emulation_artifact,
+        )
+        if path is not None
+    )
     report_path = (
         None
         if args.report is None
@@ -2586,6 +2626,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_download=False,
         trust_remote_code=False,
     )
+    if emulation_artifact is None:
+        target_w8a8_emulation: dict[str, object] = {
+            "status": "DISABLED",
+            "scheme": "disabled",
+            "scope": "framework_target",
+        }
+    else:
+        from .w8a8_emulation import apply_w8a8_emulation
+
+        target_w8a8_emulation = apply_w8a8_emulation(
+            target,
+            emulation_artifact,
+            device=args.device,
+            dtype=dtype,
+        )
     draft_memory_preflight = _draft_device_memory_preflight(
         args.device,
         dtype,
@@ -2751,6 +2806,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "model_sha256_verified": bool(args.verify_draft_sha256),
         },
         "target_checkpoint": target_checkpoint,
+        "target_w8a8_emulation": target_w8a8_emulation,
         "weight_health": weight_health,
         "feature_health": feature_health,
         "feature_collector_semantics": feature_semantics,

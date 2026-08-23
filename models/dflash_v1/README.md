@@ -41,6 +41,9 @@ query 是 1 个 anchor 加 16 个 mask，共 17 行。诊断报告始终明确�
 - `../internal_dflash_bridge.py`：复用现有 wrapper，并为每次调用新建 hybrid state。
 - `target_quant.py`：`quant` 分支的已有量化器/input-provider 合同、完整 QLinear 路径审计和
   FP16 Draft 共享权重门禁；它不实现新的量化 kernel。
+- `w8a8_emulation.py`：从真实量化 Target 导出的同一份 `W_q/scale` 构造 CPU/CUDA
+  correctness-only Linear；严格执行 per-token INT8、INT32 accumulator 和 FP16 输出，不做
+  性能声明，也不代替真实 NPU same-activation parity。
 - `internal_target_loader.py`：把已实现的 bridge 包装成 DFlash target facade。
 - `internal_target_loader_template.py`：facade 合同及自定义 loader 参考。
 - `dflash_target_hook_bridge.py`：仅供 eager/CPU 调试的 hook 方案。

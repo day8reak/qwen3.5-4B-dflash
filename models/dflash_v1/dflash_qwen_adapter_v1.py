@@ -2268,6 +2268,13 @@ def _request_payload(
         "trust_remote_code": bool(args.trust_remote_code),
         "progress_enabled": bool(args.progress),
         "draft_checkpoint_sha256_verified": True,
+        "target_w8a8_emulation_artifact": (
+            None
+            if getattr(args, "target_w8a8_emulation_artifact", None) is None
+            else str(
+                Path(args.target_w8a8_emulation_artifact).expanduser().resolve()
+            )
+        ),
     }
 
 
@@ -2409,6 +2416,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--target-w8a8-emulation-artifact",
+        help=(
+            "CPU/CUDA only: portable W_q/scale directory exported by "
+            "preflight_target_quant; replaces framework Target text linears "
+            "with the correctness-first NPU W8A8 formula emulator"
+        ),
+    )
+    parser.add_argument(
         "--npu-layout",
         choices=(_NPU_LAYOUT_EMBEDDED,),
         default=_NPU_LAYOUT_EMBEDDED,
@@ -2514,11 +2529,41 @@ def _validate_report_destination(
         Path(args.target_dir).expanduser().resolve(),
         Path(args.draft_dir).expanduser().resolve(),
     }
+    emulation_artifact = getattr(args, "target_w8a8_emulation_artifact", None)
+    if emulation_artifact is not None:
+        protected_roots.add(Path(emulation_artifact).expanduser().resolve())
     if any(_is_within(resolved, root) for root in protected_roots):
         raise ValueError(
             "--report must be in a separate run directory, outside "
             "the runtime package and target/draft model directories"
         )
+
+
+def _validate_framework_w8a8_request(args: argparse.Namespace) -> Path | None:
+    raw = getattr(args, "target_w8a8_emulation_artifact", None)
+    if raw is None:
+        return None
+    device_type = str(args.device).split(":", 1)[0].lower()
+    if device_type not in {"cpu", "cuda"}:
+        raise ValueError(
+            "--target-w8a8-emulation-artifact is a CPU/CUDA diagnostic route; "
+            "NPU must execute its real QLinear"
+        )
+    if args.target_loader is not None:
+        raise ValueError(
+            "W8A8 formula emulation requires the package-default framework "
+            "Target and cannot be combined with --target-loader"
+        )
+    if args.dtype != "float16":
+        raise ValueError(
+            "strict NPU QLinear emulation requires --dtype float16"
+        )
+    artifact = Path(raw).expanduser()
+    if artifact.is_symlink() or not artifact.is_dir():
+        raise ValueError(
+            "--target-w8a8-emulation-artifact must be a real artifact directory"
+        )
+    return artifact.resolve()
 
 
 def _configure_embedded_npu_inputs(args: argparse.Namespace) -> None:
@@ -2642,6 +2687,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     device_type = str(args.device).split(":", 1)[0].lower()
     formal_npu = device_type == "npu"
+    emulation_artifact = _validate_framework_w8a8_request(args)
     _configure_embedded_npu_inputs(args)
     _validate_ops_backend_request(args.device, args.ops_backend)
     if not formal_npu:
@@ -2698,6 +2744,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_download=args.allow_download,
         trust_remote_code=args.trust_remote_code,
     )
+    if emulation_artifact is None:
+        target_w8a8_emulation: dict[str, object] = {
+            "status": "DISABLED",
+            "scheme": "disabled",
+            "scope": "framework_target",
+        }
+    else:
+        from .w8a8_emulation import apply_w8a8_emulation
+
+        target_w8a8_emulation = apply_w8a8_emulation(
+            target,
+            emulation_artifact,
+            device=args.device,
+            dtype=dtype,
+        )
     initial_target_integration = _target_integration_audit(
         target,
         device=args.device,
@@ -2711,6 +2772,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "integration_route": initial_target_integration["route"],
             "isolation_mode": initial_target_integration["isolation"]["mode"],
             "feature_source": initial_target_integration["feature_capture"]["source"],
+            "target_w8a8_emulation": target_w8a8_emulation["status"],
         },
     )
     _emit_progress(args.progress, "draft_memory_preflight_begin", {})
@@ -2816,21 +2878,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the bounded P-Q-P output gate passed; no receiver HIAI state claim "
             "or speculative state commit/rollback is made"
         )
-        target_operator_policy = (
-            "framework target and draft execution only; receiver HIAI custom "
-            "operator interfaces are not part of this CPU/CUDA route"
-        )
+        if emulation_artifact is None:
+            target_operator_policy = (
+                "framework target and draft execution only; receiver HIAI custom "
+                "operator interfaces are not part of this CPU/CUDA route"
+            )
+        else:
+            target_operator_policy = (
+                "framework attention/GDN/norm execution with Target text Linear "
+                "modules replaced by the correctness-first NPU W8A8 formula; "
+                "the same exported W_q/scale are reused, Draft stays FP16, and "
+                "real NPU same-activation parity remains pending"
+            )
         known_internal_interface_use = {
             "route": "NOT_APPLICABLE_FRAMEWORK_TARGET",
         }
+    classification = {
+        "cpu": "CPU/framework simulation",
+        "cuda": "CUDA/framework full-prefix validation",
+        "npu": "NPU/framework execution; complete 310P gate remains external",
+    }.get(adapter.device.type, "framework device execution")
+    if emulation_artifact is not None:
+        classification = (
+            f"{adapter.device.type.upper()} correctness-first NPU W8A8 formula "
+            "emulation; no performance or real-NPU parity claim"
+        )
     report = {
         "schema_version": 2,
         "route": "qwen3.5-dflash-v1-full-prefix-replay",
-        "classification": {
-            "cpu": "CPU/framework simulation",
-            "cuda": "CUDA/framework full-prefix validation",
-            "npu": "NPU/framework execution; complete 310P gate remains external",
-        }.get(adapter.device.type, "framework device execution"),
+        "classification": classification,
         "strict_greedy_exact_match": True,
         "verification_mode": result.verification_mode,
         "feature_capture_zero_impact": result.feature_capture_zero_impact,
@@ -2848,6 +2924,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "ops_backend": backend,
         "npu_layout": args.npu_layout if formal_npu else None,
         "target_operator_policy": target_operator_policy,
+        "target_w8a8_emulation": target_w8a8_emulation,
         "target_integration": final_target_integration,
         "runtime_preflight": final_runtime_preflight,
         "dflash_execution_gate": dflash_execution,

@@ -57,6 +57,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-quantizer", required=True)
     parser.add_argument("--target-quant-artifact", required=True)
     parser.add_argument("--target-input-provider", required=True)
+    parser.add_argument(
+        "--export-w8a8-emulation-artifact",
+        help=(
+            "optional new directory receiving portable QLinear W_q/scale files "
+            "for correctness-first CPU/CUDA formula emulation"
+        ),
+    )
     parser.add_argument("--report")
     return parser
 
@@ -325,6 +332,38 @@ def _validate_report_destination(
     return resolved
 
 
+def _validate_export_destination(
+    destination: Path,
+    *,
+    target_root: Path,
+    artifact: Path,
+    report_destination: Path | None,
+) -> Path:
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(
+            "--export-w8a8-emulation-artifact must name a new directory"
+        )
+    resolved = destination.resolve()
+    package_root = Path(__file__).resolve().parents[2]
+    protected_roots = [target_root, package_root]
+    if artifact.is_dir():
+        protected_roots.append(artifact)
+    if resolved == artifact or any(
+        _is_within(resolved, root) for root in protected_roots
+    ):
+        raise ValueError(
+            "W8A8 emulation export must be outside the target, source package, "
+            "and source quant artifact"
+        )
+    if report_destination is not None and resolved == report_destination:
+        raise ValueError("W8A8 emulation export and --report must be different")
+    if not resolved.parent.is_dir():
+        raise FileNotFoundError(
+            "parent directory for --export-w8a8-emulation-artifact does not exist"
+        )
+    return resolved
+
+
 def _write_report(
     payload: Mapping[str, object],
     destination: Path,
@@ -399,6 +438,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             artifact=artifact,
         )
     )
+    export_destination = (
+        None
+        if args.export_w8a8_emulation_artifact is None
+        else _validate_export_destination(
+            Path(args.export_w8a8_emulation_artifact).expanduser(),
+            target_root=target_root,
+            artifact=artifact,
+            report_destination=report_destination,
+        )
+    )
     os.environ[TARGET_FACTORY_ENV] = DEFAULT_TARGET_FACTORY
     os.environ[PREFILL_CHUNK_SIZE_ENV] = "64"
     os.environ[DECODE_CHUNK_SIZE_ENV] = "1"
@@ -436,6 +485,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if final_quant.get("input_provider_failures") != 0:
         raise RuntimeError("quant target input provider reported failures")
 
+    emulation_export: dict[str, object] | None = None
+    if export_destination is not None:
+        from .w8a8_emulation import export_w8a8_emulation_artifact
+
+        qlinear_paths = final_quant.get("qlinear_paths")
+        if not isinstance(qlinear_paths, list) or any(
+            not isinstance(path, str) for path in qlinear_paths
+        ):
+            raise TypeError("quant target audit did not expose qlinear_paths")
+        emulation_export = export_w8a8_emulation_artifact(
+            target,
+            export_destination,
+            expected_qlinear_paths=qlinear_paths,
+        )
+
     payload: dict[str, Any] = {
         "schema_version": 1,
         "status": "PASS_TARGET_QUANT_ASSEMBLY_AND_BOUNDED_PREFIX_PROBES",
@@ -449,7 +513,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "target_isolation_initial": initial_audit,
         "target_isolation_final": final_audit,
         "bounded_probes": probes,
+        "w8a8_emulation_export": emulation_export,
         "remaining_gates": [
+            "same_activation_real_npu_qlinear_vs_cpu_cuda_formula_parity",
             "ordinary_incremental_quant_target_vs_fresh_full_prefix_parity",
             "quant_target_plus_dflash_strict_greedy_exact_match",
             "real_npu_operator_trace_and_no_fallback",

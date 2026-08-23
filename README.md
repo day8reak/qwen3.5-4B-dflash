@@ -116,6 +116,9 @@ full-prefix Target 是否等价，再以逐 proposal 的独立前缀验证统计
 无明文层级指纹和两份报告的首个分叉定位，避免把 kernel 随序列长度产生的舍入差异误报为
 BF16 调度错误。
 GPU 的 FP16/BF16 对照命令见 [DFlash V1 GPU 运行说明](docs/DFLASH_V1_GPU.md)。
+量化分支还支持从真实 NPU `QLinear` 导出同一份 `W_q/scale`，在 CPU/CUDA 完整 Target 中
+执行 correctness-only W8A8 公式仿真；导出、运行和 same-activation 对照步骤见
+[NPU Quant Target 适配分析](docs/DFLASH_V1_NPU_QUANT_DESIGN.md#13-cpucuda-w8a8-公式仿真)。
 
 固定文本也可以放进 UTF-8 文件，然后把 `--prompt "..."` 换成
 `--prompt-file /path/to/prompt.txt`。默认 `--prompt-mode chat` 会套用本地主模型 tokenizer 的

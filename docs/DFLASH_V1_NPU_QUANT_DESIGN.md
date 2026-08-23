@@ -398,6 +398,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --target-quantizer your_quant_bridge:quantize_target \
   --target-quant-artifact "$QUANT_ARTIFACT" \
   --target-input-provider your_quant_bridge:build_target_inputs \
+  --export-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
   --report "$RUN_DIR/target-quant-preflight.json"
 ```
 
@@ -440,3 +441,111 @@ def quantize_target(model, artifact_path):
 
 `build_target_inputs` 必须复用普通量化推理已有的 embedding/scale 语义，并返回完成反量化或
 等价预处理后的 FP16 `[1,S,2560]`；DFlash Bridge 不会猜 scale 是乘、除或其他布局规则。
+
+## 13. CPU/CUDA W8A8 公式仿真
+
+`--export-w8a8-emulation-artifact` 会从已经通过装配审计的真实量化 Target 中逐个导出
+`QLinear.W_q` 和 `QLinear.scale`。每个 Linear 单独保存为 safetensors，避免导出 4B Target 时
+额外聚合一份完整 INT8 权重到内存。manifest 同时记录 NPU 文本模型路径和 framework Target
+路径，加载时要求两边 Linear 拓扑完整对应；不会按名字猜缺失层。
+
+CPU/CUDA 仿真逐 token 执行：
+
+```text
+S_x = max(abs(X), dim=-1) / 127
+X_q = clamp(round(X / S_x), -127, 127).to(int8)
+A   = int32(X_q) @ int32(W_q)
+Y   = (A.float() * S_w) * S_x
+Y   = Y.to(float16)
+```
+
+零向量行固定输出 `X_q=0, S_x=0`。CPU 使用 INT32 matmul；CUDA 为避免依赖 CUDA integer GEMM，
+按输出列分块做 FP64 GEMM。Qwen 的 K 维累加绝对值小于 `2^31`，整数乘积与和也都能由 FP64
+精确表示，因此这条 CUDA 路线保留相同的整数 accumulator，代价是很慢。它不用于性能评估。
+
+这条仿真只替换 Target 文本路径里的 Linear。RMSNorm、RoPE、attention、GDN 核心、cache、
+feature collector 和 Draft 仍走 framework；Draft-facing embedding/LM head 仍保留 FP16。若正常
+NPU 量化推理还有量化 embedding/input-provider，这部分不会被静默猜测，必须单独比较其最终
+`[1,S,2560]` FP16 layer-0 hidden。
+
+### 13.1 完整 CPU/CUDA DFlash 运行
+
+CPU 示例（CUDA 只需把 device 换成 `cuda:0`）：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.dflash_qwen_adapter_v1 \
+  --target-dir "$TARGET_DIR" \
+  --draft-dir "$DRAFT_DIR" \
+  --prompt-file "$PROMPT_TXT" \
+  --prompt-mode chat \
+  --device cpu \
+  --dtype float16 \
+  --max-new-tokens 16 \
+  --max-draft-tokens 4 \
+  --eos-token-id 248044 \
+  --target-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
+  --report "$RUN_DIR/cpu-w8a8-emulation.json"
+```
+
+报告必须出现：
+
+```python
+assert report["target_w8a8_emulation"]["status"] == (
+    "PASS_FORMULA_ASSEMBLY_NO_REAL_NPU_PARITY"
+)
+assert report["target_w8a8_emulation"]["scope"] == "target_text_linear_only"
+assert report["target_w8a8_emulation"]["linear_output_dtype"] == "torch.float16"
+assert report["target_w8a8_emulation"]["draft_quantization"] == "DISABLED_FP16"
+```
+
+### 13.2 接受率与首个分叉定位
+
+同一工件也能交给已有诊断入口：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.diagnose_acceptance \
+  --target-dir "$TARGET_DIR" \
+  --draft-dir "$DRAFT_DIR" \
+  --prompt-file "$PROMPT_TXT" \
+  --prompt-mode chat \
+  --device cuda:0 \
+  --dtype float16 \
+  --proposal-counts 1,4,8,16 \
+  --acceptance-rounds 16 \
+  --trace-draft-layers \
+  --target-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
+  --report "$RUN_DIR/cuda-w8a8-diagnosis.json"
+```
+
+先将这个报告与普通 FP16 CPU/CUDA 报告比较，定位量化造成的首个 token/feature/layer 分叉；
+再在 NPU 上给同一个 `QLinear` 喂完全相同 activation，比较真实输出与
+`w8a8_emulation.emulate_w8a8_linear`。只有这个 same-activation 门禁通过，才可以把剩余整网
+差异归因到 embedding、非 Linear 算子、状态或调度。framework 自洽 PASS 本身不等于真实 NPU
+数值 parity。
+
+单层对照的核心写法如下；`qlinear` 和 `x_npu` 必须来自同一次已冻结的 Target 调用：
+
+```python
+import torch
+from models.dflash_v1.w8a8_emulation import (
+    compare_formula_output,
+    emulate_w8a8_linear,
+)
+
+with torch.inference_mode():
+    npu_output = qlinear(x_npu).detach().cpu()
+    formula_output = emulate_w8a8_linear(
+        x_npu.detach().cpu(),
+        qlinear.W_q.detach().cpu(),
+        qlinear.scale.detach().cpu(),
+        output_dtype=torch.float16,
+    )
+
+print(compare_formula_output(npu_output, formula_output))
+```
+
+先测第一层 Linear，再沿 forward 顺序找首个 `max_abs_error` 明显扩大的层。若第一层已经分叉，
+优先查 dynamic-quant rounding、scale dtype/layout 和输入 provider；若每个单层 same-input 都接近，
+但整网从某层开始分叉，则检查该层前的非 Linear 算子或状态输入。

@@ -105,6 +105,22 @@ PY
 
 只有 `cuda available: True` 后，前面的真实权重 smoke 才能用于判断 CUDA 路线是否跑通。
 
+## W8A8 correctness-only 仿真
+
+量化分支可将已量化 NPU Target 的同一份 `QLinear.W_q/scale` 导出后，在 CUDA framework
+Target 中逐层替换文本 Linear。运行命令在普通 GPU smoke 上额外加入：
+
+```bash
+--dtype float16 \
+--target-w8a8-emulation-artifact "$W8A8_EMULATION_ARTIFACT"
+```
+
+不要同时传 `--target-loader`，也不要用 BF16：当前 NPU `QLinear` 固定输出 FP16。该模式使用
+per-token INT8 和精确整数累加公式，只为定位数值差异；CUDA 实现使用很慢的分块 FP64 GEMM，
+没有性能含义。它只仿真 Target 文本 Linear，量化 embedding/input-provider 仍需单独对照。
+完整导出、报告断言和诊断命令见
+[NPU Quant Target 适配分析](DFLASH_V1_NPU_QUANT_DESIGN.md#13-cpucuda-w8a8-公式仿真)。
+
 ## 接受率诊断：先做 FP16/BF16 A/B
 
 GPU 和 NPU 都使用 FP16 时结果相同，只能降低设备独有问题的优先级，不能排除 FP16 本身。
