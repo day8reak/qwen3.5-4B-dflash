@@ -72,6 +72,7 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
 完整说明：
 
 - [项目架构与完整实现流程](docs/DFLASH_V1_ARCHITECTURE.md)
+- [量化版运行与排错指南（建议先读）](docs/DFLASH_V1_QUANT_RUNBOOK.md)
 - [NPU Quant Target 适配分析（quant 分支）](docs/DFLASH_V1_NPU_QUANT_DESIGN.md)
 - [实现和文件说明](README_DFLASH_V1.md)
 - [CPU/Golden 使用说明](docs/DFLASH_V1_GOLDEN.md)
@@ -118,6 +119,7 @@ BF16 调度错误。
 GPU 的 FP16/BF16 对照命令见 [DFlash V1 GPU 运行说明](docs/DFLASH_V1_GPU.md)。
 量化分支还支持从真实 NPU `QLinear` 导出同一份 `W_q/scale`，在 CPU/CUDA 完整 Target 中
 执行 correctness-only W8A8 公式仿真；导出、运行和 same-activation 对照步骤见
+[量化版运行与排错指南](docs/DFLASH_V1_QUANT_RUNBOOK.md)。设计边界和公式细节另见
 [NPU Quant Target 适配分析](docs/DFLASH_V1_NPU_QUANT_DESIGN.md#13-cpucuda-w8a8-公式仿真)。
 
 固定文本也可以放进 UTF-8 文件，然后把 `--prompt "..."` 换成

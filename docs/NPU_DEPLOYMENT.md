@@ -3,6 +3,7 @@
 本流程采用直接源码集成，不运行 patch，也不要求手工修改模型代码。
 
 量化 Target 实验请先阅读
+[量化版运行与排错指南](DFLASH_V1_QUANT_RUNBOOK.md)，再按需查阅
 [DFlash V1 NPU Quant Target 适配](DFLASH_V1_NPU_QUANT_DESIGN.md)。`quant` 分支复用现有
 `QLinear`、量化 artifact 和 Target 自定义算子，不新增量化 kernel；不传量化参数时仍走
 `v1-r1` 的 FP16 路径。

@@ -132,6 +132,22 @@ class TargetQuantizationResult:
     draft_output_embeddings: nn.Module | None = None
 
 
+@dataclass(frozen=True)
+class LinearTopologyEntry:
+    """Shape contract captured before one ``nn.Linear`` is converted.
+
+    The NPU ``QLinear`` stores its INT8 weight as ``[in_features,
+    out_features]`` while ``nn.Linear.weight`` uses
+    ``[out_features, in_features]``.  Capturing this information before the
+    deployment callback runs lets the bridge detect a transposed or unrelated
+    artifact without interpreting the artifact itself.
+    """
+
+    in_features: int
+    out_features: int
+    has_bias: bool
+
+
 def _optional_text(value: str | None) -> str | None:
     if value is None:
         return None
@@ -223,17 +239,36 @@ def input_provider_callback_abi(function: Callable[..., Any]) -> str:
     )
 
 
-def preconversion_linear_paths(execution_model: nn.Module) -> tuple[str, ...]:
-    """Freeze the exact ``nn.Linear`` set before an all-linear conversion."""
+def preconversion_linear_topology(
+    execution_model: nn.Module,
+) -> dict[str, LinearTopologyEntry]:
+    """Freeze every text target Linear path, shape, and bias contract."""
 
-    paths = tuple(
-        name
-        for name, module in execution_model.named_modules()
-        if name and isinstance(module, nn.Linear)
-    )
-    if not paths:
+    topology: dict[str, LinearTopologyEntry] = {}
+    for name, module in execution_model.named_modules():
+        if not name or not isinstance(module, nn.Linear):
+            continue
+        weight = _module_weight(module, name=f"pre-conversion Linear {name}")
+        expected_shape = (int(module.out_features), int(module.in_features))
+        if weight.ndim != 2 or tuple(weight.shape) != expected_shape:
+            raise ValueError(
+                f"pre-conversion Linear {name}.weight must have shape "
+                f"{expected_shape}; got {tuple(weight.shape)}"
+            )
+        topology[name] = LinearTopologyEntry(
+            in_features=int(module.in_features),
+            out_features=int(module.out_features),
+            has_bias=module.bias is not None,
+        )
+    if not topology:
         raise RuntimeError("unquantized target exposes no nn.Linear modules")
-    return paths
+    return topology
+
+
+def preconversion_linear_paths(execution_model: nn.Module) -> tuple[str, ...]:
+    """Return the exact pre-conversion Linear paths (compatibility helper)."""
+
+    return tuple(preconversion_linear_topology(execution_model))
 
 
 def invoke_quantizer(
@@ -337,6 +372,7 @@ def audit_quantized_target(
     result: TargetQuantizationResult,
     *,
     qlinear_type: type[nn.Module],
+    original_linear_topology: Mapping[str, LinearTopologyEntry],
     draft_input_embeddings: nn.Module,
     draft_output_embeddings: nn.Module,
     device: torch.device,
@@ -356,12 +392,35 @@ def audit_quantized_target(
     if len(set(expected_paths)) != len(expected_paths):
         raise ValueError("expected_qlinear_paths contains duplicates")
 
+    if not isinstance(original_linear_topology, Mapping) or not original_linear_topology:
+        raise ValueError("original_linear_topology must be a non-empty mapping")
+    topology = dict(original_linear_topology)
+    if any(
+        not isinstance(path, str)
+        or not path
+        or not isinstance(entry, LinearTopologyEntry)
+        for path, entry in topology.items()
+    ):
+        raise TypeError(
+            "original_linear_topology must map module paths to "
+            "LinearTopologyEntry values"
+        )
+
+    topology_set = set(topology)
+    expected_set = set(expected_paths)
+    unknown_expected = sorted(expected_set - topology_set)
+    if unknown_expected:
+        raise RuntimeError(
+            "quantizer manifest contains paths that were not pre-conversion "
+            f"nn.Linear modules: {unknown_expected}"
+        )
+
+    modules = dict(result.execution_model.named_modules())
     observed = {
         name: module
-        for name, module in result.execution_model.named_modules()
+        for name, module in modules.items()
         if isinstance(module, qlinear_type)
     }
-    expected_set = set(expected_paths)
     observed_set = set(observed)
     if observed_set != expected_set:
         missing = sorted(expected_set - observed_set)
@@ -371,19 +430,77 @@ def audit_quantized_target(
             f"manifest: missing={missing}, unexpected={unexpected}"
         )
 
+    expected_passthrough = topology_set - expected_set
+    observed_passthrough = {
+        name
+        for name, module in modules.items()
+        if name and isinstance(module, nn.Linear)
+    }
+    if observed_passthrough != expected_passthrough:
+        missing = sorted(expected_passthrough - observed_passthrough)
+        unexpected = sorted(observed_passthrough - expected_passthrough)
+        raise RuntimeError(
+            "post-conversion nn.Linear topology differs from the frozen target: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    scale_dtypes: set[str] = set()
+    scale_layouts: set[str] = set()
     for path, module in sorted(observed.items()):
+        entry = topology[path]
+        if entry.has_bias:
+            raise RuntimeError(
+                f"{path} had a bias before conversion, but the current QLinear "
+                "ABI has no bias input"
+            )
         weight = getattr(module, "W_q", None)
         scale = getattr(module, "scale", None)
         if not isinstance(weight, Tensor) or weight.dtype is not torch.int8:
             raise TypeError(f"{path}.W_q must be an INT8 Tensor")
         if not isinstance(scale, Tensor) or not torch.is_floating_point(scale):
             raise TypeError(f"{path}.scale must be a floating-point Tensor")
-        if weight.numel() == 0 or scale.numel() == 0:
-            raise ValueError(f"{path} has an empty quantized weight or scale")
+        expected_weight_shape = (entry.in_features, entry.out_features)
+        if weight.ndim != 2 or tuple(weight.shape) != expected_weight_shape:
+            raise ValueError(
+                f"{path}.W_q must use [in_features,out_features] layout "
+                f"{expected_weight_shape}; got {tuple(weight.shape)}"
+            )
+        if scale.ndim != 1 or scale.numel() not in {1, entry.out_features}:
+            raise ValueError(
+                f"{path}.scale must be one-dimensional with 1 or "
+                f"{entry.out_features} elements; got shape {tuple(scale.shape)}"
+            )
+        if not bool(torch.isfinite(scale).all()):
+            raise FloatingPointError(f"{path}.scale contains non-finite values")
         if weight.device != device or scale.device != device:
             raise ValueError(
                 f"{path} quantization buffers must be on {device}; got "
                 f"W_q={weight.device}, scale={scale.device}"
+            )
+        scale_dtypes.add(str(scale.dtype))
+        scale_layouts.add(
+            "per_tensor" if scale.numel() == 1 else "per_output_channel"
+        )
+
+    for path in sorted(expected_passthrough):
+        entry = topology[path]
+        module = modules[path]
+        assert isinstance(module, nn.Linear)
+        weight = _module_weight(module, name=f"passthrough Linear {path}")
+        expected_shape = (entry.out_features, entry.in_features)
+        if tuple(weight.shape) != expected_shape:
+            raise ValueError(
+                f"passthrough Linear {path}.weight must retain shape "
+                f"{expected_shape}; got {tuple(weight.shape)}"
+            )
+        if (module.bias is not None) != entry.has_bias:
+            raise RuntimeError(
+                f"passthrough Linear {path} changed its bias contract"
+            )
+        if weight.device != device or weight.dtype != dtype:
+            raise ValueError(
+                f"passthrough Linear {path}.weight must remain {dtype} on "
+                f"{device}; got {weight.dtype}/{weight.device}"
             )
 
     expected_weight_shape = (int(vocab_size), int(hidden_size))
@@ -415,7 +532,14 @@ def audit_quantized_target(
         "scheme": QUANT_MODE_W8A8_DYNAMIC,
         "qlinear_count": len(observed),
         "qlinear_paths": sorted(observed),
+        "preconversion_linear_count": len(topology),
+        "passthrough_linear_count": len(expected_passthrough),
+        "passthrough_linear_paths": sorted(expected_passthrough),
+        "linear_topology_validation": "PASS_EXACT_PATH_SHAPE_BIAS",
+        "quantized_weight_layout": "K_by_N",
         "quantized_weight_dtype": "torch.int8",
+        "quantized_scale_dtypes": sorted(scale_dtypes),
+        "quantized_scale_layouts": sorted(scale_layouts),
         "linear_output_dtype": str(dtype),
         "draft_embedding_dtype": str(draft_weights["input_embedding"].dtype),
         "draft_lm_head_dtype": str(draft_weights["lm_head"].dtype),
@@ -472,6 +596,7 @@ __all__ = [
     "TARGET_QUANTIZER_ENV",
     "TargetQuantizationRequest",
     "TargetQuantizationResult",
+    "LinearTopologyEntry",
     "audit_quantized_target",
     "input_provider_callback_abi",
     "invoke_input_provider",
@@ -479,6 +604,7 @@ __all__ = [
     "load_callback",
     "normalize_quantizer_result",
     "preconversion_linear_paths",
+    "preconversion_linear_topology",
     "quantizer_callback_abi",
     "validate_input_provider_output",
 ]

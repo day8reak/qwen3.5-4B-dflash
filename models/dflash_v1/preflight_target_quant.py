@@ -405,6 +405,12 @@ def _quantization_audit(target: nn.Module) -> tuple[dict[str, object], dict[str,
         raise TypeError("quant target qlinear_count must be an integer")
     if qlinear_count <= 0:
         raise RuntimeError("quant target contains no audited QLinear modules")
+    if normalized.get("linear_topology_validation") != "PASS_EXACT_PATH_SHAPE_BIAS":
+        raise RuntimeError(
+            "quant target did not pass exact Linear path/shape/bias validation"
+        )
+    if normalized.get("quantized_weight_layout") != "K_by_N":
+        raise RuntimeError("quant target did not prove the QLinear K-by-N layout")
     return audit, normalized
 
 

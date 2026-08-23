@@ -1646,6 +1646,15 @@ def _target_integration_audit(
                         raise RuntimeError(
                             "W8A8 target input provider has the wrong output contract"
                         )
+                    if (
+                        quantization.get("linear_topology_validation")
+                        != "PASS_EXACT_PATH_SHAPE_BIAS"
+                        or quantization.get("quantized_weight_layout") != "K_by_N"
+                    ):
+                        raise RuntimeError(
+                            "W8A8 target did not pass exact Linear topology/layout "
+                            "validation"
+                        )
                 bridge_runtime["target_quantization"] = quantization
             isolation["bridge_runtime"] = bridge_runtime
         isolation["status"] = "PASS_DECLARED_AND_INSTRUMENTED"

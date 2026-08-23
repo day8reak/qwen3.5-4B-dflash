@@ -70,4 +70,5 @@ python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
 
 完整 NPU 部署流程见 [NPU_DEPLOYMENT.md](../../docs/NPU_DEPLOYMENT.md)。
 量化 Target 接入见
+[DFLASH_V1_QUANT_RUNBOOK.md](../../docs/DFLASH_V1_QUANT_RUNBOOK.md)；完整设计边界见
 [DFLASH_V1_NPU_QUANT_DESIGN.md](../../docs/DFLASH_V1_NPU_QUANT_DESIGN.md)。

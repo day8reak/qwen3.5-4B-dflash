@@ -251,19 +251,24 @@ input provider 必须处理物理 padding 后的 IDs；Bridge 仍在输出侧裁
 
 1. quant artifact 是明确的常规文件或目录，但不能是 symlink；
 2. quantizer callback 的 module/function identity 被写入报告；
-3. 转换后 `QLinear` 数量大于 0；
-4. 每个 `QLinear.W_q` 是量化整数 Tensor；
-5. 每个 `QLinear.scale` 是浮点 Tensor；
-6. `W_q/scale` 位于请求 NPU，或由转换器明确声明合法的 lazy placement；
-7. 每个 `QLinear` 输出仍是 FP16；
-8. Target embedding/LM head 仍是 `[248320,2560]` FP16；
-9. input provider 输出是 `[1,S,2560]` FP16 NPU Tensor；
-10. feature 仍是 `[1,S,20480]` FP16；
-11. quant 模式下不允许缺失 callback 后退回非量化 Target；
-12. 报告中的 quant mode、QLinear count、provider calls 与 Target forward calls 对账。
+3. 转换前冻结全部 `nn.Linear` 的路径、输入维、输出维和 bias 合同；
+4. 转换后 `QLinear` 数量大于 0，且路径集合与 converter manifest 精确相同；
+5. 每个 `QLinear.W_q` 是 INT8 `[in_features,out_features]` Tensor；
+6. 每个 `QLinear.scale` 是一维有限浮点 Tensor，元素数为 `1` 或 `out_features`；
+7. 未量化 Linear 必须仍在原路径，weight shape 和 bias 合同不变；
+8. `W_q/scale` 位于请求 NPU；
+9. 每个 `QLinear` 输出仍是 FP16；
+10. Target embedding/LM head 仍是 `[248320,2560]` FP16；
+11. input provider 输出是 `[1,S,2560]` FP16 NPU Tensor；
+12. feature 仍是 `[1,S,20480]` FP16；
+13. quant 模式下不允许缺失 callback 后退回非量化 Target；
+14. 报告中的 quant mode、QLinear count、provider calls 与 Target forward calls 对账。
 
 实际 QLinear 名单/数量应由配套 artifact 的转换规则冻结；在拿到该规则前不能仅凭 “检测到一个
 QLinear” 就把整个 Target 标成已量化。
+
+面向首次接入者的逐步命令、报告断言和报错对照表见
+[DFlash V1 量化版：运行与排错指南](DFLASH_V1_QUANT_RUNBOOK.md)。
 
 ## 8. 数值风险
 

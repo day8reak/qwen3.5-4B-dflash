@@ -44,7 +44,7 @@ from .dflash_v1.target_quant import (
     invoke_quantizer,
     load_callback,
     normalize_quantizer_result,
-    preconversion_linear_paths,
+    preconversion_linear_topology,
     validate_input_provider_output,
 )
 
@@ -774,9 +774,10 @@ def load_qwen35_target(
             quantization_request.input_provider_spec,
             label="target input provider",
         )
-        default_expected_qlinear_paths = preconversion_linear_paths(
+        original_linear_topology = preconversion_linear_topology(
             execution_model,
         )
+        default_expected_qlinear_paths = tuple(original_linear_topology)
         raw_result = invoke_quantizer(
             quantizer,
             execution_model,
@@ -808,6 +809,7 @@ def load_qwen35_target(
         assembly = audit_quantized_target(
             quantized,
             qlinear_type=qlinear_type,
+            original_linear_topology=original_linear_topology,
             draft_input_embeddings=draft_input_embeddings,
             draft_output_embeddings=draft_output_embeddings,
             device=torch.device(device),

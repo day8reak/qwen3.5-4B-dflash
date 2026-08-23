@@ -12,7 +12,7 @@
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
-    "hiai_bridge_sha256": "634999f429162c487e5097f07772c48b60d8cc8809d906b4826561daf410a6e9",
+    "hiai_bridge_sha256": "52d79bbf1eaa9fda642cf52a73393803fd6bc70a2d3a6b400bf4f05b83eb1827",
     "hiai_bridge_policy": "loads the package wrapper, rebuilds full-attention block tables, allocates fresh call-local hybrid state, aligns multi-token prefills to 64 physical rows, slices outputs to the logical prefix, and synchronizes before releasing state",
     "npu_policy": "keep the HIAI target in models/ and install the complete DFlash package in models/dflash_v1/",
     "namespace_compatibility_file": "models/__init__.py",
@@ -74,7 +74,7 @@
     "ops_file": "models/dflash_v1/dflash_ops.py",
     "ops_sha256": "595a73d68565a009cc7bd9f8523f94e846accff41a9926a9fe3d8e24400fcb94",
     "adapter_file": "models/dflash_v1/dflash_qwen_adapter_v1.py",
-    "adapter_sha256": "51eab4b193a916546424493a7bbac90f4e0b2ca4ecaa5e5f1516e199c1823865",
+    "adapter_sha256": "33bd12dbcd0f53587fa8b36194b176b3ee7c397497f50560767a0651cfe9bbc8",
     "scheduler_file": "models/dflash_v1/dflash_reference_decode_v1.py",
     "scheduler_sha256": "04099a7ae9685fb18612053825ad99604f1340d68417c566600389a024ab67eb",
     "draft_model_file": "models/dflash_v1/modeling_dflash.py",
@@ -82,11 +82,11 @@
     "weight_loader_file": "models/dflash_v1/dflash_weights.py",
     "weight_loader_sha256": "c85bcc22620c9108d430e0f23e55b7dd08207e6a7884615e508370644bd653b2",
     "acceptance_diagnostic_file": "models/dflash_v1/diagnose_acceptance.py",
-    "acceptance_diagnostic_sha256": "e525b6949252cca4d6fee6666673a6e0145076e3b4cbb31821ede5566ea47398"
+    "acceptance_diagnostic_sha256": "17deb904b90d233230cb672973ba5c5228a771a3c8efa0e66acc4436103852a8"
   },
   "npu_embedded_runtime": {
     "runner_file": "models/dflash_v1/run_npu.py",
-    "runner_sha256": "1adceb3bd8a5dbfb9f2d1cb69412d8b11772971dedc0c964c79f0f9e79d129f8",
+    "runner_sha256": "b41bcabbf186e9547bb618898ed91e768c3ae7f163b77bfe0a882a3fb5145f3b",
     "loader_file": "models/dflash_v1/internal_target_loader.py",
     "loader_sha256": "fb8a1516d1791ad253a8d0dabbfcddae2db57dccc9e2795d938a511071efa840",
     "loader_contract_file": "models/dflash_v1/internal_target_loader_template.py",
@@ -97,6 +97,12 @@
     "hiai_runtime_sha256": "46b95a67e2cb74b98e6d3964153fee31b5134b2c27a316c991bc83f41d120d4a",
     "hiai_runtime_policy": "legacy ModelOutput sidecar compatibility only; direct HIAI Tensor/tuple source must not import it",
     "ascend_ops_file": "models/dflash_v1/dflash_ascend310p_ops.py",
-    "ascend_ops_sha256": "8647a900ef99f41b23169b63d45ad5a554051d4c1fb8bc924fa22bd270901ac3"
+    "ascend_ops_sha256": "8647a900ef99f41b23169b63d45ad5a554051d4c1fb8bc924fa22bd270901ac3",
+    "target_quant_contract_file": "models/dflash_v1/target_quant.py",
+    "target_quant_contract_sha256": "9f7a6441f66a3d2c23b5e39b5cddd3be2d1fa4dd4ff02cb73ff1e922b0552785",
+    "target_quant_preflight_file": "models/dflash_v1/preflight_target_quant.py",
+    "target_quant_preflight_sha256": "05d8cf1a023fbf11951fdfef21071d1e371ed5fdc080b9dce150131c0431bc68",
+    "w8a8_emulation_file": "models/dflash_v1/w8a8_emulation.py",
+    "w8a8_emulation_sha256": "fa604b2778f9e6a5e3c623f76ce714eb028713d5afdecbc52dae46514e070c37"
   }
 }
