@@ -10,6 +10,8 @@ target 覆盖它。
 ## 运行与调度
 
 - `run_npu.py`：内嵌目录的一键 NPU 入口，自动派生 HIAI source、loader、FP16 和 EOS。
+- `preflight_target_quant.py`：量化分支的 Target-only NPU 预检；不读取 Draft，先验证 QLinear
+  装配、量化输入 provider、feature 零影响和异长 P→Q→P。
 - `diagnose_acceptance.py`：CPU/CUDA/NPU 都对比 cached-incremental 与 fresh-full-prefix
   Target，并可在相同 greedy 前缀上扫描 K=1/4/8/16；支持直接传 UTF-8 prompt/txt、
   FP16/BF16 A/B、早中后段接受率、逐轮层级指纹、跨报告首个分叉和单轮 oracle tensor
@@ -53,6 +55,7 @@ query 是 1 个 anchor 加 16 个 mask，共 17 行。诊断报告始终明确�
 
 ```bash
 python -m models.dflash_v1.run_npu --help
+python -m models.dflash_v1.preflight_target_quant --help
 python -m models.dflash_v1.diagnose_acceptance --help
 python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
 ```

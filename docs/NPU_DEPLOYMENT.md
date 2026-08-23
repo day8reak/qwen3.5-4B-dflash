@@ -7,6 +7,10 @@
 `QLinear`、量化 artifact 和 Target 自定义算子，不新增量化 kernel；不传量化参数时仍走
 `v1-r1` 的 FP16 路径。
 
+量化首次接入应先运行 `models.dflash_v1.preflight_target_quant`。它只加载 Target，不读取
+Draft checkpoint，并在完整 DFlash 前检查转换覆盖、input provider、feature 零影响和有界
+full-prefix 状态隔离；具体命令见量化适配文档。
+
 ## 1. 路径变量
 
 ```bash

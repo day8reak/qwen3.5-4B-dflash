@@ -386,6 +386,26 @@ DFlash Bridge 量化 full-prefix Target
 
 量化器和 input provider 必须来自同一套已跑通的普通量化 Target，实现后运行：
 
+先只加载 Target 做装配、feature 零影响和异长 P→Q→P 预检；该命令不读取 Draft checkpoint：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.preflight_target_quant \
+  --target-dir "$TARGET_DIR" \
+  --prompt-ids "$PROMPT_IDS" \
+  --device npu:0 \
+  --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
+  --target-quantizer your_quant_bridge:quantize_target \
+  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-input-provider your_quant_bridge:build_target_inputs \
+  --report "$RUN_DIR/target-quant-preflight.json"
+```
+
+此 PASS 只证明量化 Target 的 DFlash-facing 装配和有界 full-prefix 行为；它不会证明普通增量
+量化推理 parity，也不会证明 Draft、strict-greedy、接受率或性能。
+
+随后运行完整 DFlash：
+
 ```bash
 PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
   --target-dir "$TARGET_DIR" \
