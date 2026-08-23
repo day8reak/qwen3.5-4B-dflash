@@ -108,8 +108,10 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 `models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM`。运行入口会校验实际类型；若不符会在
 加载后立即失败，不会静默混用两份 target。
 
-`--kv-cache-max-len` 必须使用部署配置中的实际值，并且能被 64 整除。当前 bridge 仅支持
-FP16、非量化 target 路线。`v1-r1` 在加载后会用该值重建所有 full-attention 层的 block table；
+`--kv-cache-max-len` 必须使用部署配置中的实际值，并且能被 64 整除。Bridge 的 Target/Draft
+激活、logits 和 feature 边界固定为 FP16；`quant` 分支可在该边界内选择原 FP16 Target，或让
+Target 的既有 `QLinear` 执行 W8A8 dynamic linear。加载后会用该值重建所有 full-attention
+层的 block table；
 重建层数或 shape 不一致会在 draft 加载前失败。
 
 `v1-r1` 的 bridge 对 `S=1` 保持单 token 路线；对 `S>1` 则把输入张量右补齐到下一个 64-token

@@ -89,6 +89,16 @@ embedding、未消费的 scale 或含义不明的 tuple 都会失败。
 
 ## 4. 当前量化范围
 
+从模块替换的角度看，当前转换器只把约定范围内的 `nn.Linear` 换成 `QLinear`。默认的
+“全部 Linear”合同覆盖 attention 的 Q/K/V/O projection、GDN 的输入/门控/输出 projection、
+MLP 的 gate/up/down projection，以及转换器实际遍历到的 LM head。RMSNorm、RoPE、激活、
+residual、GDN 核心、fused attention、CacheUpdate 和 KV/GDN state 不做量化替换，继续使用
+原有 NPU 路径。
+
+从完整推理链看则不应简称为“只有 Linear”：量化部署若还使用 INT8 embedding table/scale，
+它由独立 input-provider 复用，最终交给 decoder 第 0 层的仍是 FP16 hidden。这个输入步骤不是
+`QLinear` 替换，但属于量化 Target 路线的一部分。
+
 ### 4.1 原始与替换公式
 
 原 FP16 linear：
@@ -144,6 +154,7 @@ Tensor，则必须在 `TargetQuantizationResult` 中另外提供独立 FP16 Draf
 
 - 默认 `disabled`，保持 `v1-r1` 行为不变；
 - `w8a8_dynamic` 必须同时提供 quantizer、artifact 和 input provider；
+- CLI 会在读取 Draft 大权重前导入两个 callback 并校验其支持的调用签名；
 - 即使量化 Target 使用普通 FP16 embedding，也必须通过 provider 显式复用该路线；
 - 量化参数不能对 CPU/CUDA 路线生效；
 - 报告不能只写 `dtype=float16`，还要写 Target quantization profile。
@@ -186,6 +197,7 @@ def build_quant_target_inputs(
     model_wrapper: torch.nn.Module,
     input_ids: torch.Tensor,
     *,
+    artifact_path: str,
     device: torch.device,
     output_dtype: torch.dtype,
 ) -> torch.Tensor | dict[str, torch.Tensor]:

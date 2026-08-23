@@ -164,6 +164,65 @@ def load_callback(
     }
 
 
+def _select_callback_abi(
+    function: Callable[..., Any],
+    *,
+    positional: tuple[object, ...],
+    extended_keywords: Mapping[str, object],
+    label: str,
+    expected: str,
+) -> str:
+    """Select a supported callback ABI without executing the callback."""
+
+    signature = inspect.signature(function)
+    try:
+        signature.bind(*positional, **extended_keywords)
+    except TypeError:
+        try:
+            signature.bind(*positional)
+        except TypeError as error:
+            raise TypeError(f"{label} must accept {expected}") from error
+        return "simple"
+    return "extended"
+
+
+def quantizer_callback_abi(function: Callable[..., Any]) -> str:
+    """Validate and identify the existing target-quantizer callback ABI."""
+
+    return _select_callback_abi(
+        function,
+        positional=(object(), "artifact-path"),
+        extended_keywords={
+            "device": torch.device("cpu"),
+            "output_dtype": torch.float16,
+        },
+        label="target quantizer",
+        expected=(
+            "(model, artifact_path) or (model, artifact_path, *, "
+            "device, output_dtype)"
+        ),
+    )
+
+
+def input_provider_callback_abi(function: Callable[..., Any]) -> str:
+    """Validate and identify the quantized-target input-provider ABI."""
+
+    return _select_callback_abi(
+        function,
+        positional=(object(), object()),
+        extended_keywords={
+            "artifact_path": "artifact-path",
+            "device": torch.device("cpu"),
+            "output_dtype": torch.float16,
+        },
+        label="target input provider",
+        expected=(
+            "(model_wrapper, input_ids) or the same arguments plus "
+            "artifact_path/device/output_dtype"
+        ),
+    )
+
+
 def preconversion_linear_paths(execution_model: nn.Module) -> tuple[str, ...]:
     """Freeze the exact ``nn.Linear`` set before an all-linear conversion."""
 
@@ -191,27 +250,14 @@ def invoke_quantizer(
     raised inside the quantizer is never mistaken for an argument mismatch.
     """
 
-    signature = inspect.signature(function)
-    extended = (
-        execution_model,
-        str(artifact_path),
+    positional = (execution_model, str(artifact_path))
+    if quantizer_callback_abi(function) == "simple":
+        return function(*positional)
+    return function(
+        *positional,
+        device=device,
+        output_dtype=output_dtype,
     )
-    try:
-        signature.bind(
-            *extended,
-            device=device,
-            output_dtype=output_dtype,
-        )
-    except TypeError:
-        try:
-            signature.bind(*extended)
-        except TypeError as error:
-            raise TypeError(
-                "target quantizer must accept (model, artifact_path) or "
-                "(model, artifact_path, *, device, output_dtype)"
-            ) from error
-        return function(*extended)
-    return function(*extended, device=device, output_dtype=output_dtype)
 
 
 def invoke_input_provider(
@@ -225,23 +271,8 @@ def invoke_input_provider(
 ) -> object:
     """Call a simple existing provider or the extended DFlash provider ABI."""
 
-    signature = inspect.signature(function)
     positional = (model_wrapper, input_ids)
-    try:
-        signature.bind(
-            *positional,
-            artifact_path=str(artifact_path),
-            device=device,
-            output_dtype=output_dtype,
-        )
-    except TypeError:
-        try:
-            signature.bind(*positional)
-        except TypeError as error:
-            raise TypeError(
-                "target input provider must accept (model_wrapper, input_ids) "
-                "or the same arguments plus artifact_path/device/output_dtype"
-            ) from error
+    if input_provider_callback_abi(function) == "simple":
         return function(*positional)
     return function(
         *positional,
@@ -442,10 +473,12 @@ __all__ = [
     "TargetQuantizationRequest",
     "TargetQuantizationResult",
     "audit_quantized_target",
+    "input_provider_callback_abi",
     "invoke_input_provider",
     "invoke_quantizer",
     "load_callback",
     "normalize_quantizer_result",
     "preconversion_linear_paths",
+    "quantizer_callback_abi",
     "validate_input_provider_output",
 ]

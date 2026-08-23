@@ -20,6 +20,10 @@ from .target_quant import (
     TARGET_QUANT_ARTIFACT_ENV,
     TARGET_QUANT_MODE_ENV,
     TARGET_QUANTIZER_ENV,
+    TargetQuantizationRequest,
+    input_provider_callback_abi,
+    load_callback,
+    quantizer_callback_abi,
 )
 from .dflash_qwen_adapter_v1 import main as _adapter_main
 from .internal_target_loader import (
@@ -179,6 +183,25 @@ def _configure_target_quantization(args: argparse.Namespace) -> None:
     for name, value in values.items():
         assert value is not None
         os.environ[name] = str(value)
+
+    # Fail before the adapter hashes the large Draft checkpoint.  The target
+    # factory repeats these checks and records the callback identities, but a
+    # misspelled module/function or incompatible ABI should be a cheap CLI
+    # preflight error rather than a late model-loading failure.
+    request = TargetQuantizationRequest.from_environment()
+    assert request.enabled
+    assert request.quantizer_spec is not None
+    assert request.input_provider_spec is not None
+    quantizer, _ = load_callback(
+        request.quantizer_spec,
+        label="target quantizer",
+    )
+    input_provider, _ = load_callback(
+        request.input_provider_spec,
+        label="target input provider",
+    )
+    quantizer_callback_abi(quantizer)
+    input_provider_callback_abi(input_provider)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
