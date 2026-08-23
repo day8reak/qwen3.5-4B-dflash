@@ -1,6 +1,7 @@
 # DFlash V1 NPU Quant Target 适配分析与实施方案
 
-状态：`quant` 分支设计稿，尚未修改运行时数值路径，也尚未取得真实 NPU 量化验证结果。
+状态：`quant` 分支已经加入量化装配合同、Bridge 接线和 CLI；尚未取得真实 NPU 量化
+Target parity/DFlash 零差异结果，因此不得视为量化运行通过。
 
 ## 1. 目标与非目标
 
@@ -39,31 +40,34 @@ FP16 activation
 因此 Target 的 decoder hidden 和 DFlash feature 仍可保持 FP16，feature ABI
 `[B,S,20480]` 不需要改成 INT8。
 
-## 3. 当前 DFlash 路径为什么还不能直接打开量化
+## 3. `v1-r1` 的量化断点与 `quant` 分支修复
 
 ### 3.1 Bridge 没有应用量化转换
 
-当前 `models/internal_dflash_bridge.py` 只负责：
+`v1-r1` 的 `models/internal_dflash_bridge.py` 只负责：
 
 1. 构造 `Qwen3_5ForCausalLMWrapper`；
 2. 取得 `.model`；
 3. 新建 fresh hybrid state；
 4. 执行 full-prefix Target。
 
-它没有接收量化 artifact，也没有调用部署环境的量化转换器，所以源码中虽然定义了 `QLinear`，
-实际 Target 仍可能全部是 `nn.Linear`。
+`quant` 分支现在通过显式 `--target-quantizer` 和 `--target-quant-artifact` 调用已有量化器。
+转换前会冻结全部 `nn.Linear` 路径；已有两参数量化器若直接返回 `nn.Module`（或原地转换后
+返回 `None`），转换后必须一一对应为 `QLinear`。有意排除部分 Linear 的量化器则必须返回
+`TargetQuantizationResult`，明确给出完整预期路径，不能靠“检测到一个 QLinear”通过。
 
 ### 3.2 Bridge 绕过了正常 wrapper 的输入预处理
 
-Bridge 为了精确控制 KV/GDN state，直接调用 `.model` execution model，并自行执行：
+Bridge 为了精确控制 KV/GDN state，直接调用 `.model` execution model。`v1-r1` 自行执行：
 
 ```python
 inputs_embeds = get_input_embeddings()(input_ids)
 ```
 
 如果量化 Target 的正常推理还使用量化 embedding table、embedding scale 或 wrapper 内的输入
-预处理，那么当前 Bridge 会绕过这条路径。只替换 linear 无法证明 DFlash Target 与正常量化
-Target 等价。
+预处理，只替换 linear 仍不等价。`quant` 分支因此强制 `--target-input-provider`；它必须返回
+量化普通推理在第 0 层真正消费的最终 FP16 hidden，shape 为 `[1,S,2560]`。返回原始 INT8
+embedding、未消费的 scale 或含义不明的 tuple 都会失败。
 
 ### 3.3 Draft 仍依赖浮点 embedding 和 LM head
 
@@ -79,10 +83,11 @@ Target 等价。
 
 ### 3.4 当前 formal NPU 合同明确是非量化
 
-现有 `run_npu`、Bridge 和文档都锁定 FP16、非量化 Target。量化模式需要独立的显式 CLI、
-metadata 和报告字段，不能由检测到若干 `QLinear` 后静默启用。
+`run_npu` 默认仍锁定 FP16、非量化 Target。量化模式必须显式选择；装配结果、完整 QLinear
+路径、callback identity 和 input-provider 调用计数写入最终 report 的
+`target_integration.isolation.bridge_runtime.target_quantization`。
 
-## 4. 建议的量化范围
+## 4. 当前量化范围
 
 ### 4.1 原始与替换公式
 
@@ -113,19 +118,20 @@ Y_quant ≈ Y_fp16
 - sequential verifier；
 - full-prefix fresh state、64-token 对齐和同步逻辑。
 
-量化转换器可替换 Target decoder 内符合 artifact 合同的 linear。它不得替换 Draft 共享的
-embedding/LM head，除非另外提供独立 FP16 Draft-side 权重。
+量化转换器可替换 Target 内符合 artifact 合同的 linear，包括量化部署实际会替换的 LM head。
+Bridge 在转换前保留 Draft-facing FP16 embedding/LM-head view；如果量化器会原地改写这些
+Tensor，则必须在 `TargetQuantizationResult` 中另外提供独立 FP16 Draft-side 模块。
 
 ### 4.3 为什么 Draft 暂时保持 FP16
 
 量化 Target 已经会改变 feature 和 Target logits。Draft 也量化会同时引入第二组 proposal 误差，
 无法区分接受率变化来自 Target、feature 还是 Draft。本分支先只验证 “quant Target + FP16 Draft”。
 
-## 5. 建议增加的运行接口
+## 5. 运行接口
 
 ### 5.1 CLI
 
-`run_npu` 增加显式参数：
+`run_npu` 的显式参数：
 
 ```text
 --target-quant-mode disabled|w8a8_dynamic
@@ -137,8 +143,8 @@ embedding/LM head，除非另外提供独立 FP16 Draft-side 权重。
 规则：
 
 - 默认 `disabled`，保持 `v1-r1` 行为不变；
-- `w8a8_dynamic` 必须同时提供 quantizer 和 artifact；
-- 如果正常量化 Target 使用不同于普通 `nn.Embedding` 的输入路线，必须提供 input provider；
+- `w8a8_dynamic` 必须同时提供 quantizer、artifact 和 input provider；
+- 即使量化 Target 使用普通 FP16 embedding，也必须通过 provider 显式复用该路线；
 - 量化参数不能对 CPU/CUDA 路线生效；
 - 报告不能只写 `dtype=float16`，还要写 Target quantization profile。
 
@@ -153,17 +159,21 @@ def apply_target_quantization(
     *,
     device: torch.device,
     output_dtype: torch.dtype,
-) -> torch.nn.Module:
+) -> torch.nn.Module | None | TargetQuantizationResult:
     ...
 ```
 
 职责：
 
+- 可直接复用已有 `quant_model(model, artifact_path)` 两参数函数；
+- 也可接收扩展的 keyword-only `device/output_dtype`；
 - 使用和正常量化 Target 完全相同的 artifact 解释方式；
 - 替换约定范围内的 `nn.Linear` 为当前 HIAI source 的 `QLinear`；
 - 把量化 buffers 放到请求 NPU；
 - 保留 FP16 embedding 和 LM head；
-- 返回实际 execution model。
+- 返回实际 execution model；原地转换可返回 `None`；
+- 默认合同要求转换前的全部 `nn.Linear` 变成 `QLinear`；若实际范围不同，返回显式
+  `TargetQuantizationResult(expected_qlinear_paths=...)`。
 
 DFlash Bridge 只负责加载 callback、调用一次并审计结果，不复制量化工具的 checkpoint 解析代码。
 
@@ -178,7 +188,7 @@ def build_quant_target_inputs(
     *,
     device: torch.device,
     output_dtype: torch.dtype,
-) -> dict[str, torch.Tensor]:
+) -> torch.Tensor | dict[str, torch.Tensor]:
     ...
 ```
 
@@ -188,11 +198,14 @@ def build_quant_target_inputs(
 inputs_embeds: [1,S,2560] FP16 NPU Tensor
 ```
 
-它必须产生正常量化 Target 在第 0 层真正消费的同一 FP16 hidden。若部署量化 embedding 使用
+简单的已有 provider 可以只接收 `(model_wrapper, input_ids)`；扩展 ABI 还会收到
+`artifact_path/device/output_dtype`。它必须产生正常量化 Target 在第 0 层真正消费的同一
+FP16 hidden。若部署量化 embedding 使用
 INT8 table + scale，scale 的语义和反量化/融合操作由 provider 复用现有实现；Bridge 不猜
 `multiply`、`divide`、offset、group 或 layout 规则。
 
-如果正常量化 Target 本来就使用普通 FP16 embedding，可以不传 provider，Bridge 沿用现有路径。
+量化模式始终要求显式 provider；如果普通量化 Target 使用 FP16 embedding，provider 可以直接
+调用同一个 embedding，但仍需显式声明，避免因误配而静默走回非量化输入路径。
 
 ## 6. Bridge 侧设计
 
@@ -224,7 +237,7 @@ input provider 必须处理物理 padding 后的 IDs；Bridge 仍在输出侧裁
 
 启用量化时至少检查：
 
-1. quant artifact 是明确的常规文件，不是目录或 symlink；
+1. quant artifact 是明确的常规文件或目录，但不能是 symlink；
 2. quantizer callback 的 module/function identity 被写入报告；
 3. 转换后 `QLinear` 数量大于 0；
 4. 每个 `QLinear.W_q` 是量化整数 Tensor；
@@ -343,12 +356,12 @@ DFlash Bridge 量化 full-prefix Target
 - 删除量化参数即可回到当前 FP16 Target 路线；
 - 量化 Target 未通过真实设备 parity 前，不创建新的正式 release tag。
 
-## 11. 实施前需要批准的精确实验
+## 11. 已确认并实施的第一阶段边界
 
-建议批准的第一项实现是：
+第一项实现是：
 
 > 在 `quant` 分支加入显式 `w8a8_dynamic` Target 模式。使用部署方已有 quantizer 解释现有
-> quant artifact，把 HIAI decoder 约定范围内的 linear 替换为 `QLinear`；保持 Target
+> quant artifact，把 artifact 约定范围内的 linear 替换为 `QLinear`；保持 Draft-facing
 > embedding、LM head、所有 Target 输出和整个 DFlash Draft 为 FP16。若正常量化 Target 使用
 > 独立 embedding/input 预处理，则通过必需的 input-provider callback 复用该路径。保持 V1
 > full-prefix fresh state、64-token 对齐、sequential verifier 和所有零 token 差异门禁不变。
@@ -357,3 +370,41 @@ DFlash Bridge 量化 full-prefix Target
 风险是 Target token、feature 和接受率变化。回滚是关闭量化参数或删除 `quant` 分支，`main` 不受
 影响。
 
+## 12. 运行入口
+
+量化器和 input provider 必须来自同一套已跑通的普通量化 Target，实现后运行：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+  --target-dir "$TARGET_DIR" \
+  --draft-dir "$DRAFT_DIR" \
+  --prompt-file "$PROMPT_TXT" \
+  --prompt-mode chat \
+  --device npu:0 \
+  --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
+  --max-new-tokens 64 \
+  --max-draft-tokens 16 \
+  --target-quant-mode w8a8_dynamic \
+  --target-quantizer your_quant_bridge:quantize_target \
+  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-input-provider your_quant_bridge:build_target_inputs \
+  --report "$RUN_DIR/dflash-quant-report.json"
+```
+
+`quantize_target` 可以直接指向现有两参数量化函数。如果它量化全部 Linear，可以直接返回模型；
+若范围不同，使用：
+
+```python
+from models.dflash_v1.target_quant import TargetQuantizationResult
+
+def quantize_target(model, artifact_path):
+    converted = existing_quant_model(model, artifact_path)
+    return TargetQuantizationResult(
+        execution_model=converted,
+        expected_qlinear_paths=EXACT_ARTIFACT_LINEAR_PATHS,
+        profile={"scheme": "existing_w8a8_dynamic"},
+    )
+```
+
+`build_target_inputs` 必须复用普通量化推理已有的 embedding/scale 语义，并返回完成反量化或
+等价预处理后的 FP16 `[1,S,2560]`；DFlash Bridge 不会猜 scale 是乘、除或其他布局规则。

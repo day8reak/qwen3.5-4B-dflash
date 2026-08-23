@@ -37,6 +37,8 @@ query 是 1 个 anchor 加 16 个 mask，共 17 行。诊断报告始终明确�
 - `dflash_hiai_feature_runtime.py`：旧 ModelOutput sidecar 兼容代码；本次 HIAI Tensor/tuple
   主路线不导入它。
 - `../internal_dflash_bridge.py`：复用现有 wrapper，并为每次调用新建 hybrid state。
+- `target_quant.py`：`quant` 分支的已有量化器/input-provider 合同、完整 QLinear 路径审计和
+  FP16 Draft 共享权重门禁；它不实现新的量化 kernel。
 - `internal_target_loader.py`：把已实现的 bridge 包装成 DFlash target facade。
 - `internal_target_loader_template.py`：facade 合同及自定义 loader 参考。
 - `dflash_target_hook_bridge.py`：仅供 eager/CPU 调试的 hook 方案。
@@ -61,3 +63,5 @@ python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
 `raw` 模式只做普通 tokenizer 编码。
 
 完整 NPU 部署流程见 [NPU_DEPLOYMENT.md](../../docs/NPU_DEPLOYMENT.md)。
+量化 Target 接入见
+[DFLASH_V1_NPU_QUANT_DESIGN.md](../../docs/DFLASH_V1_NPU_QUANT_DESIGN.md)。

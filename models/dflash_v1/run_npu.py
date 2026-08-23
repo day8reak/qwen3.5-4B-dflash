@@ -13,6 +13,14 @@ import os
 from pathlib import Path
 from typing import Sequence
 
+from .target_quant import (
+    QUANT_MODE_DISABLED,
+    SUPPORTED_TARGET_QUANT_MODES,
+    TARGET_INPUT_PROVIDER_ENV,
+    TARGET_QUANT_ARTIFACT_ENV,
+    TARGET_QUANT_MODE_ENV,
+    TARGET_QUANTIZER_ENV,
+)
 from .dflash_qwen_adapter_v1 import main as _adapter_main
 from .internal_target_loader import (
     DECODE_CHUNK_SIZE_ENV,
@@ -77,6 +85,33 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prefill-chunk-size", type=int, default=64)
     parser.add_argument("--decode-chunk-size", type=int, default=1)
+    parser.add_argument(
+        "--target-quant-mode",
+        choices=SUPPORTED_TARGET_QUANT_MODES,
+        default=QUANT_MODE_DISABLED,
+        help=(
+            "reuse the existing target quantization path; disabled preserves "
+            "the v1-r1 FP16 target"
+        ),
+    )
+    parser.add_argument(
+        "--target-quantizer",
+        help=(
+            "MODULE:FUNCTION converting the loaded HIAI execution model and "
+            "returning nn.Module/None or an explicit TargetQuantizationResult"
+        ),
+    )
+    parser.add_argument(
+        "--target-quant-artifact",
+        help="existing quantized-target artifact consumed by --target-quantizer",
+    )
+    parser.add_argument(
+        "--target-input-provider",
+        help=(
+            "MODULE:FUNCTION returning the final FP16 layer-0 hidden for the "
+            "quantized target's padded input IDs"
+        ),
+    )
     parser.add_argument("--report")
     parser.add_argument(
         "--progress",
@@ -84,6 +119,66 @@ def _parser() -> argparse.ArgumentParser:
         default=True,
     )
     return parser
+
+
+def _configure_target_quantization(args: argparse.Namespace) -> None:
+    values = {
+        TARGET_QUANTIZER_ENV: args.target_quantizer,
+        TARGET_QUANT_ARTIFACT_ENV: args.target_quant_artifact,
+        TARGET_INPUT_PROVIDER_ENV: args.target_input_provider,
+    }
+    if args.target_quant_mode == QUANT_MODE_DISABLED:
+        supplied = [name for name, value in values.items() if value is not None]
+        if supplied:
+            raise ValueError(
+                "quantization options require --target-quant-mode "
+                "w8a8_dynamic: " + ", ".join(supplied)
+            )
+        os.environ[TARGET_QUANT_MODE_ENV] = QUANT_MODE_DISABLED
+        for name in values:
+            os.environ.pop(name, None)
+        return
+
+    if args.target_factory != DEFAULT_TARGET_FACTORY:
+        raise ValueError(
+            "target quantization currently requires the packaged "
+            f"--target-factory {DEFAULT_TARGET_FACTORY}; a custom factory "
+            "would bypass the quantization assembly audit"
+        )
+    missing = [name for name, value in values.items() if value is None]
+    if missing:
+        raise ValueError(
+            f"--target-quant-mode {args.target_quant_mode} requires "
+            + ", ".join(missing)
+        )
+    artifact = Path(args.target_quant_artifact).expanduser()
+    if artifact.is_symlink():
+        raise ValueError("--target-quant-artifact must not be a symlink")
+    if not artifact.exists():
+        raise FileNotFoundError(
+            f"target quantization artifact does not exist: {artifact}"
+        )
+    report = Path(args.report).expanduser() if args.report is not None else None
+    if report is not None:
+        resolved_report = report.resolve()
+        resolved_artifact = artifact.resolve()
+        overlaps = resolved_report == resolved_artifact
+        if artifact.is_dir():
+            try:
+                resolved_report.relative_to(resolved_artifact)
+            except ValueError:
+                pass
+            else:
+                overlaps = True
+        if overlaps:
+            raise ValueError(
+                "--report must not overwrite or be placed inside the target "
+                "quantization artifact"
+            )
+    os.environ[TARGET_QUANT_MODE_ENV] = args.target_quant_mode
+    for name, value in values.items():
+        assert value is not None
+        os.environ[name] = str(value)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -101,6 +196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         if value <= 0:
             raise ValueError(f"{name} must be positive")
+
+    _configure_target_quantization(args)
 
     package_dir = Path(__file__).resolve().parent
     hiai_source = package_dir.parent / "modeling_qwen3_5_hiai_nd.py"

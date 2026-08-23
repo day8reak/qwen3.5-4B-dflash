@@ -119,6 +119,7 @@ _EMBEDDED_RUNTIME_FILES = frozenset(
         "modeling_dflash.py",
         "modeling_qwen3_5_dflash.py",
         "run_npu.py",
+        "target_quant.py",
     }
 )
 _TARGET_STATE_OUTPUT_FIELDS = (
@@ -1579,6 +1580,73 @@ def _target_integration_audit(
                     raise TypeError(
                         f"target bridge_runtime {field} must be a non-negative int"
                     )
+            raw_quantization = bridge_runtime.get("target_quantization")
+            if raw_quantization is not None:
+                if not isinstance(raw_quantization, Mapping):
+                    raise TypeError(
+                        "target bridge_runtime target_quantization must be a mapping"
+                    )
+                quantization = dict(raw_quantization)
+                scheme = quantization.get("scheme")
+                if scheme not in {"disabled", "w8a8_dynamic"}:
+                    raise ValueError(
+                        "target quantization scheme must be disabled or w8a8_dynamic"
+                    )
+                for field in (
+                    "input_provider_calls",
+                    "input_provider_successes",
+                    "input_provider_failures",
+                ):
+                    value = quantization.get(field)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                    ):
+                        raise TypeError(
+                            f"target quantization {field} must be a non-negative int"
+                        )
+                if scheme == "disabled":
+                    if quantization.get("status") != "DISABLED":
+                        raise RuntimeError(
+                            "disabled target quantization has an inconsistent status"
+                        )
+                    if any(
+                        quantization[field] != 0
+                        for field in (
+                            "input_provider_calls",
+                            "input_provider_successes",
+                            "input_provider_failures",
+                        )
+                    ):
+                        raise RuntimeError(
+                            "disabled target quantization executed an input provider"
+                        )
+                else:
+                    if (
+                        quantization.get("status")
+                        != "PASS_ASSEMBLY_CONTRACT_NO_NUMERICAL_CLAIM"
+                    ):
+                        raise RuntimeError(
+                            "W8A8 target did not pass its assembly contract"
+                        )
+                    qlinear_count = quantization.get("qlinear_count")
+                    if (
+                        isinstance(qlinear_count, bool)
+                        or not isinstance(qlinear_count, int)
+                        or qlinear_count <= 0
+                    ):
+                        raise RuntimeError(
+                            "W8A8 target must report a positive QLinear count"
+                        )
+                    if (
+                        quantization.get("input_provider_output_contract")
+                        != "final_fp16_layer0_hidden"
+                    ):
+                        raise RuntimeError(
+                            "W8A8 target input provider has the wrong output contract"
+                        )
+                bridge_runtime["target_quantization"] = quantization
             isolation["bridge_runtime"] = bridge_runtime
         isolation["status"] = "PASS_DECLARED_AND_INSTRUMENTED"
 
@@ -1733,6 +1801,24 @@ def _target_integration_audit(
                     raise RuntimeError(
                         "packaged NPU bridge did not synchronize every completed call"
                     )
+                quantization = bridge_runtime.get("target_quantization")
+                if isinstance(quantization, Mapping):
+                    scheme = quantization.get("scheme")
+                    if scheme == "w8a8_dynamic":
+                        if quantization.get("input_provider_calls") != forward_calls:
+                            raise RuntimeError(
+                                "quantized target input-provider and forward "
+                                "call counts differ"
+                            )
+                        if quantization.get("input_provider_successes") != forward_calls:
+                            raise RuntimeError(
+                                "one or more quantized target input-provider "
+                                "calls did not complete"
+                            )
+                        if quantization.get("input_provider_failures") != 0:
+                            raise RuntimeError(
+                                "quantized target input provider reported failures"
+                            )
 
     return {
         "loader": target_loader or "package_default",

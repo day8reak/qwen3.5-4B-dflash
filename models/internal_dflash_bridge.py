@@ -36,6 +36,18 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from .dflash_v1.target_quant import (
+    QUANT_MODE_DISABLED,
+    TargetQuantizationRequest,
+    audit_quantized_target,
+    invoke_input_provider,
+    invoke_quantizer,
+    load_callback,
+    normalize_quantizer_result,
+    preconversion_linear_paths,
+    validate_input_provider_output,
+)
+
 
 KV_CACHE_MAX_LEN_ENV = "DFLASH_HIAI_KV_CACHE_MAX_LEN"
 BLOCK_SIZE = 64
@@ -143,6 +155,12 @@ class InternalDFlashTarget(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         kv_cache_max_len: int,
+        draft_input_embeddings: nn.Module | None = None,
+        draft_output_embeddings: nn.Module | None = None,
+        quantization_request: TargetQuantizationRequest | None = None,
+        target_input_provider: Any = None,
+        target_input_provider_identity: Mapping[str, object] | None = None,
+        target_quantization_audit: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(model_wrapper, nn.Module):
@@ -157,6 +175,38 @@ class InternalDFlashTarget(nn.Module):
         self.model_wrapper = model_wrapper
         self.requested_device = torch.device(device)
         self.requested_dtype = dtype
+        self.quantization_request = (
+            quantization_request or TargetQuantizationRequest.from_environment()
+        )
+        if self.quantization_request.enabled and not callable(target_input_provider):
+            raise TypeError(
+                "quantized target requires a callable target input provider"
+            )
+        if not self.quantization_request.enabled and target_input_provider is not None:
+            raise ValueError(
+                "disabled target quantization must not install an input provider"
+            )
+        self._target_input_provider = target_input_provider
+        self._target_input_provider_identity = dict(
+            target_input_provider_identity or {}
+        )
+        self._target_quantization_static_audit = dict(
+            target_quantization_audit
+            or {
+                "status": "DISABLED",
+                "scheme": QUANT_MODE_DISABLED,
+            }
+        )
+        self._draft_input_embeddings = (
+            draft_input_embeddings
+            if draft_input_embeddings is not None
+            else self._execution_input_embeddings()
+        )
+        self._draft_output_embeddings = (
+            draft_output_embeddings
+            if draft_output_embeddings is not None
+            else self._execution_output_embeddings()
+        )
         self.kv_cache_max_len = _positive_int(
             kv_cache_max_len,
             name="kv_cache_max_len",
@@ -175,6 +225,40 @@ class InternalDFlashTarget(nn.Module):
         self._total_padding_tokens = 0
         self._last_requested_sequence_length: int | None = None
         self._last_execution_sequence_length: int | None = None
+        self._target_input_provider_calls = 0
+        self._target_input_provider_successes = 0
+        self._target_input_provider_failures = 0
+
+    def _execution_input_embeddings(self) -> nn.Module:
+        getter = getattr(self.dflash_execution_model, "get_input_embeddings", None)
+        module = getter() if callable(getter) else None
+        if not isinstance(module, nn.Module):
+            raise TypeError("HIAI execution model lacks input embeddings")
+        return module
+
+    def _execution_output_embeddings(self) -> nn.Module:
+        getter = getattr(self.dflash_execution_model, "get_output_embeddings", None)
+        module = getter() if callable(getter) else None
+        if module is None:
+            module = getattr(self.dflash_execution_model, "lm_head", None)
+        if not isinstance(module, nn.Module):
+            raise TypeError("HIAI execution model lacks its LM head")
+        return module
+
+    @property
+    def dflash_target_quantization_audit(self) -> Mapping[str, object]:
+        return {
+            **self._target_quantization_static_audit,
+            "input_provider_identity": dict(self._target_input_provider_identity),
+            "input_provider_calls": self._target_input_provider_calls,
+            "input_provider_successes": self._target_input_provider_successes,
+            "input_provider_failures": self._target_input_provider_failures,
+            "input_provider_output_contract": (
+                "final_fp16_layer0_hidden"
+                if self.quantization_request.enabled
+                else "ordinary_fp16_embedding"
+            ),
+        }
 
     @property
     def dflash_full_prefix_bridge_audit(self) -> Mapping[str, object]:
@@ -190,6 +274,7 @@ class InternalDFlashTarget(nn.Module):
             "total_padding_tokens": self._total_padding_tokens,
             "last_requested_sequence_length": self._last_requested_sequence_length,
             "last_execution_sequence_length": self._last_execution_sequence_length,
+            "target_quantization": dict(self.dflash_target_quantization_audit),
         }
 
     @property
@@ -209,22 +294,53 @@ class InternalDFlashTarget(nn.Module):
         return config
 
     def get_input_embeddings(self) -> nn.Module:
-        getter = getattr(self.dflash_execution_model, "get_input_embeddings", None)
-        if not callable(getter):
-            raise TypeError("HIAI execution model lacks get_input_embeddings()")
-        module = getter()
-        if not isinstance(module, nn.Module):
-            raise TypeError("get_input_embeddings() must return torch.nn.Module")
-        return module
+        return self._draft_input_embeddings
 
     def get_output_embeddings(self) -> nn.Module:
-        getter = getattr(self.dflash_execution_model, "get_output_embeddings", None)
-        module = getter() if callable(getter) else None
-        if module is None:
-            module = getattr(self.dflash_execution_model, "lm_head", None)
-        if not isinstance(module, nn.Module):
-            raise TypeError("HIAI execution model must expose its LM head")
-        return module
+        return self._draft_output_embeddings
+
+    def _target_inputs(self, input_ids: Tensor) -> Tensor:
+        if not self.quantization_request.enabled:
+            embeddings = self.get_input_embeddings()
+            inputs_embeds = embeddings(
+                input_ids.to(embeddings.weight.device)
+            ).to(self.requested_device)
+            if inputs_embeds.dtype != self.requested_dtype:
+                raise ValueError(
+                    f"input embeddings use {inputs_embeds.dtype}, expected "
+                    f"{self.requested_dtype}"
+                )
+            return inputs_embeds
+
+        provider = self._target_input_provider
+        assert callable(provider)
+        artifact = self.quantization_request.artifact_path
+        assert artifact is not None
+        self._target_input_provider_calls += 1
+        try:
+            value = invoke_input_provider(
+                provider,
+                self.model_wrapper,
+                input_ids,
+                artifact,
+                device=self.requested_device,
+                output_dtype=self.requested_dtype,
+            )
+            inputs_embeds = validate_input_provider_output(
+                value,
+                sequence_length=int(input_ids.shape[1]),
+                hidden_size=_positive_int(
+                    getattr(self.config, "hidden_size", None),
+                    name="config.hidden_size",
+                ),
+                device=self.requested_device,
+                dtype=self.requested_dtype,
+            )
+        except Exception:
+            self._target_input_provider_failures += 1
+            raise
+        self._target_input_provider_successes += 1
+        return inputs_embeds
 
     def _rebuild_full_attention_block_tables(self) -> int:
         """Keep per-layer block tables aligned with the bridge cache length."""
@@ -487,14 +603,7 @@ class InternalDFlashTarget(nn.Module):
         self._last_execution_sequence_length = execution_length
         self._total_padding_tokens += execution_length - sequence_length
 
-        embeddings = self.get_input_embeddings()
-        inputs_embeds = embeddings(
-            execution_input_ids.to(embeddings.weight.device)
-        ).to(self.requested_device)
-        if inputs_embeds.dtype != self.requested_dtype:
-            raise ValueError(
-                f"input embeddings use {inputs_embeds.dtype}, expected {self.requested_dtype}"
-            )
+        inputs_embeds = self._target_inputs(execution_input_ids)
         attention_mask = self._fresh_attention_mask(execution_length)
         position_ids = torch.arange(
             execution_length,
@@ -583,6 +692,7 @@ def load_qwen35_target(
 ) -> nn.Module:
     """Load the existing receiver wrapper and return the DFlash target bridge."""
 
+    quantization_request = TargetQuantizationRequest.from_environment()
     raw_max_len = os.environ.get(KV_CACHE_MAX_LEN_ENV)
     if raw_max_len is None:
         raise RuntimeError(
@@ -626,11 +736,123 @@ def load_qwen35_target(
             "models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM"
         )
     wrapper.eval()
+    execution_model = wrapper.model
+    draft_input_getter = getattr(execution_model, "get_input_embeddings", None)
+    draft_input_embeddings = (
+        draft_input_getter() if callable(draft_input_getter) else None
+    )
+    draft_output_getter = getattr(execution_model, "get_output_embeddings", None)
+    draft_output_embeddings = (
+        draft_output_getter() if callable(draft_output_getter) else None
+    )
+    if draft_output_embeddings is None:
+        draft_output_embeddings = getattr(execution_model, "lm_head", None)
+    if not isinstance(draft_input_embeddings, nn.Module) or not isinstance(
+        draft_output_embeddings,
+        nn.Module,
+    ):
+        raise TypeError(
+            "unquantized target must expose FP16 embedding and LM-head modules "
+            "for the DFlash Draft"
+        )
+
+    input_provider = None
+    input_provider_identity: Mapping[str, object] | None = None
+    quantization_audit: Mapping[str, object] = {
+        "status": "DISABLED",
+        "scheme": QUANT_MODE_DISABLED,
+    }
+    if quantization_request.enabled:
+        assert quantization_request.quantizer_spec is not None
+        assert quantization_request.input_provider_spec is not None
+        assert quantization_request.artifact_path is not None
+        quantizer, quantizer_identity = load_callback(
+            quantization_request.quantizer_spec,
+            label="target quantizer",
+        )
+        input_provider, input_provider_identity = load_callback(
+            quantization_request.input_provider_spec,
+            label="target input provider",
+        )
+        default_expected_qlinear_paths = preconversion_linear_paths(
+            execution_model,
+        )
+        raw_result = invoke_quantizer(
+            quantizer,
+            execution_model,
+            quantization_request.artifact_path,
+            device=torch.device(device),
+            output_dtype=dtype,
+        )
+        quantized = normalize_quantizer_result(
+            raw_result,
+            original_execution_model=execution_model,
+            default_expected_qlinear_paths=default_expected_qlinear_paths,
+        )
+        if type(quantized.execution_model) is not expected_model_class:
+            raise RuntimeError(
+                "target quantizer must preserve the package-local "
+                "Qwen3_5ForCausalLM execution-model class"
+            )
+        # The existing converter may create new QLinear buffers after the
+        # wrapper was initially placed on NPU.  Move the converted module once
+        # here so QLinear.forward does not copy W_q/scale on every call.
+        wrapper.model = quantized.execution_model.to(torch.device(device)).eval()
+        if quantized.draft_input_embeddings is not None:
+            draft_input_embeddings = quantized.draft_input_embeddings
+        if quantized.draft_output_embeddings is not None:
+            draft_output_embeddings = quantized.draft_output_embeddings
+        qlinear_type = getattr(hiai_module, "QLinear", None)
+        if not isinstance(qlinear_type, type):
+            raise TypeError("HIAI target source must export QLinear")
+        assembly = audit_quantized_target(
+            quantized,
+            qlinear_type=qlinear_type,
+            draft_input_embeddings=draft_input_embeddings,
+            draft_output_embeddings=draft_output_embeddings,
+            device=torch.device(device),
+            dtype=dtype,
+            vocab_size=_positive_int(
+                getattr(wrapper.model.config, "vocab_size", None),
+                name="config.vocab_size",
+            ),
+            hidden_size=_positive_int(
+                getattr(wrapper.model.config, "hidden_size", None),
+                name="config.hidden_size",
+            ),
+        )
+        quantization_audit = {
+            **assembly,
+            "quantizer_identity": quantizer_identity,
+            "artifact_path": str(quantization_request.artifact_path),
+            "artifact_kind": (
+                "directory"
+                if quantization_request.artifact_path.is_dir()
+                else "file"
+            ),
+            "numerical_validation": "PENDING_REAL_NPU_PARITY",
+        }
+    else:
+        qlinear_type = getattr(hiai_module, "QLinear", None)
+        if isinstance(qlinear_type, type) and any(
+            isinstance(item, qlinear_type) for item in execution_model.modules()
+        ):
+            raise RuntimeError(
+                "target quantization is disabled but the loaded target already "
+                "contains QLinear modules"
+            )
+
     target = InternalDFlashTarget(
         wrapper,
         device=torch.device(device),
         dtype=dtype,
         kv_cache_max_len=kv_cache_max_len,
+        draft_input_embeddings=draft_input_embeddings,
+        draft_output_embeddings=draft_output_embeddings,
+        quantization_request=quantization_request,
+        target_input_provider=input_provider,
+        target_input_provider_identity=input_provider_identity,
+        target_quantization_audit=quantization_audit,
     )
     return target.eval()
 
