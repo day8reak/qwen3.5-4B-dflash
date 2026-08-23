@@ -238,11 +238,12 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --target-quantizer your_quant_bridge:quantize_target \
   --target-quant-artifact "$QUANT_ARTIFACT" \
   --target-input-provider your_quant_bridge:build_target_inputs \
+  --compare-first-qlinear \
   --export-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
   --report "$RUN_DIR/target-quant-preflight.json"
 ```
 
-它执行 8 次有界 Target 调用，检查：
+它执行 8 次有界 Target 调用，再用 1 次调用捕获第一个 QLinear 的真实输入/输出，检查：
 
 1. 同一前缀连续两次 ordinary logits 可重复；
 2. 打开 feature 不改变 logits；
@@ -251,6 +252,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 5. input provider 每次恰好成功一次；
 6. QLinear 路径、shape、scale、device 和未替换 Linear 拓扑完整；
 7. 可选导出真实 `W_q/scale` 给 CPU/CUDA 公式仿真。
+8. 同一次 NPU activation 上，第一个 QLinear 的真实输出与 CPU W8A8 公式差异被量化记录。
 
 核对报告：
 
@@ -272,13 +274,18 @@ assert quant["linear_topology_validation"] == "PASS_EXACT_PATH_SHAPE_BIAS"
 assert quant["quantized_weight_layout"] == "K_by_N"
 assert quant["input_provider_failures"] == 0
 assert report["bounded_probes"]["status"] == "PASS_BOUNDED_TARGET_PROBES"
+same = report["same_activation_qlinear"]
+assert same["status"] in {"PASS_BITWISE_EQUAL", "OBSERVED_NUMERICAL_DIFFERENCE"}
+assert len(same["comparisons"]) == 1
 export = report["w8a8_emulation_export"]
 assert export["status"] == "PASS_EXPORTED_Q_LINEAR_BUFFERS_NO_NUMERICAL_CLAIM"
 print("TARGET_QUANT_PREFLIGHT_REPORT_PASS")
 PY
 ```
 
-这个 PASS **不证明**：普通增量量化推理等价、真实 NPU QLinear 数值与 CPU 公式相同、完整
+这个 PASS 证明同一 activation 对照已真实执行，不代表数值门禁已通过。若状态不是
+`PASS_BITWISE_EQUAL`，先看 max/mean absolute error 与 cosine，再依据部署 runtime 的已冻结
+容差判断；不要临时放宽阈值。它也**不证明**其他 QLinear、普通增量量化推理等价、完整
 DFlash token 零差异、接受率或性能。
 
 ## 7. 第二步：CPU 复现同一份 W8A8 Linear
@@ -347,27 +354,12 @@ PY
 
 这是区分“Linear 公式不一致”和“整网其他部分不一致”的最有效步骤。
 
-选择第一个 QLinear，在一次固定 Target 调用中保存它的输入 `x_npu` 和真实输出 `npu_output`。
-然后用同一次调用的 `W_q/scale` 在 CPU 计算：
+第 6 节的 `--compare-first-qlinear` 已经自动完成第一层对照：它给真实 QLinear 注册临时
+pre-hook/forward-hook，在**同一次 Target forward** 中抓取 activation 和 NPU output，Target 返回后
+立即用相同 `W_q/scale` 在 CPU 重算。报告位置：
 
-```python
-import torch
-from models.dflash_v1.w8a8_emulation import (
-    compare_formula_output,
-    emulate_w8a8_linear,
-)
-
-formula_output = emulate_w8a8_linear(
-    x_npu.detach().cpu(),
-    qlinear.W_q.detach().cpu(),
-    qlinear.scale.detach().cpu(),
-    output_dtype=torch.float16,
-)
-comparison = compare_formula_output(
-    npu_output.detach().cpu(),
-    formula_output,
-)
-print(comparison)
+```text
+same_activation_qlinear.comparisons[0].npu_output_vs_cpu_formula
 ```
 
 必须使用**同一 activation**，不能分别跑两次整网后拿不同输入比较。建议按实际 forward 顺序：
@@ -378,6 +370,19 @@ print(comparison)
 4. 中间层；
 5. LM head。
 
+要检查报告 `target_quantization_final.qlinear_paths` 中的指定层，用新的报告路径重跑，并把
+`--compare-first-qlinear` 换成可重复的参数：
+
+```bash
+--compare-qlinear-path language_model.layers.0.linear_attn.in_proj_qkv \
+--compare-qlinear-path language_model.layers.0.mlp.down_proj \
+--require-qlinear-bitwise
+```
+
+路径以你自己的预检报告为准，不要照抄示例。`--require-qlinear-bitwise` 是可选的严格模式，
+只有部署环境把逐 bit 相同冻结为门禁时才启用。再次运行时不要复用已经存在的
+`--export-w8a8-emulation-artifact` 目录。
+
 判断方法：
 
 - 第一层已明显分叉：查 activation dynamic-quant rounding、scale dtype/layout、input provider。
@@ -385,9 +390,63 @@ print(comparison)
   64-token padding。
 - 单层只在特定 K/N shape 分叉：查对应 QLinear artifact 的转置和 scale 长度。
 
-## 9. 第四步：完整量化 NPU DFlash
+## 9. 第四步：普通增量量化 Target 对照 fresh full-prefix
 
-前面三步通过后，再加载 1.27 GB Draft checkpoint：
+这一步验证 Bridge 不是“只和自己一致”。诊断器会用同一个量化 input provider：一边保持
+KV/GDN state 做 prefill→单 token decode，另一边每个位置重新建立 fresh state、重算完整前缀。
+
+```bash
+set -euo pipefail
+
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.diagnose_acceptance \
+  --target-dir "$TARGET_DIR" \
+  --draft-dir "$DRAFT_DIR" \
+  --prompt-file "$PROMPT_FILE" \
+  --prompt-mode chat \
+  --enable-thinking \
+  --device npu:0 \
+  --dtype float16 \
+  --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
+  --target-parity-decode-steps 4 \
+  --proposal-counts 1 \
+  --acceptance-rounds 2 \
+  --eos-token-id 248044 \
+  --target-quant-mode w8a8_dynamic \
+  --target-quantizer your_quant_bridge:quantize_target \
+  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-input-provider your_quant_bridge:build_target_inputs \
+  --report "$RUN_DIR/npu-quant-target-parity.json"
+```
+
+检查：
+
+```bash
+"$MODEL_PYTHON" -B - "$RUN_DIR/npu-quant-target-parity.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    report = json.load(stream)
+
+parity = report["target_path_parity"]
+assert parity["all_top1_match"] is True
+assert parity["status"] in {"PASS_BITWISE_EQUAL", "PASS_TOP1_WITH_NUMERIC_DIFFERENCE"}
+quant_path = parity["target_quantization"]
+assert quant_path["scheme"] == "w8a8_dynamic"
+assert quant_path["input_path"] == "receiver_quant_input_provider"
+assert quant_path["input_provider_calls_reconciled"] is True
+assert quant_path["input_provider_call_delta"] == quant_path["expected_input_provider_call_delta"]
+print("NPU_QUANT_INCREMENTAL_FULL_PREFIX_PARITY_PASS")
+PY
+```
+
+若 Top-1 相同但 feature 数值不同，先看每个 `records[*].feature_layers`，找到最早漂移的层。
+Draft 消费的是 feature，因此不能只看 Target Top-1。
+
+## 10. 第五步：完整量化 NPU DFlash
+
+前面四步通过后，再做正式的长输出检查：
 
 ```bash
 set -euo pipefail
@@ -451,7 +510,7 @@ PY
 注意：最后这行只代表 framework/调度门禁。还需要设备 trace 证明没有 CPU fallback，才可以称为
 真实 NPU 路线通过；接受率和性能也必须单独测量。
 
-## 10. 四类比较分别回答什么
+## 11. 四类比较分别回答什么
 
 | 比较 | 回答的问题 | 不能回答的问题 |
 |---|---|---|
@@ -463,7 +522,7 @@ PY
 不要用后一个 PASS 替代前一个。例如 ordinary 与 DFlash 使用同一条错误 full-prefix Target 路线时，
 两者仍可能互相一致，所以必须单独对照普通增量量化推理。
 
-## 11. 按报错阶段定位
+## 12. 按报错阶段定位
 
 | 报错/现象 | 最可能原因 | 先做什么 |
 |---|---|---|
@@ -482,7 +541,7 @@ PY
 | strict greedy 通过但接受率低 | Draft proposal 质量或 workload 难度 | 用 `diagnose_acceptance` 扫 K=1/4/8/16 |
 | CPU 很慢 | correctness-only 的 4B full-prefix 路线 | 先短 prompt、`max-new-tokens=2`；不要据此评性能 |
 
-## 12. 接受率低时怎么查
+## 13. 接受率低时怎么查
 
 正确性通过后再运行：
 
@@ -504,6 +563,31 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --report "$RUN_DIR/cpu-w8a8-acceptance.json"
 ```
 
+在 NPU 上用同一量化 Target 诊断时，参数不能只写 `--device npu:0`；必须把量化三件套一起传入，
+否则诊断器会按设计加载非量化 Target：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.diagnose_acceptance \
+  --target-dir "$TARGET_DIR" \
+  --draft-dir "$DRAFT_DIR" \
+  --prompt-file "$PROMPT_FILE" \
+  --prompt-mode chat \
+  --enable-thinking \
+  --device npu:0 \
+  --dtype float16 \
+  --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
+  --eos-token-id 248044 \
+  --proposal-counts 1,4,8,16 \
+  --acceptance-rounds 16 \
+  --target-quant-mode w8a8_dynamic \
+  --target-quantizer your_quant_bridge:quantize_target \
+  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-input-provider your_quant_bridge:build_target_inputs \
+  --trace-draft-layers \
+  --report "$RUN_DIR/npu-w8a8-acceptance.json"
+```
+
 优先看：
 
 - `K=1 first_proposal_accuracy`：第一 proposal 都不准时，先查 feature/Draft 输入；
@@ -515,7 +599,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 如果最终 token 完全一致，只是接受率下降，这是性能/提议质量问题，不是生成正确性失败。此时应
 先比较量化前后 8 层 feature 和 Draft 每层输出，不要先修改 verifier。
 
-## 13. 提交 bug 时最小信息
+## 14. 提交 bug 时最小信息
 
 为避免泄露 prompt、路径和权重，只需要提供脱敏后的：
 
@@ -530,13 +614,13 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 
 不要上传模型权重、量化 artifact、prompt 明文、tokenizer 私有文件或包含凭据的环境变量。
 
-## 14. 什么情况下算完成
+## 15. 什么情况下算完成
 
 完整闭环至少需要：
 
 - Target-only 预检 PASS；
 - QLinear 精确拓扑/shape/scale 门禁 PASS；
-- same-activation NPU/CPU Linear 对照达到冻结阈值；
+- same-activation NPU/CPU QLinear 对照达到事先冻结的设备/runtime 阈值；逐 bit 模式可直接启用；
 - 普通增量量化 Target 与 fresh full-prefix Target token 对齐；
 - 量化 ordinary 与量化 DFlash token/EOS/stop reason 零差异；
 - 至少一个真实 Draft/feature/verify round；

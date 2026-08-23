@@ -57,6 +57,32 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-quantizer", required=True)
     parser.add_argument("--target-quant-artifact", required=True)
     parser.add_argument("--target-input-provider", required=True)
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument(
+        "--compare-first-qlinear",
+        action="store_true",
+        help=(
+            "capture the first QLinear activation/output from one real NPU "
+            "Target call and compare it with the CPU W8A8 formula"
+        ),
+    )
+    comparison.add_argument(
+        "--compare-qlinear-path",
+        action="append",
+        default=[],
+        help=(
+            "repeatable audited QLinear module path for same-activation NPU/CPU "
+            "comparison; cannot be combined with --compare-first-qlinear"
+        ),
+    )
+    parser.add_argument(
+        "--require-qlinear-bitwise",
+        action="store_true",
+        help=(
+            "return a failing status when any requested same-activation "
+            "comparison is not bitwise equal"
+        ),
+    )
     parser.add_argument(
         "--export-w8a8-emulation-artifact",
         help=(
@@ -302,6 +328,183 @@ def _run_bounded_probes(
     }
 
 
+def _quantized_execution_model(target: nn.Module) -> nn.Module:
+    controller = getattr(target, "target", None)
+    execution_model = getattr(controller, "dflash_execution_model", None)
+    if not isinstance(controller, nn.Module) or not isinstance(
+        execution_model,
+        nn.Module,
+    ):
+        raise TypeError(
+            "same-activation comparison requires the packaged facade over "
+            "InternalDFlashTarget"
+        )
+    return execution_model
+
+
+def _same_activation_qlinear_comparison(
+    target: nn.Module,
+    prefix: Tensor,
+    *,
+    audited_paths: Sequence[str],
+    compare_first: bool,
+    requested_paths: Sequence[str],
+) -> dict[str, object]:
+    """Compare real QLinear outputs with the CPU formula on identical inputs.
+
+    Hooks capture both tensors from one real Target forward.  This avoids the
+    invalid comparison where two independent whole-model runs have already
+    produced different activations before the selected QLinear.
+    """
+
+    if not compare_first and not requested_paths:
+        return {
+            "status": "DISABLED",
+            "target_forward_calls": 0,
+            "scope": "same real activation comparison was not requested",
+        }
+    if not audited_paths or any(
+        not isinstance(path, str) or not path for path in audited_paths
+    ):
+        raise ValueError("quant target audit contains no valid QLinear paths")
+    if len(audited_paths) != len(set(audited_paths)):
+        raise ValueError("quant target audit contains duplicate QLinear paths")
+
+    execution_model = _quantized_execution_model(target)
+    modules = dict(execution_model.named_modules())
+    audited_set = set(audited_paths)
+    audited_module_order = [
+        name
+        for name, module in execution_model.named_modules()
+        if name in audited_set and type(module).__name__ == "QLinear"
+    ]
+    if set(audited_module_order) != audited_set:
+        raise RuntimeError("audited QLinear paths differ from the execution model")
+    selected = [] if compare_first else list(requested_paths)
+    if not compare_first and (
+        not selected
+        or any(not isinstance(path, str) or not path for path in selected)
+    ):
+        raise ValueError("same-activation QLinear paths must be non-empty strings")
+    if len(selected) != len(set(selected)):
+        raise ValueError("same-activation QLinear paths must not repeat")
+    unknown = sorted(set(selected) - audited_set)
+    if unknown:
+        raise ValueError(
+            "requested QLinear paths are not in the quant assembly audit: "
+            + ", ".join(unknown)
+        )
+
+    hook_paths = audited_module_order if compare_first else selected
+    activations: dict[str, Tensor] = {}
+    outputs: dict[str, Tensor] = {}
+    calls = {path: 0 for path in hook_paths}
+    handles: list[torch.utils.hooks.RemovableHandle] = []
+    first_runtime_path: str | None = None
+
+    def capture_input(path: str):
+        def hook(_module: nn.Module, values: tuple[object, ...]) -> None:
+            nonlocal first_runtime_path
+            if compare_first:
+                if first_runtime_path is None:
+                    first_runtime_path = path
+                    selected.append(path)
+                if path != first_runtime_path:
+                    return
+            if calls[path] != 0:
+                raise RuntimeError(f"QLinear {path!r} executed more than once")
+            if not values or not isinstance(values[0], Tensor):
+                raise TypeError(f"QLinear {path!r} did not receive a Tensor input")
+            calls[path] = 1
+            activations[path] = values[0].detach().clone()
+
+        return hook
+
+    def capture_output(path: str):
+        def hook(_module: nn.Module, _values: tuple[object, ...], value: object) -> None:
+            if compare_first and path != first_runtime_path:
+                return
+            if not isinstance(value, Tensor):
+                raise TypeError(f"QLinear {path!r} did not return a Tensor")
+            outputs[path] = value.detach().clone()
+
+        return hook
+
+    try:
+        for path in hook_paths:
+            module = modules[path]
+            handles.append(module.register_forward_pre_hook(capture_input(path)))
+            handles.append(module.register_forward_hook(capture_output(path)))
+        _execute(target, prefix, features=False)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    if compare_first and first_runtime_path is None:
+        raise RuntimeError("the quant Target executed no audited QLinear module")
+
+    from .w8a8_emulation import compare_formula_output, emulate_w8a8_linear
+
+    records: list[dict[str, object]] = []
+    for path in selected:
+        if calls[path] != 1 or path not in activations or path not in outputs:
+            raise RuntimeError(f"QLinear {path!r} was not captured exactly once")
+        module = modules[path]
+        weight = getattr(module, "W_q", None)
+        scale = getattr(module, "scale", None)
+        if not isinstance(weight, Tensor) or not isinstance(scale, Tensor):
+            raise TypeError(f"QLinear {path!r} lost W_q/scale tensors")
+        activation = activations.pop(path)
+        npu_output = outputs.pop(path)
+        if not bool(torch.isfinite(activation).all().item()):
+            raise FloatingPointError(f"QLinear {path!r} activation is non-finite")
+        if not bool(torch.isfinite(npu_output).all().item()):
+            raise FloatingPointError(f"QLinear {path!r} output is non-finite")
+        activation_cpu = activation.to(device="cpu")
+        npu_output_cpu = npu_output.to(device="cpu")
+        formula_output = emulate_w8a8_linear(
+            activation_cpu,
+            weight.detach().to(device="cpu"),
+            scale.detach().to(device="cpu"),
+            output_dtype=torch.float16,
+        )
+        comparison = compare_formula_output(npu_output_cpu, formula_output)
+        records.append(
+            {
+                "path": path,
+                "activation_shape": list(activation_cpu.shape),
+                "activation_dtype": str(activation_cpu.dtype),
+                "weight_shape": list(weight.shape),
+                "weight_dtype": str(weight.dtype),
+                "scale_shape": list(scale.shape),
+                "scale_dtype": str(scale.dtype),
+                "npu_output_vs_cpu_formula": comparison,
+            }
+        )
+        del activation, npu_output, activation_cpu, npu_output_cpu, formula_output
+
+    bitwise = all(
+        bool(record["npu_output_vs_cpu_formula"]["bitwise_equal"])
+        for record in records
+        if isinstance(record["npu_output_vs_cpu_formula"], Mapping)
+    )
+    return {
+        "status": (
+            "PASS_BITWISE_EQUAL"
+            if bitwise
+            else "OBSERVED_NUMERICAL_DIFFERENCE"
+        ),
+        "target_forward_calls": 1,
+        "all_bitwise_equal": bitwise,
+        "selected_by": "first_runtime_forward" if compare_first else "explicit_paths",
+        "comparisons": records,
+        "scope": (
+            "same NPU activation and output versus the documented CPU W8A8 "
+            "formula; no whole-model or performance claim"
+        ),
+    }
+
+
 def _is_within(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -420,6 +623,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("quant target preflight requires --device npu or npu:N")
     if args.kv_cache_max_len <= 0 or args.kv_cache_max_len % 64:
         raise ValueError("--kv-cache-max-len must be positive and divisible by 64")
+    if args.require_qlinear_bitwise and not (
+        args.compare_first_qlinear or args.compare_qlinear_path
+    ):
+        raise ValueError(
+            "--require-qlinear-bitwise requires --compare-first-qlinear or "
+            "--compare-qlinear-path"
+        )
     tokens = _prompt_ids(args.prompt_ids)
     target_root = Path(args.target_dir).expanduser().resolve()
     if not target_root.is_dir():
@@ -469,46 +679,112 @@ def main(argv: Sequence[str] | None = None) -> int:
     initial_audit, initial_quant = _quantization_audit(target)
     device = torch.device(args.device)
     prefix = torch.tensor([tokens], dtype=torch.long, device=device)
+    qlinear_paths = initial_quant.get("qlinear_paths")
+    if not isinstance(qlinear_paths, list) or any(
+        not isinstance(path, str) for path in qlinear_paths
+    ):
+        raise TypeError("quant target audit did not expose qlinear_paths")
+    same_activation = _same_activation_qlinear_comparison(
+        target,
+        prefix,
+        audited_paths=qlinear_paths,
+        compare_first=bool(args.compare_first_qlinear),
+        requested_paths=tuple(args.compare_qlinear_path),
+    )
     probes = _run_bounded_probes(target, prefix)
     final_audit, final_quant = _quantization_audit(target)
 
-    expected_calls = int(probes["target_forward_calls"])
+    expected_calls = int(probes["target_forward_calls"]) + int(
+        same_activation["target_forward_calls"]
+    )
+    initial_bridge = initial_audit.get("bridge_runtime")
     bridge = final_audit.get("bridge_runtime")
-    assert isinstance(bridge, Mapping)
-    for label, value in (
-        ("facade target_forward_calls", final_audit.get("target_forward_calls")),
-        ("bridge full_prefix_calls", bridge.get("full_prefix_calls")),
-        ("input_provider_calls", final_quant.get("input_provider_calls")),
+    if not isinstance(initial_bridge, Mapping) or not isinstance(bridge, Mapping):
+        raise TypeError("target facade bridge audit must be a mapping")
+    for label, initial, final in (
+        (
+            "facade target_forward_calls",
+            initial_audit.get("target_forward_calls"),
+            final_audit.get("target_forward_calls"),
+        ),
+        (
+            "bridge full_prefix_calls",
+            initial_bridge.get("full_prefix_calls"),
+            bridge.get("full_prefix_calls"),
+        ),
+        (
+            "input_provider_calls",
+            initial_quant.get("input_provider_calls"),
+            final_quant.get("input_provider_calls"),
+        ),
         (
             "input_provider_successes",
+            initial_quant.get("input_provider_successes"),
             final_quant.get("input_provider_successes"),
         ),
     ):
-        if value != expected_calls:
+        if (
+            isinstance(initial, bool)
+            or not isinstance(initial, int)
+            or isinstance(final, bool)
+            or not isinstance(final, int)
+        ):
+            raise TypeError(f"{label} counters must be integers")
+        if final - initial != expected_calls:
             raise RuntimeError(
-                f"{label} must equal bounded probe calls {expected_calls}; got {value}"
+                f"{label} delta must equal executed target calls {expected_calls}; "
+                f"got initial={initial}, final={final}"
             )
-    if final_quant.get("input_provider_failures") != 0:
-        raise RuntimeError("quant target input provider reported failures")
+    initial_failures = initial_quant.get("input_provider_failures")
+    final_failures = final_quant.get("input_provider_failures")
+    if (
+        isinstance(initial_failures, bool)
+        or not isinstance(initial_failures, int)
+        or isinstance(final_failures, bool)
+        or not isinstance(final_failures, int)
+    ):
+        raise TypeError("input_provider_failures counters must be integers")
+    if final_failures - initial_failures != 0:
+        raise RuntimeError("quant target input provider reported new failures")
 
     emulation_export: dict[str, object] | None = None
     if export_destination is not None:
         from .w8a8_emulation import export_w8a8_emulation_artifact
 
-        qlinear_paths = final_quant.get("qlinear_paths")
-        if not isinstance(qlinear_paths, list) or any(
-            not isinstance(path, str) for path in qlinear_paths
-        ):
-            raise TypeError("quant target audit did not expose qlinear_paths")
         emulation_export = export_w8a8_emulation_artifact(
             target,
             export_destination,
             expected_qlinear_paths=qlinear_paths,
         )
 
+    same_activation_pass = same_activation.get("status") == "PASS_BITWISE_EQUAL"
+    strict_comparison_failure = bool(
+        args.require_qlinear_bitwise and not same_activation_pass
+    )
+    remaining_gates = [
+        "ordinary_incremental_quant_target_vs_fresh_full_prefix_parity",
+        "quant_target_plus_dflash_strict_greedy_exact_match",
+        "real_npu_operator_trace_and_no_fallback",
+        "acceptance_and_performance_measurement",
+    ]
+    if same_activation.get("status") == "DISABLED":
+        remaining_gates.insert(
+            0,
+            "same_activation_real_npu_qlinear_vs_cpu_cuda_formula_parity",
+        )
+    elif not same_activation_pass:
+        remaining_gates.insert(
+            0,
+            "review_same_activation_qlinear_numerical_difference",
+        )
+
     payload: dict[str, Any] = {
-        "schema_version": 1,
-        "status": "PASS_TARGET_QUANT_ASSEMBLY_AND_BOUNDED_PREFIX_PROBES",
+        "schema_version": 2,
+        "status": (
+            "FAIL_SAME_ACTIVATION_QLINEAR_NOT_BITWISE"
+            if strict_comparison_failure
+            else "PASS_TARGET_QUANT_ASSEMBLY_AND_BOUNDED_PREFIX_PROBES"
+        ),
         "classification": "TARGET_ONLY_NO_DFLASH_DRAFT",
         "device": str(device),
         "dtype": str(torch.float16),
@@ -518,15 +794,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "target_quantization_final": final_quant,
         "target_isolation_initial": initial_audit,
         "target_isolation_final": final_audit,
+        "same_activation_qlinear": same_activation,
         "bounded_probes": probes,
         "w8a8_emulation_export": emulation_export,
-        "remaining_gates": [
-            "same_activation_real_npu_qlinear_vs_cpu_cuda_formula_parity",
-            "ordinary_incremental_quant_target_vs_fresh_full_prefix_parity",
-            "quant_target_plus_dflash_strict_greedy_exact_match",
-            "real_npu_operator_trace_and_no_fallback",
-            "acceptance_and_performance_measurement",
-        ],
+        "remaining_gates": remaining_gates,
     }
     serialized = json.dumps(payload, indent=2, sort_keys=True)
     if args.report is None:
@@ -534,8 +805,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         assert report_destination is not None
         _write_report(payload, report_destination)
-        print(f"TARGET_QUANT_PREFLIGHT_PASS report={report_destination}")
-    return 0
+        marker = (
+            "TARGET_QUANT_PREFLIGHT_FAIL"
+            if strict_comparison_failure
+            else "TARGET_QUANT_PREFLIGHT_PASS"
+        )
+        print(f"{marker} report={report_destination}")
+    return 2 if strict_comparison_failure else 0
 
 
 if __name__ == "__main__":

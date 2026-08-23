@@ -118,7 +118,8 @@ full-prefix Target 是否等价，再以逐 proposal 的独立前缀验证统计
 BF16 调度错误。
 GPU 的 FP16/BF16 对照命令见 [DFlash V1 GPU 运行说明](docs/DFLASH_V1_GPU.md)。
 量化分支还支持从真实 NPU `QLinear` 导出同一份 `W_q/scale`，在 CPU/CUDA 完整 Target 中
-执行 correctness-only W8A8 公式仿真；导出、运行和 same-activation 对照步骤见
+执行 correctness-only W8A8 公式仿真；Target-only 预检可自动做同一次 activation 的
+NPU/CPU 单层对照，NPU 接受率诊断也会复用量化 input provider。导出、运行和完整排错步骤见
 [量化版运行与排错指南](docs/DFLASH_V1_QUANT_RUNBOOK.md)。设计边界和公式细节另见
 [NPU Quant Target 适配分析](docs/DFLASH_V1_NPU_QUANT_DESIGN.md#13-cpucuda-w8a8-公式仿真)。
 

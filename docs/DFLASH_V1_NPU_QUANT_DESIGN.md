@@ -403,12 +403,15 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --target-quantizer your_quant_bridge:quantize_target \
   --target-quant-artifact "$QUANT_ARTIFACT" \
   --target-input-provider your_quant_bridge:build_target_inputs \
+  --compare-first-qlinear \
   --export-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
   --report "$RUN_DIR/target-quant-preflight.json"
 ```
 
-此 PASS 只证明量化 Target 的 DFlash-facing 装配和有界 full-prefix 行为；它不会证明普通增量
-量化推理 parity，也不会证明 Draft、strict-greedy、接受率或性能。
+此 PASS 证明量化 Target 的 DFlash-facing 装配、有界 full-prefix 行为，以及被捕获的第一个
+QLinear 已完成同一 activation 的 CPU 公式对照；数值状态和误差在报告中，只有达到事先冻结的
+设备/runtime 阈值才算 numerical parity。它不会证明其他 QLinear、普通增量量化推理 parity，
+也不会证明 Draft、strict-greedy、接受率或性能。
 
 随后运行完整 DFlash：
 
@@ -528,31 +531,15 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
 ```
 
 先将这个报告与普通 FP16 CPU/CUDA 报告比较，定位量化造成的首个 token/feature/layer 分叉；
-再在 NPU 上给同一个 `QLinear` 喂完全相同 activation，比较真实输出与
-`w8a8_emulation.emulate_w8a8_linear`。只有这个 same-activation 门禁通过，才可以把剩余整网
-差异归因到 embedding、非 Linear 算子、状态或调度。framework 自洽 PASS 本身不等于真实 NPU
-数值 parity。
+再用 `preflight_target_quant --compare-first-qlinear` 在 NPU 上自动捕获同一次 `QLinear` 调用的
+activation/真实输出，并比较 `w8a8_emulation.emulate_w8a8_linear`。指定层可重复传
+`--compare-qlinear-path PATH`。只有这个 same-activation 门禁通过，才可以把剩余整网差异归因到
+embedding、非 Linear 算子、状态或调度。framework 自洽 PASS 本身不等于真实 NPU 数值 parity。
 
-单层对照的核心写法如下；`qlinear` 和 `x_npu` 必须来自同一次已冻结的 Target 调用：
-
-```python
-import torch
-from models.dflash_v1.w8a8_emulation import (
-    compare_formula_output,
-    emulate_w8a8_linear,
-)
-
-with torch.inference_mode():
-    npu_output = qlinear(x_npu).detach().cpu()
-    formula_output = emulate_w8a8_linear(
-        x_npu.detach().cpu(),
-        qlinear.W_q.detach().cpu(),
-        qlinear.scale.detach().cpu(),
-        output_dtype=torch.float16,
-    )
-
-print(compare_formula_output(npu_output, formula_output))
-```
+普通增量量化 Target 与 fresh full-prefix 的对照也由 `diagnose_acceptance` 直接支持；NPU 命令需
+同时传 `--target-quant-mode w8a8_dynamic`、quantizer、artifact 和 input provider。诊断器的持久
+prefill/decode 与 full-prefix 两边都会调用同一个 provider，并在
+`target_path_parity.target_quantization` 中对账调用次数。
 
 先测第一层 Linear，再沿 forward 顺序找首个 `max_abs_error` 明显扩大的层。若第一层已经分叉，
 优先查 dynamic-quant rounding、scale dtype/layout 和输入 provider；若每个单层 same-input 都接近，

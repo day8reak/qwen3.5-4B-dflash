@@ -82,7 +82,7 @@
     "weight_loader_file": "models/dflash_v1/dflash_weights.py",
     "weight_loader_sha256": "c85bcc22620c9108d430e0f23e55b7dd08207e6a7884615e508370644bd653b2",
     "acceptance_diagnostic_file": "models/dflash_v1/diagnose_acceptance.py",
-    "acceptance_diagnostic_sha256": "17deb904b90d233230cb672973ba5c5228a771a3c8efa0e66acc4436103852a8"
+    "acceptance_diagnostic_sha256": "6b58f94c6dfcf8035a0458c07e4c699d5d3c4cd2cf49d41b5d5ef9f3b9b9abd2"
   },
   "npu_embedded_runtime": {
     "runner_file": "models/dflash_v1/run_npu.py",
@@ -101,7 +101,7 @@
     "target_quant_contract_file": "models/dflash_v1/target_quant.py",
     "target_quant_contract_sha256": "9f7a6441f66a3d2c23b5e39b5cddd3be2d1fa4dd4ff02cb73ff1e922b0552785",
     "target_quant_preflight_file": "models/dflash_v1/preflight_target_quant.py",
-    "target_quant_preflight_sha256": "05d8cf1a023fbf11951fdfef21071d1e371ed5fdc080b9dce150131c0431bc68",
+    "target_quant_preflight_sha256": "ff4fc6adfc6bc684327af453c9ddcb123001d8e981109fba420dfa324879dc02",
     "w8a8_emulation_file": "models/dflash_v1/w8a8_emulation.py",
     "w8a8_emulation_sha256": "fa604b2778f9e6a5e3c623f76ce714eb028713d5afdecbc52dae46514e070c37"
   }
