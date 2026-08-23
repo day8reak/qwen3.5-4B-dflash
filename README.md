@@ -72,6 +72,7 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
 完整说明：
 
 - [项目架构与完整实现流程](docs/DFLASH_V1_ARCHITECTURE.md)
+- [NPU Quant Target 适配分析（quant 分支）](docs/DFLASH_V1_NPU_QUANT_DESIGN.md)
 - [实现和文件说明](README_DFLASH_V1.md)
 - [CPU/Golden 使用说明](docs/DFLASH_V1_GOLDEN.md)
 - [CUDA GPU 使用说明](docs/DFLASH_V1_GPU.md)
