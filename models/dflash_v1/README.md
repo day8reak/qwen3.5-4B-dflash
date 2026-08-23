@@ -4,6 +4,9 @@
 `models/modeling_qwen3_5_hiai_nd.py`；部署时将它放到父目录同名位置。不要用 CPU/CUDA
 target 覆盖它。
 
+第一次阅读项目建议先看
+[DFlash V1 项目架构与完整实现流程](../../docs/DFLASH_V1_ARCHITECTURE.md)。
+
 ## 运行与调度
 
 - `run_npu.py`：内嵌目录的一键 NPU 入口，自动派生 HIAI source、loader、FP16 和 EOS。
