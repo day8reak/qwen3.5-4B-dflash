@@ -12,10 +12,12 @@ For each input row the implemented reference is::
     accumulator = int32(x_q) @ int32(W_q)
     y = accumulator * weight_scale * activation_scale
 
-The output is FP16, matching the target ``QLinear`` implementation.  CUDA uses
-chunked FP64 GEMMs for the integer accumulator: every product and Qwen-sized
-sum is exactly representable in FP64, while avoiding any dependency on CUDA
-integer-GEMM support.  This is a diagnostic path, not a performance backend.
+The output is FP16, matching the target ``QLinear`` implementation.  CPU uses
+PyTorch's exact INT8-to-INT32 matrix multiply when available and retains an
+INT32-conversion fallback for older builds.  CUDA uses chunked FP64 GEMMs for
+the integer accumulator: every product and Qwen-sized sum is exactly
+representable in FP64, while avoiding any dependency on CUDA integer-GEMM
+support.  This is a diagnostic path, not a performance backend.
 """
 
 from __future__ import annotations
@@ -176,6 +178,20 @@ def _exact_accumulator(
     if rows.device != weight.device:
         raise ValueError("quantized activation and W_q must use the same device")
     if rows.device.type == "cpu":
+        if int(rows.shape[0]) == 0:
+            return torch.empty(
+                (0, int(weight.shape[1])),
+                dtype=torch.int32,
+                device=rows.device,
+            )
+        int_mm = getattr(torch, "_int_mm", None)
+        if callable(int_mm):
+            # This kernel consumes INT8 operands and returns the exact INT32
+            # accumulator.  Besides avoiding a 4x temporary weight copy, it is
+            # materially faster for the [2560,248320] Qwen LM head.  The
+            # independent CPU validation compares it bitwise with an INT64
+            # oracle; this remains a correctness path rather than a speed claim.
+            return int_mm(rows.contiguous(), weight.contiguous())
         return torch.matmul(rows.to(torch.int32), weight.to(torch.int32))
     if rows.device.type != "cuda":
         raise ValueError("W8A8 formula emulation supports only CPU and CUDA")
@@ -664,7 +680,11 @@ def apply_w8a8_emulation(
         "activation_int8_range": [-ACTIVATION_QMAX, ACTIVATION_QMAX],
         "weight_layout": "K_by_N",
         "accumulator": (
-            "torch_int32_matmul" if requested_device.type == "cpu" else "exact_chunked_fp64_integer_sum"
+            "torch_int8_int_mm_exact_int32"
+            if requested_device.type == "cpu" and callable(getattr(torch, "_int_mm", None))
+            else "torch_int32_conversion_matmul_fallback"
+            if requested_device.type == "cpu"
+            else "exact_chunked_fp64_integer_sum"
         ),
         "dequantization_order": "accumulator_times_weight_scale_times_pertoken_scale",
         "linear_output_dtype": str(torch.float16),

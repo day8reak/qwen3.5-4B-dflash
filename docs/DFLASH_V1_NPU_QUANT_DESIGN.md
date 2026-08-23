@@ -459,9 +459,12 @@ Y   = (A.float() * S_w) * S_x
 Y   = Y.to(float16)
 ```
 
-零向量行固定输出 `X_q=0, S_x=0`。CPU 使用 INT32 matmul；CUDA 为避免依赖 CUDA integer GEMM，
-按输出列分块做 FP64 GEMM。Qwen 的 K 维累加绝对值小于 `2^31`，整数乘积与和也都能由 FP64
-精确表示，因此这条 CUDA 路线保留相同的整数 accumulator，代价是很慢。它不用于性能评估。
+零向量行固定输出 `X_q=0, S_x=0`。CPU 优先使用 PyTorch 的 INT8 输入、INT32 输出
+`torch._int_mm`；它不改变整数公式，同时避免为每个 Linear 临时创建 4 倍大小的 INT32 权重。
+不提供该 kernel 的旧 PyTorch build 会回退到显式 INT32 matmul。CUDA 为避免依赖 CUDA
+integer GEMM，按输出列分块做 FP64 GEMM。Qwen 的 K 维累加绝对值小于 `2^31`，整数乘积与和
+也都能由 FP64 精确表示，因此这条 CUDA 路线保留相同的整数 accumulator，代价是很慢。
+所有这些路线都只用于 correctness，不用于性能评估。
 
 这条仿真只替换 Target 文本路径里的 Linear。RMSNorm、RoPE、attention、GDN 核心、cache、
 feature collector 和 Draft 仍走 framework；Draft-facing embedding/LM head 仍保留 FP16。若正常
