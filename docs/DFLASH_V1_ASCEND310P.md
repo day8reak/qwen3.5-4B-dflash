@@ -2,6 +2,8 @@
 
 本页说明代码边界和真机验证要求；实际目录、直接源码检查和命令以
 [NPU_DEPLOYMENT.md](NPU_DEPLOYMENT.md) 为准。
+后续将当前全前缀 V1 升级为单次整块 verify 时所需的 KV/GDN 状态与算子改造，见
+[完整 DFlash 与提速路线](DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)。
 
 ## 实现结构
 

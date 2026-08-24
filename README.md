@@ -69,18 +69,30 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
   --report /path/to/run/dflash-v1-cpu.json
 ```
 
-完整说明：
+建议先读主文档，再按问题进入子文档：
 
-- [项目架构与完整实现流程](docs/DFLASH_V1_ARCHITECTURE.md)
-- [量化版运行与排错指南（建议先读）](docs/DFLASH_V1_QUANT_RUNBOOK.md)
-- [NPU Quant Target 适配分析（quant 分支）](docs/DFLASH_V1_NPU_QUANT_DESIGN.md)
-- [实现和文件说明](README_DFLASH_V1.md)
-- [CPU/Golden 使用说明](docs/DFLASH_V1_GOLDEN.md)
-- [CUDA GPU 使用说明](docs/DFLASH_V1_GPU.md)
-- [Ascend 310P 接入说明](docs/DFLASH_V1_ASCEND310P.md)
-- [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
+- [整体架构与完整数据流](docs/DFLASH_V1_ARCHITECTURE.md)
+  - [Target 与 Feature](docs/DFLASH_V1_TARGET_AND_FEATURE.md)
+  - [Draft 模型](docs/DFLASH_V1_DRAFT.md)
+  - [Scheduler 与 token 验证](docs/DFLASH_V1_SCHEDULER.md)
+  - [验证流程与报告解读](docs/DFLASH_V1_VALIDATION.md)
+- [从 V1 到完整 DFlash 与真正提速](docs/DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)
+- `quant` 分支：
+  - [量化版最快运行与排错指南](docs/DFLASH_V1_QUANT_RUNBOOK.md)
+  - [NPU Quant Target 设计与边界](docs/DFLASH_V1_NPU_QUANT_DESIGN.md)
+- [实现和文件索引](README_DFLASH_V1.md)
+- 运行文档：
+  - [CPU/Golden](docs/DFLASH_V1_GOLDEN.md)
+  - [CUDA GPU](docs/DFLASH_V1_GPU.md)
+  - [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
+  - [Ascend 310P 接口与边界](docs/DFLASH_V1_ASCEND310P.md)
 
 ## NPU 快速入口
+
+下面这条是默认的 **FP16 Target + FP16 Draft** 命令。`quant` 分支不要直接在它后面只追加一个
+权重目录：量化 Target 还必须同时提供 Linear 量化权重、embedding 权重、embedding scale、
+quantizer callback 和 input-provider callback。第一次运行请直接从
+[量化版最快运行步骤](docs/DFLASH_V1_QUANT_RUNBOOK.md#0-最快跑起来按这五步)开始。
 
 先按 [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md) 部署仓库中的
 `modeling_qwen3_5_hiai_nd.py`。bridge 会复用现有

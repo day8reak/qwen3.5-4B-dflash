@@ -1,5 +1,8 @@
 # Qwen3.5-4B DFlash V1 Golden
 
+本页提供可复制的运行与报告检查命令。如果想先理解每个门禁的实现原理，请看
+[验证流程与报告解读](DFLASH_V1_VALIDATION.md)。
+
 V1 是 correctness-first 的完整前缀重算路线。本包按 vLLM 口径把 K 定义为 proposal token
 数，clean anchor 不计入 K，因此支持 K=16；此时 draft query 为 1 个 anchor 加 16 个 mask，
 共 17 行。`v1-r1` 默认让同一个普通 target 按 proposal 逐次验证独立完整前缀，接受最长连续匹配

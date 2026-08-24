@@ -6,6 +6,13 @@ target 覆盖它。
 
 第一次阅读项目建议先看
 [DFlash V1 项目架构与完整实现流程](../../docs/DFLASH_V1_ARCHITECTURE.md)。
+然后按需查看
+[Target 与 Feature](../../docs/DFLASH_V1_TARGET_AND_FEATURE.md)、
+[Draft 模型](../../docs/DFLASH_V1_DRAFT.md)、
+[Scheduler 与 token 验证](../../docs/DFLASH_V1_SCHEDULER.md)以及
+[验证流程与报告解读](../../docs/DFLASH_V1_VALIDATION.md)。
+需要将 correctness-first V1 升级成单次整块验证与增量状态路线时，阅读
+[完整 DFlash 与提速路线](../../docs/DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)。
 
 ## 运行与调度
 

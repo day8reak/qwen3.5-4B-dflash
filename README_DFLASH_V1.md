@@ -7,6 +7,12 @@
 
 先阅读：
 
+- [整体架构与完整数据流](docs/DFLASH_V1_ARCHITECTURE.md)
+- [Target 与 Feature](docs/DFLASH_V1_TARGET_AND_FEATURE.md)
+- [Draft 模型](docs/DFLASH_V1_DRAFT.md)
+- [Scheduler 与 token 验证](docs/DFLASH_V1_SCHEDULER.md)
+- [验证流程与报告解读](docs/DFLASH_V1_VALIDATION.md)
+- [从 V1 到完整 DFlash 与真正提速](docs/DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)
 - [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
 - [CPU/Golden 指南](docs/DFLASH_V1_GOLDEN.md)
 - [CUDA GPU 指南](docs/DFLASH_V1_GPU.md)
@@ -94,6 +100,11 @@ python -B -m models.dflash_v1.run_npu \
 tokenizer 的 chat template，并默认启用 thinking；`raw` 只适用于已经自行构造好模板的文本。
 非 thinking 测试显式传 `--no-enable-thinking`。运行结束会打印 ordinary Target 与 DFlash
 两份解码文本。
+
+上面是默认 FP16 Target 命令。`quant` 分支需要另外传入 quantizer、input provider 和三条量化
+数据路径，并且应先跑不读取 Draft 的 Target-only preflight；不要只在上面命令末尾追加一个
+权重目录。完整可复制流程见
+[量化版运行与排错指南](docs/DFLASH_V1_QUANT_RUNBOOK.md#0-最快跑起来按这五步)。
 
 ## 验证边界
 

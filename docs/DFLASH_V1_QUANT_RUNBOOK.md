@@ -11,6 +11,145 @@
 现有量化工具负责；DFlash 只负责调用、校验、提取 feature、提议 token 和让同一个量化 Target
 逐个验证。
 
+## 0. 最快跑起来：按这五步
+
+这一节只给最短可执行路线；每一步为什么存在、失败后怎么定位，见后续章节。
+
+### 第 1 步：确认代码和普通量化 Target
+
+使用 `quant` 分支，并先按 [NPU 部署文档](NPU_DEPLOYMENT.md)把模型文件、bridge 和
+`models/dflash_v1/` 放进同一个运行工程。先用原有 Target inference 跑同一个固定 prompt，确认
+量化 Target 在不加载 Draft 时能够正常生成。这个结果是后面 DFlash 的权威 ordinary 基线。
+
+```bash
+git branch --show-current
+# 预期：quant
+```
+
+### 第 2 步：准备三条数据路径和两个 callback
+
+```bash
+set -euo pipefail
+
+export DEPLOY_ROOT=/path/to/qwen35-runtime
+export MODEL_PYTHON=/path/to/model/python
+export TARGET_DIR=/path/to/Qwen3.5-4B
+export DRAFT_DIR=/path/to/Qwen3.5-4B-DFlash
+
+export TARGET_QUANT_WEIGHT_PATH=/path/to/linear-quant-weights
+export TARGET_EMBEDDING_WEIGHT_PATH=/path/to/embedding-weights
+export TARGET_EMBEDDING_SCALE_PATH=/path/to/embedding-scales
+
+export TARGET_QUANTIZER=your_quant_bridge:quantize_target
+export TARGET_INPUT_PROVIDER=your_quant_bridge:build_target_inputs
+export QUANT_CALLBACK_ROOT=/path/to/callback-parent
+
+export PROMPT_FILE=/path/to/prompt.txt
+export PROMPT_IDS=123,456,789
+export KV_CACHE_MAX_LEN=4096
+export RUN_DIR=/path/to/new-quant-run
+
+mkdir -p "$RUN_DIR"
+export PYTHONDONTWRITEBYTECODE=1
+unset PYTHONPYCACHEPREFIX
+export PYTHONPATH="$DEPLOY_ROOT:$QUANT_CALLBACK_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$DEPLOY_ROOT"
+```
+
+`PROMPT_IDS` 必须是 `PROMPT_FILE` 使用同一个本地 tokenizer/chat-template 后得到的一小段真实
+token ID，不能长期保留上面的示例数字。三个数据路径分别供 Linear 转换和 embedding 输入使用，
+不是一个可互换的“量化目录”参数。
+
+如果已有函数是 `quant_model(model, quant_weight_path)`，它可以直接作为 quantizer。普通量化
+推理中读取 embedding weight/scale 并生成第 0 层 FP16 hidden 的代码，需要包装成
+input-provider。两个函数的准确签名见 [第 4 节](#4-你只需要接两个已有函数)。没有这两个
+callback 时，DFlash 无法猜测部署数据格式，会在加载大权重前直接失败。
+
+### 第 3 步：便宜的 import 和路径检查
+
+```bash
+set -euo pipefail
+
+test -x "$MODEL_PYTHON"
+test -d "$TARGET_DIR"
+test -d "$DRAFT_DIR"
+test -e "$TARGET_QUANT_WEIGHT_PATH"
+test -e "$TARGET_EMBEDDING_WEIGHT_PATH"
+test -e "$TARGET_EMBEDDING_SCALE_PATH"
+test -f "$PROMPT_FILE"
+
+"$MODEL_PYTHON" -B - "$TARGET_QUANTIZER" "$TARGET_INPUT_PROVIDER" <<'PY'
+import importlib
+import sys
+import torch
+import torch_npu  # noqa: F401 - registers torch.npu
+
+for spec in sys.argv[1:]:
+    module_name, function_name = spec.split(":", 1)
+    function = getattr(importlib.import_module(module_name), function_name)
+    assert callable(function), spec
+    print(spec, "callable=", True)
+print("torch=", torch.__version__)
+print("npu_available=", torch.npu.is_available())
+PY
+```
+
+### 第 4 步：只加载量化 Target 做预检
+
+这一步不读取 Draft checkpoint。它先验证量化装配、三条路径、QLinear 拓扑、input-provider、
+feature 零影响和 fresh full-prefix 行为：
+
+```bash
+set -euo pipefail
+
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.preflight_target_quant \
+  --target-dir "$TARGET_DIR" \
+  --prompt-ids "$PROMPT_IDS" \
+  --device npu:0 \
+  --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
+  --target-quantizer "$TARGET_QUANTIZER" \
+  --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
+  --target-input-provider "$TARGET_INPUT_PROVIDER" \
+  --target-embedding-weight-path "$TARGET_EMBEDDING_WEIGHT_PATH" \
+  --target-embedding-scale-path "$TARGET_EMBEDDING_SCALE_PATH" \
+  --compare-first-qlinear \
+  --report "$RUN_DIR/target-quant-preflight.json"
+```
+
+只有报告顶层状态为 `PASS_TARGET_QUANT_ASSEMBLY_AND_BOUNDED_PREFIX_PROBES` 才进入下一步。
+`same_activation_qlinear=OBSERVED_NUMERICAL_DIFFERENCE` 只是记录到数值差异，并不自动代表达到
+设备精度门禁；具体 max/mean error 仍要按部署 runtime 的冻结阈值判断。
+
+### 第 5 步：运行完整量化 NPU DFlash
+
+```bash
+set -euo pipefail
+
+PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.run_npu \
+  --target-dir "$TARGET_DIR" \
+  --draft-dir "$DRAFT_DIR" \
+  --prompt-file "$PROMPT_FILE" \
+  --prompt-mode chat \
+  --enable-thinking \
+  --device npu:0 \
+  --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
+  --max-new-tokens 8 \
+  --max-draft-tokens 4 \
+  --target-quant-mode w8a8_dynamic \
+  --target-quantizer "$TARGET_QUANTIZER" \
+  --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
+  --target-input-provider "$TARGET_INPUT_PROVIDER" \
+  --target-embedding-weight-path "$TARGET_EMBEDDING_WEIGHT_PATH" \
+  --target-embedding-scale-path "$TARGET_EMBEDDING_SCALE_PATH" \
+  --report "$RUN_DIR/npu-quant-dflash-smoke.json"
+```
+
+首次成功后再将 `max-new-tokens/max-draft-tokens` 提高到代表性 workload。当前量化模式只改变
+Target：Draft checkpoint、Draft 网络和 Draft NPU backend 仍是 FP16。完整运行必须继续满足
+ordinary 与 DFlash token/EOS/stop reason 零差异；量化装配 PASS 不能替代这个最终门禁。
+
 ## 1. 先看懂整体框架
 
 ```text

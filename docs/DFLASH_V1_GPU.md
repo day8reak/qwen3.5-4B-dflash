@@ -1,5 +1,9 @@
 # DFlash V1 GPU 运行说明
 
+本页只讲 CUDA 运行。调度和验证原理分别见
+[Scheduler 与 token 验证](DFLASH_V1_SCHEDULER.md)和
+[验证流程与报告解读](DFLASH_V1_VALIDATION.md)。
+
 该路线用于在 NVIDIA CUDA GPU 上验证完整 V1 全前缀流程。它使用交付的
 `modeling_qwen3_5_dflash.py` 目标模型旁路和 `TorchDFlashOps` 草稿原语；草稿 attention 由
 PyTorch CUDA SDPA 执行。它不加载 HIAI receiver、不调用 310P 自定义算子，也不能作为

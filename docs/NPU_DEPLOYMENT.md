@@ -1,6 +1,8 @@
 # Ascend NPU 部署与运行
 
 本流程采用直接源码集成，不运行 patch，也不要求手工修改模型代码。
+整体数据流见 [DFlash V1 整体架构](DFLASH_V1_ARCHITECTURE.md)；各门禁为什么存在见
+[验证流程与报告解读](DFLASH_V1_VALIDATION.md)。
 
 量化 Target 实验请先阅读
 [量化版运行与排错指南](DFLASH_V1_QUANT_RUNBOOK.md)，再按需查阅
@@ -162,6 +164,26 @@ target 加载后、draft 构造前会检查当前设备可用内存。草稿参�
 512 MiB 安全空间；不足时会直接报告 free/required，而不是等分配失败。这个门禁只能发现明显
 不足，正式长序列仍需为 target、feature、logits 和 workspace 留出更多空间，并使用没有其他
 进程占用的设备。
+
+### 5.1 `quant` 分支的运行入口
+
+上面的最小 smoke 是 FP16 Target。量化 Target 必须先按
+[量化版最快运行步骤](DFLASH_V1_QUANT_RUNBOOK.md#0-最快跑起来按这五步)运行 Target-only
+preflight；通过后，完整 DFlash 命令额外提供以下六项：
+
+```bash
+--target-quant-mode w8a8_dynamic \
+--target-quantizer "$TARGET_QUANTIZER" \
+--target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
+--target-input-provider "$TARGET_INPUT_PROVIDER" \
+--target-embedding-weight-path "$TARGET_EMBEDDING_WEIGHT_PATH" \
+--target-embedding-scale-path "$TARGET_EMBEDDING_SCALE_PATH"
+```
+
+其中包含三个互相独立的数据路径和两个部署侧 callback。只传 Linear 权重目录、只替换
+`nn.Linear`，或者继续使用普通 FP16 embedding lookup，都可能让 DFlash full-prefix Target 与
+原量化 prefill/decode 不等价。`run_npu` 会在读取 Draft 大权重前检查参数、路径和 callback ABI，
+但私有数据格式的解释仍由 callback 负责。
 
 ## 6. 通过条件
 

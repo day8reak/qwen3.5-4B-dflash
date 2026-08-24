@@ -81,9 +81,10 @@ embedding、未消费的 scale 或含义不明的 tuple 都会失败。
 所以不能把 embedding 或 LM head 原地替换成只暴露 `W_q/scale` 的 `QLinear`，否则 Draft 失去
 共享权重。量化 Target 路线必须保留或单独提供 FP16 Draft-side embedding/LM-head 权重。
 
-### 3.4 当前 formal NPU 合同明确是非量化
+### 3.4 默认 NPU 路线保持 FP16，量化必须显式启用
 
-`run_npu` 默认仍锁定 FP16、非量化 Target。量化模式必须显式选择；装配结果、完整 QLinear
+`run_npu` 默认仍锁定 FP16、非量化 Target；只有显式选择 `w8a8_dynamic` 并提供两个 callback
+和三条数据路径时才进入量化 Target。装配结果、完整 QLinear
 路径、callback identity 和 input-provider 调用计数写入最终 report 的
 `target_integration.isolation.bridge_runtime.target_quantization`。
 
@@ -320,7 +321,7 @@ W8A8 是近似计算。即使 `output_dtype=FP16`，输出也不是原 FP16 line
 使用小型 fake Target/callback 验证：
 
 - quantizer 恰好调用一次；
-- artifact/callback 缺失时在 Target forward 前失败；
+- 任一量化数据路径或 callback 缺失时在 Target forward 前失败；
 - input provider 每次 full-prefix forward 调用一次；
 - physical padding length 正确传给 provider；
 - provider 失败时不执行 Target；
@@ -565,7 +566,8 @@ activation/真实输出，并比较 `w8a8_emulation.emulate_w8a8_linear`。指�
 embedding、非 Linear 算子、状态或调度。framework 自洽 PASS 本身不等于真实 NPU 数值 parity。
 
 普通增量量化 Target 与 fresh full-prefix 的对照也由 `diagnose_acceptance` 直接支持；NPU 命令需
-同时传 `--target-quant-mode w8a8_dynamic`、quantizer、artifact 和 input provider。诊断器的持久
+同时传 `--target-quant-mode w8a8_dynamic`、quantizer、Linear 量化权重路径、input provider、
+embedding 权重路径和 embedding scale 路径。诊断器的持久
 prefill/decode 与 full-prefix 两边都会调用同一个 provider，并在
 `target_path_parity.target_quantization` 中对账调用次数。
 
