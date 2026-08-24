@@ -64,6 +64,86 @@ flowchart LR
     K --> N[带新 anchor 进入下一轮]
 ```
 
+### 2.1 完整高性能 DFlash 时序图
+
+下面这张图描述的是最终希望实现的增量、整块验证路径，不是当前 `v1-r1` 已经
+启用的运行路径。本文中的 **K 始终表示 proposal 数，不包含 anchor**，所以一次
+Target verify 的输入长度是 `K+1`。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 调用方
+    participant S as DFlash Scheduler
+    participant D as Draft + Draft cache
+    participant T as Target Qwen3.5
+    participant X as Target 状态事务<br/>KV + GDN recurrent + conv
+
+    U->>S: prompt、max_new_tokens、K
+    S->>T: prefill(prompt)，请求 logits、8 层 feature、cache
+    T->>X: 提交 prompt 对应的 Target state
+    T-->>S: prompt 最后一行 logits + Target feature
+    S->>S: 选择第一个 clean anchor x
+    S-->>U: 输出 anchor x
+    Note over S,X: x 已输出，但尚未写入 Target cache；已提交边界仍在 prompt 末尾
+
+    loop 未遇到 EOS 且未达到长度上限
+        S->>D: target feature + [x, MASK × K] + 已提交 Draft cache
+        D-->>S: K 个 proposal：d1 ... dK
+
+        S->>X: begin_round()，保存本轮开始边界/状态
+        S->>T: 一次 verify([x, d1, ..., dK])
+        T->>X: 候选写入 K+1 行 KV/GDN/conv state
+        T-->>S: K+1 行 logits + 对应 Target feature
+        Note over S,T: 行号从 0 开始：row 0 预测 d1；row i 预测 d(i+1)；row K 提供 all-match bonus
+
+        S->>S: a = 从 d1 开始连续匹配 Target Top-1 的数量
+        alt a < K：首次出现不匹配
+            S->>S: correction = 第 a 行 Target Top-1
+            S-->>U: 输出 d1 ... da + correction
+        else a == K：全部 proposal 匹配
+            S->>S: bonus = 最后一行 Target Top-1
+            S-->>U: 输出 d1 ... dK + bonus
+        end
+
+        S->>X: commit(a)：只保留输入行 [x, d1, ..., da]
+        X->>X: KV 裁剪逻辑长度；GDN/conv 回退或仅重放接受段
+        X-->>S: 32 层以同一 accepted_length 原子提交
+        S->>D: Draft cache 对齐新提交边界，丢弃候选尾部
+        S->>S: 只保留 [x, d1, ..., da] 对应的 Target feature
+        S->>S: correction/bonus 成为下一轮 x，仍未写入 cache
+    end
+
+    S-->>U: 最终 token、EOS/length 停止原因、acceptance 统计
+```
+
+读图时重点看五件事：
+
+1. Draft 产生的 proposal 必须先回到 Scheduler，再进入 Target；它不能直接写入最终输出。
+2. 每轮只有一次 Target verify，输入是 `anchor + K proposals`，这是相对当前 V1
+   减少 Target 调用数的主要来源。
+3. Target 的 `K+1` 行状态先是**候选状态**。知道连续接受长度 `a` 后，才把
+   `anchor + a 个 proposal` 变成**已提交状态**。
+4. correction/bonus 虽由验证 logits 得出并在本轮输出，但该 token 本身还没有作为
+   Target 输入执行；它作为下一轮 anchor，在下一次 verify 时才进入 Target cache。
+5. KV、GDN recurrent state、conv state、位置计数和有效长度必须共用同一个 `a`
+   原子提交。只回退其中一种状态会让下一轮结果漂移。
+
+图中的“Target 状态事务”不是第四个模型或独立进程，而是 Target runtime/bridge
+必须提供的一组状态所有权边界。图中也没有再跑一条 ordinary baseline：普通增量
+greedy 属于开发验收的对照路线，不应进入最终高性能生成的热路径。
+
+例如 Draft 给出 `[202, 999, 888]`，Target 验证行给出的前两个 Top-1 是
+`[202, 303]`，则 `a=1`。本轮输出 `[202, 303]`，Target 状态只提交
+`[旧 anchor, 202]`；`999/888` 的候选状态被丢弃，`303` 成为下一轮尚未缓存的
+anchor。这样既避免重新计算整个历史前缀，也不会让错误 proposal 污染下一轮。
+
+当前 `v1-r1` 的逐前缀、无跨轮状态版本见
+[V1 准确调用时序](DFLASH_V1_ARCHITECTURE.md#21-一轮-dflash-的准确调用时序)。
+上图只有在本页后续的整块 verifier oracle、状态事务和跨轮 cache 门禁全部通过后，
+才能成为默认运行路径。采样模式会把“连续 Top-1 相等”换成 rejection sampling，
+但候选状态、接受长度和提交/回退的时序边界不变。
+
 ## 3. Target 上必须处理的三类状态
 
 ### 3.1 Full-attention KV cache
