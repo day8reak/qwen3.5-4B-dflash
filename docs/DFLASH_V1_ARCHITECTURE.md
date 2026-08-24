@@ -64,6 +64,79 @@ flowchart TD
 [调度与 token 验证](DFLASH_V1_SCHEDULER.md)及
 [验证流程与报告解读](DFLASH_V1_VALIDATION.md)。
 
+### 2.1 一轮 DFlash 的准确调用时序
+
+下图按当前 `sequential` 源码路径展开。与简化总流程图不同，它把 Adapter
+也画了出来：Scheduler 的 bootstrap、feature 请求和 verify 都不会绕过
+`Qwen35DFlashFullPrefixAdapter`。图中 K 表示本轮真正进入验证的 proposal 数；
+它可能因剩余生成长度或 Draft 提前给出 EOS 而小于 `max_draft_tokens`。
+
+```mermaid
+sequenceDiagram
+    participant S as V1 Scheduler
+    participant A as Qwen35 Adapter
+    participant T as Target Qwen3.5-4B
+    participant D as 6-layer Draft
+
+    Note over S,T: DFlash bootstrap；若 anchor 已是 EOS，则不进入 Draft round
+    S->>A: forward_logits(prompt)
+    A->>T: features=False，完整前缀 forward
+    T-->>A: logits [1,P,V]
+    A-->>S: 完整 logits
+    S->>S: 最后一行 Top-1 = clean anchor
+    S->>S: committed = prompt + anchor
+
+    loop 每个 DFlash round
+        S->>A: propose(committed, K)
+        A->>T: 对 committed[:-1] 做 feature forward
+        Note over A,T: NPU 路线在每次 Target forward 前准备 fresh call-local KV/GDN state
+        T-->>A: dflash_features [1,C,20480]
+        A->>A: 构造 [anchor, MASK × K] embedding 与 position IDs
+        A->>D: draft_top1(target features, block embedding)
+        D-->>A: proposal IDs [1,K]
+        A-->>S: proposals[0:K]
+
+        loop proposal i，直到首次不匹配或 K 个全部通过
+            S->>A: forward_logits(committed + proposals[:i])
+            A->>T: features=False，fresh full-prefix forward
+            T-->>A: logits [1,S_i,V]
+            A-->>S: 完整 logits
+            S->>S: 取最后一行 Target Top-1
+            alt proposal[i] == Target Top-1
+                S->>S: 接受 proposal[i]，继续验证
+            else 第一个不匹配
+                S->>S: Target Top-1 成为 correction，停止内层验证
+            end
+        end
+
+        alt K 个 proposal 全部匹配
+            S->>A: forward_logits(committed + proposals)
+            A->>T: features=False，fresh full-prefix forward
+            T-->>A: logits
+            A-->>S: 最后一行对应 bonus token
+        end
+
+        S->>S: 提交连续匹配 proposal + correction/bonus
+    end
+```
+
+这张图经过与当前调用链逐项对照：
+
+- `_call_draft()` 调用 `Adapter.propose()`，proposal 明确返回 Scheduler；
+- `Adapter.propose()` 先从 Target 取 `committed[:-1]` 的 feature，再调用 6 层 Draft；
+- `_target_top1()` 经 `Adapter.forward_logits()` 调用 Target，然后取指定 logit 行的 Top-1；
+- proposal `i` 只在 `committed + proposals[:i]` 上验证，不匹配 proposal 不会进入
+  后续验证前缀；
+- 全部 proposal 命中时才多做一次 Target 调用取 bonus。
+
+图中没展开极少见的 empty-proposal 分支：如果 Draft 没有返回候选，Scheduler
+会调用一次 Target Top-1 保证本轮至少前进一个 token。
+
+这是当前 correctness-first V1 的时序。后续高性能路线会把内层的多次独立 Target
+forward 替换为一次 `[anchor, proposal×K]` 整块 verify，但必须先完成 KV/GDN
+候选状态的提交与回退，见
+[完整 DFlash 与提速路线](DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)。
+
 ## 3. 一轮 DFlash 的直观例子
 
 假设 prompt 后，Target 首先生成 anchor `101`。当前已提交前缀为：
