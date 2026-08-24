@@ -2257,12 +2257,20 @@ def _parser() -> argparse.ArgumentParser:
         help="NPU only: MODULE:FUNCTION used by the deployed quant Target",
     )
     parser.add_argument(
-        "--target-quant-artifact",
-        help="NPU only: deployed quantized-target artifact",
+        "--target-quant-weight-path",
+        help="NPU only: deployed Linear quant-weight file or directory",
     )
     parser.add_argument(
         "--target-input-provider",
         help="NPU only: MODULE:FUNCTION producing the quant Target layer-0 input",
+    )
+    parser.add_argument(
+        "--target-embedding-weight-path",
+        help="NPU only: deployed quantized embedding-weight file or directory",
+    )
+    parser.add_argument(
+        "--target-embedding-scale-path",
+        help="NPU only: deployed quantized embedding-scale file or directory",
     )
     parser.add_argument(
         "--kv-cache-max-len",
@@ -2378,8 +2386,10 @@ def _validate_args(args: argparse.Namespace) -> tuple[int, ...]:
     if device_type != "npu" and (
         args.target_quant_mode != QUANT_MODE_DISABLED
         or args.target_quantizer is not None
-        or args.target_quant_artifact is not None
+        or args.target_quant_weight_path is not None
         or args.target_input_provider is not None
+        or args.target_embedding_weight_path is not None
+        or args.target_embedding_scale_path is not None
     ):
         raise ValueError(
             "NPU target quantization options are not valid on CPU/CUDA; use "
@@ -2632,10 +2642,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.target_w8a8_emulation_artifact is None
         else Path(args.target_w8a8_emulation_artifact).expanduser().resolve()
     )
-    quant_artifact = (
-        None
-        if args.target_quant_artifact is None
-        else Path(args.target_quant_artifact).expanduser().resolve()
+    quantization_paths = tuple(
+        Path(value).expanduser().resolve()
+        for value in (
+            args.target_quant_weight_path,
+            args.target_embedding_weight_path,
+            args.target_embedding_scale_path,
+        )
+        if value is not None
     )
     protected_roots = tuple(
         path
@@ -2644,7 +2658,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             target_root,
             draft_root,
             emulation_artifact,
-            quant_artifact,
+            *quantization_paths,
         )
         if path is not None
     )

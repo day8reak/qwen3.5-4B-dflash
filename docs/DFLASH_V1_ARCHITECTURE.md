@@ -523,8 +523,8 @@ output_dflash_features=True
 | GDN | `torch_npu.npu_chunk_gated_delta_rule` | linear-attention 核心计算 |
 | GDN state | `copy_` 到 fresh recurrent state | 保存本次调用内的最终状态 |
 
-`run_npu` 默认仍是 FP16、非量化 Target。`quant` 分支只有显式传入量化 mode、量化器、artifact
-和 input provider 时才启用 `QLinear`；报告必须记录完整 QLinear 覆盖和 provider 调用计数，不能
+`run_npu` 默认仍是 FP16、非量化 Target。`quant` 分支只有显式传入量化 mode、量化器、Linear
+权重路径、input provider、embedding 权重路径和 embedding scale 路径时才启用 `QLinear`；报告必须记录完整 QLinear 覆盖和 provider 调用计数，不能
 仅因源码中存在量化 API 就声称本次实际执行了量化路线。
 
 ### 9.3 为什么 NPU 需要 Bridge
@@ -625,7 +625,9 @@ flowchart LR
     PAD --> IP[input provider]
     IP --> H0[第 0 层 FP16 hidden]
     H0 --> QT[量化 HIAI Target]
-    ART[部署量化 artifact] --> QZ[quantizer callback]
+    QW[Linear 量化权重路径] --> QZ[quantizer callback]
+    EW[Embedding 权重路径] --> IP
+    ES[Embedding scale 路径] --> IP
     QZ --> QT
     QT --> QL[QLinear: dynamic INT8 x INT8]
     QT --> NON[attention / GDN / norm / state]
@@ -637,11 +639,11 @@ flowchart LR
 
 这里故意保留两个 callback 边界：
 
-- `quantizer` 解释部署 artifact，并建立真实 `QLinear(W_q, scale)`；
+- `quantizer` 只解释 Linear 量化权重路径，并建立真实 `QLinear(W_q, scale)`；
 - `input provider` 复用量化推理自己的 embedding/scale 语义，返回第 0 层真正消费的
   `[1,S,2560]` FP16 hidden。
 
-仓库不能仅凭一个路径猜 artifact 的二进制布局，也不能猜 embedding scale 应该乘、除还是融合，
+仓库不能猜三份部署数据的二进制布局，也不能猜 embedding scale 应该乘、除还是融合，
 所以这两个边界不会被一个“通用自动转换器”静默替代。正常 FP16 embedding 也要显式 provider，
 这样误接非量化输入时会直接失败。
 

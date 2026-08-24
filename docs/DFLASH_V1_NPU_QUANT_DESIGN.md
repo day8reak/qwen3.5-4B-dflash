@@ -51,7 +51,7 @@ FP16 activation
 3. 新建 fresh hybrid state；
 4. 执行 full-prefix Target。
 
-`quant` 分支现在通过显式 `--target-quantizer` 和 `--target-quant-artifact` 调用已有量化器。
+`quant` 分支现在通过显式 `--target-quantizer` 和 `--target-quant-weight-path` 调用已有量化器。
 转换前会冻结全部 `nn.Linear` 路径；已有两参数量化器若直接返回 `nn.Module`（或原地转换后
 返回 `None`），转换后必须一一对应为 `QLinear`。有意排除部分 Linear 的量化器则必须返回
 `TargetQuantizationResult`，明确给出完整预期路径，不能靠“检测到一个 QLinear”通过。
@@ -146,14 +146,17 @@ Tensor，则必须在 `TargetQuantizationResult` 中另外提供独立 FP16 Draf
 ```text
 --target-quant-mode disabled|w8a8_dynamic
 --target-quantizer MODULE:FUNCTION
---target-quant-artifact /path/to/quantized-target-artifact
+--target-quant-weight-path /path/to/linear-quant-weights
 --target-input-provider MODULE:FUNCTION   # 量化 embedding/input 路线使用
+--target-embedding-weight-path /path/to/embedding-weights
+--target-embedding-scale-path /path/to/embedding-scales
 ```
 
 规则：
 
 - 默认 `disabled`，保持 `v1-r1` 行为不变；
-- `w8a8_dynamic` 必须同时提供 quantizer、artifact 和 input provider；
+- `w8a8_dynamic` 必须同时提供 quantizer、Linear 权重路径、input provider、embedding 权重路径和
+  embedding scale 路径；
 - CLI 会在读取 Draft 大权重前导入两个 callback 并校验其支持的调用签名；
 - 即使量化 Target 使用普通 FP16 embedding，也必须通过 provider 显式复用该路线；
 - 量化参数不能对 CPU/CUDA 路线生效；
@@ -166,7 +169,7 @@ Tensor，则必须在 `TargetQuantizationResult` 中另外提供独立 FP16 Draf
 ```python
 def apply_target_quantization(
     execution_model: torch.nn.Module,
-    artifact_path: str,
+    quant_weight_path: str,
     *,
     device: torch.device,
     output_dtype: torch.dtype,
@@ -176,7 +179,7 @@ def apply_target_quantization(
 
 职责：
 
-- 可直接复用已有 `quant_model(model, artifact_path)` 两参数函数；
+- 可直接复用已有 `quant_model(model, quant_weight_path)` 两参数函数；
 - 也可接收扩展的 keyword-only `device/output_dtype`；
 - 使用和正常量化 Target 完全相同的 artifact 解释方式；
 - 替换约定范围内的 `nn.Linear` 为当前 HIAI source 的 `QLinear`；
@@ -197,7 +200,8 @@ def build_quant_target_inputs(
     model_wrapper: torch.nn.Module,
     input_ids: torch.Tensor,
     *,
-    artifact_path: str,
+    embedding_weight_path: str,
+    embedding_scale_path: str,
     device: torch.device,
     output_dtype: torch.dtype,
 ) -> torch.Tensor | dict[str, torch.Tensor]:
@@ -211,13 +215,20 @@ inputs_embeds: [1,S,2560] FP16 NPU Tensor
 ```
 
 简单的已有 provider 可以只接收 `(model_wrapper, input_ids)`；扩展 ABI 还会收到
-`artifact_path/device/output_dtype`。它必须产生正常量化 Target 在第 0 层真正消费的同一
+`embedding_weight_path/embedding_scale_path/device/output_dtype`。它必须产生正常量化 Target 在第 0 层真正消费的同一
 FP16 hidden。若部署量化 embedding 使用
 INT8 table + scale，scale 的语义和反量化/融合操作由 provider 复用现有实现；Bridge 不猜
 `multiply`、`divide`、offset、group 或 layout 规则。
 
 量化模式始终要求显式 provider；如果普通量化 Target 使用 FP16 embedding，provider 可以直接
 调用同一个 embedding，但仍需显式声明，避免因误配而静默走回非量化输入路径。
+
+### 5.4 Target-only 不依赖 DFlash
+
+这组三路径参数是 DFlash Bridge 对现有量化流程的显式映射，不会改变主模型文件或原推理入口。
+Target 可以继续单独运行：原推理入口直接读取相同的 Linear 权重、embedding 权重和 embedding
+scale，不加载 Draft，也不进入 DFlash scheduler。其 ordinary greedy 输出是后续 DFlash
+strict-greedy 比较的权威基线。
 
 ## 6. Bridge 侧设计
 
@@ -249,7 +260,7 @@ input provider 必须处理物理 padding 后的 IDs；Bridge 仍在输出侧裁
 
 启用量化时至少检查：
 
-1. quant artifact 是明确的常规文件或目录，但不能是 symlink；
+1. Linear 权重、embedding 权重和 embedding scale 都是明确的常规文件或目录，且不能是 symlink；
 2. quantizer callback 的 module/function identity 被写入报告；
 3. 转换前冻结全部 `nn.Linear` 的路径、输入维、输出维和 bias 合同；
 4. 转换后 `QLinear` 数量大于 0，且路径集合与 converter manifest 精确相同；
@@ -378,7 +389,7 @@ DFlash Bridge 量化 full-prefix Target
 第一项实现是：
 
 > 在 `quant` 分支加入显式 `w8a8_dynamic` Target 模式。使用部署方已有 quantizer 解释现有
-> quant artifact，把 artifact 约定范围内的 linear 替换为 `QLinear`；保持 Draft-facing
+> Linear 量化权重路径，把其约定范围内的 linear 替换为 `QLinear`；保持 Draft-facing
 > embedding、LM head、所有 Target 输出和整个 DFlash Draft 为 FP16。若正常量化 Target 使用
 > 独立 embedding/input 预处理，则通过必需的 input-provider callback 复用该路径。保持 V1
 > full-prefix fresh state、64-token 对齐、sequential verifier 和所有零 token 差异门禁不变。
@@ -401,8 +412,10 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --device npu:0 \
   --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
   --target-quantizer your_quant_bridge:quantize_target \
-  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
   --target-input-provider your_quant_bridge:build_target_inputs \
+  --target-embedding-weight-path "$TARGET_EMBEDDING_WEIGHT_PATH" \
+  --target-embedding-scale-path "$TARGET_EMBEDDING_SCALE_PATH" \
   --compare-first-qlinear \
   --export-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
   --report "$RUN_DIR/target-quant-preflight.json"
@@ -427,8 +440,10 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
   --max-draft-tokens 16 \
   --target-quant-mode w8a8_dynamic \
   --target-quantizer your_quant_bridge:quantize_target \
-  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
   --target-input-provider your_quant_bridge:build_target_inputs \
+  --target-embedding-weight-path "$TARGET_EMBEDDING_WEIGHT_PATH" \
+  --target-embedding-scale-path "$TARGET_EMBEDDING_SCALE_PATH" \
   --report "$RUN_DIR/dflash-quant-report.json"
 ```
 
@@ -438,8 +453,8 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
 ```python
 from models.dflash_v1.target_quant import TargetQuantizationResult
 
-def quantize_target(model, artifact_path):
-    converted = existing_quant_model(model, artifact_path)
+def quantize_target(model, quant_weight_path):
+    converted = existing_quant_model(model, quant_weight_path)
     return TargetQuantizationResult(
         execution_model=converted,
         expected_qlinear_paths=EXACT_ARTIFACT_LINEAR_PATHS,

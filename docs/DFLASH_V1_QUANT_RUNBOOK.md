@@ -54,17 +54,29 @@ FP16 DFlash Draft（6 层，checkpoint 不变）
 3. **V1 每次 Target 调用都从新状态重算完整前缀。** 它先保证正确性，不做投机 KV/GDN
    commit/rollback。
 
-## 2. 两种 artifact 不要混用
+### Target 仍可单独推理
 
-本流程会出现两个不同目录：
+可以。量化接入只改变 DFlash 的装配入口，不修改主模型，也不接管原来的 Target inference：
+
+- **Target-only**：继续使用原来的推理入口、配置和三份量化路径，不加载 Draft；
+- **Target + DFlash**：把同三份路径传给本文的 quantizer/input-provider 接口；
+- ordinary 量化 Target 的 greedy 输出始终是 DFlash 严格对照的权威结果。
+
+因此排错时应先确认 Target-only 正常吐字，再运行 Target-only preflight，最后才运行完整 DFlash。
+
+## 2. 四类路径不要混用
+
+部署侧三条路径各有唯一用途，另有一条可选的 CPU/CUDA 仿真导出目录：
 
 | 名称 | 谁生成 | 谁读取 | 用途 |
 |---|---|---|---|
-| 部署量化 artifact | 现有量化工具 | `--target-quantizer` | 在 NPU Target 中创建 `QLinear` |
+| Linear 量化权重路径 | 现有量化工具 | `--target-quantizer` | 在 NPU Target 中创建 `QLinear` |
+| Embedding 权重路径 | 现有量化工具 | `--target-input-provider` | 读取量化 embedding 表 |
+| Embedding scale 路径 | 现有量化工具 | `--target-input-provider` | 按普通量化推理语义恢复第 0 层输入 |
 | W8A8 仿真 artifact | `preflight_target_quant` | CPU/CUDA framework Target | 导出真实 `W_q/scale`，复现 Linear 公式 |
 
-不要把第二个目录传给 `--target-quant-artifact`。它只用于 CPU/CUDA correctness 诊断，不能替代
-部署量化 artifact。
+前三条都可以是普通文件或目录，但不能是 symlink；它们也可以指向同一部署根目录。仿真 artifact
+只用于 CPU/CUDA correctness 诊断，不能替代前三条部署路径。
 
 ## 3. 代码各自负责什么
 
@@ -83,14 +95,14 @@ FP16 DFlash Draft（6 层，checkpoint 不变）
 
 ## 4. 你只需要接两个已有函数
 
-DFlash 不知道部署量化 artifact 的私有格式，因此需要两个 `MODULE:FUNCTION` callback。
+DFlash 不知道三份部署量化数据的私有格式，因此需要两个 `MODULE:FUNCTION` callback。
 
 ### 4.1 Quantizer
 
 如果已有量化函数就是：
 
 ```python
-def quant_model(model, artifact_path):
+def quant_model(model, quant_weight_path):
     ...
     return model
 ```
@@ -104,7 +116,7 @@ def quant_model(model, artifact_path):
 也支持扩展签名：
 
 ```python
-def quantize_target(model, artifact_path, *, device, output_dtype):
+def quantize_target(model, quant_weight_path, *, device, output_dtype):
     ...
     return model
 ```
@@ -136,7 +148,8 @@ def build_target_inputs(
     model_wrapper,
     input_ids,
     *,
-    artifact_path,
+    embedding_weight_path,
+    embedding_scale_path,
     device,
     output_dtype,
 ):
@@ -168,7 +181,9 @@ set -euo pipefail
 export MODEL_PYTHON=/path/to/model/python
 export TARGET_DIR=/path/to/Qwen3.5-4B
 export DRAFT_DIR=/path/to/Qwen3.5-4B-DFlash
-export QUANT_ARTIFACT=/path/to/deployment-quant-artifact
+export TARGET_QUANT_WEIGHT_PATH=/path/to/linear-quant-weights
+export TARGET_EMBEDDING_WEIGHT_PATH=/path/to/embedding-weights
+export TARGET_EMBEDDING_SCALE_PATH=/path/to/embedding-scales
 export PROMPT_FILE=/path/to/prompt.txt
 export RUN_DIR=/path/to/new-run-directory
 export KV_CACHE_MAX_LEN=4096
@@ -187,7 +202,9 @@ export PYTHONPATH="$PWD:$QUANT_CALLBACK_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 - `MODEL_PYTHON`：能够导入 PyTorch、torch_npu、Transformers 和当前模型的 Python 3.10。
 - `TARGET_DIR`：本地 Qwen3.5-4B target checkpoint。
 - `DRAFT_DIR`：官方 Qwen3.5-4B-DFlash checkpoint。
-- `QUANT_ARTIFACT`：普通量化 Target 已使用的部署 artifact。
+- `TARGET_QUANT_WEIGHT_PATH`：普通量化 Target 使用的 Linear 量化权重文件或目录。
+- `TARGET_EMBEDDING_WEIGHT_PATH`：普通量化 Target 使用的 embedding 权重文件或目录。
+- `TARGET_EMBEDDING_SCALE_PATH`：与上述 embedding 权重匹配的 scale 文件或目录。
 - `PROMPT_FILE`：固定 UTF-8 文本；报告不保存 prompt 明文。
 - `RUN_DIR`：本次报告和导出文件的独立目录，不能放进源码或权重目录。
 - `KV_CACHE_MAX_LEN`：与普通 NPU 推理配置相同，且能被 64 整除。
@@ -198,7 +215,9 @@ export PYTHONPATH="$PWD:$QUANT_CALLBACK_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 test -x "$MODEL_PYTHON"
 test -d "$TARGET_DIR"
 test -d "$DRAFT_DIR"
-test -e "$QUANT_ARTIFACT"
+test -e "$TARGET_QUANT_WEIGHT_PATH"
+test -e "$TARGET_EMBEDDING_WEIGHT_PATH"
+test -e "$TARGET_EMBEDDING_SCALE_PATH"
 test -f "$PROMPT_FILE"
 
 "$MODEL_PYTHON" -B - <<'PY'
@@ -272,8 +291,10 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --device npu:0 \
   --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
   --target-quantizer your_quant_bridge:quantize_target \
-  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
   --target-input-provider your_quant_bridge:build_target_inputs \
+  --target-embedding-weight-path "$TARGET_EMBEDDING_WEIGHT_PATH" \
+  --target-embedding-scale-path "$TARGET_EMBEDDING_SCALE_PATH" \
   --compare-first-qlinear \
   --export-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
   --report "$RUN_DIR/target-quant-preflight.json"
@@ -450,8 +471,10 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --eos-token-id 248044 \
   --target-quant-mode w8a8_dynamic \
   --target-quantizer your_quant_bridge:quantize_target \
-  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
   --target-input-provider your_quant_bridge:build_target_inputs \
+  --target-embedding-weight-path "$TARGET_EMBEDDING_WEIGHT_PATH" \
+  --target-embedding-scale-path "$TARGET_EMBEDDING_SCALE_PATH" \
   --report "$RUN_DIR/npu-quant-target-parity.json"
 ```
 
@@ -500,8 +523,10 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --max-draft-tokens 16 \
   --target-quant-mode w8a8_dynamic \
   --target-quantizer your_quant_bridge:quantize_target \
-  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
   --target-input-provider your_quant_bridge:build_target_inputs \
+  --target-embedding-weight-path "$TARGET_EMBEDDING_WEIGHT_PATH" \
+  --target-embedding-scale-path "$TARGET_EMBEDDING_SCALE_PATH" \
   --report "$RUN_DIR/npu-quant-dflash.json"
 ```
 
@@ -619,8 +644,10 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --acceptance-rounds 16 \
   --target-quant-mode w8a8_dynamic \
   --target-quantizer your_quant_bridge:quantize_target \
-  --target-quant-artifact "$QUANT_ARTIFACT" \
+  --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
   --target-input-provider your_quant_bridge:build_target_inputs \
+  --target-embedding-weight-path "$TARGET_EMBEDDING_WEIGHT_PATH" \
+  --target-embedding-scale-path "$TARGET_EMBEDDING_SCALE_PATH" \
   --trace-draft-layers \
   --report "$RUN_DIR/npu-w8a8-acceptance.json"
 ```

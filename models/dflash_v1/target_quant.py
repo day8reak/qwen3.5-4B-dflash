@@ -23,7 +23,9 @@ from torch import Tensor, nn
 
 TARGET_QUANT_MODE_ENV = "DFLASH_TARGET_QUANT_MODE"
 TARGET_QUANTIZER_ENV = "DFLASH_TARGET_QUANTIZER"
-TARGET_QUANT_ARTIFACT_ENV = "DFLASH_TARGET_QUANT_ARTIFACT"
+TARGET_QUANT_WEIGHT_PATH_ENV = "DFLASH_TARGET_QUANT_WEIGHT_PATH"
+TARGET_EMBEDDING_WEIGHT_PATH_ENV = "DFLASH_TARGET_EMBEDDING_WEIGHT_PATH"
+TARGET_EMBEDDING_SCALE_PATH_ENV = "DFLASH_TARGET_EMBEDDING_SCALE_PATH"
 TARGET_INPUT_PROVIDER_ENV = "DFLASH_TARGET_INPUT_PROVIDER"
 
 QUANT_MODE_DISABLED = "disabled"
@@ -40,8 +42,10 @@ class TargetQuantizationRequest:
 
     mode: str
     quantizer_spec: str | None
-    artifact_path: Path | None
+    quant_weight_path: Path | None
     input_provider_spec: str | None
+    embedding_weight_path: Path | None
+    embedding_scale_path: Path | None
 
     @property
     def enabled(self) -> bool:
@@ -56,17 +60,27 @@ class TargetQuantizationRequest:
                 f"{SUPPORTED_TARGET_QUANT_MODES}; got {mode!r}"
             )
         quantizer_spec = _optional_text(os.environ.get(TARGET_QUANTIZER_ENV))
-        artifact_text = _optional_text(os.environ.get(TARGET_QUANT_ARTIFACT_ENV))
+        quant_weight_text = _optional_text(
+            os.environ.get(TARGET_QUANT_WEIGHT_PATH_ENV)
+        )
         input_provider_spec = _optional_text(
             os.environ.get(TARGET_INPUT_PROVIDER_ENV)
+        )
+        embedding_weight_text = _optional_text(
+            os.environ.get(TARGET_EMBEDDING_WEIGHT_PATH_ENV)
+        )
+        embedding_scale_text = _optional_text(
+            os.environ.get(TARGET_EMBEDDING_SCALE_PATH_ENV)
         )
         if mode == QUANT_MODE_DISABLED:
             stale = [
                 name
                 for name, value in (
                     (TARGET_QUANTIZER_ENV, quantizer_spec),
-                    (TARGET_QUANT_ARTIFACT_ENV, artifact_text),
+                    (TARGET_QUANT_WEIGHT_PATH_ENV, quant_weight_text),
                     (TARGET_INPUT_PROVIDER_ENV, input_provider_spec),
+                    (TARGET_EMBEDDING_WEIGHT_PATH_ENV, embedding_weight_text),
+                    (TARGET_EMBEDDING_SCALE_PATH_ENV, embedding_scale_text),
                 )
                 if value is not None
             ]
@@ -75,14 +89,16 @@ class TargetQuantizationRequest:
                     "target quantization is disabled but quantization settings "
                     "remain configured: " + ", ".join(stale)
                 )
-            return cls(mode, None, None, None)
+            return cls(mode, None, None, None, None, None)
 
         missing = [
             name
             for name, value in (
                 (TARGET_QUANTIZER_ENV, quantizer_spec),
-                (TARGET_QUANT_ARTIFACT_ENV, artifact_text),
+                (TARGET_QUANT_WEIGHT_PATH_ENV, quant_weight_text),
                 (TARGET_INPUT_PROVIDER_ENV, input_provider_spec),
+                (TARGET_EMBEDDING_WEIGHT_PATH_ENV, embedding_weight_text),
+                (TARGET_EMBEDDING_SCALE_PATH_ENV, embedding_scale_text),
             )
             if value is None
         ]
@@ -90,23 +106,25 @@ class TargetQuantizationRequest:
             raise ValueError(
                 f"{mode} requires " + ", ".join(missing)
             )
-        assert artifact_text is not None
-        artifact = Path(artifact_text).expanduser()
-        if artifact.is_symlink():
-            raise ValueError("target quantization artifact must not be a symlink")
-        if not artifact.exists():
-            raise FileNotFoundError(
-                f"target quantization artifact does not exist: {artifact}"
-            )
-        if not artifact.is_file() and not artifact.is_dir():
-            raise ValueError(
-                "target quantization artifact must be a regular file or directory"
-            )
+        assert quant_weight_text is not None
+        assert embedding_weight_text is not None
+        assert embedding_scale_text is not None
         return cls(
             mode=mode,
             quantizer_spec=quantizer_spec,
-            artifact_path=artifact.resolve(),
+            quant_weight_path=_validated_data_path(
+                quant_weight_text,
+                label="target quantization weight path",
+            ),
             input_provider_spec=input_provider_spec,
+            embedding_weight_path=_validated_data_path(
+                embedding_weight_text,
+                label="target embedding weight path",
+            ),
+            embedding_scale_path=_validated_data_path(
+                embedding_scale_text,
+                label="target embedding scale path",
+            ),
         )
 
 
@@ -153,6 +171,19 @@ def _optional_text(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _validated_data_path(value: str, *, label: str) -> Path:
+    """Resolve one deployment-owned file or directory without following a leaf link."""
+
+    path = Path(value).expanduser()
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symlink")
+    if not path.exists():
+        raise FileNotFoundError(f"{label} does not exist: {path}")
+    if not path.is_file() and not path.is_dir():
+        raise ValueError(f"{label} must be a regular file or directory")
+    return path.resolve()
 
 
 def load_callback(
@@ -207,14 +238,14 @@ def quantizer_callback_abi(function: Callable[..., Any]) -> str:
 
     return _select_callback_abi(
         function,
-        positional=(object(), "artifact-path"),
+        positional=(object(), "quant-weight-path"),
         extended_keywords={
             "device": torch.device("cpu"),
             "output_dtype": torch.float16,
         },
         label="target quantizer",
         expected=(
-            "(model, artifact_path) or (model, artifact_path, *, "
+            "(model, quant_weight_path) or (model, quant_weight_path, *, "
             "device, output_dtype)"
         ),
     )
@@ -227,14 +258,15 @@ def input_provider_callback_abi(function: Callable[..., Any]) -> str:
         function,
         positional=(object(), object()),
         extended_keywords={
-            "artifact_path": "artifact-path",
+            "embedding_weight_path": "embedding-weight-path",
+            "embedding_scale_path": "embedding-scale-path",
             "device": torch.device("cpu"),
             "output_dtype": torch.float16,
         },
         label="target input provider",
         expected=(
             "(model_wrapper, input_ids) or the same arguments plus "
-            "artifact_path/device/output_dtype"
+            "embedding_weight_path/embedding_scale_path/device/output_dtype"
         ),
     )
 
@@ -274,7 +306,7 @@ def preconversion_linear_paths(execution_model: nn.Module) -> tuple[str, ...]:
 def invoke_quantizer(
     function: Callable[..., Any],
     execution_model: nn.Module,
-    artifact_path: Path,
+    quant_weight_path: Path,
     *,
     device: torch.device,
     output_dtype: torch.dtype,
@@ -285,7 +317,7 @@ def invoke_quantizer(
     raised inside the quantizer is never mistaken for an argument mismatch.
     """
 
-    positional = (execution_model, str(artifact_path))
+    positional = (execution_model, str(quant_weight_path))
     if quantizer_callback_abi(function) == "simple":
         return function(*positional)
     return function(
@@ -299,7 +331,8 @@ def invoke_input_provider(
     function: Callable[..., Any],
     model_wrapper: nn.Module,
     input_ids: Tensor,
-    artifact_path: Path,
+    embedding_weight_path: Path,
+    embedding_scale_path: Path,
     *,
     device: torch.device,
     output_dtype: torch.dtype,
@@ -311,7 +344,8 @@ def invoke_input_provider(
         return function(*positional)
     return function(
         *positional,
-        artifact_path=str(artifact_path),
+        embedding_weight_path=str(embedding_weight_path),
+        embedding_scale_path=str(embedding_scale_path),
         device=device,
         output_dtype=output_dtype,
     )
@@ -590,9 +624,11 @@ __all__ = [
     "QUANT_MODE_DISABLED",
     "QUANT_MODE_W8A8_DYNAMIC",
     "SUPPORTED_TARGET_QUANT_MODES",
+    "TARGET_EMBEDDING_SCALE_PATH_ENV",
+    "TARGET_EMBEDDING_WEIGHT_PATH_ENV",
     "TARGET_INPUT_PROVIDER_ENV",
-    "TARGET_QUANT_ARTIFACT_ENV",
     "TARGET_QUANT_MODE_ENV",
+    "TARGET_QUANT_WEIGHT_PATH_ENV",
     "TARGET_QUANTIZER_ENV",
     "TargetQuantizationRequest",
     "TargetQuantizationResult",

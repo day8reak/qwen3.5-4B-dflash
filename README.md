@@ -124,7 +124,7 @@ NPU/CPU 单层对照，NPU 接受率诊断也会复用量化 input provider。�
 [NPU Quant Target 适配分析](docs/DFLASH_V1_NPU_QUANT_DESIGN.md#13-cpucuda-w8a8-公式仿真)。
 在没有权重和 NPU 的机器上，可以先运行
 `python -B -m models.dflash_v1.validate_w8a8_cpu`；它只验证 CPU 公式和整数累加实现，不能代替
-真实量化 artifact、embedding 输入路径或 NPU 同 activation 对照。
+真实 Linear 量化权重、embedding 权重/scale 输入路径或 NPU 同 activation 对照。
 
 固定文本也可以放进 UTF-8 文件，然后把 `--prompt "..."` 换成
 `--prompt-file /path/to/prompt.txt`。默认 `--prompt-mode chat` 会套用本地主模型 tokenizer 的

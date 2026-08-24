@@ -55,8 +55,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--kv-cache-max-len", type=int, required=True)
     parser.add_argument("--target-quantizer", required=True)
-    parser.add_argument("--target-quant-artifact", required=True)
+    parser.add_argument("--target-quant-weight-path", required=True)
     parser.add_argument("--target-input-provider", required=True)
+    parser.add_argument("--target-embedding-weight-path", required=True)
+    parser.add_argument("--target-embedding-scale-path", required=True)
     comparison = parser.add_mutually_exclusive_group()
     comparison.add_argument(
         "--compare-first-qlinear",
@@ -517,20 +519,20 @@ def _validate_report_destination(
     destination: Path,
     *,
     target_root: Path,
-    artifact: Path,
+    quantization_paths: Sequence[Path],
 ) -> Path:
     if destination.is_symlink():
         raise ValueError("--report must not be a symlink")
     resolved = destination.resolve()
     package_root = Path(__file__).resolve().parents[2]
     protected_roots = [target_root, package_root]
-    if artifact.is_dir():
-        protected_roots.append(artifact)
-    if resolved == artifact or any(
+    protected_roots.extend(path for path in quantization_paths if path.is_dir())
+    if resolved in quantization_paths or any(
         _is_within(resolved, root) for root in protected_roots
     ):
         raise ValueError(
-            "--report must be outside the target, source package, and quant artifact"
+            "--report must be outside the target, source package, and all "
+            "quantization data paths"
         )
     return resolved
 
@@ -539,7 +541,7 @@ def _validate_export_destination(
     destination: Path,
     *,
     target_root: Path,
-    artifact: Path,
+    quantization_paths: Sequence[Path],
     report_destination: Path | None,
 ) -> Path:
     if destination.exists() or destination.is_symlink():
@@ -549,14 +551,13 @@ def _validate_export_destination(
     resolved = destination.resolve()
     package_root = Path(__file__).resolve().parents[2]
     protected_roots = [target_root, package_root]
-    if artifact.is_dir():
-        protected_roots.append(artifact)
-    if resolved == artifact or any(
+    protected_roots.extend(path for path in quantization_paths if path.is_dir())
+    if resolved in quantization_paths or any(
         _is_within(resolved, root) for root in protected_roots
     ):
         raise ValueError(
             "W8A8 emulation export must be outside the target, source package, "
-            "and source quant artifact"
+            "and quantization data paths"
         )
     if report_destination is not None and resolved == report_destination:
         raise ValueError("W8A8 emulation export and --report must be different")
@@ -639,19 +640,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_quant_mode=QUANT_MODE_W8A8_DYNAMIC,
         target_factory=DEFAULT_TARGET_FACTORY,
         target_quantizer=args.target_quantizer,
-        target_quant_artifact=args.target_quant_artifact,
+        target_quant_weight_path=args.target_quant_weight_path,
         target_input_provider=args.target_input_provider,
+        target_embedding_weight_path=args.target_embedding_weight_path,
+        target_embedding_scale_path=args.target_embedding_scale_path,
         report=args.report,
     )
     _configure_target_quantization(quant_args)
-    artifact = Path(args.target_quant_artifact).expanduser().resolve()
+    quantization_paths = (
+        Path(args.target_quant_weight_path).expanduser().resolve(),
+        Path(args.target_embedding_weight_path).expanduser().resolve(),
+        Path(args.target_embedding_scale_path).expanduser().resolve(),
+    )
     report_destination = (
         None
         if args.report is None
         else _validate_report_destination(
             Path(args.report).expanduser(),
             target_root=target_root,
-            artifact=artifact,
+            quantization_paths=quantization_paths,
         )
     )
     export_destination = (
@@ -660,7 +667,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else _validate_export_destination(
             Path(args.export_w8a8_emulation_artifact).expanduser(),
             target_root=target_root,
-            artifact=artifact,
+            quantization_paths=quantization_paths,
             report_destination=report_destination,
         )
     )

@@ -5,12 +5,15 @@
 量化 Target 实验请先阅读
 [量化版运行与排错指南](DFLASH_V1_QUANT_RUNBOOK.md)，再按需查阅
 [DFlash V1 NPU Quant Target 适配](DFLASH_V1_NPU_QUANT_DESIGN.md)。`quant` 分支复用现有
-`QLinear`、量化 artifact 和 Target 自定义算子，不新增量化 kernel；不传量化参数时仍走
+`QLinear`、Linear 量化权重、embedding 权重/scale 和 Target 自定义算子，不新增量化 kernel；不传量化参数时仍走
 `v1-r1` 的 FP16 路径。
 
 量化首次接入应先运行 `models.dflash_v1.preflight_target_quant`。它只加载 Target，不读取
 Draft checkpoint，并在完整 DFlash 前检查转换覆盖、input provider、feature 零影响和有界
 full-prefix 状态隔离；具体命令见量化适配文档。
+
+主模型仍可完全脱离 DFlash 单独推理。原 Target inference 继续使用原配置和三份量化路径，
+不加载 Draft；DFlash 入口只是把相同三份路径显式映射到 quantizer 和 input provider。
 
 ## 1. 路径变量
 

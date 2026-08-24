@@ -314,15 +314,18 @@ class InternalDFlashTarget(nn.Module):
 
         provider = self._target_input_provider
         assert callable(provider)
-        artifact = self.quantization_request.artifact_path
-        assert artifact is not None
+        embedding_weight_path = self.quantization_request.embedding_weight_path
+        embedding_scale_path = self.quantization_request.embedding_scale_path
+        assert embedding_weight_path is not None
+        assert embedding_scale_path is not None
         self._target_input_provider_calls += 1
         try:
             value = invoke_input_provider(
                 provider,
                 self.model_wrapper,
                 input_ids,
-                artifact,
+                embedding_weight_path,
+                embedding_scale_path,
                 device=self.requested_device,
                 output_dtype=self.requested_dtype,
             )
@@ -765,7 +768,9 @@ def load_qwen35_target(
     if quantization_request.enabled:
         assert quantization_request.quantizer_spec is not None
         assert quantization_request.input_provider_spec is not None
-        assert quantization_request.artifact_path is not None
+        assert quantization_request.quant_weight_path is not None
+        assert quantization_request.embedding_weight_path is not None
+        assert quantization_request.embedding_scale_path is not None
         quantizer, quantizer_identity = load_callback(
             quantization_request.quantizer_spec,
             label="target quantizer",
@@ -781,7 +786,7 @@ def load_qwen35_target(
         raw_result = invoke_quantizer(
             quantizer,
             execution_model,
-            quantization_request.artifact_path,
+            quantization_request.quant_weight_path,
             device=torch.device(device),
             output_dtype=dtype,
         )
@@ -826,10 +831,26 @@ def load_qwen35_target(
         quantization_audit = {
             **assembly,
             "quantizer_identity": quantizer_identity,
-            "artifact_path": str(quantization_request.artifact_path),
-            "artifact_kind": (
+            "quant_weight_path": str(quantization_request.quant_weight_path),
+            "quant_weight_path_kind": (
                 "directory"
-                if quantization_request.artifact_path.is_dir()
+                if quantization_request.quant_weight_path.is_dir()
+                else "file"
+            ),
+            "embedding_weight_path": str(
+                quantization_request.embedding_weight_path
+            ),
+            "embedding_weight_path_kind": (
+                "directory"
+                if quantization_request.embedding_weight_path.is_dir()
+                else "file"
+            ),
+            "embedding_scale_path": str(
+                quantization_request.embedding_scale_path
+            ),
+            "embedding_scale_path_kind": (
+                "directory"
+                if quantization_request.embedding_scale_path.is_dir()
                 else "file"
             ),
             "numerical_validation": "PENDING_REAL_NPU_PARITY",

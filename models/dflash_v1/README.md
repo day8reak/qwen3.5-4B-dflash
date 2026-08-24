@@ -16,7 +16,7 @@ target 覆盖它。
 - `diagnose_acceptance.py`：CPU/CUDA/NPU 都对比 cached-incremental 与 fresh-full-prefix
   Target，并可在相同 greedy 前缀上扫描 K=1/4/8/16；支持直接传 UTF-8 prompt/txt、
   FP16/BF16 A/B、早中后段接受率、逐轮层级指纹、跨报告首个分叉和单轮 oracle tensor
-  bundle，默认不输出 token ID；NPU 诊断可复用 `run_npu` 的 quantizer/artifact/input-provider
+  bundle，默认不输出 token ID；NPU 诊断可复用 `run_npu` 的 quantizer/三路径/input-provider
   参数，避免增量侧绕过量化输入。
 - `dflash_qwen_adapter_v1.py`：CPU/CUDA/NPU 完整入口和严格 greedy 验证流程。
 - `dflash_reference_decode_v1.py`：无 cache 的完整前缀 DFlash 调度 golden；默认逐 proposal

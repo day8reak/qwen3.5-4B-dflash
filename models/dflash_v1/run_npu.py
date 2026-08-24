@@ -16,9 +16,11 @@ from typing import Sequence
 from .target_quant import (
     QUANT_MODE_DISABLED,
     SUPPORTED_TARGET_QUANT_MODES,
+    TARGET_EMBEDDING_SCALE_PATH_ENV,
+    TARGET_EMBEDDING_WEIGHT_PATH_ENV,
     TARGET_INPUT_PROVIDER_ENV,
-    TARGET_QUANT_ARTIFACT_ENV,
     TARGET_QUANT_MODE_ENV,
+    TARGET_QUANT_WEIGHT_PATH_ENV,
     TARGET_QUANTIZER_ENV,
     TargetQuantizationRequest,
     input_provider_callback_abi,
@@ -106,8 +108,11 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--target-quant-artifact",
-        help="existing quantized-target artifact consumed by --target-quantizer",
+        "--target-quant-weight-path",
+        help=(
+            "existing Linear quant-weight file or directory consumed by "
+            "--target-quantizer"
+        ),
     )
     parser.add_argument(
         "--target-input-provider",
@@ -115,6 +120,14 @@ def _parser() -> argparse.ArgumentParser:
             "MODULE:FUNCTION returning the final FP16 layer-0 hidden for the "
             "quantized target's padded input IDs"
         ),
+    )
+    parser.add_argument(
+        "--target-embedding-weight-path",
+        help="existing quantized embedding-weight file or directory",
+    )
+    parser.add_argument(
+        "--target-embedding-scale-path",
+        help="existing quantized embedding-scale file or directory",
     )
     parser.add_argument("--report")
     parser.add_argument(
@@ -128,8 +141,10 @@ def _parser() -> argparse.ArgumentParser:
 def _configure_target_quantization(args: argparse.Namespace) -> None:
     values = {
         TARGET_QUANTIZER_ENV: args.target_quantizer,
-        TARGET_QUANT_ARTIFACT_ENV: args.target_quant_artifact,
+        TARGET_QUANT_WEIGHT_PATH_ENV: args.target_quant_weight_path,
         TARGET_INPUT_PROVIDER_ENV: args.target_input_provider,
+        TARGET_EMBEDDING_WEIGHT_PATH_ENV: args.target_embedding_weight_path,
+        TARGET_EMBEDDING_SCALE_PATH_ENV: args.target_embedding_scale_path,
     }
     if args.target_quant_mode == QUANT_MODE_DISABLED:
         supplied = [name for name, value in values.items() if value is not None]
@@ -155,30 +170,6 @@ def _configure_target_quantization(args: argparse.Namespace) -> None:
             f"--target-quant-mode {args.target_quant_mode} requires "
             + ", ".join(missing)
         )
-    artifact = Path(args.target_quant_artifact).expanduser()
-    if artifact.is_symlink():
-        raise ValueError("--target-quant-artifact must not be a symlink")
-    if not artifact.exists():
-        raise FileNotFoundError(
-            f"target quantization artifact does not exist: {artifact}"
-        )
-    report = Path(args.report).expanduser() if args.report is not None else None
-    if report is not None:
-        resolved_report = report.resolve()
-        resolved_artifact = artifact.resolve()
-        overlaps = resolved_report == resolved_artifact
-        if artifact.is_dir():
-            try:
-                resolved_report.relative_to(resolved_artifact)
-            except ValueError:
-                pass
-            else:
-                overlaps = True
-        if overlaps:
-            raise ValueError(
-                "--report must not overwrite or be placed inside the target "
-                "quantization artifact"
-            )
     os.environ[TARGET_QUANT_MODE_ENV] = args.target_quant_mode
     for name, value in values.items():
         assert value is not None
@@ -192,6 +183,32 @@ def _configure_target_quantization(args: argparse.Namespace) -> None:
     assert request.enabled
     assert request.quantizer_spec is not None
     assert request.input_provider_spec is not None
+    protected_paths = (
+        request.quant_weight_path,
+        request.embedding_weight_path,
+        request.embedding_scale_path,
+    )
+    assert all(path is not None for path in protected_paths)
+    report = Path(args.report).expanduser() if args.report is not None else None
+    if report is not None:
+        if report.is_symlink():
+            raise ValueError("--report must not be a symlink")
+        resolved_report = report.resolve()
+        for protected in protected_paths:
+            assert protected is not None
+            overlaps = resolved_report == protected
+            if protected.is_dir():
+                try:
+                    resolved_report.relative_to(protected)
+                except ValueError:
+                    pass
+                else:
+                    overlaps = True
+            if overlaps:
+                raise ValueError(
+                    "--report must not overwrite or be placed inside any "
+                    "target quantization data path"
+                )
     quantizer, _ = load_callback(
         request.quantizer_spec,
         label="target quantizer",
