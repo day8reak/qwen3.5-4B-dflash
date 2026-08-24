@@ -1,6 +1,8 @@
 # Ascend NPU 部署与运行
 
 本流程采用直接源码集成，不运行 patch，也不要求手工修改模型代码。
+整体数据流见 [DFlash V1 整体架构](DFLASH_V1_ARCHITECTURE.md)；各门禁为什么存在见
+[验证流程与报告解读](DFLASH_V1_VALIDATION.md)。
 
 ## 1. 路径变量
 

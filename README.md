@@ -69,14 +69,20 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
   --report /path/to/run/dflash-v1-cpu.json
 ```
 
-完整说明：
+建议先读主文档，再按问题进入子文档：
 
-- [项目架构与完整实现流程](docs/DFLASH_V1_ARCHITECTURE.md)
-- [实现和文件说明](README_DFLASH_V1.md)
-- [CPU/Golden 使用说明](docs/DFLASH_V1_GOLDEN.md)
-- [CUDA GPU 使用说明](docs/DFLASH_V1_GPU.md)
-- [Ascend 310P 接入说明](docs/DFLASH_V1_ASCEND310P.md)
-- [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
+- [整体架构与完整数据流](docs/DFLASH_V1_ARCHITECTURE.md)
+  - [Target 与 Feature](docs/DFLASH_V1_TARGET_AND_FEATURE.md)
+  - [Draft 模型](docs/DFLASH_V1_DRAFT.md)
+  - [Scheduler 与 token 验证](docs/DFLASH_V1_SCHEDULER.md)
+  - [验证流程与报告解读](docs/DFLASH_V1_VALIDATION.md)
+- [从 V1 到完整 DFlash 与真正提速](docs/DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)
+- [实现和文件索引](README_DFLASH_V1.md)
+- 运行文档：
+  - [CPU/Golden](docs/DFLASH_V1_GOLDEN.md)
+  - [CUDA GPU](docs/DFLASH_V1_GPU.md)
+  - [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
+  - [Ascend 310P 接口与边界](docs/DFLASH_V1_ASCEND310P.md)
 
 ## NPU 快速入口
 

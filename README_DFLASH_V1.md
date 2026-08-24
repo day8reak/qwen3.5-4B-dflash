@@ -7,6 +7,12 @@
 
 先阅读：
 
+- [整体架构与完整数据流](docs/DFLASH_V1_ARCHITECTURE.md)
+- [Target 与 Feature](docs/DFLASH_V1_TARGET_AND_FEATURE.md)
+- [Draft 模型](docs/DFLASH_V1_DRAFT.md)
+- [Scheduler 与 token 验证](docs/DFLASH_V1_SCHEDULER.md)
+- [验证流程与报告解读](docs/DFLASH_V1_VALIDATION.md)
+- [从 V1 到完整 DFlash 与真正提速](docs/DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)
 - [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
 - [CPU/Golden 指南](docs/DFLASH_V1_GOLDEN.md)
 - [CUDA GPU 指南](docs/DFLASH_V1_GPU.md)
