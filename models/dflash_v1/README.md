@@ -17,6 +17,8 @@ target 覆盖它。
 ## 运行与调度
 
 - `run_npu.py`：内嵌目录的一键 NPU 入口，自动派生 HIAI source、loader、FP16 和 EOS。
+- `benchmark_npu.py`：真实 NPU 的 ordinary/DFlash 分进程 benchmark；加载后先做零 token
+  差异门禁，再执行 device-synchronized warmup/measurement，并支持 MSTX range。
 - `diagnose_acceptance.py`：CPU/CUDA/NPU 都对比 cached-incremental 与 fresh-full-prefix
   Target，并可在相同 greedy 前缀上扫描 K=1/4/8/16；支持直接传 UTF-8 prompt/txt、
   FP16/BF16 A/B、早中后段接受率、逐轮层级指纹、跨报告首个分叉和单轮 oracle tensor
@@ -58,13 +60,15 @@ query 是 1 个 anchor 加 16 个 mask，共 17 行。诊断报告始终明确�
 
 ```bash
 python -m models.dflash_v1.run_npu --help
+python -m models.dflash_v1.benchmark_npu --help
 python -m models.dflash_v1.diagnose_acceptance --help
 python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
 ```
 
-三个入口都接受 `--prompt "文本"` 或 `--prompt-file /path/to/prompt.txt`。默认
+四个入口都接受 `--prompt "文本"` 或 `--prompt-file /path/to/prompt.txt`。默认
 `--prompt-mode chat` 使用本地主模型 tokenizer 的 chat template，默认启用 thinking，并输出
 解码后的 ordinary Target 与 DFlash 文本；`--no-enable-thinking` 可复现非 thinking workload，
 `raw` 模式只做普通 tokenizer 编码。
 
-完整 NPU 部署流程见 [NPU_DEPLOYMENT.md](../../docs/NPU_DEPLOYMENT.md)。
+完整 NPU 部署流程见 [NPU_DEPLOYMENT.md](../../docs/NPU_DEPLOYMENT.md)，性能测量和
+`msprof` 采集见 [NPU_BENCHMARK.md](../../docs/NPU_BENCHMARK.md)。

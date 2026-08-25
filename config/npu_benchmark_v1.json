@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "contract_id": "qwen3.5-4b-dflash-v1-npu-benchmark",
+  "scope": "batch-1 strict-greedy ordinary full-prefix versus sequential full-prefix DFlash V1",
+  "prerequisites": {
+    "real_npu_required": true,
+    "cpu_fallback_allowed": false,
+    "strict_greedy_token_mismatches_allowed": 0,
+    "correctness_gate_runs_before_timing": true
+  },
+  "case_identity": [
+    "Git revision and source hashes",
+    "Target and Draft checkpoint hashes",
+    "NPU model and device index",
+    "CANN, driver, firmware, torch and torch_npu versions",
+    "prompt token hash and thinking mode",
+    "max_new_tokens and max_draft_tokens",
+    "kv_cache_max_len and prefill/decode chunk sizes"
+  ],
+  "runner": {
+    "entrypoint": "python -B -m models.dflash_v1.benchmark_npu",
+    "modes": ["ordinary", "dflash"],
+    "separate_process_per_mode": true,
+    "warmup_iterations": 3,
+    "measured_iterations": 10,
+    "synchronize_before_and_after_each_iteration": true,
+    "stable_result_required_for_every_iteration": true,
+    "retain_all_measurements": true,
+    "latency_summary": [
+      "min",
+      "max",
+      "mean",
+      "median",
+      "p90",
+      "population_stdev"
+    ]
+  },
+  "msprof": {
+    "wrapper": "tools/run_msprof.sh",
+    "diagnostic_not_baseline": true,
+    "recommended_warmup_iterations": 1,
+    "recommended_measured_iterations": 1,
+    "default_options": {
+      "ascendcl": "on",
+      "runtime-api": "on",
+      "task-time": "on",
+      "aicpu": "on",
+      "ai-core": "on",
+      "aic-mode": "task-based",
+      "aic-metrics": "PipeUtilization",
+      "msproftx": "on"
+    },
+    "separate_metric_passes": ["PipeUtilization", "Memory", "MemoryUB"]
+  },
+  "route_boundary": {
+    "ordinary": "ordinary full-prefix greedy replay",
+    "dflash": "target bootstrap plus sequential full-prefix DFlash V1 replay",
+    "not_claimed": [
+      "incremental Target cache performance",
+      "vectorized K+1 verification",
+      "transactional KV/GDN/conv state performance",
+      "future fused Draft operator performance"
+    ]
+  }
+}

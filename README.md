@@ -14,8 +14,8 @@ CPU/CUDA 后端，以及 Ascend NPU/HIAI target 所需的检查和 loader。
 - `models/internal_dflash_bridge.py`：复用现有 HIAI wrapper，并为每次完整前缀调用创建
   全新的 hybrid KV/GDN state。
 - `models/dflash_qwen_adapter_v1.py`：旧命令兼容入口。
-- `tools/`：自定义算子静态预检工具。
-- `config/`：预检工具使用的算子接口合同。
+- `tools/`：自定义算子静态预检工具和 `msprof` 采集 wrapper。
+- `config/`：算子接口与 NPU benchmark 的机器可读合同。
 - `docs/`：CPU、CUDA 和 Ascend NPU 使用说明。
 - `SOURCE_LOCK.json`：framework 启动和草稿 checkpoint 身份检查所需的精简运行合同。
 
@@ -82,6 +82,7 @@ python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
   - [CPU/Golden](docs/DFLASH_V1_GOLDEN.md)
   - [CUDA GPU](docs/DFLASH_V1_GPU.md)
   - [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
+  - [Ascend NPU benchmark 与 msprof](docs/NPU_BENCHMARK.md)
   - [Ascend 310P 接口与边界](docs/DFLASH_V1_ASCEND310P.md)
 
 ## NPU 快速入口
@@ -112,6 +113,16 @@ python -B -m models.dflash_v1.run_npu \
 把 `4096` 替换成部署配置中 `kv_cache_max_len` 的真实值。
 不需要修改 bridge 源码。`run_npu` 会自动固定 FP16、EOS `248044`、内嵌目录、package-local NPU
 backend 和 HIAI source，不再要求 overlay JSON。
+
+真实 NPU 性能基线使用独立 benchmark 入口，ordinary 和 DFlash 必须分别启动进程：
+
+```bash
+python -B -m models.dflash_v1.benchmark_npu --help
+```
+
+它会先执行 strict-greedy 零 token 差异门禁，再进行 device-synchronized warmup 和测量；
+`tools/run_msprof.sh` 用于 timeline/AI Core 诊断。完整命令和结果边界见
+[Ascend NPU benchmark 与 msprof](docs/NPU_BENCHMARK.md)。
 
 如果已经能生成但接受率偏低，按
 [NPU 接受率分层诊断](docs/NPU_DEPLOYMENT.md#7-接受率低时的分层诊断) 运行

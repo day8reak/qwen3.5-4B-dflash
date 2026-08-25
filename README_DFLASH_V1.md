@@ -64,6 +64,11 @@ decoder 层 `1,5,9,13,17,21,25,29` 的层后、最终 norm 前输出
 shape/dtype 来自模型配置和固定 ABI。`run_npu` 默认使用已经实现好的 bridge；
 只需传部署配置中的 `kv_cache_max_len`。
 
+真实设备性能使用 `models.dflash_v1.benchmark_npu`。它分别测量当前 ordinary
+full-prefix 和 DFlash sequential full-prefix 路线，计时前强制通过 strict-greedy correctness
+gate，并在每次计时前后同步 NPU。`tools/run_msprof.sh` 提供独立的 msprof 诊断采集；命令和
+claim boundary 见 `docs/NPU_BENCHMARK.md`。
+
 ## Draft backend
 
 ```text

@@ -98,5 +98,16 @@
     "hiai_runtime_policy": "legacy ModelOutput sidecar compatibility only; direct HIAI Tensor/tuple source must not import it",
     "ascend_ops_file": "models/dflash_v1/dflash_ascend310p_ops.py",
     "ascend_ops_sha256": "8647a900ef99f41b23169b63d45ad5a554051d4c1fb8bc924fa22bd270901ac3"
+  },
+  "npu_benchmark": {
+    "runner_file": "models/dflash_v1/benchmark_npu.py",
+    "runner_sha256": "584033b3d16610f4da8acab8227c594b3f080fe66776fe3468507a89ca9151ea",
+    "msprof_wrapper_file": "tools/run_msprof.sh",
+    "msprof_wrapper_sha256": "3facb8d5fea35b22c62b25243711a3e244a1afb65aaac9482a795684662005b6",
+    "contract_file": "config/npu_benchmark_v1.json",
+    "contract_sha256": "6e56cc7228f73d6451ac2945e6b1fcd14e096ba3a6db489edf4f4e8e00fe1334",
+    "documentation_file": "docs/NPU_BENCHMARK.md",
+    "documentation_sha256": "b87034597143a0c7a8e65de9ea840cbaad10cd98933e86704d70e7cef727cbc5",
+    "policy": "strict-greedy gate before timing; separate ordinary/dflash processes; synchronized unprofiled baseline; msprof diagnostic only; no CPU fallback"
   }
 }
