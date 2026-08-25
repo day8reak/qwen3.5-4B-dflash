@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "abi_id": "qwen35-4b-ascend310p-performance-v1",
+  "scope": "text-only batch-1 strict-greedy ordinary versus MTP target timing",
+  "prerequisites": {
+    "real_device_required": true,
+    "cpu_fallback_allowed": false,
+    "integrated_accuracy_must_pass_before_promotion": true,
+    "ordinary_and_mtp_final_token_mismatches_allowed": 0
+  },
+  "case_identity": [
+    "model and target source revisions",
+    "checkpoint and target artifact SHA-256",
+    "device model and device ID",
+    "CANN, driver, firmware and runtime versions",
+    "dtype",
+    "prompt token IDs",
+    "max new tokens",
+    "maximum draft tokens"
+  ],
+  "runner_contract": {
+    "modes": ["ordinary", "mtp"],
+    "separate_process_per_mode": true,
+    "required_backend_hook": "synchronize()",
+    "optional_state_reset_hooks_in_priority_order": [
+      "reset_benchmark_state()",
+      "reset_state()",
+      "clear_cache()"
+    ],
+    "stable_token_ids_across_repetitions": true
+  },
+  "unprofiled_baseline": {
+    "warmup_iterations": 3,
+    "measured_iterations": 10,
+    "retain_all_raw_measurements": true,
+    "summary": ["min", "max", "mean", "median", "p90", "population_stdev"]
+  },
+  "msprof_diagnosis": {
+    "not_a_baseline_timing": true,
+    "recommended_measured_iterations": "1..3",
+    "default_options": {
+      "ascendcl": "on",
+      "runtime-api": "on",
+      "task-time": "on",
+      "aicpu": "on",
+      "ai-core": "on",
+      "aic-mode": "task-based",
+      "aic-metrics": "PipeUtilization",
+      "msproftx": "on"
+    },
+    "separate_metric_passes": ["PipeUtilization", "Memory", "MemoryUB"]
+  },
+  "artifacts": {
+    "root": "$AI_RUN_DIR",
+    "benchmark_report": "out/performance/<mode>.json",
+    "msprof_profile": "profile/msprof/<label>/PROF_*",
+    "msprof_manifest": "out/performance/msprof/<label>.manifest.json",
+    "logs": "log/msprof-<label>*.log"
+  },
+  "claim_boundary": "msprof is diagnostic evidence; promotion requires the unprofiled 10/10 accuracy-stable target distribution"
+}

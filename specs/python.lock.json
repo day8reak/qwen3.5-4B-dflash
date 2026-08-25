@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "environment_profile": "qwen3.5-py310",
+  "environment_manifest_sha256": "221035da9f43538c06ae1cf82b55d0eb5a42eb8a5c13b091a02aded073087be3",
+  "python": "3.10.12",
+  "packages": {
+    "torch": "2.12.1+cpu",
+    "transformers": "5.13.0",
+    "safetensors": "0.8.0",
+    "onnx": "1.22.0",
+    "onnxruntime": "1.23.2",
+    "numpy": "2.2.6"
+  }
+}

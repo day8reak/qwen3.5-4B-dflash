@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "project_id": "qwen3.5-4b",
+  "kit": {
+    "version": "0.1.0",
+    "commit": "5e47f652867a738cadeba3a18693ef4d78217718"
+  },
+  "default_target": "ascend310p",
+  "contexts": {
+    "understand": ["README.md", "docs", "specs"],
+    "model": ["model", "docs", "specs"],
+    "reference": ["model", "reference", "docs", "specs"],
+    "operator": ["reference/contracts", "targets/ascend310p/operators", "targets/ascend310p/abi", "specs"],
+    "runtime": ["model", "targets/ascend310p/abi", "targets/ascend310p/runtime", "targets/ascend310p/scripts", "specs"],
+    "validate": ["reference", "tests", "targets/ascend310p/abi", "targets/ascend310p/tests", "targets/ascend310p/scripts", "specs"],
+    "release": ["docs", "specs", "targets/ascend310p/abi", "targets/ascend310p/scripts"]
+  },
+  "targets": {
+    "ascend310p": {
+      "path": "targets/ascend310p",
+      "profile": "ascend310p-local",
+      "skills": {
+        "model": ["setup-ascend310p-model-env"],
+        "runtime": ["setup-ascend310p-model-env"],
+        "validate": ["setup-ascend310p-model-env"]
+      },
+      "knowledge": []
+    }
+  },
+  "specs": [
+    "specs/model-workflow.json",
+    "specs/python.lock.json",
+    "specs/data.lock.json",
+    "specs/environment.lock.json",
+    "specs/upstream.lock.json",
+    "specs/mtp-contract.json",
+    "specs/dflash-contract.json",
+    "specs/dflash-target-feature-contract.json",
+    "specs/fp16-experiment.json"
+  ],
+  "skills": {
+    "common": ["deliver-model-end-to-end"],
+    "tasks": {
+      "operator": ["develop-custom-operators", "package-operator-production", "cce-operator-optimization-patterns"]
+    }
+  },
+  "knowledge": {"common": []},
+  "dependencies": {
+    "target_profiles": ["ascend310p-local"],
+    "environments": {"model": "qwen3.5-py310"},
+    "data": ["qwen3.5-4b"]
+  },
+  "artifact_namespace": "qwen3.5-4b",
+  "release_namespace": "qwen3.5-4b"
+}

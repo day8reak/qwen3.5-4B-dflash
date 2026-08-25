@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "model_id": "qwen3.5-4b",
+  "target": "ascend310p",
+  "hardware_reference_policy": "use",
+  "active_phase": "reference",
+  "run_id": "20260819T015109Z-5594-199c17",
+  "phases": [
+    {
+      "id": "contract",
+      "owner": "model",
+      "status": "passed",
+      "frozen": {
+        "upstream_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        "target_profile": "ascend310p-local",
+        "mode": "text-only batch-1 strict greedy",
+        "default_draft_tokens": 2,
+        "final_token_mismatches_allowed": 0
+      },
+      "evidence": [
+        ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/out/contract/checkpoint-audit.json",
+        "specs/mtp-contract.json",
+        "docs/ACCURACY_CONTRACT.md"
+      ],
+      "experience_audit": {
+        "captured": [
+          "Official 4B checkpoint contains exactly 15 one-layer MTP tensors",
+          "Ascend 310P BF16 attention/SwiGLU limitation creates an explicit precision approval boundary"
+        ],
+        "destination": ["docs/DESIGN.md", "docs/ACCURACY_CONTRACT.md"],
+        "skills_changed": [],
+        "remaining_hypotheses": ["FP16 target ordinary can meet the future frozen task-quality gate"]
+      },
+      "next_command": null
+    },
+    {
+      "id": "reference",
+      "owner": "model",
+      "status": "in_progress",
+      "evidence": [
+        ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/log/unit-tests-final.log",
+        ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/out/contract/real-mtp-smoke.json",
+        ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/out/contract/real-main-smoke.json",
+        ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/out/reference/real-weight-mtp-probe.json",
+        ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/out/onnx/qwen35-4b-mtp-core-s1-p1-bf16.onnx.json",
+        ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/log/unit-tests-fp16-v2.log",
+        ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/out/fp16/text-the-capital-of-france-is-assessment-v2.json",
+        ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/out/fp16/cases/real-text-nihao-comma-s1-p1/manifest.json",
+        ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/out/fp16/cases/real-text-nihao-comma-s1-p1/onnxruntime-compare.json",
+        ".work/qwen3.5-4b/20260819T011224Z-20601-0eec1a/log/dflash-official-parity-window.log",
+        ".work/qwen3.5-4b/20260819T011224Z-20601-0eec1a/log/dflash-remote-header-audit-pass.log",
+        ".work/qwen3.5-4b/20260819T011224Z-20601-0eec1a/log/unit-tests-dflash-final-v2.log",
+        ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/log/shared-conversation-latest.log",
+        ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/log/unit-tests-target-feature-final.log",
+        ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/log/unit-tests-target-feature-layout-final.log",
+        ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/log/test-dflash-exact-layout-config.log",
+        ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/log/qwen3_5-overlay-manifest-final.log",
+        ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/log/test-dflash-archive-layout-final.log",
+        ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/out/qwen3_5-dflash-phase1-overlay.tar.gz"
+      ],
+      "blocker": "The user's modified torch_npu target source is external, so bitwise target logits/cache and selective-feature parity gates remain pending; the earlier real-weight multi-prompt ordinary/MTP paired set is also incomplete",
+      "experience_audit": {
+        "captured": [
+          "Approved BF16-to-FP16 range loss must be reported and judged by frozen numerical/token gates, not by an invented exact-roundtrip gate",
+          "The exported FP16 core intentionally contains eight FP16 matrix weights and seven FP32 constant-folded RMSNorm vectors",
+          "One real-text CPU admission case and one S1/P1 export-parity case pass, but neither is a target-device claim",
+          "Qwen3.5-4B-DFlash projects eight target hidden-state streams once and injects the result as per-layer K/V; the draft block alone supplies Q",
+          "The locked DFlash checkpoint sets use_sliding_window=true; omitting it when constructing a reduced Qwen3Config silently normalizes sliding_window to null",
+          "Phase-1 target integration needs only post-layer capture at decoder IDs 1,5,9,13,17,21,25,29; it must not introduce speculative cache semantics",
+          "The local Qwen3.5 base output can carry fields such as rope_deltas, so DFlash integration must extend the existing output dataclass instead of replacing it with a generic BaseModelOutputWithPast",
+          "An accuracy-first preallocated [B,S,20480] feature buffer isolates captured values from in-place custom operators without retaining eight clones plus a second concatenation buffer",
+          "Workspace-internal model/qwen35_dflash paths must be translated into an additive qwen3_5-rooted overlay for the user's existing project; they are not a requested repository migration"
+        ],
+        "destination": [
+          "docs/ACCURACY_CONTRACT.md",
+          "docs/ASCEND310P_INTEGRATION.md",
+          "model/qwen35_mtp/precision.py",
+          "targets/ascend310p/scripts",
+          "model/qwen35_dflash",
+          "docs/DFLASH_GOLDEN.md",
+          "docs/DFLASH_TARGET_INTEGRATION.md",
+          "specs/dflash-contract.json",
+          "specs/dflash-target-feature-contract.json"
+        ],
+        "skills_changed": [],
+        "rejected_promotions": [
+          "The shared context/noise concatenation design was rejected because it does not match the official per-layer K/V injection graph",
+          "The cache-free draft-core was not promoted or described as a complete end-to-end DFlash decoder",
+          "Replacing the user's modified modeling_qwen3_5.py with a newer generated Transformers file was rejected",
+          "output_hidden_states=True and an unimplemented speculative_mode flag were rejected for the phase-1 production interface"
+        ],
+        "remaining_hypotheses": [
+          "The candidate remains within frozen gates over a representative multi-prompt set",
+          "Internal Ascend 310P operators reproduce the admitted FP16 graph without fallback",
+          "The DFlash FP16 draft-core matches frozen PyTorch cases on Ascend 310P",
+          "A transactional verifier/cache implementation preserves ordinary Qwen3.5 final token IDs",
+          "The user's real torch_npu target produces bitwise-identical logits and all cache/state tensors with selective feature capture enabled",
+          "The user's selected features exactly match one diagnostic all-hidden-state run"
+        ]
+      },
+      "next_command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -m pytest -q -p no:cacheprovider tests/test_target_feature.py && run the three real-target gates in docs/DFLASH_TARGET_INTEGRATION.md"
+    },
+    {
+      "id": "target-plan",
+      "owner": "model",
+      "status": "pending",
+      "evidence": [
+        "docs/ASCEND310P_INTEGRATION.md",
+        "targets/ascend310p/abi/runtime-v1.json",
+        "specs/fp16-experiment.json",
+        ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/out/approvals/ascend310p-fp16-precision-proposal.json",
+        ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/out/approvals/ascend310p-fp16-precision-approval.json",
+        ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/out/fp16/onnx/qwen35-4b-mtp-core-s1-p1-fp16-validation-v2.json"
+      ],
+      "blocker": "CPU candidate is admitted, but the exact internal runtime/device profile, ATC/CAModel, ordinary target graph and on-board outputs are unavailable",
+      "next_command": "Run the packaged S1/P1 case through the strict internal Ascend 310P backend and return manifest, raw outputs, logs and hashes"
+    },
+    {"id": "adaptation", "owner": "model", "status": "pending", "evidence": [], "next_command": null},
+    {"id": "integration", "owner": "model", "status": "pending", "evidence": [], "next_command": null},
+    {"id": "accuracy", "owner": "model", "status": "pending", "evidence": [], "next_command": null},
+    {"id": "performance", "owner": "model", "status": "pending", "evidence": [], "next_command": null},
+    {"id": "release", "owner": "model", "status": "pending", "evidence": [], "next_command": null}
+  ],
+  "device_probe": {
+    "status": "pending-no-device-in-profile",
+    "profile_mode": "simulation-only",
+    "evidence": ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/log/ascend310p-preflight.log"
+  }
+}

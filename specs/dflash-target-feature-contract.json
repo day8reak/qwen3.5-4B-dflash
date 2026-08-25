@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "contract_id": "qwen3.5-4b-dflash-target-features-v1",
+  "phase": "target feature capture only",
+  "source_conversation": {
+    "url": "https://chatgpt.com/share/6a850b21-59fc-83ea-a1ea-f8dadb68f4f7",
+    "shared_conversation_id": "6a850b21-59fc-83ea-a1ea-f8dadb68f4f7",
+    "backing_conversation_id": "6a8476c2-1ab4-83ea-93f5-442b514704d3",
+    "update_time": 1787104182.223777,
+    "latest_message_id": "22a044bf-6194-4cb4-9a15-e37ef0309e5d"
+  },
+  "existing_project_mapping": {
+    "models/modeling_qwen3_5.py": "add an opt-in collector around the existing decoder loop",
+    "models/modeling_qwen3_5_hiai_nd.py": "unchanged in phase 1",
+    "models/export_model_wrapper_qwen3_5.py": "unchanged in phase 1",
+    "inference.py": "ordinary path unchanged; an optional flag may request features for a CPU golden case",
+    "config/dflash.yaml": "new independent DFlash feature contract",
+    "dflash/target_features.py": "new portable collector and opt-in output types",
+    "tests/test_target_feature.py": "new zero-impact and shape/order gates"
+  },
+  "feature": {
+    "layer_ids": [1, 5, 9, 13, 17, 21, 25, 29],
+    "capture_point": "post decoder layer, before target final RMSNorm",
+    "hidden_size": 2560,
+    "feature_size": 20480,
+    "shape": "[B,S,20480]",
+    "order": "ascending layer ID in checkpoint order",
+    "default_detach": true,
+    "default_clone": true
+  },
+  "compatibility": {
+    "ordinary_forward": "flag defaults false; preserve the existing return type and tensor path",
+    "feature_forward": "return an opt-in output subtype with dflash_features",
+    "return_dict_false": "when explicitly supported by the local target, append features only for an opted-in call",
+    "output_hidden_states": "must remain false unless independently requested; do not retain all 32 layers"
+  },
+  "must_not_change": [
+    "GDN operator or formula",
+    "full-attention operator",
+    "target cache layout or update",
+    "modeling_qwen3_5_hiai_nd.py",
+    "ordinary inference scheduler",
+    "target logits or committed state"
+  ],
+  "gates": {
+    "portable_unit": "ordinary and feature-mode logits are bitwise equal; shape and layer order are exact",
+    "internal_target": "same input produces bitwise-identical logits and state/cache with the flag false versus true",
+    "official_cross_check": "features exactly equal concatenated output_hidden_states[2,6,10,14,18,22,26,30]",
+    "device_status": "pending; phase 1 is a CPU/PyTorch interface change only"
+  }
+}

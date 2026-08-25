@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "model": "Qwen3.5-4B",
+  "mode": "strict-greedy-speculative-decoding",
+  "scope": {
+    "modality": "text-only",
+    "batch": 1,
+    "default_max_draft_tokens": 2,
+    "sampling": false,
+    "quantization": false,
+    "shortlist": false
+  },
+  "official_structure": {
+    "hidden_size": 2560,
+    "intermediate_size": 9216,
+    "vocab_size": 248320,
+    "attention_heads": 16,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "rotary_dim": 64,
+    "mtp_layers": 1,
+    "dedicated_embedding": false,
+    "tied_embedding_lm_head": true,
+    "mtp_tensor_count": 15
+  },
+  "alignment": "input token x[i] is paired with final normalized main hidden h[i-1]",
+  "acceptance": "longest consecutive draft prefix equal to main Top1, followed by main correction/next token",
+  "accuracy": {
+    "final_token_id_mismatches": 0,
+    "eos_mismatches": 0,
+    "silent_fallback_allowed": false
+  },
+  "state_policy": {
+    "poc": "recompute all committed main and draft prefixes",
+    "optimized_target": "transactional verify and commit only accepted prefix",
+    "optimized_target_status": "pending"
+  }
+}

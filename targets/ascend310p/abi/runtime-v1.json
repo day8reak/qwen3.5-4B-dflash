@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "abi_id": "qwen35-4b-mtp-recompute-v1",
+  "scope": "text-only batch-1 strict-greedy proof",
+  "precision": {
+    "checkpoint_and_cpu_reference": "BF16",
+    "ascend310p_candidate": "FP16",
+    "candidate_status": "approved experiment; CPU admission passed; target ordinary and device gates pending"
+  },
+  "constants": {
+    "hidden_size": 2560,
+    "intermediate_size": 9216,
+    "vocab_size": 248320,
+    "attention_heads": 16,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "rotary_dim": 64,
+    "mtp_layers": 1,
+    "default_draft_tokens": 2
+  },
+  "main_backend": {
+    "method": "evaluate",
+    "inputs": [
+      {"name": "input_ids", "dtype": "INT64", "shape": [1, "S"]},
+      {"name": "top1_positions", "dtype": "INT64", "shape": ["R"]}
+    ],
+    "outputs": [
+      {
+        "name": "hidden_states",
+        "dtype": "TARGET_FLOAT",
+        "shape": [1, "S", 2560],
+        "semantic": "final text-model hidden after the main final RMSNorm"
+      },
+      {
+        "name": "top1_token_ids",
+        "dtype": "INT64",
+        "shape": [1, "R"],
+        "semantic": "stable argmax of tied full-vocabulary LM head at requested rows"
+      }
+    ]
+  },
+  "mtp_block": {
+    "inputs": [
+      {"name": "input_ids", "dtype": "INT64", "shape": [1, "Q"]},
+      {"name": "hidden_sources", "dtype": "TARGET_FLOAT", "shape": [1, "Q", 2560]},
+      {"name": "position_ids", "dtype": "INT64", "shape": [1, "Q"]},
+      {"name": "past_key", "dtype": "TARGET_FLOAT", "shape": [1, 4, "P", 256]},
+      {"name": "past_value", "dtype": "TARGET_FLOAT", "shape": [1, 4, "P", 256]}
+    ],
+    "outputs": [
+      {"name": "mtp_hidden", "dtype": "TARGET_FLOAT", "shape": [1, "Q", 2560]},
+      {"name": "present_key", "dtype": "TARGET_FLOAT", "shape": [1, 4, "P+Q", 256]},
+      {"name": "present_value", "dtype": "TARGET_FLOAT", "shape": [1, 4, "P+Q", 256]},
+      {"name": "top1_token_id", "dtype": "INT64", "shape": [1, 1]}
+    ],
+    "shift": "committed input token x[i] is paired with main final hidden h[i-1]",
+    "lm_head": "full 248320-row matrix tied to model.language_model.embed_tokens.weight"
+  },
+  "mtp_core_onnx": {
+    "scope": "fixed-gear core without embedding lookup or tied LM head",
+    "inputs": [
+      {"name": "inputs_embeds", "dtype": "FP16", "shape": [1, "Q", 2560]},
+      {"name": "hidden_sources", "dtype": "FP16", "shape": [1, "Q", 2560]},
+      {"name": "position_ids", "dtype": "INT64", "shape": [1, "Q"]},
+      {"name": "past_key", "dtype": "FP16", "shape": [1, 4, "P", 256]},
+      {"name": "past_value", "dtype": "FP16", "shape": [1, 4, "P", 256]}
+    ],
+    "outputs": [
+      {"name": "mtp_hidden", "dtype": "FP16", "shape": [1, "Q", 2560]},
+      {"name": "present_key", "dtype": "FP16", "shape": [1, 4, "P+Q", 256]},
+      {"name": "present_value", "dtype": "FP16", "shape": [1, 4, "P+Q", 256]}
+    ],
+    "s1_p1_artifact_sha256": "25a657bff09064d45f970eceb4e8d8ae875dac4b7147195d494406afef350e3c",
+    "precision_profile": "8 FP16 matrix weights; 5x[2560] and 2x[256] FP32 RMSNorm vectors; FP16 ABI tensors",
+    "external_operations": ["shared embedding lookup", "tied full-vocabulary LM head", "stable Top1"]
+  },
+  "fine_grained_ops": {
+    "rms_norm": "Qwen3.5 delta-scale RMSNorm; effective scale is 1+weight",
+    "linear": "bias-free F.linear(x, weight)",
+    "attention": "GQA causal full attention, FP32 softmax, Q output sigmoid gate",
+    "swiglu": "SiLU(gate) * up",
+    "top1": "full-vocabulary stable argmax; lowest token ID wins ties"
+  },
+  "acceptance": {
+    "algorithm": "strict longest matching prefix",
+    "main_is_authoritative": true,
+    "recompute_initial_implementation": true,
+    "final_token_mismatch_allowed": 0
+  }
+}

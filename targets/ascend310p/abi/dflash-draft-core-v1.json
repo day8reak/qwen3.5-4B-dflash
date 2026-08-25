@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "abi_id": "qwen35-4b-dflash-cache-free-draft-core-v1",
+  "scope": "batch-1 cache-free DFlash draft-core numerical golden; not an end-to-end speculative decoder",
+  "precision": {
+    "checkpoint": "BF16",
+    "cpu_oracle": "FP32/BF16/FP16 selectable",
+    "ascend310p_candidate": "FP16 approved experiment; target evidence pending"
+  },
+  "inputs": [
+    {
+      "name": "target_hidden",
+      "dtype": "TARGET_FLOAT",
+      "shape": [1, "C", 20480],
+      "semantic": "concatenated target hidden_states[layer_id+1] for 1,5,9,13,17,21,25,29"
+    },
+    {
+      "name": "noise_embedding",
+      "dtype": "TARGET_FLOAT",
+      "shape": [1, "D", 2560],
+      "constraints": "1 <= D <= 16; row zero is the clean anchor"
+    },
+    {
+      "name": "position_ids",
+      "dtype": "INT64",
+      "shape": [1, "C+D"]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "hidden_states",
+      "dtype": "TARGET_FLOAT",
+      "shape": [1, "D", 2560],
+      "semantic": "row zero is anchor output; rows 1: are draft rows"
+    }
+  ],
+  "replaceable_operations": {
+    "rms_norm": "standard Qwen3 RMSNorm; output = weight * x * rsqrt(mean(x^2)+eps)",
+    "linear": "bias-free F.linear(x, weight)",
+    "rotary": "full head_dim=128 RoPE over query and concatenated context/draft key",
+    "attention": "32-query-head/8-KV-head GQA SDPA; boolean True means visible",
+    "swiglu": "SiLU(gate) * up",
+    "top1": "optional tied 248320-row LM head plus stable argmax"
+  },
+  "layer_attention": [
+    "sliding-causal",
+    "sliding-causal",
+    "sliding-causal",
+    "sliding-causal",
+    "sliding-causal",
+    "full-bidirectional"
+  ],
+  "not_in_scope": [
+    "draft KV cache",
+    "target verifier",
+    "accept/reject and bonus-token selection",
+    "target KV/Gated-DeltaNet state transaction",
+    "decode scheduler",
+    "device performance claim"
+  ],
+  "acceptance": {
+    "hidden_compare": "use a frozen PyTorch case and declared FP16 tolerances",
+    "draft_top1": "exact token-ID equality",
+    "strict_target_dispatch": true,
+    "silent_fallback_allowed": false
+  }
+}

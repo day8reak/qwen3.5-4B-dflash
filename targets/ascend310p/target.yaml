@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "target_id": "ascend310p",
+  "profile_id": "ascend310p-local",
+  "architecture": "Ascend310P",
+  "current_mode": "simulation-only",
+  "reference_dtype": "BF16",
+  "target_dtype": {
+    "candidate": "FP16",
+    "status": "cpu-admission-pass-awaiting-ascend310p",
+    "approval_run_id": "20260818T105058Z-8154-e71669",
+    "candidate_onnx_sha256": "25a657bff09064d45f970eceb4e8d8ae875dac4b7147195d494406afef350e3c",
+    "reason": "Ascend 310P attention and SwiGLU paths do not support BF16"
+  },
+  "batch_size": 1,
+  "default_draft_tokens": 2,
+  "fallback_policy": {
+    "simulation": "allowed-and-reported",
+    "target": "forbidden"
+  },
+  "device_gate": "pending-until-internal-board-feedback"
+}

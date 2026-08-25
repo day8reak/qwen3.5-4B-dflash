@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "target": "ascend310p",
+  "target_profile": "ascend310p-local",
+  "target_profile_manifest_sha256": "758490773004a603e9e5c3287e968b705a013260a79351c291bce17efaba8b32",
+  "target_adapter_sha256": "0fb42ea3624e6582f3a55560ede83aa3f02ee63755e95f7c2e140f2264a7d3ca",
+  "mode": "simulation-only",
+  "available": ["CPU PyTorch", "ONNX checker", "ONNX Runtime CPU"],
+  "pending": ["CANN/ATC", "CAModel", "Ascend 310P device"],
+  "limitations": [
+    "No OM compilation evidence",
+    "No CAModel evidence",
+    "No Ascend 310P on-board evidence",
+    "310P BF16 attention/SwiGLU unsupported; approved FP16 candidate has CPU admission evidence only"
+  ]
+}

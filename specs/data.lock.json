@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "resources": [
+    {
+      "role": "model-checkpoint",
+      "asset_id": "qwen3.5-4b",
+      "manifest_sha256": "031310e096a395062f6011fc64a1d92d7c1201a1e7d60dfe235e49f2ac967032",
+      "source_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+      "tensor_count": 738,
+      "tensor_bytes": 9319737856,
+      "shards": 2
+    }
+  ],
+  "weights_in_repository": false
+}

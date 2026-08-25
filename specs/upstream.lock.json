@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "repository": "Qwen/Qwen3.5-4B",
+  "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "license": "Apache-2.0",
+  "config_sha256": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+  "safetensors_index_sha256": "cf3f798ee02ba45f9622aa8892a47369ab667d0afbf154ee7c2212de42e6302d",
+  "official_sources": [
+    "https://huggingface.co/Qwen/Qwen3.5-4B",
+    "https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_5_mtp.py"
+  ],
+  "scope": "configuration, tokenizer, text-model weights, and the 15 official MTP tensors"
+}

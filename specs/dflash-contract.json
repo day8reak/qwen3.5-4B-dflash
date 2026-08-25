@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "candidate": "qwen3.5-4b-dflash-golden",
+  "relationship_to_mtp": "independent candidate; does not replace or modify the official one-layer Qwen3.5 MTP baseline",
+  "sources": {
+    "algorithm_repository": "z-lab/dflash",
+    "algorithm_revision": "07ebd93db9f472af339b644bb70221ad8428328a",
+    "checkpoint_repository": "z-lab/Qwen3.5-4B-DFlash",
+    "checkpoint_revision": "9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf",
+    "config_sha256": "6fa9ca0d10d2c3f5c93043bdd492e35283e284e4eb6a9e0479ba663609117203",
+    "model_sha256": "1eb221d36abb13a5f1b972f8d031a9723fad8cbb7d275abe548b60e77577eb42",
+    "model_bytes": 1268859081,
+    "parameter_count": 634425856,
+    "license": "Apache-2.0"
+  },
+  "scope": {
+    "implemented": [
+      "target hidden-state selection and concatenation",
+      "portable opt-in target feature collector and output contract",
+      "cross-layer feature projection and RMSNorm",
+      "six Qwen3 DFlash decoder layers",
+      "per-layer target-context KV injection",
+      "mixed sliding-causal and final bidirectional attention",
+      "checkpoint use_sliding_window normalization",
+      "RoPE, GQA, SwiGLU and final RMSNorm",
+      "shared target embedding/LM-head helpers",
+      "strict replaceable primitive operator interface",
+      "official checkpoint tensor audit and streaming load"
+    ],
+    "not_implemented": [
+      "draft KV cache",
+      "target verifier integration",
+      "Gated DeltaNet/full-attention transactional state commit or rollback",
+      "sampling or rejection sampling",
+      "Ascend graph conversion or on-board execution",
+      "performance or acceptance-rate claim"
+    ]
+  },
+  "inputs": {
+    "target_hidden": "[B,C,20480], concatenated target hidden_states[layer_id + 1] for layer IDs 1,5,9,13,17,21,25,29",
+    "noise_embedding": "[B,D,2560], one clean anchor embedding followed by mask-token embeddings, 1 <= D <= 16",
+    "position_ids": "[B,C+D], positions for injected target context followed by the draft block"
+  },
+  "outputs": {
+    "hidden_states": "[B,D,2560]; row zero is the clean anchor and rows 1: are draft prediction rows",
+    "top1": "optional [B,D-1] via the target's tied LM head"
+  },
+  "accuracy": {
+    "official_source_parity": "allclose on a deterministic reduced-shape case",
+    "custom_operator_gate": "candidate hidden within frozen tolerance and Top1 exactly equal to PyTorch golden",
+    "end_to_end_gate": "strict greedy final token IDs and EOS exactly equal to the same ordinary FP16 target"
+  },
+  "classification": "exact graph reproduction; FP16 execution remains an approved experiment rather than a promoted precision"
+}

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "status": "FROZEN_BEFORE_FIRST_FP16_MEASUREMENT",
+  "model": "Qwen/Qwen3.5-4B",
+  "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "target": "Ascend 310P",
+  "approval_run_id": "20260818T105058Z-8154-e71669",
+  "candidate": {
+    "source_weights": "BF16",
+    "target_weights_and_matmul": "FP16",
+    "structure_change": false,
+    "quantization": false,
+    "vocabulary_shortlist": false,
+    "rmsnorm_softmax_top1_accumulation": "highest precision exposed by the target operators"
+  },
+  "metric_thresholds": {
+    "ordinary_final_hidden": {"max_relative_l2": 0.03, "min_cosine": 0.999},
+    "ordinary_full_vocab_logits": {"max_relative_l2": 0.03, "min_cosine": 0.999},
+    "mtp_hidden": {"max_relative_l2": 0.02, "min_cosine": 0.9995},
+    "mtp_cache": {"max_relative_l2": 0.02, "min_cosine": 0.9995},
+    "mtp_full_vocab_logits": {"max_relative_l2": 0.02, "min_cosine": 0.9995}
+  },
+  "exact_gates": {
+    "all_values_finite": true,
+    "ordinary_top1_mismatches": 0,
+    "ordinary_vs_mtp_final_greedy_token_mismatches": 0,
+    "stable_tie_break": "lowest token ID",
+    "accepted_prefix_coverage": "r=0..K",
+    "device_repetitions": "10/10"
+  },
+  "reporting": ["max_abs", "mean_abs", "rmse", "relative_l2", "cosine", "top1", "top2", "top1_top2_margin", "NaN/Inf"],
+  "rollback": "Reject the candidate and retain the immutable BF16 checkpoint/reference if any frozen gate fails.",
+  "claim_boundary": "CPU results may admit a candidate to target testing but cannot promote it or prove Ascend 310P correctness."
+}
