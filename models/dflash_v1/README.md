@@ -1,52 +1,44 @@
 # DFlash rollback 源码索引
 
-当前默认路线是 persistent incremental rollback；完整历史前缀重算只保留为 oracle。
+当前默认路线是 persistent incremental rollback；完整历史前缀重算只作为 oracle 保留。
 
-## 运行与调度
+## 调度与运行
 
-- `run_rollback.py`：CPU/CUDA/NPU 统一入口；
-- `run_npu.py`：HIAI rollback 简化入口；
-- `dflash_rollback_decode.py`：T=K+1 verify、最长连续接受、correction/bonus 调度；
-- `dflash_rollback_adapter.py`：CPU/CUDA `DynamicCache` 事务和 Qwen3.5 Draft 接线；
-- `dflash_reference_decode_v1.py`：旧 full-prefix sequential oracle；
-- `dflash_qwen_adapter_v1.py`：旧 oracle 的完整 adapter/CLI 和共享加载、审计工具。
+| 文件 | 职责 |
+| --- | --- |
+| run_rollback.py | CPU、CUDA、NPU 共用入口和报告生成 |
+| run_npu.py | HIAI 固定参数入口 |
+| dflash_rollback_decode.py | ordinary incremental、T=K+1 verify、accept 和 EOS 调度 |
+| dflash_rollback_adapter.py | framework Target transaction、feature history 和 Draft adapter |
+| dflash_reference_decode_v1.py | 旧 full-prefix sequential oracle，不是默认执行路径 |
+| diagnose_acceptance.py | 固定 workload 的 proposal、verifier 和接受率诊断 |
 
-兼容命令 `python -m models.dflash_qwen_adapter_v1` 默认进入 rollback；若需要显式运行旧 oracle，
-使用 `python -m models.dflash_v1.dflash_qwen_adapter_v1`。
+## Target 与 Draft
 
-## Target
+| 文件 | 职责 |
+| --- | --- |
+| modeling_qwen3_5_dflash.py | CPU/CUDA feature-enabled Target |
+| ../modeling_qwen3_5_hiai_nd_dflash_rollback.py | 独立 HIAI rollback Target |
+| ../internal_dflash_bridge.py | HIAI state bank 与 logical KV cursor |
+| ../export_model_wrapper_qwen3_5_dflash_rollback.py | 部署 wrapper adapter |
+| modeling_dflash.py | 官方 6 层 Draft |
+| dflash_config.py、dflash_weights.py | 结构、69 tensor 和 checkpoint identity 门禁 |
+| dflash_ops.py | CPU/CUDA Torch backend |
+| dflash_ascend310p_ops.py | NPU Tensor 分解 backend |
 
-- `modeling_qwen3_5_dflash.py`：CPU/CUDA feature-enabled framework Target；
-- `../modeling_qwen3_5_hiai_nd.py`：保留不变的普通/full-prefix HIAI 文件；
-- `../modeling_qwen3_5_hiai_nd_dflash_rollback.py`：独立 HIAI state-bank 文件；
-- `../internal_dflash_bridge.py`：persistent HIAI transaction、GDN bank 和 logical KV cursor；
-- `../export_model_wrapper_qwen3_5_dflash_rollback.py`：复用部署 wrapper 加载逻辑并绑定 rollback
-  modeling。
+统一使用 proposal-count K：anchor 不计入 K，Target verify 长度 T=K+1，最大 K=16。
 
-## Draft 与算子 backend
+## 文档与检查
 
-- `modeling_dflash.py`：官方六层 Draft；
-- `dflash_config.py` / `dflash_weights.py`：锁定结构、69 tensors 和 checkpoint hash；
-- `dflash_ops.py`：Torch CPU/CUDA backend；
-- `dflash_ascend310p_ops.py`：NPU Tensor 分解 backend；
-- `dflash_custom_ops_template.py`：未来 fused/custom Draft op 接线模板。
+- [完整框架流程](../../docs/DFLASH_ARCHITECTURE.md)
+- [自定义算子表](../../docs/DFLASH_OPERATORS.md)
+- [运行和验证](../../docs/DFLASH_RUN_AND_VALIDATE.md)
 
-统一使用 proposal-count K：anchor 不计入 K，Target verify T=`K+1`，官方最大 K=16/T=17。
-
-## 文档
-
-- [Scheduler 与 token 验证](../../docs/DFLASH_V1_SCHEDULER.md)
-- [验证流程与报告](../../docs/DFLASH_V1_VALIDATION.md)
-- [rollback 自定义算子分析](../../docs/DFLASH_ROLLBACK_OPERATOR_ANALYSIS.md)
-- [NPU 部署](../../docs/NPU_DEPLOYMENT.md)
-
-## 快速检查
-
-```bash
+~~~bash
 python -m models.dflash_v1.run_rollback --help
 python -m models.dflash_v1.run_npu --help
 python tests/test_dflash_rollback_scheduler.py
 python tests/test_dflash_framework_rollback.py
 python tests/test_internal_dflash_bridge_rollback.py
 python tests/test_dflash_rollback_helpers.py
-```
+~~~
