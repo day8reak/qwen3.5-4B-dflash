@@ -6,6 +6,11 @@ import unittest
 
 import torch
 
+from models.dflash_v1.dflash_config import (
+    OFFICIAL_DFLASH_BLOCK_SIZE,
+    OFFICIAL_DFLASH_PROPOSAL_CAPACITY,
+    OFFICIAL_DFLASH_PROPOSAL_SWEEP,
+)
 from models.dflash_v1.dflash_reference_decode_v1 import (
     dflash_full_prefix_greedy,
 )
@@ -13,6 +18,15 @@ from models.dflash_v1.diagnose_acceptance import parse_proposal_counts
 
 
 class DFlashBlockSizeContractTest(unittest.TestCase):
+    def test_official_limits_and_sweep_share_one_conversion(self) -> None:
+        self.assertEqual(OFFICIAL_DFLASH_BLOCK_SIZE, 16)
+        self.assertEqual(OFFICIAL_DFLASH_PROPOSAL_CAPACITY, 15)
+        self.assertEqual(OFFICIAL_DFLASH_PROPOSAL_SWEEP, (1, 3, 5, 7, 15))
+        self.assertEqual(
+            tuple(count + 1 for count in OFFICIAL_DFLASH_PROPOSAL_SWEEP),
+            (2, 4, 6, 8, 16),
+        )
+
     def test_block_size_includes_anchor_row(self) -> None:
         proposal_limits: list[int] = []
 
