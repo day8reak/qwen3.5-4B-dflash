@@ -13,9 +13,9 @@ The adapter implements both protocols consumed by
 * ``propose(prefix_ids, K)`` builds ``[anchor, K * mask]`` and runs the
   official six-layer DFlash draft with the target embedding and LM head.
 
-This runtime follows the vLLM proposal-count convention: ``max_draft_tokens=K``
-means exactly ``K`` speculative proposal tokens.  The draft query contains one
-additional clean anchor, so ``K=16`` uses 17 query rows.
+This runtime follows the locked upstream DFlash convention: ``block_size=B``
+is the total draft-query/target-verification row count.  One row is the clean
+anchor, so the official ``B=16`` configuration permits ``K=15`` proposals.
 """
 
 from __future__ import annotations
@@ -344,18 +344,36 @@ def _validate_token_tensor(
 
 def _proposal_count(value: int, *, maximum: int) -> int:
     if isinstance(value, bool):
-        raise TypeError("max_draft_tokens must be an integer, not bool")
+        raise TypeError("proposal_limit must be an integer, not bool")
     try:
         count = int(operator.index(value))
     except TypeError as error:
-        raise TypeError("max_draft_tokens must be an integer") from error
+        raise TypeError("proposal_limit must be an integer") from error
     if count <= 0:
-        raise ValueError("max_draft_tokens must be positive")
+        raise ValueError("proposal_limit must be positive")
     if count > maximum:
         raise ValueError(
-            "max_draft_tokens exceeds the DFlash proposal capacity: "
-            f"requested {count}, maximum {maximum} "
-            "(K counts proposal tokens; the clean anchor is an extra query row)"
+            "proposal_limit exceeds the DFlash proposal capacity: "
+            f"requested {count}, maximum {maximum}"
+        )
+    return count
+
+
+def _block_size(value: int, *, maximum: int) -> int:
+    if isinstance(value, bool):
+        raise TypeError("block_size must be an integer, not bool")
+    try:
+        count = int(operator.index(value))
+    except TypeError as error:
+        raise TypeError("block_size must be an integer") from error
+    if count < 2:
+        raise ValueError(
+            "block_size must be at least 2 (one anchor plus one proposal)"
+        )
+    if count > maximum:
+        raise ValueError(
+            "block_size exceeds the DFlash checkpoint capacity: "
+            f"requested {count}, maximum {maximum}"
         )
     return count
 
@@ -464,8 +482,10 @@ class Qwen35DFlashFullPrefixAdapter:
 
     @property
     def max_proposal_tokens(self) -> int:
-        # Match vLLM's num_speculative_tokens convention: block_size is the
-        # proposal capacity and the clean anchor is an additional query row.
+        return int(self.draft.config.proposal_capacity)
+
+    @property
+    def max_block_size(self) -> int:
         return int(self.draft.config.block_size)
 
     def reset_stats(self) -> None:
@@ -858,7 +878,7 @@ class Qwen35DFlashFullPrefixAdapter:
             "per_state_device_trace": "PENDING",
         }
 
-    def propose(self, prefix_ids: Tensor, max_draft_tokens: int) -> Tensor:
+    def propose(self, prefix_ids: Tensor, proposal_limit: int) -> Tensor:
         """Return ``K`` DFlash Top-1 proposals for one committed prefix.
 
         ``prefix_ids[:, -1]`` is the clean anchor.  Target features cover the
@@ -874,7 +894,7 @@ class Qwen35DFlashFullPrefixAdapter:
             name="draft prefix_ids",
         )
         proposal_count = _proposal_count(
-            max_draft_tokens,
+            proposal_limit,
             maximum=self.max_proposal_tokens,
         )
         context_ids = prefix_ids[:, :-1]
@@ -970,7 +990,7 @@ def validate_qwen35_dflash_strict_greedy(
     prompt_token_ids: Sequence[int] | Tensor,
     *,
     max_new_tokens: int,
-    max_draft_tokens: int | None = None,
+    block_size: int | None = None,
     eos_token_ids: Iterable[int] = (),
     progress_callback: Callable[[str, Mapping[str, object]], None] | None = None,
 ) -> Qwen35GoldenValidation:
@@ -980,14 +1000,12 @@ def validate_qwen35_dflash_strict_greedy(
         if progress_callback is not None:
             progress_callback(event, fields)
 
-    proposal_count = (
-        adapter.max_proposal_tokens
-        if max_draft_tokens is None
-        else _proposal_count(
-            max_draft_tokens,
-            maximum=adapter.max_proposal_tokens,
-        )
+    effective_block_size = (
+        adapter.max_block_size
+        if block_size is None
+        else _block_size(block_size, maximum=adapter.max_block_size)
     )
+    proposal_count = effective_block_size - 1
     if isinstance(prompt_token_ids, Tensor):
         gate_ids = prompt_token_ids
         if gate_ids.ndim == 1:
@@ -1054,14 +1072,15 @@ def validate_qwen35_dflash_strict_greedy(
         notify(
             "dflash_replay_begin",
             max_new_tokens=max_new_tokens - 1,
-            max_draft_tokens=proposal_count,
+            block_size=effective_block_size,
+            proposal_capacity=proposal_count,
         )
         tail = dflash_full_prefix_greedy(
             adapter,
             adapter,
             seeded_prefix,
             max_new_tokens=max_new_tokens - 1,
-            max_draft_tokens=proposal_count,
+            block_size=effective_block_size,
             eos_token_ids=eos_token_ids,
             input_device=adapter.device,
             verification_mode="sequential",
@@ -2223,7 +2242,7 @@ def _resolve_prompt(
 def _request_payload(
     args: argparse.Namespace,
     *,
-    effective_max_draft_tokens: int,
+    effective_block_size: int,
     prompt_token_ids: Sequence[int],
 ) -> dict[str, object]:
     """Return non-secret controls needed to reproduce one CLI validation."""
@@ -2239,8 +2258,9 @@ def _request_payload(
         prompt_source = "json_file"
     return {
         "max_new_tokens": int(args.max_new_tokens),
-        "requested_max_draft_tokens": args.max_draft_tokens,
-        "effective_max_draft_tokens": int(effective_max_draft_tokens),
+        "requested_block_size": args.block_size,
+        "effective_block_size": int(effective_block_size),
+        "proposal_capacity": int(effective_block_size) - 1,
         "eos_token_ids": list(args.eos_token_id),
         "formal_locked_eos_token_id": (
             _FORMAL_EOS_TOKEN_ID if formal_npu else None
@@ -2398,11 +2418,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-new-tokens", type=int, required=True)
     parser.add_argument(
-        "--max-draft-tokens",
+        "--block-size",
         type=int,
         help=(
-            "proposal count K using the vLLM convention; the draft query has "
-            "one extra anchor row (official maximum K: 16)"
+            "total draft/verify rows B, including one clean anchor; the "
+            "official B=16 configuration permits K=15 proposals"
         ),
     )
     parser.add_argument("--eos-token-id", type=int, action="append", default=[])
@@ -2816,14 +2836,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         {
             "prompt_tokens": len(prompt_ids),
             "max_new_tokens": args.max_new_tokens,
-            "max_draft_tokens": args.max_draft_tokens,
+            "block_size": args.block_size,
         },
     )
     result = validate_qwen35_dflash_strict_greedy(
         adapter,
         prompt_ids,
         max_new_tokens=args.max_new_tokens,
-        max_draft_tokens=args.max_draft_tokens,
+        block_size=args.block_size,
         eos_token_ids=args.eos_token_id,
         progress_callback=lambda event, fields: _emit_progress(
             args.progress,
@@ -2944,13 +2964,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "draft_dir": str(Path(args.draft_dir).expanduser().resolve()),
         "draft_checkpoint": draft_checkpoint,
         "draft_memory_preflight": draft_memory_preflight,
+        "block_size": (
+            adapter.max_block_size if args.block_size is None else args.block_size
+        ),
         "max_proposal_tokens": adapter.max_proposal_tokens,
         "request": _request_payload(
             args,
-            effective_max_draft_tokens=(
-                adapter.max_proposal_tokens
-                if args.max_draft_tokens is None
-                else args.max_draft_tokens
+            effective_block_size=(
+                adapter.max_block_size
+                if args.block_size is None
+                else args.block_size
             ),
             prompt_token_ids=prompt_ids,
         ),

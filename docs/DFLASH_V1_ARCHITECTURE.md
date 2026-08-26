@@ -69,7 +69,7 @@ flowchart TD
 下图按当前 `sequential` 源码路径展开。与简化总流程图不同，它把 Adapter
 也画了出来：Scheduler 的 bootstrap、feature 请求和 verify 都不会绕过
 `Qwen35DFlashFullPrefixAdapter`。图中 K 表示本轮真正进入验证的 proposal 数；
-它可能因剩余生成长度或 Draft 提前给出 EOS 而小于 `max_draft_tokens`。
+它可能因剩余生成长度或 Draft 提前给出 EOS 而小于 `block_size-1`。
 
 ```mermaid
 sequenceDiagram
@@ -191,8 +191,9 @@ Target context feature: [B,C,20480] → 投影到 [B,C,2560]
 Draft block:             [anchor, MASK × K] → embedding [B,K+1,2560]
 ```
 
-6 层 Draft 并行计算后丢弃 anchor 行，通过 Target LM head 得到 K 个 proposal。这里的 K 只表示
-proposal 数，不包含 anchor；所以 `K=16` 时 Draft block 有 17 行。
+6 层 Draft 并行计算后丢弃 anchor 行，通过 Target LM head 得到 K 个 proposal。官方
+`block_size` 表示包含 anchor 的总行数，因此 `K=block_size-1`；配置值 16 对应 K=15，
+Draft block 最多 16 行。
 
 结构、mask 和设备算子分派见 [Draft 模型](DFLASH_V1_DRAFT.md)。
 

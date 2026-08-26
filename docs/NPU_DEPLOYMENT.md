@@ -150,7 +150,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 2 \
-  --max-draft-tokens 1 \
+  --block-size 2 \
   --device npu:0 \
   --report "$RUN_DIR/dflash-v1-npu-smoke.json" \
   2>&1 | tee "$RUN_DIR/dflash-v1-npu-smoke.log"
@@ -213,7 +213,7 @@ synchronization。若仍失败，再依据新增的 max/mean error、RMSE、rela
 最小 smoke 通过后再使用：
 
 ```text
---max-new-tokens 32 --max-draft-tokens 16
+--max-new-tokens 32 --block-size 16
 ```
 
 真实 NPU 接受率、无 fallback、显存和性能只能由目标设备运行确认。
@@ -251,7 +251,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --target-parity-decode-steps 4 \
   --acceptance-rounds 16 \
   --verification-mode sequential \
-  --proposal-counts 1,4,8,16 \
+  --proposal-counts 1,3,5,7,15 \
   --trace-draft-layers \
   --report "$RUN_DIR/dflash-v1-acceptance-diagnosis.json" \
   2>&1 | tee "$RUN_DIR/dflash-v1-acceptance-diagnosis.log"
@@ -264,19 +264,19 @@ SHA-256；只有临时缩短排查时间时才使用 `--no-verify-draft-sha256`�
 显式加 `--no-enable-thinking`。终端会直接打印 Target 续写文本、最大 K 的逐轮接受长度以及
 early / middle / late 三段均值；JSON 默认仍不保存明文 token ID。
 
-### 为什么是 K=1、4、8、16
+### 为什么是 K=1、3、5、7、15
 
 这里的 `K` 是草稿 proposal/mask token 数。每个 draft query 还包含 1 个已经由 Target
 确认的 anchor：
 
 ```text
-query rows = 1 个 anchor + K 个 proposal
-K=1 / 4 / 8 / 16 对应 query rows=2 / 5 / 9 / 17
+block_size = query rows = 1 个 anchor + K 个 proposal
+K=1 / 3 / 5 / 7 / 15 对应 block_size=2 / 4 / 6 / 8 / 16
 ```
 
-本包统一采用 vLLM `num_speculative_tokens` 口径：K 只计算 proposal，anchor 是额外一行。
-因此官方配置值 16 对应最大 K=16，而不是 15。选择 1/4/8/16 可以观察单 token、小 block、
-中 block 和最大 proposal 档位，同时保持全部档位语义一致。K=8 已足以排查低接受率，K
+运行入口统一采用官方 DFlash `block_size` 口径：anchor 已包含在总行数中。因此官方配置值
+16 对应最大 K=15。诊断参数 `--proposal-counts` 明确使用 K，只为直接观察接受率；选择
+1/3/5/7/15 覆盖官方 block 扫点。K=7 已足以排查低接受率，K
 口径本身不能解释“不同设备/精度都只接受相近 token 数”的现象。
 
 ### 结果怎么读

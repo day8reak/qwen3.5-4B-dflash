@@ -35,7 +35,8 @@ proposal 随后必须回到 Scheduler，由 Target 逐个验证。
 | head dim | 128 |
 | Target feature 层数 | 8 |
 | Target feature width | 20480 |
-| 最大 proposal 数 K | 16 |
+| 官方 block_size | 16（含 anchor） |
+| 最大 proposal 数 K | 15 |
 | mask token ID | 248077 |
 | vocab size | 248320 |
 | checkpoint tensor 数 | 69 |
@@ -65,18 +66,21 @@ block_ids   = [a0, MASK, MASK, ..., MASK]
 Target feature 只覆盖 `context_ids`；anchor 位于 Draft block 第 0 行。这样不会把 anchor 同时放进
 Target context 和 Draft block 两次。
 
-## 4. K 为什么是 proposal 数
+## 4. block_size 与 K 的关系
 
-`max_draft_tokens=K` 表示 mask/proposal 数，anchor 不计入 K：
+官方 `block_size` 表示包含 anchor 的 query 总行数，K 表示 mask/proposal 数，因此
+`K=block_size-1`：
 
 ```text
 K=1  → [anchor, mask]                  共 2 行
-K=4  → [anchor, mask, mask, mask, mask] 共 5 行
-K=16 → 1 个 anchor + 16 个 mask        共 17 行
+K=3  → 1 个 anchor + 3 个 mask          共 4 行
+K=5  → 1 个 anchor + 5 个 mask          共 6 行
+K=7  → 1 个 anchor + 7 个 mask          共 8 行
+K=15 → 1 个 anchor + 15 个 mask        共 16 行
 ```
 
-Draft 最终丢弃 anchor 对应的 row 0，只输出 K 个 proposal。不要把 `K=16` 误写成 Draft query
-只有 16 行。
+Draft 最终丢弃 anchor 对应的 row 0，只输出 K 个 proposal。官方配置 `block_size=16` 的
+最大 K 是 15，不能把配置值直接当 proposal 数。
 
 ## 5. 输入准备
 

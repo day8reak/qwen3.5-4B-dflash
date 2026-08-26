@@ -6,7 +6,7 @@ deployed source tree.  It answers three questions in order:
 1. Does a fresh full-prefix target call produce the same last-row logits and
    DFlash features as a persistent prefill/decode path on the same device?
 2. On identical ordinary-greedy prefixes, how does acceptance change for
-   proposal counts K=1,4,8,16?
+   proposal counts K=1,3,5,7,15?
 3. At which measured boundary do two device/dtype reports first diverge?
 
 The first question is more fundamental.  Strict-greedy token equality alone
@@ -38,6 +38,10 @@ import tempfile
 import torch
 from torch import Tensor, nn
 
+from .dflash_config import (
+    OFFICIAL_DFLASH_PROPOSAL_CAPACITY,
+    OFFICIAL_DFLASH_PROPOSAL_SWEEP,
+)
 from .dflash_ops import TorchDFlashOps
 from .dflash_qwen_adapter_v1 import (
     Qwen35DFlashFullPrefixAdapter,
@@ -129,7 +133,11 @@ def _feature_fingerprints(
     }
 
 
-def parse_proposal_counts(raw: str, *, maximum: int = 16) -> tuple[int, ...]:
+def parse_proposal_counts(
+    raw: str,
+    *,
+    maximum: int = OFFICIAL_DFLASH_PROPOSAL_CAPACITY,
+) -> tuple[int, ...]:
     """Parse sorted, unique proposal counts from a comma-separated string."""
 
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
@@ -2096,7 +2104,7 @@ def diagnose_next_actions(report: Mapping[str, object]) -> list[str]:
         return actions
     return [
         "Target 路径未见 Top-1 分叉；扩大 --acceptance-rounds 获取稳定统计。",
-        "若 K=1 稳定而 K=8/16 明显退化，打开 --trace-draft-layers 检查 block attention、位置和低精度边界。",
+        "若 K=1 稳定而 K=7/15 明显退化，打开 --trace-draft-layers 检查 block attention、位置和低精度边界。",
         "mean_theoretical_emitted_per_verify 才接近吞吐收益口径，不要把 accepted/proposed 百分比直接当官方加速指标。",
     ]
 
@@ -2293,10 +2301,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--proposal-counts",
-        default="1,4,8,16",
+        default=",".join(str(value) for value in OFFICIAL_DFLASH_PROPOSAL_SWEEP),
         help=(
-            "K proposal/mask tokens using the vLLM convention; the clean "
-            "anchor is an additional query row, so K=16 uses 17 rows"
+            "explicit proposal/mask count K; upstream block_size is K+1, "
+            "so the official block_size=16 limit gives K=15"
         ),
     )
     parser.add_argument("--eos-token-id", type=int, default=OFFICIAL_EOS_TOKEN_ID)

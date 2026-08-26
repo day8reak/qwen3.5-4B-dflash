@@ -84,7 +84,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 2 \
-  --max-draft-tokens 1 \
+  --block-size 2 \
   --device npu:0 \
   --report "$RUN_DIR/dflash-v1-npu-smoke.json" \
   2>&1 | tee "$RUN_DIR/dflash-v1-npu-smoke.log"
@@ -115,7 +115,7 @@ table 或完整前缀 prefill。门禁通过前不要继续解释接受率。
 
 ```text
 max_new_tokens=32
-max_draft_tokens=8（稳定后再测 16）
+block_size=8（K=7；稳定后再测 block_size=16，即 K=15）
 ```
 
 CPU/GPU 接受率只作为诊断参考。最终 NPU 接受率依赖 NPU target features、draft backend、
@@ -125,9 +125,8 @@ fallback 已通过。
 固定 workload 推荐保存为 UTF-8 文件，并使用
 `--prompt-file /path/to/prompt.txt --prompt-mode chat`。入口会在本地套用 Qwen chat
 template，默认启用 thinking，运行结束直接打印 ordinary Target 与 DFlash 两份解码文本。
-非 thinking 对照显式加 `--no-enable-thinking`。本包统一使用 vLLM
-proposal-count 口径，clean anchor 不计入 `max_draft_tokens`，因此最大 K 为 16；K=16 时
-draft query 共 17 行。
+非 thinking 对照显式加 `--no-enable-thinking`。本包统一使用官方 DFlash `block_size`
+口径：它包含 clean anchor，所以官方最大 `block_size=16` 对应 K=15，draft query 共 16 行。
 
 ## 自定义算子说明
 

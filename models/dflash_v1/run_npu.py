@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 from typing import Sequence
 
+from .dflash_config import DFLASH_MIN_BLOCK_SIZE, OFFICIAL_DFLASH_BLOCK_SIZE
 from .target_quant import (
     QUANT_MODE_DISABLED,
     SUPPORTED_TARGET_QUANT_MODES,
@@ -81,7 +82,12 @@ def _parser() -> argparse.ArgumentParser:
         help="enable Qwen thinking in chat mode (default: enabled)",
     )
     parser.add_argument("--max-new-tokens", type=int, default=2)
-    parser.add_argument("--max-draft-tokens", type=int, default=1)
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=DFLASH_MIN_BLOCK_SIZE,
+        help="total draft/verify rows, including one anchor (official range: 2..16)",
+    )
     parser.add_argument("--device", default="npu:0")
     parser.add_argument(
         "--kv-cache-max-len",
@@ -227,8 +233,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("run_npu requires --device npu or npu:N")
     if args.max_new_tokens < 2:
         raise ValueError("NPU DFlash smoke requires --max-new-tokens >= 2")
-    if not 1 <= args.max_draft_tokens <= 16:
-        raise ValueError("--max-draft-tokens must be between 1 and 16")
+    if not DFLASH_MIN_BLOCK_SIZE <= args.block_size <= OFFICIAL_DFLASH_BLOCK_SIZE:
+        raise ValueError(
+            "--block-size must be between "
+            f"{DFLASH_MIN_BLOCK_SIZE} and {OFFICIAL_DFLASH_BLOCK_SIZE}"
+        )
     for name, value in (
         ("--kv-cache-max-len", args.kv_cache_max_len),
         ("--prefill-chunk-size", args.prefill_chunk_size),
@@ -266,8 +275,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "248044",
         "--max-new-tokens",
         str(args.max_new_tokens),
-        "--max-draft-tokens",
-        str(args.max_draft_tokens),
+        "--block-size",
+        str(args.block_size),
     ]
     if args.reset_hook is not None:
         adapter_args.extend(["--reset-hook", args.reset_hook])
