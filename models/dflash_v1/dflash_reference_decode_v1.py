@@ -23,6 +23,8 @@ from typing import Any, Protocol
 import torch
 from torch import Tensor
 
+from .dflash_config import DFLASH_MIN_BLOCK_SIZE, OFFICIAL_DFLASH_BLOCK_SIZE
+
 
 DraftTokens = Sequence[int] | Tensor
 TargetLogitsCallback = Callable[[Tensor], Tensor | Any]
@@ -38,7 +40,7 @@ class TargetLogitsAdapter(Protocol):
 class DraftBlockAdapter(Protocol):
     """Object adapter accepted by :func:`dflash_full_prefix_greedy`."""
 
-    def propose(self, prefix_ids: Tensor, max_draft_tokens: int) -> DraftTokens: ...
+    def propose(self, prefix_ids: Tensor, proposal_limit: int) -> DraftTokens: ...
 
 
 @dataclass
@@ -149,6 +151,22 @@ def _positive_count(value: int, *, name: str) -> int:
     normalized = _non_negative_count(value, name=name)
     if normalized == 0:
         raise ValueError(f"{name} must be positive")
+    return normalized
+
+
+def _dflash_block_size(value: int) -> int:
+    """Validate upstream DFlash's total-row block-size convention."""
+
+    normalized = _positive_count(value, name="block_size")
+    if normalized < DFLASH_MIN_BLOCK_SIZE:
+        raise ValueError(
+            "block_size must be at least 2 (one anchor plus one proposal)"
+        )
+    if normalized > OFFICIAL_DFLASH_BLOCK_SIZE:
+        raise ValueError(
+            "block_size exceeds the locked upstream maximum: "
+            f"{normalized} > {OFFICIAL_DFLASH_BLOCK_SIZE}"
+        )
     return normalized
 
 
@@ -321,7 +339,7 @@ def dflash_full_prefix_greedy(
     prompt_token_ids: Sequence[int] | Tensor,
     *,
     max_new_tokens: int,
-    max_draft_tokens: int,
+    block_size: int,
     eos_token_ids: Iterable[int] = (),
     input_device: str | torch.device | None = None,
     verification_mode: str = "sequential",
@@ -347,7 +365,8 @@ def dflash_full_prefix_greedy(
 
     prompt, device = _normalize_prompt(prompt_token_ids, input_device)
     maximum = _non_negative_count(max_new_tokens, name="max_new_tokens")
-    block_size = _positive_count(max_draft_tokens, name="max_draft_tokens")
+    block_size = _dflash_block_size(block_size)
+    proposal_capacity = block_size - 1
     if verification_mode not in {"sequential", "vectorized"}:
         raise ValueError(
             "verification_mode must be 'sequential' or 'vectorized'"
@@ -361,7 +380,7 @@ def dflash_full_prefix_greedy(
 
     while len(generated) < maximum and not reached_eos:
         remaining = maximum - len(generated)
-        proposal_limit = min(block_size, remaining)
+        proposal_limit = min(proposal_capacity, remaining)
         prefix_length = len(committed)
         raw_proposals = _call_draft(
             draft,

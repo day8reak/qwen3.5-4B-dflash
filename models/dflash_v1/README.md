@@ -20,7 +20,7 @@ target 覆盖它。
 - `benchmark_npu.py`：真实 NPU 的 ordinary/DFlash 分进程 benchmark；加载后先做零 token
   差异门禁，再执行 device-synchronized warmup/measurement，并支持 MSTX range。
 - `diagnose_acceptance.py`：CPU/CUDA/NPU 都对比 cached-incremental 与 fresh-full-prefix
-  Target，并可在相同 greedy 前缀上扫描 K=1/4/8/16；支持直接传 UTF-8 prompt/txt、
+  Target，并可在相同 greedy 前缀上扫描 K=1/3/5/7/15；支持直接传 UTF-8 prompt/txt、
   FP16/BF16 A/B、早中后段接受率、逐轮层级指纹、跨报告首个分叉和单轮 oracle tensor
   bundle，默认不输出 token ID。
 - `dflash_qwen_adapter_v1.py`：CPU/CUDA/NPU 完整入口和严格 greedy 验证流程。
@@ -33,9 +33,9 @@ target 覆盖它。
 - `dflash_config.py`：草稿结构与 shape 合同。
 - `dflash_weights.py`：官方草稿 checkpoint 校验和加载。
 
-本包统一使用 vLLM 的 proposal-count 口径：`max_draft_tokens=K` 就是 proposal/mask 数，
-clean anchor 不计入 K。官方配置值为 16，因此 K 的合法范围是 1 到 16；K=16 时 draft
-query 是 1 个 anchor 加 16 个 mask，共 17 行。诊断报告始终明确记录 proposal count K。
+本包统一使用官方 DFlash 口径：`block_size` 是包含 clean anchor 的 Draft query/Target verify
+总行数。官方配置 `block_size=16` 因此对应 1 个 anchor 加最多 15 个 proposal，即
+`K=block_size-1=15`。接受率诊断仍显式记录 proposal count K，避免把 K 与 block_size 混用。
 
 ## Target 主模型与 feature
 

@@ -22,7 +22,8 @@
 
 - 普通 target greedy 始终是权威结果；DFlash 的 token ID、EOS 和停止原因必须完全一致。
 - 每个 target 调用都重算完整已提交前缀。V1 不提交、分支或回退投机 KV/GDN state。
-- target 先生成 anchor，draft 最多产生 16 个 proposal，target 验证最长连续匹配前缀并给出
+- target 先生成 anchor；官方 `block_size=16` 包含该 anchor，因此 draft 最多产生 15 个
+  proposal，target 验证最长连续匹配前缀并给出
   correction/bonus。
 - `v1-r1` 默认逐个 proposal 使用独立完整前缀校验；一次调用验证整块的 vectorized 路径只用于
   诊断，因为不同输入长度可能选择不同 kernel，不能假定更长输入里较早 logit 行逐 bit 不变。
@@ -92,7 +93,7 @@ python -B -m models.dflash_v1.run_npu \
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 2 \
-  --max-draft-tokens 1 \
+  --block-size 2 \
   --device npu:0 \
   --report /path/to/run/dflash-v1-npu-smoke.json
 ```
@@ -115,4 +116,4 @@ CPU/CUDA 可以验证 framework 调度与 draft 数学，但不能替代 NPU tar
 - feature 开关不改变 target logits；
 - 至少实际执行一次 draft/feature/verify round；
 - 没有 CPU fallback；
-- 小参数通过后再测 `max_draft_tokens=16` 的接受率和性能。
+- 小参数通过后再测 `block_size=16`（K=15）的接受率和性能。
