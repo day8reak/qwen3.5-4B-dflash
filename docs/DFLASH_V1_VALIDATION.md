@@ -66,7 +66,7 @@ Target config / Draft checkpoint / device / dtype 检查
 - Draft config 与官方 6 层 DFlash 合同一致；
 - Draft checkpoint 的 69 个 tensor 名称和 shape 正确；
 - Target、Draft、embedding、LM head 的 device/dtype 一致；
-- K 位于 `1..16`；
+- `block_size` 位于 `2..16`，对应 K 位于 `1..15`；
 - NPU 只允许 FP16 和 EOS `248044`；
 - CUDA/NPU 在大权重加载前先检查设备可用性。
 
@@ -399,7 +399,7 @@ acceptance_rate = accepted_draft_tokens / drafted_tokens
 mean_emitted_tokens_per_draft_round
 ```
 
-举例：K=4，一轮接受 2 个 proposal 后由 Target correction 1 个 token：
+举例：K=3，一轮接受 2 个 proposal 后由 Target correction 1 个 token：
 
 ```text
 accepted = 2

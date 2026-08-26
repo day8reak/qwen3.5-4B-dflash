@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 
+DFLASH_MIN_BLOCK_SIZE = 2
+OFFICIAL_DFLASH_BLOCK_SIZE = 16
+OFFICIAL_DFLASH_PROPOSAL_CAPACITY = OFFICIAL_DFLASH_BLOCK_SIZE - 1
+OFFICIAL_DFLASH_PROPOSAL_SWEEP = (1, 3, 5, 7, 15)
+
+
 @dataclass(frozen=True)
 class Qwen35DFlashConfig:
     hidden_size: int
@@ -39,6 +45,12 @@ class Qwen35DFlashConfig:
     @property
     def feature_size(self) -> int:
         return len(self.target_layer_ids) * self.hidden_size
+
+    @property
+    def proposal_capacity(self) -> int:
+        """Maximum proposal count K for the official total-row block size."""
+
+        return self.block_size - 1
 
     @property
     def query_width(self) -> int:
@@ -111,6 +123,15 @@ class Qwen35DFlashConfig:
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
             raise ValueError(f"DFlash configuration values must be positive: {invalid}")
+        if self.block_size < DFLASH_MIN_BLOCK_SIZE:
+            raise ValueError(
+                "DFlash block_size includes one anchor row and must be at least 2"
+            )
+        if self.block_size > OFFICIAL_DFLASH_BLOCK_SIZE:
+            raise ValueError(
+                "DFlash block_size exceeds the locked upstream maximum: "
+                f"{self.block_size} > {OFFICIAL_DFLASH_BLOCK_SIZE}"
+            )
         if self.num_attention_heads % self.num_key_value_heads:
             raise ValueError("attention heads must be divisible by KV heads")
         if len(self.layer_types) != self.num_hidden_layers:
@@ -142,6 +163,7 @@ class Qwen35DFlashConfig:
         result["target_layer_ids"] = list(self.target_layer_ids)
         result["layer_types"] = list(self.layer_types)
         result["feature_size"] = self.feature_size
+        result["proposal_capacity"] = self.proposal_capacity
         result["query_width"] = self.query_width
         result["key_value_width"] = self.key_value_width
         result["num_key_value_groups"] = self.num_key_value_groups
@@ -199,7 +221,7 @@ OFFICIAL_QWEN35_4B_DFLASH = {
         "sliding_attention",
         "full_attention",
     ],
-    "block_size": 16,
+    "block_size": OFFICIAL_DFLASH_BLOCK_SIZE,
     "mask_token_id": 248077,
     "rms_norm_eps": 1e-6,
     "rope_theta": 10_000_000.0,

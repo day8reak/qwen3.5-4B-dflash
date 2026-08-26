@@ -187,7 +187,7 @@ causal-conv 实现会原位改 state，它也必须加入同一个事务边界�
 | `CacheUpdate` | 支持 `K+1` 候选写入、跨 64 block 位置，并在接受后只提交逻辑前缀 | 如已有多行/向量位置 ABI，可仅改 runtime；否则需扩展算子或新增 commit/crop 伴随算子 |
 | `ChunkGatedDeltaRule` | 候选执行不能直接覆盖已提交 recurrent state；要能得到接受位置的 state | 现有计算核可能复用，但 final-state-only 接口不足以高效提交部分前缀；需扩展输出或新增 state-commit/replay 路径 |
 | causal-conv state update | 快照候选前 `conv_state`，接受后只保留已提交窗口 | 如可用非原地输出+显式 copy 完成，无需新 kernel；如只有原地融合路径，需加 snapshot/commit 能力 |
-| fused infer attention | 验证 `q_seq_len=2..17`、块内 causal mask、历史 KV、`actual_seq_lengths` 及跨 block 语义 | 支持且数值通过则不改；若只支持 decode=1 或 prefill=64，才需改 kernel/调度 |
+| fused infer attention | 验证 `q_seq_len=2..16`、块内 causal mask、历史 KV、`actual_seq_lengths` 及跨 block 语义 | 支持且数值通过则不改；若只支持 decode=1 或 prefill=64，才需改 kernel/调度 |
 | `DynamicQuant` / quant matmul | 如 Target 量化，验证 `K+1` 行动态量化与 matmul，不能假定 decode 只有 1 行 | 没有 token-count 限制就不改；有限制时扩展 |
 | RMSNorm/RoPE/MLP | 确认 `K+1` 行和位置向量正确 | 通常无需语义改造，只在 profiling 显示瓶颈时融合 |
 
@@ -236,8 +236,8 @@ Draft 融合算子与 Target 的 `CacheUpdate`/`ChunkGatedDeltaRule` 是两组�
 ### 阶段 B：先做无状态的单次整块 verifier oracle
 
 - 在 CPU/CUDA 上将单次整块 Target 每一行的 Top-1，与独立前缀调用逐行对比；
-- 覆盖 K=1/4/8/16，以及 mismatch 在第 0、中间、最后位和 all-match；
-- NPU 上先用 scratch state 验证 `q_seq_len=2..17`，不提交候选 state。
+- 覆盖 K=1/3/5/7/15，以及 mismatch 在第 0、中间、最后位和 all-match；
+- NPU 上先用 scratch state 验证 `q_seq_len=2..16`，不提交候选 state。
 
 这一阶段不提速，但能先判定多 token attention/GDN 是否会选择不等价 kernel。
 
@@ -272,7 +272,7 @@ Draft 融合算子与 Target 的 `CacheUpdate`/`ChunkGatedDeltaRule` 是两组�
 | 类型 | 至少覆盖 |
 |---|---|
 | 接受位置 | `accepted=0, 1, K-1, K` |
-| K | `1, 4, 8, 16` |
+| K | `1, 3, 5, 7, 15`（对应 `block_size=2, 4, 6, 8, 16`） |
 | block 边界 | committed position 位于 `62, 63, 64, 65` 附近 |
 | 停止 | proposal 内 EOS、correction EOS、bonus EOS、长度截断 |
 | GDN state | 候选后回退，再跑下一 token，与普通增量路径对比 |
@@ -320,7 +320,7 @@ Target(已提交前缀 + proposal[:i]) 的最后一行 Top-1
 - `Target verify calls / emitted token` 明显低于 ordinary；
 - Draft + state commit 的总成本小于节省的 Target 成本；
 - 在相同 prompt/output 和相同测量边界下，TPOT/tokens/s 有可重复改善；
-- 短 prompt、长 prompt、早/中/后生成阶段以及 K=1/4/8/16 都分开报告；
+- 短 prompt、长 prompt、早/中/后生成阶段以及 K=1/3/5/7/15 都分开报告；
 - 长时运行无 cache/state 漂移、无内存持续增长。
 
 如果一次整块 verify 或 state transaction 任意一项失败，应显式回到当前

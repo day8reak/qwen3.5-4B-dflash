@@ -3,9 +3,9 @@
 本页提供可复制的运行与报告检查命令。如果想先理解每个门禁的实现原理，请看
 [验证流程与报告解读](DFLASH_V1_VALIDATION.md)。
 
-V1 是 correctness-first 的完整前缀重算路线。本包按 vLLM 口径把 K 定义为 proposal token
-数，clean anchor 不计入 K，因此支持 K=16；此时 draft query 为 1 个 anchor 加 16 个 mask，
-共 17 行。`v1-r1` 默认让同一个普通 target 按 proposal 逐次验证独立完整前缀，接受最长连续匹配
+V1 是 correctness-first 的完整前缀重算路线。本包按官方 DFlash 口径把 `block_size` 定义为
+包含 clean anchor 的总行数，因此配置值 16 对应 1 个 anchor 加最多 15 个 proposal（K=15），
+共 16 行。`v1-r1` 默认让同一个普通 target 按 proposal 逐次验证独立完整前缀，接受最长连续匹配
 前缀，并产生 correction/bonus；一次 target 调用验证整块仅作为 prefix-invariance 诊断。
 
 ## 不可放宽的正确性条件
@@ -42,7 +42,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -B \
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 2 \
-  --max-draft-tokens 1 \
+  --block-size 2 \
   --eos-token-id 248044 \
   --dtype float16 \
   --device cpu \
@@ -74,7 +74,7 @@ PYTHONDONTWRITEBYTECODE=1 python -B -m models.dflash_v1.run_npu \
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 2 \
-  --max-draft-tokens 1 \
+  --block-size 2 \
   --device npu:0 \
   --report /path/to/run/dflash-v1-npu-smoke.json
 ```
@@ -141,7 +141,7 @@ PY
 最小 smoke 通过后：
 
 1. 增加 prompt 长度并覆盖 64-token prefill 分块边界；
-2. 改为 `max_new_tokens=32`、`max_draft_tokens=8`，确认稳定后再测 16；
+2. 改为 `max_new_tokens=32`、`block_size=8`（K=7），确认稳定后再测 `block_size=16`（K=15）；
 3. 记录每轮 proposal、接受长度和 correction；
 4. 用 profiler 确认 target、draft 和所有中间 tensor 留在 NPU；
 5. 最后才测延迟、吞吐和加速比。
