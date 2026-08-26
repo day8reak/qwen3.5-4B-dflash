@@ -419,9 +419,10 @@ class DFlashDraftModel(nn.Module):
                 f"noise embedding width must be {self.config.hidden_size}, "
                 f"got {noise_embedding.shape[-1]}"
             )
-        # Use the vLLM proposal-count convention. ``block_size=16`` permits
-        # 16 proposal/mask rows, while the clean anchor is an extra query row.
-        maximum_query_rows = self.config.block_size + 1
+        # Match upstream DFlash: block_size is the total query-row count,
+        # including the clean anchor.  block_size=16 therefore permits at
+        # most 15 proposal/mask rows.
+        maximum_query_rows = self.config.block_size
         if not 1 <= noise_embedding.shape[1] <= maximum_query_rows:
             raise ValueError(
                 f"noise length must be in [1, {maximum_query_rows}]"

@@ -26,7 +26,9 @@
 | dflash_ops.py | CPU/CUDA Torch backend |
 | dflash_ascend310p_ops.py | NPU Tensor 分解 backend |
 
-统一使用 proposal-count K：anchor 不计入 K，Target verify 长度 T=K+1，最大 K=16。
+本包统一使用官方 DFlash 口径：`block_size` 是包含 clean anchor 的 Draft query/Target verify
+总行数。官方配置 `block_size=16` 因此对应 1 个 anchor 加最多 15 个 proposal，即
+`K=block_size-1=15`。接受率诊断仍显式记录 proposal count K，避免把 K 与 block_size 混用。
 
 ## 文档与检查
 
