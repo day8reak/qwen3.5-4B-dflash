@@ -4,6 +4,9 @@
 Draft proposal、Target verify 和状态提交如何对齐。旧 full-prefix sequential 路线只用于定位，
 不属于默认 CPU、CUDA 或 NPU 流程。
 
+当前实现与官方锁定 Transformers/MLX runner 的 Draft cache、block-size 口径、sampling 和
+Target rollback 差异，见[官方完整 DFlash 对照](DFLASH_UPSTREAM_COMPARISON.md)。
+
 ## 1. 固定术语与不变量
 
 - K 是 Draft proposal 数，不包含 anchor；范围为 1 到 16。

@@ -103,6 +103,7 @@ NPU 部署必须已经注册用户完成的 npu_gated_delta_rule_mtp。kv-cache-
 ## 文档
 
 - [DFlash 框架与 token/state 流程](docs/DFLASH_ARCHITECTURE.md)
+- [当前 rollback 与官方完整 DFlash 的差异](docs/DFLASH_UPSTREAM_COMPARISON.md)
 - [现有算子与待开发自定义算子](docs/DFLASH_OPERATORS.md)
 - [CPU、CUDA、NPU 运行和验证](docs/DFLASH_RUN_AND_VALIDATE.md)
 - [源码索引](models/dflash_v1/README.md)

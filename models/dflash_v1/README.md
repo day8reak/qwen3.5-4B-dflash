@@ -31,6 +31,7 @@
 ## 文档与检查
 
 - [完整框架流程](../../docs/DFLASH_ARCHITECTURE.md)
+- [与官方完整 DFlash 的差异](../../docs/DFLASH_UPSTREAM_COMPARISON.md)
 - [自定义算子表](../../docs/DFLASH_OPERATORS.md)
 - [运行和验证](../../docs/DFLASH_RUN_AND_VALIDATE.md)
 
