@@ -136,7 +136,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --device npu:0 \
   --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
   --max-new-tokens 8 \
-  --max-draft-tokens 4 \
+  --block-size 4 \
   --target-quant-mode w8a8_dynamic \
   --target-quantizer "$TARGET_QUANTIZER" \
   --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
@@ -146,7 +146,8 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --report "$RUN_DIR/npu-quant-dflash-smoke.json"
 ```
 
-首次成功后再将 `max-new-tokens/max-draft-tokens` 提高到代表性 workload。当前量化模式只改变
+首次成功后再将 `max-new-tokens/block-size` 提高到代表性 workload。`block_size` 包含 anchor，
+所以值 4 对应 K=3。当前量化模式只改变
 Target：Draft checkpoint、Draft 网络和 Draft NPU backend 仍是 FP16。完整运行必须继续满足
 ordinary 与 DFlash token/EOS/stop reason 零差异；量化装配 PASS 不能替代这个最终门禁。
 
@@ -502,7 +503,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --device cpu \
   --dtype float16 \
   --max-new-tokens 16 \
-  --max-draft-tokens 4 \
+  --block-size 4 \
   --eos-token-id 248044 \
   --target-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
   --report "$RUN_DIR/cpu-w8a8-dflash.json"
@@ -659,7 +660,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --device npu:0 \
   --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
   --max-new-tokens 64 \
-  --max-draft-tokens 16 \
+  --block-size 16 \
   --target-quant-mode w8a8_dynamic \
   --target-quantizer your_quant_bridge:quantize_target \
   --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
@@ -739,7 +740,7 @@ PY
 | CPU artifact topology mismatch | 导出 artifact 与当前 framework checkpoint 不同 | 用同一 target revision 重新导出，不按名字强行套用 |
 | same-activation 第一层分叉 | rounding、scale 或 weight layout | 保存第一层 x/W_q/scale/output 做最小对照 |
 | strict greedy mismatch | verifier/状态/Target 路径不一致 | 找第一轮、第一 proposal 的 Target Top-1 分叉 |
-| strict greedy 通过但接受率低 | Draft proposal 质量或 workload 难度 | 用 `diagnose_acceptance` 扫 K=1/4/8/16 |
+| strict greedy 通过但接受率低 | Draft proposal 质量或 workload 难度 | 用 `diagnose_acceptance` 扫 K=1/3/5/7/15 |
 | CPU 很慢 | correctness-only 的 4B full-prefix 路线 | 先短 prompt、`max-new-tokens=2`；不要据此评性能 |
 
 ## 14. 接受率低时怎么查
@@ -757,7 +758,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --device cpu \
   --dtype float16 \
   --eos-token-id 248044 \
-  --proposal-counts 1,4,8,16 \
+  --proposal-counts 1,3,5,7,15 \
   --acceptance-rounds 16 \
   --trace-draft-layers \
   --target-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
@@ -779,7 +780,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --dtype float16 \
   --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
   --eos-token-id 248044 \
-  --proposal-counts 1,4,8,16 \
+  --proposal-counts 1,3,5,7,15 \
   --acceptance-rounds 16 \
   --target-quant-mode w8a8_dynamic \
   --target-quantizer your_quant_bridge:quantize_target \

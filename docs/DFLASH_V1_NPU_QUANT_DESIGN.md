@@ -438,7 +438,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
   --device npu:0 \
   --kv-cache-max-len "$KV_CACHE_MAX_LEN" \
   --max-new-tokens 64 \
-  --max-draft-tokens 16 \
+  --block-size 16 \
   --target-quant-mode w8a8_dynamic \
   --target-quantizer your_quant_bridge:quantize_target \
   --target-quant-weight-path "$TARGET_QUANT_WEIGHT_PATH" \
@@ -522,7 +522,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --device cpu \
   --dtype float16 \
   --max-new-tokens 16 \
-  --max-draft-tokens 4 \
+  --block-size 4 \
   --eos-token-id 248044 \
   --target-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
   --report "$RUN_DIR/cpu-w8a8-emulation.json"
@@ -552,7 +552,7 @@ PYTHONDONTWRITEBYTECODE=1 "$MODEL_PYTHON" -B \
   --prompt-mode chat \
   --device cuda:0 \
   --dtype float16 \
-  --proposal-counts 1,4,8,16 \
+  --proposal-counts 1,3,5,7,15 \
   --acceptance-rounds 16 \
   --trace-draft-layers \
   --target-w8a8-emulation-artifact "$RUN_DIR/w8a8-linear-artifact" \
