@@ -18,7 +18,7 @@
     "namespace_compatibility_file": "models/__init__.py",
     "namespace_compatibility_sha256": "9bf3e37aed93d372ca13b17b9c6dae32efa47f805f32b48628fb5316eae34b6d",
     "compatibility_entry_file": "models/dflash_qwen_adapter_v1.py",
-    "compatibility_entry_sha256": "e3953f3dc2952480b4bc28b58519508653842f88c5212bafc4e0335f670a3611"
+    "compatibility_entry_sha256": "f6fc41736b41928ebfc7d5368fbf31e509b1b3db9c5e9291e51d968080bd046b"
   },
   "target_modeling": {
     "repository": "huggingface/transformers",
