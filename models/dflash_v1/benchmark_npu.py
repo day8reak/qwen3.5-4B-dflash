@@ -35,6 +35,7 @@ sys.dont_write_bytecode = True
 
 import torch
 
+from .dflash_config import DFLASH_MIN_BLOCK_SIZE, OFFICIAL_DFLASH_BLOCK_SIZE
 from .dflash_qwen_adapter_v1 import (
     Qwen35DFlashFullPrefixAdapter,
     _audit_target_config,
@@ -86,7 +87,7 @@ class BenchmarkConfig:
     warmup: int = 3
     repetitions: int = 10
     max_new_tokens: int = 32
-    max_draft_tokens: int = 16
+    block_size: int = OFFICIAL_DFLASH_BLOCK_SIZE
 
     def validate(self) -> None:
         if self.mode not in {"ordinary", "dflash"}:
@@ -100,8 +101,11 @@ class BenchmarkConfig:
                 "NPU benchmark max_new_tokens must be at least 2 so the "
                 "correctness gate executes a post-bootstrap DFlash round"
             )
-        if not 1 <= self.max_draft_tokens <= 16:
-            raise ValueError("max_draft_tokens must be between 1 and 16")
+        if not DFLASH_MIN_BLOCK_SIZE <= self.block_size <= OFFICIAL_DFLASH_BLOCK_SIZE:
+            raise ValueError(
+                "block_size must be between "
+                f"{DFLASH_MIN_BLOCK_SIZE} and {OFFICIAL_DFLASH_BLOCK_SIZE}"
+            )
 
 
 @dataclass(frozen=True)
@@ -251,7 +255,8 @@ def run_benchmark(
             "warmup": config.warmup,
             "repetitions": config.repetitions,
             "max_new_tokens": config.max_new_tokens,
-            "max_draft_tokens": config.max_draft_tokens,
+            "block_size": config.block_size,
+            "proposal_capacity": config.block_size - 1,
         },
         "timing_scope": (
             "complete generation after target/draft load and correctness gate; "
@@ -321,7 +326,7 @@ def _dflash_invocation(
     prompt_token_ids: Sequence[int],
     *,
     max_new_tokens: int,
-    max_draft_tokens: int,
+    block_size: int,
     eos_token_ids: Sequence[int],
 ) -> BenchmarkInvocation:
     """Execute the same target-bootstrap DFlash route used by validation."""
@@ -345,7 +350,7 @@ def _dflash_invocation(
             adapter,
             (*bootstrap.prompt_token_ids, bootstrap_token),
             max_new_tokens=max_new_tokens - 1,
-            max_draft_tokens=max_draft_tokens,
+            block_size=block_size,
             eos_token_ids=eos_token_ids,
             input_device=adapter.device,
             verification_mode="sequential",
@@ -562,7 +567,12 @@ def _parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument("--max-new-tokens", type=int, required=True)
-    parser.add_argument("--max-draft-tokens", type=int, default=16)
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=OFFICIAL_DFLASH_BLOCK_SIZE,
+        help="total draft/verify rows including one anchor (official range: 2..16)",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--device", default="npu:0")
@@ -590,7 +600,7 @@ def _configure_formal_args(args: argparse.Namespace) -> BenchmarkConfig:
         warmup=args.warmup,
         repetitions=args.repetitions,
         max_new_tokens=args.max_new_tokens,
-        max_draft_tokens=args.max_draft_tokens,
+        block_size=args.block_size,
     )
     config.validate()
     if str(args.device).split(":", 1)[0].lower() != "npu":
@@ -693,7 +703,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         adapter,
         prompt_ids,
         max_new_tokens=config.max_new_tokens,
-        max_draft_tokens=config.max_draft_tokens,
+        block_size=config.block_size,
         eos_token_ids=args.eos_token_id,
         progress_callback=lambda event, fields: _emit_progress(
             args.progress,
@@ -741,7 +751,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             adapter,
             prompt_ids,
             max_new_tokens=config.max_new_tokens,
-            max_draft_tokens=config.max_draft_tokens,
+            block_size=config.block_size,
             eos_token_ids=args.eos_token_id,
         )
 
@@ -798,7 +808,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "strict_greedy_exact_match": True,
         "request": _request_payload(
             args,
-            effective_max_draft_tokens=config.max_draft_tokens,
+            effective_block_size=config.block_size,
             prompt_token_ids=prompt_ids,
         ),
         "runtime_identity": _runtime_identity(device),

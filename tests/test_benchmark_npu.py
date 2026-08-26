@@ -92,7 +92,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 warmup=1,
                 repetitions=2,
                 max_new_tokens=3,
-                max_draft_tokens=2,
+                block_size=4,
             ),
             synchronize=lambda: sync_calls.append(1),
             synchronization_source="test",
@@ -131,7 +131,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     warmup=1,
                     repetitions=1,
                     max_new_tokens=2,
-                    max_draft_tokens=1,
+                    block_size=2,
                 ),
                 synchronize=lambda: None,
                 synchronization_source="test",
@@ -149,7 +149,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
             adapter,
             [1],
             max_new_tokens=4,
-            max_draft_tokens=2,
+            block_size=4,
             eos_token_ids=(),
         )
         self.assertEqual(
@@ -165,7 +165,8 @@ class BenchmarkHarnessTests(unittest.TestCase):
             BenchmarkConfig("ordinary", warmup=-1),
             BenchmarkConfig("ordinary", repetitions=0),
             BenchmarkConfig("ordinary", max_new_tokens=1),
-            BenchmarkConfig("ordinary", max_draft_tokens=17),
+            BenchmarkConfig("ordinary", block_size=1),
+            BenchmarkConfig("ordinary", block_size=17),
         )
         for config in invalid:
             with self.subTest(config=config):

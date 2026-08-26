@@ -58,7 +58,7 @@ npu-smi info
 
 ## 2. 跑未 profiling 基线
 
-ordinary 和 DFlash 必须用两个独立进程；以下命令使用相同 prompt、生成长度、K、cache
+ordinary 和 DFlash 必须用两个独立进程；以下命令使用相同 prompt、生成长度、`block_size`、cache
 长度、3 次 warmup 和 10 次正式测量：
 
 ```bash
@@ -71,7 +71,7 @@ ordinary 和 DFlash 必须用两个独立进程；以下命令使用相同 promp
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 32 \
-  --max-draft-tokens 16 \
+  --block-size 16 \
   --warmup 3 \
   --repetitions 10 \
   --device npu:0 \
@@ -86,7 +86,7 @@ ordinary 和 DFlash 必须用两个独立进程；以下命令使用相同 promp
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 32 \
-  --max-draft-tokens 16 \
+  --block-size 16 \
   --warmup 3 \
   --repetitions 10 \
   --device npu:0 \
@@ -115,7 +115,7 @@ ordinary 和 DFlash 必须用两个独立进程；以下命令使用相同 promp
     --prompt-mode chat \
     --enable-thinking \
     --max-new-tokens 32 \
-    --max-draft-tokens 16 \
+    --block-size 16 \
     --warmup 1 \
     --repetitions 1 \
     --device npu:0 \

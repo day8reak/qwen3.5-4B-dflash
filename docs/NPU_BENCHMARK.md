@@ -97,7 +97,7 @@ ordinary 与 DFlash 必须分别启动进程，避免 allocator、状态或先�
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 32 \
-  --max-draft-tokens 16 \
+  --block-size 16 \
   --warmup 3 \
   --repetitions 10 \
   --device npu:0 \
@@ -112,15 +112,16 @@ ordinary 与 DFlash 必须分别启动进程，避免 allocator、状态或先�
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 32 \
-  --max-draft-tokens 16 \
+  --block-size 16 \
   --warmup 3 \
   --repetitions 10 \
   --device npu:0 \
   --report "$RUN_ROOT/dflash.json"
 ```
 
-`--max-draft-tokens` 在 ordinary 的计时路径中不参与生成，但仍用于进程内的 DFlash
-correctness gate 和 case identity，因此两边必须保持一致。
+`--block-size` 使用官方总行数口径：包含 1 个 anchor，因此值 16 对应 K=15。它在 ordinary
+的计时路径中不参与生成，但仍用于进程内的 DFlash correctness gate 和 case identity，
+所以两边必须保持一致。
 
 每份报告至少核对：
 
@@ -171,7 +172,7 @@ msprof 会给运行增加开销，所以 profile 数据不能替代上一节的�
     --prompt-mode chat \
     --enable-thinking \
     --max-new-tokens 32 \
-    --max-draft-tokens 16 \
+    --block-size 16 \
     --warmup 1 \
     --repetitions 1 \
     --device npu:0 \

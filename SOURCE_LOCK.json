@@ -101,13 +101,13 @@
   },
   "npu_benchmark": {
     "runner_file": "models/dflash_v1/benchmark_npu.py",
-    "runner_sha256": "584033b3d16610f4da8acab8227c594b3f080fe66776fe3468507a89ca9151ea",
+    "runner_sha256": "a51f9833d31d5f84cb18d2acf6902026b7399477e47735336bba0915f7f07214",
     "msprof_wrapper_file": "tools/run_msprof.sh",
     "msprof_wrapper_sha256": "3facb8d5fea35b22c62b25243711a3e244a1afb65aaac9482a795684662005b6",
     "contract_file": "config/npu_benchmark_v1.json",
-    "contract_sha256": "6e56cc7228f73d6451ac2945e6b1fcd14e096ba3a6db489edf4f4e8e00fe1334",
+    "contract_sha256": "fe3f996c602736c551749aebdb5e63319cdc77133d5eaff9c9e3fd4605ad39eb",
     "documentation_file": "docs/NPU_BENCHMARK.md",
-    "documentation_sha256": "b87034597143a0c7a8e65de9ea840cbaad10cd98933e86704d70e7cef727cbc5",
+    "documentation_sha256": "09605db2fa7204f9af95099995f378cdd4f7af5b27b91ac0b139d02e56bbb4da",
     "policy": "strict-greedy gate before timing; separate ordinary/dflash processes; synchronized unprofiled baseline; msprof diagnostic only; no CPU fallback"
   }
 }

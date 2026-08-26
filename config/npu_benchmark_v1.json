@@ -14,7 +14,7 @@
     "NPU model and device index",
     "CANN, driver, firmware, torch and torch_npu versions",
     "prompt token hash and thinking mode",
-    "max_new_tokens and max_draft_tokens",
+    "max_new_tokens and block_size (anchor included)",
     "kv_cache_max_len and prefill/decode chunk sizes"
   ],
   "runner": {
