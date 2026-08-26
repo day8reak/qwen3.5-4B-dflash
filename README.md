@@ -12,7 +12,7 @@ Target。
 | 环节 | 当前实现 |
 | --- | --- |
 | Draft | 官方 6 层、69 tensor；`block_size=16` 含 anchor，最多提出 K=15 个 token |
-| Target verify | 一次输入 [anchor, d1, ..., dK]，长度 T=K+1=`block_size`，最大 16 |
+| Target verify | 一次输入 [anchor, d1, ..., dK]，本轮 T=K+1≤`block_size`，最大 16 |
 | 接受规则 | 只接受从 d1 开始的最长连续匹配前缀 |
 | CPU/CUDA 状态 | 持久 DynamicCache；verify 后恢复 KV/GDN，再只重放 anchor 和已接受 proposal |
 | HIAI/NPU 状态 | GDR MTP recurrent bank、输入 NPU 上的 Torch conv golden、paged-KV logical cursor |

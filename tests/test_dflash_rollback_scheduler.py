@@ -52,10 +52,10 @@ class BoundaryAdapter:
     def propose_rollback(
         self,
         prefix_ids: torch.Tensor,
-        max_draft_tokens: int,
+        proposal_limit: int,
     ) -> torch.Tensor:
         return torch.tensor(
-            [self.proposals[:max_draft_tokens]],
+            [self.proposals[:proposal_limit]],
             dtype=torch.long,
         )
 
@@ -120,7 +120,7 @@ def check_acceptance_boundary(accepted: int, proposal_count: int) -> None:
         rollback_adapter,
         [1],
         max_new_tokens=proposal_count + 2,
-        max_draft_tokens=proposal_count,
+        block_size=proposal_count + 1,
         eos_token_ids=[eos],
     )
 
@@ -137,7 +137,7 @@ def check_acceptance_boundary(accepted: int, proposal_count: int) -> None:
 
 
 def main() -> None:
-    proposal_count = 4
+    proposal_count = 15
     for accepted in range(proposal_count + 1):
         check_acceptance_boundary(accepted, proposal_count)
     failing = FailingVerifyAdapter(
@@ -149,7 +149,7 @@ def main() -> None:
             failing,
             [1],
             max_new_tokens=3,
-            max_draft_tokens=1,
+            block_size=2,
             eos_token_ids=[99],
         )
     except RuntimeError as error:

@@ -68,8 +68,9 @@ else:
 logger = logging.get_logger(__name__)
 
 
-DFLASH_MAX_PROPOSALS = 16
-DFLASH_MAX_VERIFY_TOKENS = DFLASH_MAX_PROPOSALS + 1
+DFLASH_BLOCK_SIZE = 16
+DFLASH_MAX_PROPOSALS = DFLASH_BLOCK_SIZE - 1
+DFLASH_MAX_VERIFY_TOKENS = DFLASH_BLOCK_SIZE
 
 
 def _require_dflash_accepted_tokens(
@@ -219,7 +220,10 @@ def torch_dflash_causal_conv1d_mtp(
         raise ValueError("conv_state_bank must have shape [B,T,C,Kc]")
     batch_size, channels, sequence_length = hidden_states.shape
     if sequence_length < 1 or sequence_length > DFLASH_MAX_VERIFY_TOKENS:
-        raise ValueError("DFlash verify sequence length must be in [1,17]")
+        raise ValueError(
+            f"DFlash verify sequence length must be in "
+            f"[1,{DFLASH_MAX_VERIFY_TOKENS}]"
+        )
     expected_bank_prefix = (batch_size, sequence_length, channels)
     if tuple(conv_state_bank.shape[:3]) != expected_bank_prefix:
         raise ValueError(
@@ -689,7 +693,7 @@ class Qwen3_5Attention(nn.Module):
         The receiver's current CacheUpdate call supplies one target block and
         one offset.  Until its multi-row/cross-block ABI is proven, issue the
         already-supported single-row form for every verification row.  This is
-        deliberately an optimization boundary, not a claim that 17 launches
+        deliberately an optimization boundary, not a claim that 16 launches
         per K/V tensor are production-efficient.
         """
 
@@ -701,7 +705,10 @@ class Qwen3_5Attention(nn.Module):
         if cache_position.numel() != sequence_length:
             raise ValueError("DFlash cache_position length must equal K+1")
         if sequence_length > DFLASH_MAX_VERIFY_TOKENS:
-            raise ValueError("DFlash CacheUpdate supports at most 17 rows")
+            raise ValueError(
+                "DFlash CacheUpdate supports at most "
+                f"{DFLASH_MAX_VERIFY_TOKENS} rows"
+            )
 
         flattened = new_k.reshape(batch_size, sequence_length, -1, 16)
         for token_index in range(sequence_length):

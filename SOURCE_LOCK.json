@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "purpose": "runtime identity contract for Qwen3.5-4B DFlash V1",
+  "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback",
   "package_revision": "r1",
-  "route_version": "dflash-v1-sequential-chunk-aligned-full-prefix-direct-hiai-tensor-tuple",
+  "route_version": "dflash-rollback-incremental-transactional-upstream-block-size",
   "package_layout": {
     "version": 2,
     "canonical_package": "models.dflash_v1",
@@ -12,8 +12,8 @@
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
-    "hiai_bridge_sha256": "634999f429162c487e5097f07772c48b60d8cc8809d906b4826561daf410a6e9",
-    "hiai_bridge_policy": "loads the package wrapper, rebuilds full-attention block tables, allocates fresh call-local hybrid state, aligns multi-token prefills to 64 physical rows, slices outputs to the logical prefix, and synchronizes before releasing state",
+    "hiai_bridge_sha256": "72ab9d853345e3b2ddc1416aa5c581d482270cad65143e7f39ef1d004862a241",
+    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with at most 16 verify rows, GDN/conv state banks, provisional paged-KV writes, one logical commit cursor, and synchronized state ownership",
     "npu_policy": "keep the HIAI target in models/ and install the complete DFlash package in models/dflash_v1/",
     "namespace_compatibility_file": "models/__init__.py",
     "namespace_compatibility_sha256": "9bf3e37aed93d372ca13b17b9c6dae32efa47f805f32b48628fb5316eae34b6d",

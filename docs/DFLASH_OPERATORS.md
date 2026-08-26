@@ -22,7 +22,7 @@ FusedInferAttentionMTP 必须先做现有算子能力测试；TargetLmHeadTop1Ac
 | 已完成 | GatedDeltaRuleMTP | 已接入，补 24 层、多轮真机证据 |
 | 生产优先 | CausalConv1dMTP | 建议新增，替换 Tensor 分解 golden |
 | 条件新增 | CacheUpdateMTP | 现有多行/跨块能力或性能不足时新增 |
-| 条件新增 | FusedInferAttentionMTP | 现有 T=2/5/9/17 能力失败时扩展或新增 |
+| 条件新增 | FusedInferAttentionMTP | 现有 T=2/4/6/8/16 能力失败时扩展或新增 |
 | 性能优先 | TargetLmHeadTop1Accept | correctness 不依赖，但可消除完整 logits 落地和 D2H |
 | Profiling 后 | Draft projection、GQA、Draft Top-1 | Draft 热点确认后逐项融合 |
 
@@ -40,7 +40,7 @@ FusedInferAttentionMTP 必须先做现有算子能力测试；TargetLmHeadTop1Ac
 | GDN mixed QKV channels | 8192 |
 | GDN conv kernel/state length | 4 |
 | Vocab size | 248320 |
-| 最大 proposal K / verify T | 16 / 17 |
+| 官方 block_size / 最大 proposal K / verify T | 16 / 15 / 16 |
 | KV block size | 64 |
 | 单层 packed KV cache | [num_blocks,64,64,16] FP16 |
 
@@ -114,7 +114,7 @@ torch_dflash_causal_conv1d_mtp 已实现同一数学语义。输入是 NPU tenso
 
 ### 验收
 
-- K 为 1、4、8、16；
+- K 为 1、3、5、7、15；
 - accepted 为 0、1、K-1、K；
 - 每个输出 row 和 state slot 对齐逐 token ordinary reference；
 - 下一轮至少再执行一个 token，确认拒绝尾部没有污染；
@@ -149,7 +149,7 @@ torch_dflash_causal_conv1d_mtp 已实现同一数学语义。输入是 NPU tenso
 
 ### 验收
 
-- T 为 2、5、9、17；
+- T 为 2、4、6、8、16；
 - round start 位于 62、63、64、65；
 - 写入位置与逐 row oracle 完全相同；
 - prefix 和未触及 suffix sentinel 不变；
@@ -169,7 +169,7 @@ torch_dflash_causal_conv1d_mtp 已实现同一数学语义。输入是 NPU tenso
 | actual query / KV length | runtime scalar 或 vector |
 | output | [B,256,T,16] FP16，恢复后为 [B,T,4096] |
 
-只有现有 op 在 T=2、5、9、17、不同历史长度或跨块场景中出现能力限制或数值不等价时，才扩展
+只有现有 op 在 T=2、4、6、8、16、不同历史长度或跨块场景中出现能力限制或数值不等价时，才扩展
 它或新增 FusedInferAttentionMTP。每个有效 row 的 Top-1 都要与独立前缀 oracle 对齐。
 
 ## 7. 高价值性能算子：TargetLmHeadTop1Accept
@@ -228,8 +228,8 @@ attention 的 block non-causal mask 也不能被统一改成前五层的 causal 
 
 ## 10. 内存取舍
 
-T=17、B=1 时，单层 recurrent bank 约 34 MiB，24 层约 816 MiB；单层 conv bank 约
-1.0625 MiB，24 层约 25.5 MiB。两者合计约 841.5 MiB，还未包含 KV、权重和 workspace。
+T=16、B=1 时，单层 recurrent bank 为 32 MiB，24 层为 768 MiB；单层 conv bank 为
+1 MiB，24 层为 24 MiB。两者合计约 792 MiB，还未包含 KV、权重和 workspace。
 
 需要在真机比较：
 
@@ -242,7 +242,7 @@ T=17、B=1 时，单层 recurrent bank 约 34 MiB，24 层约 816 MiB；单层 c
 ## 11. 建议开发顺序
 
 1. 用当前 conv golden、逐 row CacheUpdate 和现有 attention 跑通 K=1/T=2。
-2. 扩到 K=16/T=17，覆盖 accepted 0、1、K-1、K 和 cursor 62、63、64、65。
+2. 扩到 `block_size=16`（K=15/T=16），覆盖 accepted 0、1、K-1、K 和 cursor 62、63、64、65。
 3. 证明 ordinary 与 DFlash 多 prompt、多轮 strict-greedy 零 token mismatch，且无 fallback。
 4. 开发 CausalConv1dMTP，并逐 row、逐 state slot 对齐 golden。
 5. Profile CacheUpdate、attention、完整 logits D2H 和 Draft 热点。

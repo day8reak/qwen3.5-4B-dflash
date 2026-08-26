@@ -45,6 +45,7 @@ KV_CACHE_MAX_LEN_ENV = "DFLASH_HIAI_KV_CACHE_MAX_LEN"
 BLOCK_SIZE = 64
 FEATURE_WIDTH = 20_480
 VOCAB_SIZE = 248_320
+DFLASH_MAX_VERIFY_TOKENS = 16
 
 _FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
 _ROLLBACK_FEATURE_SOURCE = (
@@ -660,8 +661,11 @@ class InternalDFlashTarget(nn.Module):
     def _prepare_rollback_state(self, verify_tokens: int) -> Tensor:
         if not self.rollback_enabled:
             raise RuntimeError("this HIAI bridge was not loaded in rollback mode")
-        if not 1 <= verify_tokens <= 17:
-            raise ValueError("rollback verify block must contain 1..17 rows")
+        if not 1 <= verify_tokens <= DFLASH_MAX_VERIFY_TOKENS:
+            raise ValueError(
+                "rollback verify block must contain 1.."
+                f"{DFLASH_MAX_VERIFY_TOKENS} rows"
+            )
         state = self._persistent_state
         if state is None:
             raise RuntimeError("rollback state has not been initialized")

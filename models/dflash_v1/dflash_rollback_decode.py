@@ -32,6 +32,7 @@ from .dflash_reference_decode_v1 import (
     ReplayDecodeResult,
     ReplayDecodeStats,
     ReplayRound,
+    _dflash_block_size,
 )
 
 
@@ -56,7 +57,7 @@ class IncrementalRollbackAdapter(Protocol):
     def propose_rollback(
         self,
         prefix_ids: Tensor,
-        max_draft_tokens: int,
+        proposal_limit: int,
     ) -> DraftTokens: ...
 
     def verify_rollback(self, block_ids: Tensor) -> Tensor | Any: ...
@@ -249,7 +250,7 @@ def dflash_rollback_greedy(
     prompt_token_ids: Sequence[int] | Tensor,
     *,
     max_new_tokens: int,
-    max_draft_tokens: int,
+    block_size: int,
     eos_token_ids: Iterable[int] = (),
     input_device: str | torch.device | None = None,
 ) -> ReplayDecodeResult:
@@ -257,11 +258,8 @@ def dflash_rollback_greedy(
 
     prompt, device = _normalize_prompt(prompt_token_ids, input_device)
     maximum = _count(max_new_tokens, name="max_new_tokens")
-    block_size = _count(
-        max_draft_tokens,
-        name="max_draft_tokens",
-        positive=True,
-    )
+    block_size = _dflash_block_size(block_size)
+    proposal_capacity = block_size - 1
     eos = _normalize_eos(eos_token_ids)
     stats = ReplayDecodeStats()
     rounds: list[ReplayRound] = []
@@ -301,7 +299,7 @@ def dflash_rollback_greedy(
 
     while len(generated) < maximum and not reached_eos:
         remaining = maximum - len(generated)
-        proposal_limit = min(block_size, remaining)
+        proposal_limit = min(proposal_capacity, remaining)
         prefix_length = len(committed)
         raw_proposals = adapter.propose_rollback(
             _input_ids(committed, device),

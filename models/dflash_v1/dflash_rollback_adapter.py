@@ -23,6 +23,7 @@ from transformers.cache_utils import DynamicCache
 
 from .dflash_qwen_adapter_v1 import (
     Qwen35DFlashFullPrefixAdapter,
+    _block_size,
     _proposal_count,
     _tensor_field,
     _validate_token_tensor,
@@ -494,7 +495,7 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
         self.rollback_stats.rollback_prefill_calls += 1
         return logits
 
-    def propose_rollback(self, prefix_ids: Tensor, max_draft_tokens: int) -> Tensor:
+    def propose_rollback(self, prefix_ids: Tensor, proposal_limit: int) -> Tensor:
         prefix_ids = _validate_token_tensor(
             prefix_ids,
             device=self.device,
@@ -502,7 +503,7 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
             name="rollback draft prefix_ids",
         )
         proposal_count = _proposal_count(
-            max_draft_tokens,
+            proposal_limit,
             maximum=self.max_proposal_tokens,
         )
         target_hidden = self._rollback_features
@@ -562,8 +563,10 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
             vocab_size=self.vocab_size,
             name="rollback verification block_ids",
         )
-        if not 1 <= block_ids.shape[1] <= self.max_proposal_tokens + 1:
-            raise ValueError("rollback verification block must contain 1..K+1 rows")
+        if not 1 <= block_ids.shape[1] <= self.max_block_size:
+            raise ValueError(
+                "rollback verification block exceeds the configured block_size"
+            )
         if self._pending_verify_rows is not None:
             raise RuntimeError("a rollback verification is already pending")
         output = self.target.verify_rollback(block_ids)
@@ -625,18 +628,15 @@ def validate_qwen35_dflash_rollback(
     prompt_token_ids: Sequence[int] | Tensor,
     *,
     max_new_tokens: int,
-    max_draft_tokens: int | None = None,
+    block_size: int | None = None,
     eos_token_ids: Iterable[int] = (),
 ) -> Qwen35RollbackValidation:
     """Compare ordinary and DFlash incremental streams with zero mismatch."""
 
-    proposal_count = (
-        adapter.max_proposal_tokens
-        if max_draft_tokens is None
-        else _proposal_count(
-            max_draft_tokens,
-            maximum=adapter.max_proposal_tokens,
-        )
+    effective_block_size = (
+        adapter.max_block_size
+        if block_size is None
+        else _block_size(block_size, maximum=adapter.max_block_size)
     )
     adapter.reset_rollback_stats()
     ordinary = ordinary_incremental_greedy(
@@ -652,7 +652,7 @@ def validate_qwen35_dflash_rollback(
         adapter,
         prompt_token_ids,
         max_new_tokens=max_new_tokens,
-        max_draft_tokens=proposal_count,
+        block_size=effective_block_size,
         eos_token_ids=eos_token_ids,
         input_device=adapter.device,
     )

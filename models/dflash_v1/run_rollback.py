@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from . import dflash_qwen_adapter_v1 as _legacy
+from .dflash_config import DFLASH_MIN_BLOCK_SIZE, OFFICIAL_DFLASH_BLOCK_SIZE
 from .dflash_rollback_adapter import (
     FrameworkDFlashRollbackTarget,
     Qwen35DFlashRollbackAdapter,
@@ -181,8 +182,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "accelerator rollback validation needs at least two new tokens"
         )
-    if args.max_draft_tokens is not None and not 1 <= args.max_draft_tokens <= 16:
-        raise ValueError("--max-draft-tokens must be between 1 and 16")
+    if args.block_size is not None and not (
+        DFLASH_MIN_BLOCK_SIZE <= args.block_size <= OFFICIAL_DFLASH_BLOCK_SIZE
+    ):
+        raise ValueError(
+            "--block-size must be between "
+            f"{DFLASH_MIN_BLOCK_SIZE} and {OFFICIAL_DFLASH_BLOCK_SIZE}"
+        )
     if args.allow_op_fallback and device_type != "cpu":
         raise ValueError("operator fallback is allowed only for CPU simulation")
     if args.reset_hook is not None:
@@ -269,10 +275,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         dtype=dtype,
     )
     adapter = Qwen35DFlashRollbackAdapter(target, draft)
-    effective_k = (
-        adapter.max_proposal_tokens
-        if args.max_draft_tokens is None
-        else args.max_draft_tokens
+    effective_block_size = (
+        adapter.max_block_size
+        if args.block_size is None
+        else args.block_size
     )
 
     _legacy._emit_progress(
@@ -281,7 +287,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         {
             "prompt_tokens": len(prompt_ids),
             "max_new_tokens": args.max_new_tokens,
-            "max_draft_tokens": effective_k,
+            "block_size": effective_block_size,
+            "proposal_capacity": effective_block_size - 1,
             "historical_prefix_replay": False,
         },
     )
@@ -289,7 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         adapter,
         prompt_ids,
         max_new_tokens=args.max_new_tokens,
-        max_draft_tokens=effective_k,
+        block_size=effective_block_size,
         eos_token_ids=args.eos_token_id,
     )
     source_identity_after = _rollback_runtime_identity(package_dir)
@@ -354,10 +361,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "draft_dir": str(Path(args.draft_dir).expanduser().resolve()),
         "draft_checkpoint": draft_checkpoint,
         "draft_memory_preflight": draft_memory_preflight,
+        "block_size": effective_block_size,
         "max_proposal_tokens": adapter.max_proposal_tokens,
         "request": _legacy._request_payload(
             args,
-            effective_max_draft_tokens=effective_k,
+            effective_block_size=effective_block_size,
             prompt_token_ids=prompt_ids,
         ),
         "ordinary": _legacy._decode_payload(result.ordinary, tokenizer=tokenizer),

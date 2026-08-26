@@ -22,7 +22,7 @@ Ascend 310P 的完整 Target、真实自定义算子和无 fallback 证据。
 - 与 CPU、CUDA 或 NPU 匹配的 PyTorch；
 - 本地 Qwen3.5-4B Target checkpoint 和完整 tokenizer；
 - 本地 z-lab/Qwen3.5-4B-DFlash 官方 Draft checkpoint；
-- K 在 1 到 16，Target verify 长度 T=K+1；
+- `block_size` 在 2 到 16 且包含 anchor；proposal capacity=`block_size-1`，本轮 T≤`block_size`；
 - 报告、日志和 cache 写到仓库外的运行目录。
 
 安装通用依赖：
@@ -49,7 +49,7 @@ python -B -m models.dflash_v1.run_rollback \
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 32 \
-  --max-draft-tokens 16 \
+  --block-size 16 \
   --eos-token-id 248044 \
   --dtype float16 \
   --device cuda:0 \
@@ -63,7 +63,7 @@ CUDA 路线不要传 HIAI factory、source、reset hook 或 NPU ops backend。�
 FrameworkDFlashRollbackTarget、DynamicCache 和 TorchDFlashOps。CUDA 不可用时必须直接失败，
 不能用 CPU 结果伪装 CUDA。
 
-如果要比较 FP16 和 BF16，必须保持 prompt、chat template、thinking、K、生成长度和 checkpoint
+如果要比较 FP16 和 BF16，必须保持 prompt、chat template、thinking、block_size、生成长度和 checkpoint
 完全相同，并先确认 torch.cuda.is_bf16_supported 为真。跨 dtype 的浮点 tensor hash 不会相同，
 判断重点应是 proposal、Target Top-1、accepted length 和最终 token。
 
@@ -145,7 +145,7 @@ mkdir -p "$RUN_DIR"
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 2 \
-  --max-draft-tokens 1 \
+  --block-size 2 \
   --device npu:0 \
   --report "$RUN_DIR/dflash-rollback-npu-smoke.json"
 ~~~
@@ -172,6 +172,8 @@ assert report["route"] == "qwen3.5-dflash-incremental-rollback"
 assert report["strict_greedy_exact_match"] is True
 assert report["verification_mode"] == "incremental_transactional_rollback"
 assert report["historical_prefix_replay_during_verify"] is False
+assert 2 <= report["block_size"] <= 16
+assert report["request"]["proposal_capacity"] == report["block_size"] - 1
 assert report["ordinary"]["generated_token_ids"] == report["dflash"]["generated_token_ids"]
 assert report["ordinary"]["reached_eos"] == report["dflash"]["reached_eos"]
 assert report["ordinary"]["stop_reason"] == report["dflash"]["stop_reason"]
@@ -253,17 +255,17 @@ PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_rollback_helpers.py
 | 阶段 | 至少覆盖 |
 | --- | --- |
 | 小块接线 | K=1、连续多轮、accepted 0/1、ordinary token 零差异 |
-| State bank | K=1/4/8/16，accepted 0/1/K-1/K，最后一轮动态 T |
+| State bank | K=1/3/5/7/15，accepted 0/1/K-1/K，最后一轮动态 T |
 | KV boundary | cursor 62/63/64/65，拒绝尾部不可见且被覆盖 |
-| Attention | T=2/5/9/17、多档历史长度、每个有效 row 对齐独立 prefix oracle |
+| Attention | T=2/4/6/8/16、多档历史长度、每个有效 row 对齐独立 prefix oracle |
 | Feature | 八个固定层、只提交 1+a 行、开关不改变 Target Top-1 |
 | 故障 | 不同 decoder 层失败后 session 整体失效 |
 | 稳定性 | 多 prompt、多进程重复，无越界、状态泄漏或持续内存增长 |
 | 身份 | 记录 device、runtime、算子包/source hash 和 kernel trace，无 CPU fallback |
 | 整网 | token ID、EOS、stop reason 对 ordinary incremental 全部零差异 |
 
-先跑 K=1，再扩 K=16；先证明正确性，再测性能。现有 CacheUpdate 或 fused attention 能力通过
-时应直接复用，不因名称不同而提前重写 kernel。
+先跑 K=1，再扩 K=15（`block_size=16`）；先证明正确性，再测性能。现有 CacheUpdate 或
+fused attention 能力通过时应直接复用，不因名称不同而提前重写 kernel。
 
 ## 10. 接受率和分叉诊断
 
@@ -282,7 +284,7 @@ python -B -m models.dflash_v1.diagnose_acceptance \
   --eos-token-id 248044 \
   --acceptance-rounds 16 \
   --verification-mode sequential \
-  --proposal-counts 1,4,8,16 \
+  --proposal-counts 1,3,5,7,15 \
   --trace-draft-layers \
   --report /path/to/run/acceptance-diagnosis.json
 ~~~

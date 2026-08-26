@@ -15,6 +15,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from models.internal_dflash_bridge import (  # noqa: E402
+    DFLASH_MAX_VERIFY_TOKENS,
     FEATURE_WIDTH,
     InternalDFlashTarget,
     VOCAB_SIZE,
@@ -130,6 +131,7 @@ class FakeWrapper(nn.Module):
 
 
 def main() -> None:
+    assert DFLASH_MAX_VERIFY_TOKENS == 16
     model = FakeHIAIModel().eval()
     bridge = InternalDFlashTarget(
         FakeWrapper(model).eval(),
@@ -141,6 +143,13 @@ def main() -> None:
     bridge.begin_rollback(torch.tensor([[1, 2]], dtype=torch.long))
     assert bridge.dflash_rollback_audit["persistent_cursor"] == 2
     assert model.calls[-1]["positions"] == (1,)
+
+    try:
+        bridge._prepare_rollback_state(17)
+    except ValueError as error:
+        assert "1..16 rows" in str(error)
+    else:
+        raise AssertionError("17-row rollback verify block was not rejected")
 
     bridge.verify_rollback(torch.tensor([[3, 4, 99]], dtype=torch.long))
     state = bridge._persistent_state

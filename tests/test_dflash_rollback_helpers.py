@@ -24,7 +24,11 @@ HELPERS = {
     "rebase_dflash_gdn_state_banks",
     "torch_dflash_causal_conv1d_mtp",
 }
-CONSTANTS = {"DFLASH_MAX_PROPOSALS", "DFLASH_MAX_VERIFY_TOKENS"}
+CONSTANTS = {
+    "DFLASH_BLOCK_SIZE",
+    "DFLASH_MAX_PROPOSALS",
+    "DFLASH_MAX_VERIFY_TOKENS",
+}
 
 
 def load_helpers() -> dict[str, object]:
@@ -81,6 +85,9 @@ def sequential_reference(
 
 def main() -> None:
     helper = load_helpers()
+    assert helper["DFLASH_BLOCK_SIZE"] == 16
+    assert helper["DFLASH_MAX_PROPOSALS"] == 15
+    assert helper["DFLASH_MAX_VERIFY_TOKENS"] == 16
     seed = helper["seed_dflash_gdn_state_banks"]
     rebase = helper["rebase_dflash_gdn_state_banks"]
     conv = helper["torch_dflash_causal_conv1d_mtp"]
@@ -101,7 +108,7 @@ def main() -> None:
     # Give every previous slot a distinct identity so selection mistakes are
     # visible, then compare the vectorized convolution with a token loop for
     # the MTP sizes used by the device operator.
-    for tokens in (2, 5, 17):
+    for tokens in (2, 5, 16):
         conv_bank = torch.randn(2, tokens, 3, 4, dtype=torch.float32)
         recurrent_bank = torch.randn(2, tokens, 2, 3, 4, dtype=torch.float32)
         hidden = torch.randn(2, 3, tokens, dtype=torch.float32)
@@ -149,7 +156,7 @@ def main() -> None:
             conv_bank,
             weight,
             bias,
-            torch.tensor([0, 17], dtype=torch.int8),
+            torch.tensor([0, 16], dtype=torch.int8),
             "silu",
         )
     except ValueError as error:

@@ -4,13 +4,14 @@
 Draft proposal、Target verify 和状态提交如何对齐。旧 full-prefix sequential 路线只用于定位，
 不属于默认 CPU、CUDA 或 NPU 流程。
 
-当前实现与官方锁定 Transformers/MLX runner 的 Draft cache、block-size 口径、sampling 和
-Target rollback 差异，见[官方完整 DFlash 对照](DFLASH_UPSTREAM_COMPARISON.md)。
+当前实现的 `block_size` 口径已与官方锁定 Transformers/MLX runner 对齐；Draft cache、sampling
+和 Target rollback 实现差异见[官方完整 DFlash 对照](DFLASH_UPSTREAM_COMPARISON.md)。
 
 ## 1. 固定术语与不变量
 
-- K 是 Draft proposal 数，不包含 anchor；范围为 1 到 16。
-- T 是 Target verify 的输入行数，T=K+1；范围为 2 到 17。
+- `block_size` 是包含 clean anchor 的 Draft query/Target verify 最大总行数，范围为 2 到 16。
+- K 是本轮 Draft proposal 数，不包含 anchor，`K≤block_size-1`；最大范围为 1 到 15。
+- T 是本轮 Target verify 输入行数，`T=K+1≤block_size`；范围为 2 到 16。
 - 当前调度只支持 batch 1、strict greedy。
 - Target 是唯一裁判。Draft token 在通过 Target 验证前不能成为最终结果。
 - Target 状态、position、feature 和 cache 必须用同一个 accepted count 原子提交。
@@ -115,7 +116,7 @@ norm 之前：
 | feature width | 20480 |
 | vocab size | 248320 |
 | checkpoint tensor 数 | 69 |
-| 最大 proposal K | 16 |
+| 官方 block_size / proposal capacity | 16 / 15 |
 
 前五层是 causal sliding attention，最后一层允许 Draft block 内 non-causal 可见。最后经过共享
 Target LM head，只取 mask 对应的 K 行 Top-1。

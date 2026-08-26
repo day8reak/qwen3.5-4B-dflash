@@ -45,7 +45,7 @@ Draft 数学主体与官方 checkpoint 对齐；Target state、Draft cache、sam
 | --- | --- | --- | --- |
 | Draft checkpoint | checkpoint config 决定 Draft 拓扑 | 锁定同一 Qwen3.5-4B checkpoint、6 层、69 tensor 和 hash | 对齐且检查更严格 |
 | Target feature | 8 个指定层拼接并投影 | 层 1、5、9、13、17、21、25、29，宽度 20480 | 对齐 |
-| Draft block | clean anchor 加 mask block | clean anchor 加 K 个 mask | 数学相同，长度口径不同 |
+| Draft block | `block_size` 包含 clean anchor | 相同；B=16 时为 anchor 加 15 个 mask | 口径与数学均对齐 |
 | Draft attention | context KV 注入；前层 sliding causal，末层按 config | 相同 6 层与 mask 语义 | 对齐，代码重写 |
 | 共享权重 | 使用 Target embedding 和 LM head | 使用并审计 Target embedding 和 LM head | 对齐 |
 | Target verify | 一次验证 anchor 加 proposal | 一次 T=K+1 verify | 核心算法对齐 |
@@ -61,9 +61,9 @@ Draft 数学主体与官方 checkpoint 对齐；Target state、Draft cache、sam
 | Backend | PyTorch Qwen3/LLaMA；MLX Qwen3.5 等 | PyTorch Qwen3.5 CPU/CUDA；HIAI/NPU | 当前新增 port |
 | 性能定位 | 使用 Draft cache，并提供本地生成/性能统计 | correctness bring-up；ordinary 对照不属于生产热路径 | 当前不能直接比较 TPS |
 
-## 4. 最大长度口径不同
+## 4. block_size 口径已对齐
 
-这是当前最容易被忽略的差异。
+这是当前统一后的公共合同。
 
 官方本地 Transformers 和 MLX runner 都把 block_size 当成 Target verify 的总行数：
 
@@ -73,31 +73,25 @@ block_size 16       = anchor + 15 proposals
 Target verify T     = 16
 ~~~
 
-当前仓库按 vLLM 的 num_speculative_tokens 口径，把 block_size/命令行参数解释成 proposal capacity：
+当前仓库的配置、scheduler、CPU/CUDA/NPU CLI、报告和状态 bank 使用同一语义：
 
 ~~~text
-current K = proposal 数
-max-draft-tokens 16 = anchor + 16 proposals
-Target verify T     = 17
+--block-size 16     = anchor + 15 proposals
+current K           = block_size - 1 = 15
+Target verify T     = block_size = 16
 ~~~
 
-影响包括：
-
-- Draft query、Target verify、GDR/conv bank 多一行；
-- state-bank 峰值内存和 CacheUpdate 次数改变；
-- accepted/proposed 与 emitted/verify 统计口径改变；
-- K=16/T=17 超出官方本地 block_size=16 的原样调用分布。
-
-如果要做锁定官方 runner 的同口径 parity，应先运行：
+官方 block 档位与显式 proposal 诊断档位的换算为：
 
 ~~~text
---max-draft-tokens 15
-K = 15
-T = 16
+block_size = 2 / 4 / 6 / 8 / 16
+K          = 1 / 3 / 5 / 7 / 15
+T          = 2 / 4 / 6 / 8 / 16
 ~~~
 
-K=16/T=17 可以保留为当前 GDR MTP/vLLM 口径扩展，但报告必须标记为 extension，不能与官方
-block_size=16 的结果直接混比。
+`--proposal-counts` 只在接受率诊断中显式表示 K；运行入口只接收官方总行数口径。因此报告
+可以直接与官方相同 block_size 档位比较，不再存在额外的 17-row 扩展档。生成尾轮或 proposal
+遇到 EOS 时，本轮有效 K/T 可以更小，但始终满足 K≤block_size-1、T≤block_size。
 
 ## 5. Draft cache 是当前最大的功能差异
 
@@ -206,14 +200,14 @@ ordinary 对照是当前 bring-up 的必要验收，但它会额外执行一次 
 | 使用官方 Qwen3.5-4B DFlash checkpoint 与 Draft 拓扑 | 是 | checkpoint/hash 审计通过 |
 | greedy DFlash 核心 proposal/verify/accept 算法对齐 | 是 | 最长连续匹配和 1+a commit 通过 |
 | 官方完整 CPU/GPU 实现 | 否 | 当前是 Qwen3.5 PyTorch port |
-| 官方 block_size=16 原样对齐 | 默认否 | 使用 K=15/T=16 才同口径 |
+| 官方 block_size=16 原样对齐 | 是 | 默认 B=16/K=15/T=16 |
 | 完整官方 generation 功能 | 否 | 缺 Draft cache 和 sampling |
 | Qwen3.5 transactional rollback port | 是 | CPU/CUDA/NPU 各自状态门禁通过 |
 | 已达到官方性能 | 否 | 当前没有同边界配对性能证据 |
 
 ## 10. 补齐完整原版能力的建议顺序
 
-1. 新增 upstream-parity 配置，固定 K=15/T=16、temperature=0。
+1. 保持默认 `block_size=16`，即 K=15/T=16、temperature=0。
 2. 对每轮比较 Draft proposal、Target Top-1、accepted、bonus 和 emitted token。
 3. 比较拒绝后下一 token 的完整 Target state，而不只比较当前输出。
 4. 实现 Draft KV cache 和 accepted-boundary trim/crop；保持无 cache 路线作为 golden。
