@@ -17,6 +17,14 @@
 - [CPU/Golden 指南](docs/DFLASH_V1_GOLDEN.md)
 - [CUDA GPU 指南](docs/DFLASH_V1_GPU.md)
 - [Ascend 接口与验证边界](docs/DFLASH_V1_ASCEND310P.md)
+- [Target 状态回退版与自定义算子分析](docs/DFLASH_ROLLBACK_OPERATOR_ANALYSIS.md)
+
+`rollback` 分支额外保留
+`models/modeling_qwen3_5_hiai_nd_dflash_rollback.py`。原
+`models/modeling_qwen3_5_hiai_nd.py` 不变；只有调用方显式传入
+`accepted_tokens` 时，新文件才进入 GDR/conv state-bank 与跨 block KV 写入路径。
+现有 V1 scheduler/bridge 仍是完整前缀重算，不会自动启用该路径，接入要求和剩余算子边界
+见上述分析文档。
 
 ## 共同算法
 
