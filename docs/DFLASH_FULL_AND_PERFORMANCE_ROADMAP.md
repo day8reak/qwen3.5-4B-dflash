@@ -1,14 +1,12 @@
-# 从 V1 到完整 DFlash 与真正提速
+# 从 rollback correctness 到真正提速
 
-本页说明当前 correctness-first V1 与完整 DFlash 运行时之间还差什么，
-以及 Ascend NPU 上哪些状态和算子需要改造。它是后续开发路线，不是对当前
-`v1-r1` 已具备性能收益的声明。
+当前分支已实现一次 T=K+1 Target verify、持久状态和 accepted-prefix commit。本页说明该
+correctness bring-up 距离生产性能还差什么，不声明当前已有加速收益。
 
 先记住结论：
 
-> 当前 V1 的 token 验证规则是对的，但为了隔离 NPU 状态，它会重算完整前缀并逐个
-> 检查 proposal。完整 DFlash 的提速关键是：Draft 一次提出 K 个 token，Target 一次
-> 验证整块，然后只保留已接受前缀的 KV/GDN 状态。
+> Target rollback 主链已经不重算历史前缀；下一阶段重点是 310P 真机正确性、conv/KV/Top-1
+> 热点融合、Draft cache，以及证明这些额外成本小于一次整块 verify 节省的 Target 成本。
 
 官方参考实现锁定到 `z-lab/dflash` commit
 [`07ebd93`](https://github.com/z-lab/dflash/tree/07ebd93db9f472af339b644bb70221ad8428328a)。
@@ -17,20 +15,20 @@
 GDN 状态回退的参考思路可见
 [`dflash/model_mlx.py`](https://github.com/z-lab/dflash/blob/07ebd93db9f472af339b644bb70221ad8428328a/dflash/model_mlx.py)。
 
-## 1. 当前 V1 与完整路线的差异
+## 1. 当前 rollback 与生产性能路线的差异
 
-| 项目 | 当前 `v1-r1` | 完整、可提速路线 |
+| 项目 | 当前 correctness rollback | 生产、可提速路线 |
 |---|---|---|
 | Draft | 并行产生 K 个 proposal | 同样并行产生 K 个 proposal |
-| Target 验证 | 对 proposal 逐个重算完整前缀 | 对 `[anchor, d1, ..., dK]` 只执行一次 |
-| Target 状态 | 每次新建 KV/GDN state，返回后丢弃 | 跨轮复用已提交状态 |
-| 错误 proposal | 天然不会进入下次调用 | 必须从候选状态中丢弃 |
-| Draft cache | 可重算已提交前缀 | 保留已提交部分，只处理新 context/block |
-| 性能目标 | 正确性和设备接线 | 减少 Target 调用数、计算量和同步次数 |
+| Target 验证 | 一次 `[anchor,d1,...,dK]` | 相同，并融合 Top-1/accept |
+| Target 状态 | CPU/GPU 快照+bounded replay；NPU state bank+logical KV | 去除不必要 replay/逐 row launch，降低 bank/临时内存 |
+| 错误 proposal | 已通过 rollback 丢弃 | 相同，增加设备故障原子性证据 |
+| Draft cache | feature history 保存，Draft context 仍重算 | 保留已提交 Draft KV，只处理新 context/block |
+| logits/accept | 完整 logits 搬到 host 做 Top-1/scan | 设备侧分块 Top-1、accept、correction/bonus |
+| 性能目标 | 正确性和接线 | 减少计算、D2H、launch、同步与峰值内存 |
 
-因此，仅把当前 `verification_mode` 从 `sequential` 改成 `vectorized` 并不等于
-完成提速。如果没有状态事务，一次整块验证会把未接受 token 的 KV/GDN 状态
-污染到下一轮。
+一次整块 verify 本身不等于提速：还必须让状态事务正确、避免完整 logits D2H、控制 state-bank
+内存，并把 Draft/commit 开销计入端到端测量。
 
 ## 2. 完整 DFlash 的一轮验证
 
@@ -64,11 +62,11 @@ flowchart LR
     K --> N[带新 anchor 进入下一轮]
 ```
 
-### 2.1 完整高性能 DFlash 时序图
+### 2.1 目标时序图
 
-下面这张图描述的是最终希望实现的增量、整块验证路径，不是当前 `v1-r1` 已经
-启用的运行路径。本文中的 **K 始终表示 proposal 数，不包含 anchor**，所以一次
-Target verify 的输入长度是 `K+1`。
+下面时序的 Target transaction 已在当前 correctness 路线启用；图中的 Draft cache 和融合执行仍
+是后续优化。本文中的 **K 始终表示 proposal 数，不包含 anchor**，所以一次 Target verify 的
+输入长度是 `K+1`。
 
 ```mermaid
 sequenceDiagram
@@ -120,8 +118,8 @@ sequenceDiagram
 读图时重点看五件事：
 
 1. Draft 产生的 proposal 必须先回到 Scheduler，再进入 Target；它不能直接写入最终输出。
-2. 每轮只有一次 Target verify，输入是 `anchor + K proposals`，这是相对当前 V1
-   减少 Target 调用数的主要来源。
+2. 每轮只有一次 Target verify，输入是 `anchor + K proposals`；当前已实现，仍需证明其端到端
+   收益没有被 commit、Draft 和 D2H 抵消。
 3. Target 的 `K+1` 行状态先是**候选状态**。知道连续接受长度 `a` 后，才把
    `anchor + a 个 proposal` 变成**已提交状态**。
 4. correction/bonus 虽由验证 logits 得出并在本轮输出，但该 token 本身还没有作为
@@ -138,11 +136,8 @@ greedy 属于开发验收的对照路线，不应进入最终高性能生成的�
 `[旧 anchor, 202]`；`999/888` 的候选状态被丢弃，`303` 成为下一轮尚未缓存的
 anchor。这样既避免重新计算整个历史前缀，也不会让错误 proposal 污染下一轮。
 
-当前 `v1-r1` 的逐前缀、无跨轮状态版本见
-[V1 准确调用时序](DFLASH_V1_ARCHITECTURE.md#21-一轮-dflash-的准确调用时序)。
-上图只有在本页后续的整块 verifier oracle、状态事务和跨轮 cache 门禁全部通过后，
-才能成为默认运行路径。采样模式会把“连续 Top-1 相等”换成 rejection sampling，
-但候选状态、接受长度和提交/回退的时序边界不变。
+旧逐前缀、无跨轮状态版本保留在 `dflash_reference_decode_v1.py` 作 debug oracle。当前默认已经
+使用上图的 greedy transaction；采样模式仍未实现。
 
 ## 3. Target 上必须处理的三类状态
 
@@ -227,13 +222,13 @@ Draft 融合算子与 Target 的 `CacheUpdate`/`ChunkGatedDeltaRule` 是两组�
 
 ## 6. 建议实现顺序
 
-### 阶段 A：锁定现有 V1 baseline
+### 阶段 A：锁定 rollback baseline（软件已完成，真机待补）
 
 - 固定 prompt、tokenizer、thinking 模式、dtype、K 和 EOS；
 - 保留 ordinary/DFlash 零 token 差异报告；
 - 记录 Target forward 数、Draft 时间、verify 时间、同步次数和显存。
 
-### 阶段 B：先做无状态的单次整块 verifier oracle
+### 阶段 B：单次整块 verifier oracle（CPU 边界已完成，310P 待补）
 
 - 在 CPU/CUDA 上将单次整块 Target 每一行的 Top-1，与独立前缀调用逐行对比；
 - 覆盖 K=1/4/8/16，以及 mismatch 在第 0、中间、最后位和 all-match；
@@ -241,14 +236,14 @@ Draft 融合算子与 Target 的 `CacheUpdate`/`ChunkGatedDeltaRule` 是两组�
 
 这一阶段不提速，但能先判定多 token attention/GDN 是否会选择不等价 kernel。
 
-### 阶段 C：实现 Target 状态事务
+### 阶段 C：实现 Target 状态事务（已实现，310P 证据待补）
 
 - 定义 `begin_round → provisional_verify → commit(accepted_length)` 接口；
 - 将 KV、recurrent state、conv state、逻辑长度和位置计数纳入一个事务；
 - 任何层失败都 fail closed，不允许部分层已提交；
 - 状态提交后与普通增量 Target 的下一 token logits 对比。
 
-### 阶段 D：调度器切换到生产 vectorized verify
+### 阶段 D：调度器切换到一次整块 verify（已实现）
 
 - 每轮 Target verify 调用数从最多 `K+1` 降到 1；
 - accept scan 、EOS 裁剪和 commit length 使用同一个结果；
@@ -289,7 +284,7 @@ vectorized Target 第 i 行 Top-1
 Target(已提交前缀 + proposal[:i]) 的最后一行 Top-1
 ```
 
-只有这个关系在 NPU 上通过，才能用一次整块调用取代当前的逐前缀验证。
+只有这个关系在 NPU 上通过，当前一次整块调用才能从 bring-up 晋级为目标设备通过。
 
 ## 8. 如果要支持原始 DFlash 的采样模式
 
@@ -323,5 +318,5 @@ Target(已提交前缀 + proposal[:i]) 的最后一行 Top-1
 - 短 prompt、长 prompt、早/中/后生成阶段以及 K=1/4/8/16 都分开报告；
 - 长时运行无 cache/state 漂移、无内存持续增长。
 
-如果一次整块 verify 或 state transaction 任意一项失败，应显式回到当前
-sequential full-prefix V1，不能带着部分候选状态继续生成。
+如果一次整块 verify 或 state transaction 任意一项失败，应使 rollback session 失败并停止；
+可单独运行 sequential full-prefix oracle 定位，但不能在同一生成中带着部分候选状态继续。

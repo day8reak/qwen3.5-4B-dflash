@@ -1,253 +1,169 @@
-# DFlash V1：调度与 Token 验证
+# DFlash rollback：调度与 Token 验证
 
-本文专门解释 Draft 输出的多个 token 怎样进入验证路线，以及 accept、correction、bonus 分别是
-什么。公共实现位于 `models/dflash_v1/dflash_reference_decode_v1.py`。
+当前默认实现位于：
 
-先读整体关系：[DFlash V1 整体架构](DFLASH_V1_ARCHITECTURE.md)。
+- `models/dflash_v1/dflash_rollback_decode.py`：后端无关的调度器；
+- `models/dflash_v1/dflash_rollback_adapter.py`：CPU/CUDA 事务缓存和 Qwen/Draft 接线；
+- `models/internal_dflash_bridge.py`：HIAI/NPU state bank 与逻辑 KV cursor；
+- `models/dflash_v1/dflash_reference_decode_v1.py`：旧的完整前缀 correctness oracle，不再是
+  CPU/GPU/NPU 默认验证路径。
 
-## 1. 最重要的连接
+## 1. 当前验证不再重算历史前缀
 
-Draft 输出不会直接变成最终文本。真实链路是：
-
-```mermaid
-flowchart LR
-    C[committed prefix] --> A[Adapter.propose]
-    A --> F[Target context features]
-    F --> D[6-layer Draft]
-    D -->|K proposal IDs| A
-    A -->|返回 proposal| S[dflash_full_prefix_greedy]
-    S -->|逐个构造验证前缀| T[Target forward_logits]
-    T -->|权威 Top-1| S
-    S -->|accept + correction/bonus| C
-```
-
-代码中的对应关系：
+普通基线和 DFlash 都维护一个持久 Target 状态。每轮 Target 只接收：
 
 ```text
-_call_draft()
-  └─ adapter.propose()
-       └─ draft.draft_top1()
-            ↓ proposal IDs 返回
-dflash_full_prefix_greedy()
-  └─ for proposal_index, proposal in enumerate(proposals)
-       └─ _target_top1(committed + proposals[:proposal_index])
+[anchor, proposal_1, ..., proposal_K]
+T = K + 1，1 <= T <= 17
 ```
 
-所以 Draft 路由和验证路由不是两个互不相干的分支；Scheduler 正是它们的连接点。
-
-## 2. ordinary greedy 基线
-
-`ordinary_full_prefix_greedy()` 是最简单的权威路线：
+历史 prompt/committed prefix 不会再次进入正式 verify 调用。报告中的：
 
 ```text
-committed = prompt
-while 还需要生成:
-    logits = Target(committed)
-    token = argmax(logits 的最后一行)
-    committed.append(token)
-    如果 token 是 EOS: 停止
+verification_mode = incremental_transactional_rollback
+historical_prefix_replay_during_verify = false
 ```
 
-它每生成一个 token 都重新计算完整前缀，所以叫 `ordinary-full-prefix-greedy`。这不是性能最优的
-增量 KV inference，而是与当前 V1 DFlash 使用相同 full-prefix 条件的 correctness oracle。
+是这条合同的显式记录。
 
-## 3. DFlash 开始前为什么 bootstrap
+## 2. Bootstrap 与状态对齐
 
-正式 DFlash 不是直接把 prompt 最后一个 token 当 anchor。`validate_qwen35_dflash_strict_greedy()`
-先单独让 Target 生成一个 token：
+先对 prompt 做一次 prefill，读取 prompt 最后一行 logits 的 Top-1，得到 clean anchor：
 
 ```text
-prompt → Target Top-1 → clean anchor
+Target state/features 已处理：prompt
+已输出但尚未作为 Target 输入处理：anchor
 ```
 
-然后才把：
+Draft 的 context feature 正好覆盖 `prompt`，Draft block 第 0 行放 anchor，后面 K 行放 mask。
+这与 checkpoint 的训练数据流一致，不会把 anchor 同时放进 context feature 和 block。
+
+## 3. 一次 T=K+1 验证怎样读 logits
+
+Target 对整块做因果计算：
 
 ```text
-seeded_prefix = prompt + anchor
+input row 0 = anchor       → logits row 0 验证 proposal_1
+input row 1 = proposal_1   → logits row 1 验证 proposal_2
+...
+input row K-1              → logits row K-1 验证 proposal_K
+input row K                → logits row K 给出 all-match bonus
 ```
 
-交给 `dflash_full_prefix_greedy()`。最终 DFlash 结果由 `anchor + 后续 DFlash tail` 组成，再与
-ordinary 的完整生成结果比较。
+Scheduler 从左到右比较 proposal 与对应 Target Top-1，只接受最长连续匹配前缀。若首次错误位置是
+`a`，则接受 `proposal[:a]`，并使用 `target_top1[a]` 作为 correction；若 K 个全部匹配，
+`target_top1[K]` 是 bonus。
 
-## 4. sequential 验证算法
+错误 proposal 后面的 logits 不参与决定。因果 mask 保证错误位置之前的行不会读取右侧拒绝尾部。
 
-当前正式模式是 `verification_mode="sequential"`。伪代码如下：
+## 4. Commit 的 off-by-one 规则
+
+若本轮接受了 `a` 个 proposal，Target 输入状态只提交：
 
 ```text
-while 还需要生成:
-    proposals = Draft.propose(committed, K)
-    accepted = []
-
-    for i, proposal in enumerate(proposals):
-        verify_prefix = committed + proposals[:i]
-        target_token = Target.top1(verify_prefix)
-
-        if proposal != target_token:
-            correction = target_token
-            break
-
-        accepted.append(proposal)
-
-    if 全部 proposals 都匹配:
-        bonus = Target.top1(committed + proposals)
-
-    committed += accepted
-    committed += [correction 或 bonus]
+block[:, :a+1] = anchor + a 个已接受 proposal
 ```
 
-关键点是 `proposals[:i]` 只包含已经通过的前序 proposal。第一个错误 proposal 从未作为后续
-Target 上下文。
-
-## 5. 一轮具体例子：中途猜错
-
-已有前缀：
+因此状态 cursor 增加 `1+a`。本轮输出的 correction/bonus 不在这次提交中；它是下一轮尚未处理的
+anchor：
 
 ```text
-committed = [..., 101]
+Target state/features 已处理：... + anchor + accepted proposals
+已输出但尚未处理：correction/bonus
 ```
 
-Draft 返回：
+这条规则必须同时用于 GDN recurrent、causal-conv、attention KV cursor、position 和 feature
+history。把 correction 提前写入状态，或只推进 `a` 行，都会产生一轮后的错位。
+
+## 5. CPU/CUDA 如何 rollback
+
+`FrameworkDFlashRollbackTarget` 使用一个持久 `DynamicCache`：
+
+1. verify 前记录 full-attention KV 长度；
+2. clone 每个 linear-attention 层的 conv/recurrent state 和初始化标志；
+3. 一次执行完整 T 行 verify；
+4. 得到 `a` 后，用 `DynamicCache.crop()` 恢复 attention KV，并恢复 GDN 快照；
+5. 逐 token 重放 `anchor + accepted proposals`，最多 `K+1` 行，提交精确的普通增量状态；
+6. 丢弃拒绝尾部，绝不重放历史 prefix。
+
+提交阶段选择逐 token 而不是一次短 chunk，是 correctness-first 决定：它让提交后的 GDN 数值路径
+尽量与 ordinary incremental decode 一致。代价是每轮多 `1+a` 个小调用；后续可以在设备证据证明
+短 chunk 与逐 token 状态等价后再优化。
+
+## 6. NPU 如何 rollback
+
+HIAI route 不做 CPU/GPU 式重放：
+
+- `npu_gated_delta_rule_mtp` 为每个 verify row 产生 recurrent state bank；
+- `torch_dflash_causal_conv1d_mtp` 在输入所在 NPU device 上产生 conv state bank；它是 Torch Tensor
+  golden，不是 CPU fallback；
+- 第一次 verify 从 prefill 后的 scalar state 扩成 T 个槽；
+- 下一轮通过 `accepted_tokens=a` 选择上一轮第 a 槽；若下一轮 T 改变，先 select 再 rebase；
+- full-attention K/V 可以物理写入全部 provisional rows，但只推进 logical cursor `1+a`；下一轮从
+  新 cursor 覆写拒绝尾部，并由 mask/length 保证尾部不可见。
+
+注意 modeling 收到的 `accepted_tokens` 是“上一轮已提交槽的 selector”。当前轮的接受长度只有在
+Target logits 返回后才能得到，bridge 把它保存给下一轮使用。
+
+## 7. 两个例子
+
+中途错误：
 
 ```text
-proposals = [202, 999, 888]
+anchor = 101
+proposal = [202, 999, 888]
+Target rows = [202, 303, ... , ...]
+
+a = 1
+状态提交输入 = [101, 202]
+本轮输出 = [202, 303]
+下一轮 anchor = 303
 ```
 
-Scheduler 的调用顺序：
-
-| 步骤 | 传给 Target 的前缀 | Target Top-1 | Draft proposal | 结果 |
-|---|---|---:|---:|---|
-| 验证 0 | `committed` | 202 | 202 | 接受 202 |
-| 验证 1 | `committed + [202]` | 303 | 999 | 首次不匹配，停止 |
-
-本轮提交：
+全部命中：
 
 ```text
-accepted   = [202]
-correction = 303
-emitted    = [202, 303]
+anchor = 101
+proposal = [202, 303, 404]
+Target rows = [202, 303, 404, 505]
+
+a = 3
+状态提交输入 = [101, 202, 303, 404]
+本轮输出 = [202, 303, 404, 505]
+下一轮 anchor = 505
 ```
 
-proposal `999` 被 correction `303` 替换；`888` 不再验证，也不会进入 committed。
+## 8. EOS 与生成上限
 
-## 6. 一轮具体例子：全部猜对
+Draft 若在固定宽度槽中提出 EOS，EOS 后的 proposal 不再验证。提交 accepted token 或
+correction/bonus 时遇到 EOS 立即停止。若 `max_new_tokens` 已用完，已计算的 bonus 不输出；状态
+可以已经处理最后一个 accepted input，但不会把未输出 bonus 当作 committed token。
 
-Draft 返回：
+每轮必须推进至少一个输出 token。空 proposal 会退化成只验证 `[anchor]`，提交 anchor 输入并输出
+Target correction；官方 Draft route 正常返回至少一个 proposal。
 
-```text
-proposals = [202, 303, 404]
-```
+## 9. Ordinary 基线与最终门禁
 
-Target 逐个给出相同结果后，Scheduler 还会调用：
+`ordinary_incremental_greedy()` 使用同一个后端的普通持久缓存：prompt prefill 一次，之后每次只
+输入上一个已生成 token。它不使用 Draft，也不做完整前缀重算。
 
-```text
-Target(committed + [202,303,404]) → bonus 505
-```
-
-本轮提交：
+`assert_exact_greedy_match()` 最终严格比较：
 
 ```text
-[202, 303, 404, 505]
-```
-
-前三个来自 Draft，但都已经被 Target 确认；`505` 直接来自 Target。因此 K 个 proposal 全部命中时，
-一轮最多推进 `K+1` 个 token。
-
-## 7. 如果 Draft 返回空 proposal
-
-Scheduler 会退化成一次普通 Target Top-1：
-
-```text
-Target(committed) → fallback token
-```
-
-每轮必须至少提交一个 token，否则代码会抛出 `a DFlash round made no token-level progress`。
-
-这里的 `fallback_token` 是统计字段的历史名称；在 strict sequential 路线里，它表示 correction、
-all-accepted bonus 或 empty-draft 时的普通 Target token，不表示回退到 CPU 算子。
-
-## 8. EOS 和生成上限
-
-每轮 proposal 数先限制为：
-
-```text
-proposal_limit = min(K, 剩余可生成 token 数)
-```
-
-如果固定宽度 Draft 在某个位置提出 EOS，后面的 proposal 槽位不再参与验证。提交 accepted token
-或 correction/bonus 后，一旦遇到 EOS 就立刻停止。
-
-最终记录两个停止结果：
-
-```text
-reached_eos = true/false
-stop_reason = eos 或 max_new_tokens
-```
-
-它们必须与 ordinary 路线完全一致。
-
-## 9. 为什么正式路线不用一次向量化验证
-
-`vectorized` 诊断模式会把：
-
-```text
-committed + 全部 proposals
-```
-
-一次送进 Target，再读取多行 logits。它调用次数少，但隐含一个假设：长序列某个早期位置的
-logits 与较短前缀最后一行等价。
-
-不同长度可能触发不同 kernel、padding 或数值路径，尤其是设备适配 Target。因此当前正式 V1
-采用 sequential 独立前缀：proposal i 只在 `committed + proposals[:i]` 上验证。
-
-`vectorized` 仍可用于定位 prefix-invariance 差异，但不能代替正式 acceptance 决策。
-
-## 10. 最终零差异怎样检查
-
-`assert_exact_greedy_match()` 比较 ordinary 与 DFlash：
-
-```text
-prompt_token_ids
 generated_token_ids
 reached_eos
 stop_reason
 ```
 
-生成 token 只要有一个不同，就报告第一个 generated offset，以及 ordinary/DFlash 各自的 token。
-这里没有数值容差，也没有“接受率高就允许文本不同”的例外。
+没有浮点容差或文本级宽松比较。任意一个 token ID 不同即失败。旧 full-prefix sequential 实现只
+用于额外 oracle/定位，不参与默认 CPU、CUDA 或 NPU rollback 报告。
 
-## 11. 统计字段怎么读
+## 10. 当前验证覆盖
 
-| 字段 | 含义 |
-|---|---|
-| `draft_calls` | 真正执行了多少个 Draft round |
-| `drafted_tokens` | Draft 一共提出多少 proposal |
-| `accepted_draft_tokens` | 最长连续前缀中被 Target 接受的 proposal 数 |
-| `rejected_draft_tokens` | 没有被提交的 proposal 数 |
-| `target_verify_calls` | proposal/correction/bonus 使用的 Target 验证调用数 |
-| `fallback_tokens` | bootstrap、correction、bonus 或 empty-draft Target token 数 |
-| `acceptance_rate` | `accepted_draft_tokens / drafted_tokens` |
+- `tests/test_dflash_rollback_scheduler.py`：`accepted=0..K`、correction/bonus 和状态提交边界；
+- `tests/test_dflash_framework_rollback.py`：CPU `DynamicCache` KV crop、GDN restore 和有界重放；
+- `tests/test_internal_dflash_bridge_rollback.py`：HIAI bank select/rebase 与逻辑 KV cursor；
+- `tests/test_dflash_rollback_helpers.py`：conv bank 与逐 token reference。
 
-仅看 acceptance rate 不够。更贴近一轮推进效率的是：
-
-```text
-mean_emitted_tokens_per_draft_round
-```
-
-它包含接受的 proposal 和本轮 correction/bonus。
-
-## 12. 正确性与接受率要分开
-
-```text
-最终 token 不一致 → 正确性失败，必须修复
-最终 token 一致但接受率低 → 正确，但可能没有加速收益
-最终 token 一致且接受率高 → 再进入性能测量
-```
-
-接受率低时优先检查 anchor、Target feature、position/mask、Draft 权重和设备数值；不要修改
-sequential verifier 去“多接受”错误 proposal。
-
-下一步阅读：
-
-- [验证流程与报告解读](DFLASH_V1_VALIDATION.md)：当前 V1 怎样证明正确。
-- [完整 DFlash 与提速路线](DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)：后续怎样将逐前缀验证
-  升级为一次 Target 整块验证。
+这些是 CPU/模拟证据。310P 上仍须验证 24 个 GDN 层、多轮、KV block boundary、现有 fused
+attention 的 T=2/5/9/17 能力以及无 fallback/device identity。

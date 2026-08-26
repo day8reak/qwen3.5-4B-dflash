@@ -4,10 +4,14 @@
 [Scheduler 与 token 验证](DFLASH_V1_SCHEDULER.md)和
 [验证流程与报告解读](DFLASH_V1_VALIDATION.md)。
 
-该路线用于在 NVIDIA CUDA GPU 上验证完整 V1 全前缀流程。它使用交付的
+该路线用于在 NVIDIA CUDA GPU 上验证 persistent rollback 流程。它使用交付的
 `modeling_qwen3_5_dflash.py` 目标模型旁路和 `TorchDFlashOps` 草稿原语；草稿 attention 由
 PyTorch CUDA SDPA 执行。它不加载 HIAI receiver、不调用 310P 自定义算子，也不能作为
 Ascend 310P 通过证据。
+
+Target prompt 只 prefill 一次；每轮用一个 T=K+1 block 验证。verify 后 crop attention KV、恢复
+GDN conv/recurrent snapshot，并逐 token 重放最多 `anchor + accepted` 的 K+1 行。历史 prefix
+不会进入正式 verify 或 commit replay。
 
 ## 前提
 
@@ -33,7 +37,7 @@ export PYTHONDONTWRITEBYTECODE=1
 unset PYTHONPYCACHEPREFIX
 export PYTHONPATH="$PWD"
 
-"$MODEL_PYTHON" -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
+"$MODEL_PYTHON" -B -m models.dflash_v1.run_rollback \
   --target-dir "$TARGET_DIR" \
   --draft-dir "$DRAFT_DIR" \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
@@ -44,8 +48,8 @@ export PYTHONPATH="$PWD"
   --eos-token-id 248044 \
   --dtype float16 \
   --device cuda:0 \
-  --report "$RUN_DIR/dflash-v1-gpu-smoke.json" \
-  2>&1 | tee "$RUN_DIR/dflash-v1-gpu-smoke.log"
+  --report "$RUN_DIR/dflash-rollback-gpu-smoke.json" \
+  2>&1 | tee "$RUN_DIR/dflash-rollback-gpu-smoke.log"
 ```
 
 GPU 路线不要传 `--target-loader`、`--hiai-source`、`--target-factory`、`--reset-hook`、
@@ -60,39 +64,41 @@ draft backend 报告为 `torch_cuda`。CUDA 不可用时会在 1.27 GB 草稿权
 至少检查：
 
 ```bash
-python - "$RUN_DIR/dflash-v1-gpu-smoke.json" <<'PY'
+python - "$RUN_DIR/dflash-rollback-gpu-smoke.json" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     report = json.load(stream)
 
-assert report["classification"] == "CUDA/framework full-prefix validation"
+assert report["route"] == "qwen3.5-dflash-incremental-rollback"
+assert report["classification"] == "CUDA/framework rollback validation"
 assert report["runtime_identity"]["device_type"] == "cuda"
 assert report["device"].startswith("cuda")
 assert report["dtype"] == "torch.float16"
 assert report["ops_backend"] == "torch_cuda"
 assert report["operator_fallback_enabled"] is False
 assert report["strict_greedy_exact_match"] is True
-assert report["verification_mode"] == "sequential_isolated_prefix"
-assert report["feature_capture_zero_impact"] is True
-assert report["bounded_full_prefix_repeatability"] is True
+assert report["verification_mode"] == "incremental_transactional_rollback"
+assert report["historical_prefix_replay_during_verify"] is False
 assert report["ordinary"]["generated_token_ids"] == report["dflash"]["generated_token_ids"]
 assert report["ordinary"]["reached_eos"] == report["dflash"]["reached_eos"]
 assert report["ordinary"]["stop_reason"] == report["dflash"]["stop_reason"]
 assert report["dflash_execution_gate"]["status"] == "PASS"
 assert report["dflash_execution_gate"]["draft_round_executed"] is True
-assert report["dflash_execution_gate"]["draft_calls"] > 0
-assert report["dflash_execution_gate"]["target_feature_calls"] > 0
 assert report["dflash_execution_gate"]["target_verify_calls"] > 0
-print("DFLASH_V1_CUDA_FRAMEWORK_REPORT_GATE_PASS")
+audit = report["target_rollback_audit"]
+assert audit["historical_prefix_replay_during_verify"] is False
+assert audit["pending_transaction"] is False
+assert audit["rollback_commit_transactions"] > 0
+assert audit["rollback_commit_replay_calls"] > 0
+print("DFLASH_ROLLBACK_CUDA_FRAMEWORK_REPORT_GATE_PASS")
 PY
 ```
 
-GPU 报告验证的是 HF/PyTorch V1 流程、特征旁路和严格 greedy token 等价。`v1-r1` 默认对每个
-proposal 单独执行完整前缀 target 校验；这条 correctness 路线不把“同一个更长 target 输入中
-较早 logit 行不变”当作前提。它不证明 HIAI
-直接源码集成、receiver 状态隔离、310P 自定义算子、310P 无 fallback 或性能收益。
+GPU 报告验证的是 HF/PyTorch rollback、持久 cache 和严格 greedy token 等价。整块 verify
+依赖因果 Target 的早期行不读取右侧 proposal；最终 ordinary/DFlash 零 token mismatch 是硬门禁。
+该报告不证明 HIAI 直接源码集成、310P 自定义算子、310P 无 fallback 或性能收益。
 
 ## CUDA 环境快速检查
 
@@ -158,7 +164,8 @@ late 三段均值。
   --report "$RUN_DIR/gpu-bfloat16-vs-float16.json"
 ```
 
-此前 BF16 在生成中途出现 ordinary/DFlash token mismatch 时，应先看报告里的
+下面的 `diagnose_acceptance.py` 仍包含 full-prefix/sequential oracle。BF16 在生成中途出现
+ordinary/DFlash token mismatch 时，应先看诊断报告里的
 `vectorized_prefix_invariance`：若它失败而 sequential 决策正常，问题是整块 target 验证对
 序列长度/kernel 选择过敏，不是 BF16 draft 本身。跨 dtype 时浮点 tensor 的原始 SHA 必然
 不同，因此工具只比较 prefix、position、proposal、

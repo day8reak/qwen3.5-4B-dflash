@@ -1,9 +1,8 @@
-"""Simple NPU entry point for the embedded HIAI layout.
+"""Simple NPU entry point for the embedded HIAI rollback layout.
 
 This command derives the HIAI source and DFlash loader from the colocated
 ``models`` package.  It intentionally exposes only the controls needed for a
-V1 strict-greedy smoke or validation run.  The colocated source tree is
-validated directly; no generated overlay report is needed.
+strict-greedy persistent rollback smoke or validation run.
 """
 
 from __future__ import annotations
@@ -13,22 +12,24 @@ import os
 from pathlib import Path
 from typing import Sequence
 
-from .dflash_qwen_adapter_v1 import main as _adapter_main
+from .run_rollback import (
+    DEFAULT_NPU_TARGET_FACTORY,
+    main as _adapter_main,
+)
 from .internal_target_loader import (
     DECODE_CHUNK_SIZE_ENV,
     PREFILL_CHUNK_SIZE_ENV,
 )
 
 
-DEFAULT_TARGET_FACTORY = "models.internal_dflash_bridge:load_qwen35_target"
+DEFAULT_TARGET_FACTORY = DEFAULT_NPU_TARGET_FACTORY
 KV_CACHE_MAX_LEN_ENV = "DFLASH_HIAI_KV_CACHE_MAX_LEN"
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run Qwen3.5-4B DFlash V1 with the original HIAI model in "
-            "models/ and DFlash in models/dflash_v1/"
+            "Run Qwen3.5-4B DFlash with persistent HIAI state-bank rollback"
         )
     )
     parser.add_argument("--target-dir", required=True)
@@ -37,16 +38,15 @@ def _parser() -> argparse.ArgumentParser:
         "--target-factory",
         default=DEFAULT_TARGET_FACTORY,
         help=(
-            "advanced override; default models.internal_dflash_bridge:"
-            "load_qwen35_target reuses Qwen3_5ForCausalLMWrapper and builds "
-            "fresh hybrid state for every target call"
+            "advanced override; the default loads the separate rollback "
+            "modeling through the deployed wrapper adapter"
         ),
     )
     parser.add_argument(
         "--reset-hook",
         help=(
-            "advanced override for a custom target factory; the packaged "
-            "internal_dflash_bridge does not need a reset hook"
+            "unsupported compatibility option; rollback owns state through "
+            "begin/verify/commit/abort"
         ),
     )
     prompt = parser.add_mutually_exclusive_group(required=True)
@@ -75,8 +75,18 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="same kv_cache_max_len used by the existing HIAI inference YAML",
     )
-    parser.add_argument("--prefill-chunk-size", type=int, default=64)
-    parser.add_argument("--decode-chunk-size", type=int, default=1)
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        default=64,
+        help="compatibility setting; the current receiver contract requires 64",
+    )
+    parser.add_argument(
+        "--decode-chunk-size",
+        type=int,
+        default=1,
+        help="compatibility setting; prompt bootstrap/decode require 1",
+    )
     parser.add_argument("--report")
     parser.add_argument(
         "--progress",
@@ -90,6 +100,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if not str(args.device).startswith("npu"):
         raise ValueError("run_npu requires --device npu or npu:N")
+    if args.reset_hook is not None:
+        raise ValueError("--reset-hook is not part of the rollback transaction")
     if args.max_new_tokens < 2:
         raise ValueError("NPU DFlash smoke requires --max-new-tokens >= 2")
     if not 1 <= args.max_draft_tokens <= 16:
@@ -101,12 +113,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         if value <= 0:
             raise ValueError(f"{name} must be positive")
+    if args.prefill_chunk_size != 64 or args.decode_chunk_size != 1:
+        raise ValueError(
+            "rollback HIAI requires prefill-chunk-size=64 and "
+            "decode-chunk-size=1"
+        )
 
     package_dir = Path(__file__).resolve().parent
-    hiai_source = package_dir.parent / "modeling_qwen3_5_hiai_nd.py"
+    hiai_source = (
+        package_dir.parent / "modeling_qwen3_5_hiai_nd_dflash_rollback.py"
+    )
     if hiai_source.is_symlink() or not hiai_source.is_file():
         raise FileNotFoundError(
-            "expected original HIAI source at models/modeling_qwen3_5_hiai_nd.py"
+            "expected rollback HIAI source at "
+            "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py"
         )
     os.environ[PREFILL_CHUNK_SIZE_ENV] = str(args.prefill_chunk_size)
     os.environ[DECODE_CHUNK_SIZE_ENV] = str(args.decode_chunk_size)
@@ -132,8 +152,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--max-draft-tokens",
         str(args.max_draft_tokens),
     ]
-    if args.reset_hook is not None:
-        adapter_args.extend(["--reset-hook", args.reset_hook])
     if args.prompt_ids is not None:
         adapter_args.extend(["--prompt-ids", args.prompt_ids])
     elif args.prompt_json is not None:

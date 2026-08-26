@@ -1,215 +1,120 @@
-# DFlash V1：Target 与 Feature 详细实现
+# DFlash rollback：Target、Feature 与状态所有权
 
-本文只讲完整 Qwen3.5-4B Target：它为什么是权威答案、为了 DFlash 增加了什么、NPU 为什么还
-需要 Bridge，以及相关门禁怎样发现状态污染。
+## 1. Target 的职责
 
-先读整体关系：[DFlash V1 整体架构](DFLASH_V1_ARCHITECTURE.md)。
+Target 同时提供：
 
-## 1. Target 的两个职责
+1. ordinary incremental 的权威 logits；
+2. DFlash T=K+1 verify 的每行 logits；
+3. 八个 decoder 层输出拼接成的 Draft feature；
+4. 与 verify 配套的 KV/GDN provisional state transaction。
 
-在 DFlash V1 中，Target 同时负责：
-
-1. 对任意完整前缀返回每一行 logits，Scheduler 用它验证 proposal。
-2. 在显式打开 feature 时，返回 8 个 decoder layer 的 hidden states 拼接结果。
-
-公共 Adapter 看到的接口可以简化为：
-
-```text
-features=False:
-input_ids [1,S] → logits [1,S,248320]
-
-features=True:
-input_ids [1,S] → logits + dflash_features [1,S,20480]
-```
-
-Target 不负责接受 proposal，也不运行 6 层 Draft。接受规则属于 Scheduler。
+接受规则仍在 Scheduler：Target 不直接决定哪些 proposal 输出。
 
 ## 2. CPU/CUDA Target
 
-CPU 和 CUDA 使用：
+`models/dflash_v1/modeling_qwen3_5_dflash.py` 在 Transformers Qwen3.5 text decoder 上增加 opt-in
+feature collector。`FrameworkDFlashRollbackTarget` 持有一个 `DynamicCache`：
 
-```text
-models/dflash_v1/modeling_qwen3_5_dflash.py
-```
+- ordinary：prompt prefill 一次，之后单 token advance；
+- rollback verify：保存 round-start KV/GDN，执行 T 行；
+- commit：恢复 round-start，逐 token 重放 `anchor + accepted`；
+- abort：恢复后销毁 transaction，禁止继续使用半提交状态。
 
-它保持 Transformers Qwen3.5 的 text decoder 数学，只在 decoder loop 增加可选 collector。
-同一份 Python 模型放到 CPU 或 CUDA，PyTorch 根据 Tensor device 选择设备 kernel。
+`DynamicCache.crop()` 只处理 attention KV，因此 conv/recurrent tensor、初始化标志和
+`has_previous_state` 必须另行 snapshot/restore。恢复 inference tensor 时也必须处于
+`torch.inference_mode()`。
 
-普通路径默认关闭 feature，所以普通 Target 返回结构和数学不应改变。
+## 3. HIAI/NPU Target
 
-## 3. NPU Target
-
-NPU 使用：
+普通文件保持：
 
 ```text
 models/modeling_qwen3_5_hiai_nd.py
 ```
 
-这份 Target 自己显式调用 HIAI/NPU attention、GDN、CacheUpdate 等路径。DFlash 没有把
-CPU Target 动态搬到 NPU，也没有在运行时 patch 它。
-
-DFlash 只增加 opt-in feature 输出：
+rollback 独立文件是：
 
 ```text
-output_dflash_features=False → 保持普通 logits Tensor
-output_dflash_features=True  → (logits, dflash_features)
+models/modeling_qwen3_5_hiai_nd_dflash_rollback.py
 ```
 
-因此 Target-only inference 仍可关闭 feature，完全不进入 Draft 或 Scheduler。
-
-## 4. Feature 捕获位置
-
-固定层号为：
+`accepted_tokens=None` 时仍走普通单 token/chunk GDN。传 `accepted_tokens: INT8[B]` 时，输入必须
+为 `[anchor, proposals...]`，T<=17，并进入：
 
 ```text
-1, 5, 9, 13, 17, 21, 25, 29
+GDN recurrent bank → npu_gated_delta_rule_mtp
+GDN conv bank      → torch_dflash_causal_conv1d_mtp
+full-attention KV  → provisional paged-cache rows
 ```
 
-它们从 0 开始计数。每层捕获点是 decoder layer 已经完成 residual/MLP 之后、最终模型 norm
-之前：
+Bridge 持有跨轮 state。prompt 为避免 64-row padding 污染状态，逐 token bootstrap；verify
+从 logical cursor 开始构造 position、cache position、mask 和 `allQLen`。
 
-```python
-for layer_id, decoder_layer in enumerate(layers):
-    hidden_states = decoder_layer(...)
-    collector.capture(layer_id, hidden_states)
+## 4. Feature 捕获合同
 
-hidden_states = final_norm(hidden_states)
-```
-
-每层 hidden shape 是 `[B,S,2560]`。collector 按固定层号顺序写入预分配 buffer：
+固定层号：
 
 ```text
-8 × 2560 = 20480
-最终 feature = [B,S,20480]
+1, 5, 9, 13, 17, 21, 25, 29（0-based）
 ```
 
-实现位于 `models/dflash_v1/dflash_target_features.py`。它会检查：
-
-- 8 层全部出现且没有重复；
-- batch 和 sequence length 一致；
-- dtype 和 device 一致；
-- hidden width 恰好为 2560；
-- 输出拼接顺序与 checkpoint 合同一致。
-
-默认使用 `detach + clone`，避免后续原地操作覆盖已经捕获的层输出。
-
-## 5. Adapter 为什么要求完整 logits
-
-`Qwen35DFlashFullPrefixAdapter.forward_logits()` 调用 Target 时设置：
+捕获点是每层 decoder 输出后、final norm 前：
 
 ```text
-use_cache=False
-output_dflash_features=False
-logits_to_keep=0
+8 × [B,S,2560] → [B,S,20480]
 ```
 
-`logits_to_keep=0` 表示验证需要 `[1,S,vocab]` 全部行，而不是只保留最后一行。Scheduler 在
-sequential 模式主要读取最后一行，但完整 shape 合同能阻止 Target loader 静默改变公共 ABI。
+collector 检查层数、顺序、batch/sequence、dtype/device 和 hidden width，并 detach+clone，防止
+后续原地计算覆盖 feature。
 
-`_replay_target_features()` 则打开 feature，并只要求一个 LM-head row，因为 Draft 真正需要的是
-全部 decoder feature，而不是全部 vocab logits。
+## 5. Feature 生命周期
 
-## 6. 为什么 NPU 需要 Bridge
-
-公共 Scheduler 只传 `input_ids`，但 NPU Target 还需要：
-
-- linear-attention 的 `conv_state + recurrent_state`；
-- full-attention 的 block-table K/V cache；
-- attention mask、position IDs、cache positions 和逻辑长度；
-- prefill/decode chunk 语义。
-
-`models/internal_dflash_bridge.py` 每次 Target 调用都会：
-
-1. 根据 `layer_types` 创建全新的 32 层 hybrid state。
-2. 为 linear-attention 层创建新的 conv/recurrent state。
-3. 为 full-attention 层创建新的 block-table K/V。
-4. 重建与 `kv_cache_max_len` 一致的 block table。
-5. 构造 mask、position 和 cache position。
-6. 执行一次 fresh full-prefix prefill。
-7. 截取真实逻辑长度的 logits/features。
-8. 等 NPU 异步执行完成后再释放本次 state。
-
-V1 不把这些状态交给 Scheduler，也不跨 Target 调用复用它们。
-
-## 7. 为什么 NPU 前缀会补到 64
-
-当前 Target GDN 多 token 路径使用 `chunk_size=64`：
+Bootstrap 后 feature history 覆盖 prompt，而 anchor 尚未作为 Target 输入。每轮 verify 得到 T 行
+feature；接受 a 个 proposal 后只追加：
 
 ```text
-S = 1 → 物理长度 1
-S > 1 → 物理长度 ceil(S/64) × 64
+verify_features[:, :a+1]
 ```
 
-例如逻辑前缀长度 17，Bridge 会右补齐到 64 行执行，但：
-
-- `allQLen` 仍是 17；
-- 返回结果只保留前 17 行；
-- padding token 不会进入 committed prefix；
-- Scheduler 仍认为序列长度是 17。
-
-补齐是 Target 物理执行细节，不改变 DFlash token 语义。
-
-## 8. Feature 零影响门禁
-
-`validate_feature_capture_zero_impact()` 对同一前缀运行两次：
+也就是 anchor 和 a 个 accepted proposal。Correction/bonus 是下一轮 anchor，不在本轮追加。
+因此进入下一次 Draft 前始终满足：
 
 ```text
-A: features=False → clone logits_A
-B: features=True  → clone logits_B + 检查 feature shape
+feature_history_length == committed_token_length - 1
 ```
 
-然后比较：
+## 6. Full-attention KV
 
-- logits device/dtype 相同；
-- 每个位置 Top-1 相同；
-- 浮点差异不超过该 dtype 的有界容差；
-- feature shape 恰好是 `[1,S,20480]`。
+CPU/CUDA 将 speculative KV append 到 `DynamicCache`，之后 crop 回 round start，再 replay accepted
+输入。NPU 可以保留物理 provisional K/V：commit 只推进 logical cursor `1+a`，mask 和有效长度
+不得读取拒绝尾部，下一轮从新 cursor 覆写。
 
-先 clone A 再运行 B 很重要：某些运行时会复用输出 buffer，如果不立即 clone，B 可能覆盖 A，
-导致错误地“自己和自己相等”。
+必须验证 cursor 位于 62/63/64/65 时的 block crossing。当前 NPU correctness fallback 对每个
+verify row 分别调用已有 `npu_cache_update_`，性能版是否需要 `CacheUpdateMTP` 由真机能力和
+profiling 决定。
 
-报告字段：
+## 7. GDN state
+
+CPU/CUDA snapshot scalar conv/recurrent state，commit 使用普通单 token 路径重建。NPU 为每个
+linear-attention 层保存：
 
 ```text
-feature_capture_zero_impact = true
-feature_capture_audit.status = PASS_BOUNDED_ZERO_IMPACT
+conv_state_bank      [B,T,8192,4]       FP16
+recurrent_state_bank [B,T,32,128,128]   FP32
 ```
 
-## 9. 状态隔离门禁
+bank slot i 表示执行 verify input rows `0..i` 后的状态。当前轮接受 a 个 proposal时，第 a 槽就是
+`anchor + a proposals` 后的已提交状态；下一轮用 accepted selector a。
 
-`validate_full_prefix_state_isolation()` 不仅运行一次 `P→Q→P`，还先做立即重复对照：
+## 8. 正确性门禁
 
-```text
-ordinary 模式：P → P → Q → P
-feature 模式： P → P → Q → P
-```
+- ordinary incremental 与 rollback 最终 token/EOS/stop 零差异；
+- feature-enabled verify 的 Target Top-1 不得偏离 ordinary 权威流；
+- accepted `0/1/K-1/K` 后再跑下一 token，与普通增量状态对比；
+- correction/bonus 不得提前进入 cache 或 feature；
+- 任一层失败不得留下可继续使用的部分 state；
+- NPU 必须记录真实 device/runtime/operator identity 并禁用 CPU fallback。
 
-其中 Q 与 P 长度不同。检查内容包括：
-
-- 立即 `P→P` 是否稳定；
-- 经过 Q 后，P 的 logits Top-1 和数值是否仍稳定；
-- feature 模式的 logits 是否稳定；
-- P 的完整 feature 是否稳定。
-
-立即 `P→P` 是设备本身重复性基线，`P→Q→P` 才用于发现跨调用 KV/GDN 残留。
-
-报告状态是：
-
-```text
-full_prefix_repeatability_audit.status = PASS_BOUNDED_P_Q_P
-```
-
-它是有界行为检查，不等于逐个内部 state 的设备 trace；报告会把后者保留为 `PENDING`。
-
-## 10. 常见问题怎么定位
-
-| 现象 | 优先检查 |
-|---|---|
-| feature shape 不对 | 捕获层号、捕获点、拼接顺序、hidden size |
-| feature 开关后 logits 变化 | collector 是否原地修改 hidden、输出 buffer 是否复用、分支是否改变 Target forward |
-| 立即 P→P 都不稳定 | 设备算子确定性、异步同步、未初始化内存 |
-| P→P 稳定但 P→Q→P 失败 | KV/GDN state 没有重建或清理、call-local tensor 生命周期 |
-| CPU/GPU 正常但 NPU feature 不同 | NPU Target 实现、padding/chunk、位置/mask 或自定义算子数值 |
-| ordinary 文本正常但接受率低 | 先确认 feature 与 Draft 输入；不要先改 verifier |
-
-下一步阅读：[Draft 模型](DFLASH_V1_DRAFT.md)。
+自动化测试覆盖 framework restore 和 bridge state machine，但当前没有 310P 全模型证据。剩余
+算子 ABI 见[rollback 算子分析](DFLASH_ROLLBACK_OPERATOR_ANALYSIS.md)。

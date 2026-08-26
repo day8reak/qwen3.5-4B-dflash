@@ -1,12 +1,10 @@
-"""Bridge a Qwen3.5 HIAI wrapper to DFlash V1.
+"""Bridge a Qwen3.5 HIAI wrapper to DFlash full-prefix and rollback routes.
 
-The HIAI target owns model loading and its custom
-operators.  DFlash V1, however, asks the target to evaluate a complete prefix
-on every call and does not carry target cache state across calls.  This module
-adapts those two interfaces without replacing attention, GDN, CacheUpdate, or
-any other target operator.
+The HIAI target owns model loading and its custom operators.  This module
+keeps the old complete-prefix adapter as an oracle and adds a persistent
+rollback transaction for the separate state-bank modeling.
 
-Each call builds a fresh hybrid cache from the model configuration:
+The legacy full-prefix route builds a fresh hybrid cache per call:
 
 * linear-attention layers receive ``(conv_state, recurrent_state)``;
 * full-attention layers receive block-table ``(key_cache, value_cache)``;
@@ -15,15 +13,21 @@ Each call builds a fresh hybrid cache from the model configuration:
   to the real token rows;
 * only ``logits`` and optional ``dflash_features`` cross back to DFlash.
 
-The explicit chunk alignment is important for the target GDN kernel: its
+The rollback route instead bootstraps the prompt one token at a time, keeps
+hybrid state across rounds, executes one ``K + 1`` verification block, selects
+GDN state-bank slots, and commits full-attention KV through a logical cursor.
+Its causal-conv bank is currently a Tensor golden on the input device.
+
+The legacy chunk alignment is important for the target GDN kernel: its
 multi-token path uses ``chunk_size=64``.  It is also important that the device
 is synchronized before the call-local KV/GDN tensors leave scope; otherwise an
 asynchronous custom operator may still be consuming storage which the caching
 allocator is free to reuse for the next full-prefix call.
 
-The public factory is :func:`load_qwen35_target`.  It is consumed by
-``models.dflash_v1.internal_target_loader`` and needs no hand-written reset
-hook.
+The legacy public factory :func:`load_qwen35_target` preserves the V1
+full-prefix oracle.  :func:`load_qwen35_rollback_target` binds the separate
+rollback modeling/wrapper and exposes a persistent transaction used by the
+incremental CPU/CUDA/NPU scheduler.
 """
 
 from __future__ import annotations
@@ -43,8 +47,12 @@ FEATURE_WIDTH = 20_480
 VOCAB_SIZE = 248_320
 
 _FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
+_ROLLBACK_FEATURE_SOURCE = (
+    "package_local:modeling_qwen3_5_hiai_nd_dflash_rollback.py"
+)
 _CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 _FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
+_ROLLBACK_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-rollback-v1"
 
 
 def _positive_int(value: object, *, name: str) -> int:
@@ -68,6 +76,50 @@ def _round_up_prefill_length(sequence_length: int) -> int:
         # a single-token request.
         return 1
     return ((length + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+
+
+def _select_state_bank_slot(state_bank: Tensor, accepted: Tensor) -> Tensor:
+    if state_bank.ndim < 3:
+        raise ValueError("rollback state bank must have rank at least 3")
+    if accepted.dtype != torch.int8 or tuple(accepted.shape) != (
+        state_bank.shape[0],
+    ):
+        raise ValueError("accepted selector must use int8 shape [B]")
+    index_shape = (state_bank.shape[0], 1, *((1,) * (state_bank.ndim - 2)))
+    index = accepted.to(torch.long).view(index_shape)
+    index = index.expand(state_bank.shape[0], 1, *state_bank.shape[2:])
+    return torch.gather(state_bank, 1, index).squeeze(1)
+
+
+def _seed_gdn_banks(
+    conv_state: Tensor,
+    recurrent_state: Tensor,
+    verify_tokens: int,
+) -> tuple[Tensor, Tensor]:
+    if conv_state.ndim != 3 or recurrent_state.ndim != 4:
+        raise ValueError("scalar GDN state must use conv rank 3/recurrent rank 4")
+    conv_bank = conv_state.unsqueeze(1).expand(
+        conv_state.shape[0], verify_tokens, *conv_state.shape[1:]
+    ).clone()
+    recurrent_bank = recurrent_state.to(torch.float32).unsqueeze(1).expand(
+        recurrent_state.shape[0], verify_tokens, *recurrent_state.shape[1:]
+    ).clone()
+    return conv_bank, recurrent_bank
+
+
+def _rebase_gdn_banks(
+    conv_bank: Tensor,
+    recurrent_bank: Tensor,
+    accepted: Tensor,
+    verify_tokens: int,
+) -> tuple[Tensor, Tensor]:
+    if conv_bank.ndim != 4 or recurrent_bank.ndim != 5:
+        raise ValueError("banked GDN state must use conv rank 4/recurrent rank 5")
+    return _seed_gdn_banks(
+        _select_state_bank_slot(conv_bank, accepted),
+        _select_state_bank_slot(recurrent_bank, accepted),
+        verify_tokens,
+    )
 
 
 def _tensor_field(output: object, name: str) -> Tensor | None:
@@ -121,7 +173,7 @@ def _unwrap_logits_and_features(
 
 
 class InternalDFlashTarget(nn.Module):
-    """Stateless DFlash-facing facade over the receiver's loaded HIAI model."""
+    """Full-prefix oracle plus opt-in persistent HIAI rollback facade."""
 
     dflash_feature_source = _FEATURE_SOURCE
     dflash_feature_capture_point = _CAPTURE_POINT
@@ -143,6 +195,7 @@ class InternalDFlashTarget(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         kv_cache_max_len: int,
+        rollback_enabled: bool = False,
     ) -> None:
         super().__init__()
         if not isinstance(model_wrapper, nn.Module):
@@ -157,6 +210,14 @@ class InternalDFlashTarget(nn.Module):
         self.model_wrapper = model_wrapper
         self.requested_device = torch.device(device)
         self.requested_dtype = dtype
+        self.rollback_enabled = bool(rollback_enabled)
+        if self.rollback_enabled:
+            self.dflash_feature_source = _ROLLBACK_FEATURE_SOURCE
+            self.dflash_full_prefix_execution_mode = "persistent_incremental_rollback"
+            self.dflash_rollback_contract_id = _ROLLBACK_CONTRACT_ID
+            self.dflash_rollback_mode = (
+                "gdr-mtp-state-bank-torch-conv-bank-logical-paged-kv"
+            )
         self.kv_cache_max_len = _positive_int(
             kv_cache_max_len,
             name="kv_cache_max_len",
@@ -175,6 +236,19 @@ class InternalDFlashTarget(nn.Module):
         self._total_padding_tokens = 0
         self._last_requested_sequence_length: int | None = None
         self._last_execution_sequence_length: int | None = None
+        self._persistent_state: list[tuple[Tensor, Tensor]] | None = None
+        self._persistent_cursor = 0
+        self._persistent_mode: str | None = None
+        self._previous_accepted = 0
+        self._pending_verify_rows: int | None = None
+        self._pending_verify_output: Mapping[str, Tensor] | None = None
+        self._rollback_invalid = False
+        self._ordinary_prefill_token_calls = 0
+        self._ordinary_decode_calls = 0
+        self._rollback_prefill_token_calls = 0
+        self._rollback_verify_calls = 0
+        self._rollback_commit_calls = 0
+        self._rollback_aborts = 0
 
     @property
     def dflash_full_prefix_bridge_audit(self) -> Mapping[str, object]:
@@ -190,6 +264,29 @@ class InternalDFlashTarget(nn.Module):
             "total_padding_tokens": self._total_padding_tokens,
             "last_requested_sequence_length": self._last_requested_sequence_length,
             "last_execution_sequence_length": self._last_execution_sequence_length,
+        }
+
+    @property
+    def dflash_rollback_audit(self) -> Mapping[str, object]:
+        return {
+            "contract_id": getattr(self, "dflash_rollback_contract_id", None),
+            "mode": getattr(self, "dflash_rollback_mode", None),
+            "enabled": self.rollback_enabled,
+            "historical_prefix_replay_during_verify": False,
+            "conv_bank_backend": "torch_tensor_golden_on_input_device",
+            "gdr_backend": "npu_gated_delta_rule_mtp",
+            "kv_policy": "physical_provisional_writes_logical_cursor_commit",
+            "persistent_mode": self._persistent_mode,
+            "persistent_cursor": self._persistent_cursor,
+            "previous_accepted": self._previous_accepted,
+            "pending_verify_rows": self._pending_verify_rows,
+            "session_invalid": self._rollback_invalid,
+            "ordinary_prefill_token_calls": self._ordinary_prefill_token_calls,
+            "ordinary_decode_calls": self._ordinary_decode_calls,
+            "rollback_prefill_token_calls": self._rollback_prefill_token_calls,
+            "rollback_verify_calls": self._rollback_verify_calls,
+            "rollback_commit_calls": self._rollback_commit_calls,
+            "rollback_aborts": self._rollback_aborts,
         }
 
     @property
@@ -436,6 +533,308 @@ class InternalDFlashTarget(nn.Module):
                 )
         return result
 
+    def _incremental_attention_mask(
+        self,
+        *,
+        start_position: int,
+        sequence_length: int,
+    ) -> Tensor:
+        positions = start_position + torch.arange(
+            sequence_length,
+            device=self.requested_device,
+        )
+        columns = torch.arange(
+            self.kv_cache_max_len,
+            device=self.requested_device,
+        )
+        visible = columns.view(1, -1) <= positions.view(-1, 1)
+        zero = torch.zeros((), device=self.requested_device, dtype=torch.float32)
+        negative_infinity = torch.full(
+            (),
+            float("-inf"),
+            device=self.requested_device,
+            dtype=torch.float32,
+        )
+        return torch.where(visible, zero, negative_infinity).unsqueeze(0).unsqueeze(0)
+
+    def _reset_persistent_session(self, mode: str) -> None:
+        if mode not in {"ordinary", "rollback"}:
+            raise ValueError("persistent mode must be ordinary or rollback")
+        self._persistent_state = self._fresh_hybrid_cache(batch_size=1)
+        self._persistent_cursor = 0
+        self._persistent_mode = mode
+        self._previous_accepted = 0
+        self._pending_verify_rows = None
+        self._pending_verify_output = None
+        self._rollback_invalid = False
+
+    def _execute_incremental_rows(
+        self,
+        input_ids: Tensor,
+        *,
+        start_position: int,
+        output_dflash_features: bool,
+        accepted_tokens: Tensor | None,
+    ) -> Mapping[str, Tensor]:
+        if not self.rollback_enabled:
+            raise RuntimeError(
+                "persistent execution requires load_qwen35_rollback_target()"
+            )
+        state = self._persistent_state
+        if state is None:
+            raise RuntimeError("persistent HIAI state has not been initialized")
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("persistent HIAI input_ids must have shape [1,T]")
+        if input_ids.dtype != torch.long:
+            raise TypeError("persistent HIAI input_ids must use torch.long")
+        if input_ids.device != self.requested_device:
+            raise ValueError(
+                "persistent HIAI input_ids must stay on the requested device"
+            )
+        sequence_length = int(input_ids.shape[1])
+        if sequence_length <= 0:
+            raise ValueError("persistent HIAI execution requires at least one row")
+        logical_end = start_position + sequence_length
+        if start_position < 0 or logical_end > self.kv_cache_max_len:
+            raise ValueError("persistent HIAI rows exceed kv_cache_max_len")
+
+        embeddings = self.get_input_embeddings()
+        inputs_embeds = embeddings(
+            input_ids.to(embeddings.weight.device)
+        ).to(self.requested_device)
+        if inputs_embeds.dtype != self.requested_dtype:
+            raise ValueError("persistent input embeddings use the wrong dtype")
+        positions = torch.arange(
+            start_position,
+            logical_end,
+            device=self.requested_device,
+            dtype=torch.long,
+        )
+        try:
+            with torch.inference_mode():
+                raw_output = self.dflash_execution_model(
+                    input_ids=input_ids,
+                    attention_mask=self._incremental_attention_mask(
+                        start_position=start_position,
+                        sequence_length=sequence_length,
+                    ),
+                    position_ids=positions.unsqueeze(0),
+                    past_key_values=state,
+                    new_kv_cache_pos=positions,
+                    use_cache=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    inputs_embeds=inputs_embeds,
+                    embed_scale=None,
+                    output_pos=None,
+                    allQLen=[logical_end],
+                    output_dflash_features=bool(output_dflash_features),
+                    accepted_tokens=accepted_tokens,
+                )
+            logits, features = _unwrap_logits_and_features(
+                raw_output,
+                feature_enabled=bool(output_dflash_features),
+            )
+            expected_logits = (1, sequence_length, VOCAB_SIZE)
+            if tuple(logits.shape) != expected_logits:
+                raise ValueError(
+                    f"persistent HIAI logits must have shape {expected_logits}"
+                )
+            result: dict[str, Tensor] = {"logits": logits}
+            if output_dflash_features:
+                assert features is not None
+                expected_features = (1, sequence_length, FEATURE_WIDTH)
+                if tuple(features.shape) != expected_features:
+                    raise ValueError(
+                        "persistent HIAI features must have shape "
+                        f"{expected_features}"
+                    )
+                result["dflash_features"] = features
+            self._synchronize_call_local_state()
+            return result
+        except Exception:
+            if accepted_tokens is not None:
+                self._rollback_invalid = True
+            raise
+
+    def _prepare_rollback_state(self, verify_tokens: int) -> Tensor:
+        if not self.rollback_enabled:
+            raise RuntimeError("this HIAI bridge was not loaded in rollback mode")
+        if not 1 <= verify_tokens <= 17:
+            raise ValueError("rollback verify block must contain 1..17 rows")
+        state = self._persistent_state
+        if state is None:
+            raise RuntimeError("rollback state has not been initialized")
+        layer_types = tuple(getattr(self.config, "layer_types", ()))
+        linear_indices = [
+            index for index, value in enumerate(layer_types)
+            if value == "linear_attention"
+        ]
+        if not linear_indices:
+            raise RuntimeError("rollback target has no linear-attention layers")
+        ranks = {
+            (state[index][0].ndim, state[index][1].ndim)
+            for index in linear_indices
+        }
+        if len(ranks) != 1:
+            raise RuntimeError("GDN layers disagree on scalar versus banked state")
+
+        selector_value = self._previous_accepted
+        updated = list(state)
+        rank = next(iter(ranks))
+        if rank == (3, 4):
+            for index in linear_indices:
+                updated[index] = _seed_gdn_banks(
+                    state[index][0],
+                    state[index][1],
+                    verify_tokens,
+                )
+            selector_value = 0
+        elif rank == (4, 5):
+            previous_slots = {int(state[index][0].shape[1]) for index in linear_indices}
+            if len(previous_slots) != 1:
+                raise RuntimeError("GDN layers disagree on state-bank slot count")
+            old_slots = next(iter(previous_slots))
+            if not 0 <= selector_value < old_slots:
+                raise RuntimeError("previous accepted selector is outside the state bank")
+            if old_slots != verify_tokens:
+                accepted = torch.tensor(
+                    [selector_value],
+                    dtype=torch.int8,
+                    device=self.requested_device,
+                )
+                for index in linear_indices:
+                    updated[index] = _rebase_gdn_banks(
+                        state[index][0],
+                        state[index][1],
+                        accepted,
+                        verify_tokens,
+                    )
+                selector_value = 0
+        else:
+            raise ValueError("rollback GDN state must be scalar or banked")
+
+        self._persistent_state = updated
+        return torch.tensor(
+            [selector_value],
+            dtype=torch.int8,
+            device=self.requested_device,
+        )
+
+    def begin_ordinary(self, prompt_ids: Tensor) -> Mapping[str, Tensor]:
+        """Prefill once with the receiver's single-token incremental path."""
+
+        self._reset_persistent_session("ordinary")
+        last_output: Mapping[str, Tensor] | None = None
+        for index in range(int(prompt_ids.shape[1])):
+            last_output = self._execute_incremental_rows(
+                prompt_ids[:, index : index + 1],
+                start_position=index,
+                output_dflash_features=False,
+                accepted_tokens=None,
+            )
+            self._persistent_cursor += 1
+            self._ordinary_prefill_token_calls += 1
+        if last_output is None:
+            raise ValueError("ordinary prefill requires a non-empty prompt")
+        return last_output
+
+    def advance_ordinary(self, input_ids: Tensor) -> Mapping[str, Tensor]:
+        if self._persistent_mode != "ordinary" or self._persistent_state is None:
+            raise RuntimeError("ordinary persistent session is not active")
+        if tuple(input_ids.shape) != (1, 1):
+            raise ValueError("ordinary persistent decode requires [1,1] input")
+        output = self._execute_incremental_rows(
+            input_ids,
+            start_position=self._persistent_cursor,
+            output_dflash_features=False,
+            accepted_tokens=None,
+        )
+        self._persistent_cursor += 1
+        self._ordinary_decode_calls += 1
+        return output
+
+    def begin_rollback(self, prompt_ids: Tensor) -> Mapping[str, Tensor]:
+        """Initialize scalar GDN state and retain prompt feature history."""
+
+        if not self.rollback_enabled:
+            raise RuntimeError("rollback factory must be used for this route")
+        self._reset_persistent_session("rollback")
+        last_logits: Tensor | None = None
+        features: list[Tensor] = []
+        for index in range(int(prompt_ids.shape[1])):
+            output = self._execute_incremental_rows(
+                prompt_ids[:, index : index + 1],
+                start_position=index,
+                output_dflash_features=True,
+                accepted_tokens=None,
+            )
+            last_logits = output["logits"]
+            features.append(output["dflash_features"])
+            self._persistent_cursor += 1
+            self._rollback_prefill_token_calls += 1
+        if last_logits is None:
+            raise ValueError("rollback prefill requires a non-empty prompt")
+        return {
+            "logits": last_logits,
+            "dflash_features": torch.cat(features, dim=1),
+        }
+
+    def verify_rollback(self, block_ids: Tensor) -> Mapping[str, Tensor]:
+        if self._persistent_mode != "rollback" or self._persistent_state is None:
+            raise RuntimeError("rollback persistent session is not active")
+        if self._rollback_invalid:
+            raise RuntimeError("rollback session is invalid after a failed verify")
+        if self._pending_verify_rows is not None:
+            raise RuntimeError("a rollback verification is already pending")
+        verify_tokens = int(block_ids.shape[1])
+        accepted = self._prepare_rollback_state(verify_tokens)
+        output = self._execute_incremental_rows(
+            block_ids,
+            start_position=self._persistent_cursor,
+            output_dflash_features=True,
+            accepted_tokens=accepted,
+        )
+        self._pending_verify_rows = verify_tokens
+        self._pending_verify_output = output
+        self._rollback_verify_calls += 1
+        return output
+
+    def commit_rollback(self, accepted_draft_tokens: int) -> Mapping[str, Tensor]:
+        rows = self._pending_verify_rows
+        output = self._pending_verify_output
+        if rows is None or output is None:
+            raise RuntimeError("no rollback verification is pending")
+        if isinstance(accepted_draft_tokens, bool) or not isinstance(
+            accepted_draft_tokens,
+            int,
+        ):
+            raise TypeError("accepted_draft_tokens must be an integer")
+        if not 0 <= accepted_draft_tokens < rows:
+            raise ValueError("accepted count is outside the pending verify block")
+        committed_rows = accepted_draft_tokens + 1
+        self._persistent_cursor += committed_rows
+        self._previous_accepted = accepted_draft_tokens
+        committed = {
+            "logits": output["logits"][:, :committed_rows, :],
+            "dflash_features": output["dflash_features"][:, :committed_rows, :],
+        }
+        self._pending_verify_rows = None
+        self._pending_verify_output = None
+        self._rollback_commit_calls += 1
+        return committed
+
+    def abort_rollback(self) -> None:
+        if self._pending_verify_rows is not None or self._rollback_invalid:
+            self._rollback_aborts += 1
+        # The GDR/conv banks may have been partially overwritten.  Fail closed
+        # instead of pretending the previous state is still recoverable.
+        self._persistent_state = None
+        self._persistent_mode = None
+        self._pending_verify_rows = None
+        self._pending_verify_output = None
+        self._rollback_invalid = True
+
     def forward(
         self,
         input_ids: Tensor,
@@ -575,32 +974,32 @@ class InternalDFlashTarget(nn.Module):
         return result
 
 
-def load_qwen35_target(
+def _load_qwen35_target_impl(
     target_dir: str,
     *,
     device: torch.device,
     dtype: torch.dtype,
+    wrapper_module_name: str,
+    hiai_module_name: str,
+    rollback_enabled: bool,
 ) -> nn.Module:
-    """Load the existing receiver wrapper and return the DFlash target bridge."""
-
     raw_max_len = os.environ.get(KV_CACHE_MAX_LEN_ENV)
     if raw_max_len is None:
         raise RuntimeError(
             f"{KV_CACHE_MAX_LEN_ENV} is unset; pass --kv-cache-max-len to run_npu"
         )
     kv_cache_max_len = _positive_int(raw_max_len, name=KV_CACHE_MAX_LEN_ENV)
-    module = importlib.import_module("models.export_model_wrapper_qwen3_5")
+    module = importlib.import_module(wrapper_module_name)
     wrapper_class = getattr(module, "Qwen3_5ForCausalLMWrapper", None)
     if not isinstance(wrapper_class, type):
         raise TypeError(
-            "models.export_model_wrapper_qwen3_5 must export "
-            "Qwen3_5ForCausalLMWrapper"
+            f"{wrapper_module_name} must export Qwen3_5ForCausalLMWrapper"
         )
-    hiai_module = importlib.import_module("models.modeling_qwen3_5_hiai_nd")
+    hiai_module = importlib.import_module(hiai_module_name)
     expected_model_class = getattr(hiai_module, "Qwen3_5ForCausalLM", None)
     if not isinstance(expected_model_class, type):
         raise TypeError(
-            "models.modeling_qwen3_5_hiai_nd must export Qwen3_5ForCausalLM"
+            f"{hiai_module_name} must export Qwen3_5ForCausalLM"
         )
     wrapper_model_class = getattr(module, "Qwen3_5ForCausalLM", None)
     if (
@@ -608,9 +1007,8 @@ def load_qwen35_target(
         and wrapper_model_class is not expected_model_class
     ):
         raise RuntimeError(
-            "export_model_wrapper_qwen3_5 imports a different "
-            "Qwen3_5ForCausalLM; it must use "
-            "models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM"
+            f"{wrapper_module_name} imports a different Qwen3_5ForCausalLM; "
+            f"it must use {hiai_module_name}.Qwen3_5ForCausalLM"
         )
     wrapper = wrapper_class(
         model_path=target_dir,
@@ -622,8 +1020,8 @@ def load_qwen35_target(
         raise TypeError("Qwen3_5ForCausalLMWrapper must inherit torch.nn.Module")
     if type(getattr(wrapper, "model", None)) is not expected_model_class:
         raise RuntimeError(
-            "Qwen3_5ForCausalLMWrapper.model is not the package-local "
-            "models.modeling_qwen3_5_hiai_nd.Qwen3_5ForCausalLM"
+            "Qwen3_5ForCausalLMWrapper.model is not the requested package-local "
+            f"{hiai_module_name}.Qwen3_5ForCausalLM"
         )
     wrapper.eval()
     target = InternalDFlashTarget(
@@ -631,13 +1029,53 @@ def load_qwen35_target(
         device=torch.device(device),
         dtype=dtype,
         kv_cache_max_len=kv_cache_max_len,
+        rollback_enabled=rollback_enabled,
     )
     return target.eval()
+
+
+def load_qwen35_target(
+    target_dir: str,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> nn.Module:
+    """Load the unchanged receiver model for the full-prefix oracle."""
+
+    return _load_qwen35_target_impl(
+        target_dir,
+        device=device,
+        dtype=dtype,
+        wrapper_module_name="models.export_model_wrapper_qwen3_5",
+        hiai_module_name="models.modeling_qwen3_5_hiai_nd",
+        rollback_enabled=False,
+    )
+
+
+def load_qwen35_rollback_target(
+    target_dir: str,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> nn.Module:
+    """Load the separate rollback modeling through the wrapper adapter."""
+
+    return _load_qwen35_target_impl(
+        target_dir,
+        device=device,
+        dtype=dtype,
+        wrapper_module_name=(
+            "models.export_model_wrapper_qwen3_5_dflash_rollback"
+        ),
+        hiai_module_name="models.modeling_qwen3_5_hiai_nd_dflash_rollback",
+        rollback_enabled=True,
+    )
 
 
 __all__ = [
     "BLOCK_SIZE",
     "InternalDFlashTarget",
     "KV_CACHE_MAX_LEN_ENV",
+    "load_qwen35_rollback_target",
     "load_qwen35_target",
 ]

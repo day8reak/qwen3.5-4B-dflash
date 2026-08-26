@@ -159,16 +159,18 @@ final RMSNorm
 `output_multiplier` 和可选 tanh softcap 是单调变换，不改变 Top-1。因此当前实现可以在统一
 `DFlashOps.top1()` 边界得到 proposal。
 
-## 8. 为什么 Draft 没有 cache
+## 8. 当前 Draft cache 边界
 
-当前 V1 每轮重新计算：
+rollback Target 不再重新计算 committed prefix feature；adapter 在 prefill 时保存 feature history，
+每轮 commit 只追加 `anchor + accepted` 对应的 `a+1` 行。不过 Draft 自身尚未维护跨轮 KV cache，
+因此每轮仍重新计算：
 
-- 当前 committed prefix 的 Target feature；
+- 已保存的 committed Target feature 上的 Draft context；
 - `[anchor, MASK × K]` Draft block；
 - 全部 6 层 Draft。
 
-这样 CPU/GPU/NPU 更容易对齐，也不需要处理 Draft cache 在 proposal 被拒绝时的回滚。代价是
-计算量大，所以它是 correctness-first 实现，不是最终性能结构。
+这样先闭合 Target rollback，不需要同时处理 Draft KV 的拒绝尾部。代价是 Draft 计算量仍大，
+所以当前是 correctness-first 实现，不是最终性能结构。
 
 ## 9. Draft ops 如何切换设备
 
@@ -189,13 +191,13 @@ package-local `dflash_ascend310p_ops`，禁止缺算子时静默回退到 CPU。
 这不是全局 hook。`DFlashDraftModel.from_pretrained(..., ops=selected_ops)` 将策略对象显式传入
 各个 Draft 子模块。
 
-## 10. Adapter.propose() 的真实顺序
+## 10. Rollback Adapter.propose() 的真实顺序
 
-`Qwen35DFlashFullPrefixAdapter.propose()` 做以下事情：
+`Qwen35DFlashRollbackAdapter.propose_rollback()` 做以下事情：
 
 1. 检查 committed prefix、device、token 范围。
-2. 取 `context_ids = prefix_ids[:, :-1]`。
-3. 让 Target 对 context 重新计算 `[1,C,20480]` feature。
+2. 要求持久 feature history 的长度恰好等于 `prefix_ids.shape[1]-1`。
+3. 直接复用已提交的 `[1,C,20480]` feature，不调用 Target 重算 context。
 4. 构造 `[anchor, MASK × K]`。
 5. 用 Target embedding 得到 Draft block embedding。
 6. 构造 context + block 的 position IDs。
@@ -217,6 +219,6 @@ package-local `dflash_ascend310p_ops`，禁止缺算子时静默回退到 CPU。
 | 最终 token 与 ordinary 不同 | 先查 Scheduler/Target verify，不应通过降低接受标准解决 |
 | K 越大后半段越差 | 正常可能性较高；查看每轮连续接受长度，而非只看总命中数 |
 
-当前 Draft 为什么还不代表已经提速，以及后续的 Draft cache、融合算子和
-Target 整块验证怎样配合，见
+当前 Draft 为什么还不代表已经提速，以及后续 Draft cache、融合算子怎样与已实现的
+Target 整块验证配合，见
 [完整 DFlash 与提速路线](DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)。

@@ -1,274 +1,115 @@
-# DFlash V1 整体架构
+# DFlash rollback 整体架构
 
-这篇是项目的主文档，只回答四个问题：有哪些组件、一次生成怎样流动、CPU/GPU/NPU
-哪里相同、应该按什么顺序验证。每个步骤的源码细节放在后面的子文档中。
+Target 是权威裁判，Draft 一次提出 K 个候选。当前默认路线让 Target 一次验证 T=K+1 行，随后
+只提交 anchor 和连续接受的 proposal 状态；普通基线与 DFlash 都使用持久增量状态，不再验证
+增长的完整历史前缀。
 
-如果只记住一句话：
+## 1. 组件
 
-> Target 是裁判，Draft 是一次猜多个 token 的助手；猜中的连续 token 可以直接提交，第一次猜错
-> 就使用 Target 的答案纠正，所以 DFlash 最终文本必须与普通 Target greedy 完全相同。
-
-当前版本是 correctness-first 的 V1：Target 每次都重新计算完整已提交前缀。它先把正确性和
-设备接线验证清楚，不实现投机 KV/GDN 状态的提交或回滚。
-
-## 1. 三个核心角色
-
-| 角色 | 通俗理解 | 代码位置 |
+| 角色 | CPU/CUDA | HIAI/NPU |
 |---|---|---|
-| Target | 完整 Qwen3.5-4B，给出权威下一个 token，同时提供 8 层 feature | CPU/GPU 使用 `modeling_qwen3_5_dflash.py`；NPU 使用 `modeling_qwen3_5_hiai_nd.py` |
-| Draft | 官方 6 层 DFlash 小模型，一次并行猜 K 个 proposal | `modeling_dflash.py` |
-| Scheduler | 接收 Draft proposal，让 Target 逐个检查，只提交连续正确的部分 | `dflash_reference_decode_v1.py` |
+| Target modeling | `dflash_v1/modeling_qwen3_5_dflash.py` | `modeling_qwen3_5_hiai_nd_dflash_rollback.py` |
+| Target transaction | `FrameworkDFlashRollbackTarget` | `InternalDFlashTarget(rollback_enabled=True)` |
+| Draft | `DFlashDraftModel` + Torch ops | 同一 Draft + package-local NPU ops |
+| Scheduler/adapter | `dflash_rollback_decode.py` / `dflash_rollback_adapter.py` | 相同 |
+| CLI | `run_rollback.py` | `run_npu.py` → `run_rollback.py` |
 
-`Qwen35DFlashFullPrefixAdapter` 位于 `dflash_qwen_adapter_v1.py`，负责把 Target 和 Draft
-接到统一接口上：
+原 `modeling_qwen3_5_hiai_nd.py` 和 `dflash_reference_decode_v1.py` 保留，分别用于普通接收端和
+full-prefix oracle，不是默认 rollback Target/调度器。
 
-```text
-Target: input_ids [1,S] → logits [1,S,vocab]
-                         → 可选 features [1,S,20480]
-
-Draft:  committed prefix + Target features → proposal IDs [1,K]
-```
-
-## 2. 一次完整运行的总流程
+## 2. 数据流
 
 ```mermaid
 flowchart TD
-    P[1. Prompt 文本] --> T[2. 本地 tokenizer / chat template]
-    T --> L[3. 加载 Target 与 6 层 Draft]
-    L --> G1[4. Target 状态隔离检查]
-    G1 --> G2[5. Feature 零影响检查]
-    G2 --> O[6. 单独运行 ordinary Target greedy]
-    O --> B[7. Target 生成 clean anchor]
-    B --> F[8. Target 输出 8 层 feature]
-    F --> D[9. Draft 并行提出 K 个 token]
-    D -->|proposal IDs| S[10. Scheduler 接收 proposal]
-    S -->|committed + 已通过 proposal| V[11. Target 逐个验证]
-    V -->|匹配结果和 correction/bonus| C[12. Scheduler 提交本轮 token]
-    C -->|未到 EOS 或长度上限| F
-    C --> X[13. 比较 ordinary 与 DFlash 的 token/EOS/stop]
-    X --> R[14. 写 JSON 报告并打印两份文本]
+    P[Prompt] --> B[Target persistent prefill]
+    B --> A[Target Top-1 clean anchor]
+    B --> F[8-layer feature history]
+    A --> D[Draft block: anchor + K masks]
+    F --> D
+    D --> Q[K proposal IDs]
+    Q --> V[Target once: anchor + K proposals]
+    V --> M[Longest contiguous match a]
+    M --> C[Commit input state: anchor + accepted a]
+    M --> E[Emit accepted + correction/bonus]
+    C --> F2[Append only a+1 Target feature rows]
+    E --> N[correction/bonus becomes next anchor]
+    F2 --> D
+    N --> D
 ```
 
-图中 `Draft → Scheduler → Target verify` 是必须存在的闭环：Draft 只提供候选，Scheduler
-不会直接提交它们；每个 proposal 都要经过 Target 判断。
-
-最容易混淆的是第 6、7、10、11、13 步：
-
-- 第 6 步先独立跑出一份普通 greedy 结果，作为最终对照答案。
-- 第 7 步是 DFlash 路线自己的第一次 Target 调用，产生 Draft block 的 anchor。
-- 第 10 步 Draft proposal 回到 Scheduler，不是直接进入最终输出。
-- 第 11 步由 Target 对 proposal 做权威判断。
-- 第 13 步再比较两条完整生成结果，任何 token、EOS 或停止原因不同都会直接报错。
-
-验证的逐行例子和源码对应关系见
-[调度与 token 验证](DFLASH_V1_SCHEDULER.md)及
-[验证流程与报告解读](DFLASH_V1_VALIDATION.md)。
-
-### 2.1 一轮 DFlash 的准确调用时序
-
-下图按当前 `sequential` 源码路径展开。与简化总流程图不同，它把 Adapter
-也画了出来：Scheduler 的 bootstrap、feature 请求和 verify 都不会绕过
-`Qwen35DFlashFullPrefixAdapter`。图中 K 表示本轮真正进入验证的 proposal 数；
-它可能因剩余生成长度或 Draft 提前给出 EOS 而小于 `max_draft_tokens`。
-
-```mermaid
-sequenceDiagram
-    participant S as V1 Scheduler
-    participant A as Qwen35 Adapter
-    participant T as Target Qwen3.5-4B
-    participant D as 6-layer Draft
-
-    Note over S,T: DFlash bootstrap；若 anchor 已是 EOS，则不进入 Draft round
-    S->>A: forward_logits(prompt)
-    A->>T: features=False，完整前缀 forward
-    T-->>A: logits [1,P,V]
-    A-->>S: 完整 logits
-    S->>S: 最后一行 Top-1 = clean anchor
-    S->>S: committed = prompt + anchor
-
-    loop 每个 DFlash round
-        S->>A: propose(committed, K)
-        A->>T: 对 committed[:-1] 做 feature forward
-        Note over A,T: NPU 路线在每次 Target forward 前准备 fresh call-local KV/GDN state
-        T-->>A: dflash_features [1,C,20480]
-        A->>A: 构造 [anchor, MASK × K] embedding 与 position IDs
-        A->>D: draft_top1(target features, block embedding)
-        D-->>A: proposal IDs [1,K]
-        A-->>S: proposals[0:K]
-
-        loop proposal i，直到首次不匹配或 K 个全部通过
-            S->>A: forward_logits(committed + proposals[:i])
-            A->>T: features=False，fresh full-prefix forward
-            T-->>A: logits [1,S_i,V]
-            A-->>S: 完整 logits
-            S->>S: 取最后一行 Target Top-1
-            alt proposal[i] == Target Top-1
-                S->>S: 接受 proposal[i]，继续验证
-            else 第一个不匹配
-                S->>S: Target Top-1 成为 correction，停止内层验证
-            end
-        end
-
-        alt K 个 proposal 全部匹配
-            S->>A: forward_logits(committed + proposals)
-            A->>T: features=False，fresh full-prefix forward
-            T-->>A: logits
-            A-->>S: 最后一行对应 bonus token
-        end
-
-        S->>S: 提交连续匹配 proposal + correction/bonus
-    end
-```
-
-这张图经过与当前调用链逐项对照：
-
-- `_call_draft()` 调用 `Adapter.propose()`，proposal 明确返回 Scheduler；
-- `Adapter.propose()` 先从 Target 取 `committed[:-1]` 的 feature，再调用 6 层 Draft；
-- `_target_top1()` 经 `Adapter.forward_logits()` 调用 Target，然后取指定 logit 行的 Top-1；
-- proposal `i` 只在 `committed + proposals[:i]` 上验证，不匹配 proposal 不会进入
-  后续验证前缀；
-- 全部 proposal 命中时才多做一次 Target 调用取 bonus。
-
-图中没展开极少见的 empty-proposal 分支：如果 Draft 没有返回候选，Scheduler
-会调用一次 Target Top-1 保证本轮至少前进一个 token。
-
-这是当前 correctness-first V1 的时序。后续高性能路线会把内层的多次独立 Target
-forward 替换为一次 `[anchor, proposal×K]` 整块 verify，但必须先完成 KV/GDN
-候选状态的提交与回退，见
-[完整 DFlash 与提速路线](DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)。
-
-## 3. 一轮 DFlash 的直观例子
-
-假设 prompt 后，Target 首先生成 anchor `101`。当前已提交前缀为：
+Bootstrap 后有一个重要不变量：
 
 ```text
-[prompt..., 101]
+Target state/features 已处理到 current anchor 之前
+current anchor 已输出，但尚未作为 Target 输入处理
 ```
 
-Draft 一次猜三个 token：
+所以 Draft context feature 不含 anchor，verify block 第 0 行才是 anchor。
+
+## 3. 状态事务
+
+| 状态 | CPU/CUDA | HIAI/NPU |
+|---|---|---|
+| full-attention KV | verify 前记长度，commit 前 crop | provisional 物理写，logical cursor 只加 `1+a` |
+| GDN conv | clone/restore，逐 token commit replay | T 槽 conv bank，当前为 NPU Tensor golden |
+| GDN recurrent | clone/restore，逐 token commit replay | `npu_gated_delta_rule_mtp` FP32 state bank |
+| Target feature | verify output 只追加前 `1+a` 行 | 同左 |
+| 失败 | 恢复后销毁 transaction | session 整体失效，禁止部分提交 |
+
+CPU/CUDA commit replay 最多 K+1 行，不包含 prompt 或更早 prefix。NPU 同 K 时下一轮直接用上一轮
+`accepted=a` 选择 bank 槽；T 变化时先 select 再 rebase。
+
+## 4. Token 验证
+
+Target 输入和 logits 对齐：
 
 ```text
-[202, 999, 888]
+input  = [anchor, d1, d2, ..., dK]
+top1   = [t1,     t2, t3, ..., bonus]
+compare d1==t1, d2==t2, ...
 ```
 
-Scheduler 收到 proposal 后，请 Target 逐个检查：
+首次错误下标为 a 时：
 
 ```text
-位置 0 → Target 给出 202 → 与 proposal 202 相同，接受
-位置 1 → Target 给出 303 → 与 proposal 999 不同，停止继续验证
+accepted = d[:a]
+correction = top1[a]
+state commit rows = input[:a+1]
+next anchor = correction
 ```
 
-本轮实际提交：
+全部命中时 `top1[K]` 是 bonus。详细 EOS、max token 和边界示例见
+[调度文档](DFLASH_V1_SCHEDULER.md)。
+
+## 5. Ordinary 与正确性
+
+普通路线执行一次 prompt prefill，之后每次只输入上一个 generated token。DFlash 路线从相同
+prompt 建立独立 session。最终严格比较 token IDs、EOS 和 stop reason，没有容差。
+
+整块 verify 可能与逐 token kernel 存在浮点路径差异；这不能通过“多接受”规避。出现 token
+分叉时应查 GDR/conv/attention 的 causal prefix 等价、position、bank selector 和 cursor。
+
+## 6. Feature 与 Draft
+
+Target 在 decoder 层 `1,5,9,13,17,21,25,29` 后、final norm 前收集：
 
 ```text
-[202, 303]
+8 × [B,S,2560] → [B,S,20480]
 ```
 
-其中 `202` 是接受的 Draft token，`303` 是 Target correction。`999` 不会进入下一轮上下文，
-`888` 也不会被继续使用。因此即使 Draft 猜错，最终生成仍沿着 Target greedy 路径前进。
+Draft 使用官方锁定的 6 层结构和 69 tensor checkpoint。Target embedding 与 LM head 与 Draft
+共享数学权重。当前保存完整已提交 feature history，Draft 仍可重算自己的 context；Draft cache 是
+后续性能优化，不影响 Target rollback 正确性。
 
-如果三个 proposal 全部正确，Target 会再计算一个 bonus token，本轮最多提交 `K+1` 个 token。
+## 7. 运行身份与边界
 
-## 4. Target feature 在哪里进入
-
-Draft 不读取 Target KV cache，而是读取 Target 的 8 个 decoder layer 输出：
+rollback 报告固定写出：
 
 ```text
-层号 1,5,9,13,17,21,25,29（从 0 开始）
-每层 [B,S,2560]
-按固定顺序拼接 → [B,S,20480]
+route = qwen3.5-dflash-incremental-rollback
+verification_mode = incremental_transactional_rollback
+historical_prefix_replay_during_verify = false
 ```
 
-捕获点位于 decoder layer 输出之后、最终 norm 之前。feature 默认关闭；开启 feature 时必须保证
-Target logits 不变。详细实现见 [Target 与 Feature](DFLASH_V1_TARGET_AND_FEATURE.md)。
-
-## 5. Draft 怎么使用 feature
-
-Draft 的输入由两部分组成：
-
-```text
-Target context feature: [B,C,20480] → 投影到 [B,C,2560]
-Draft block:             [anchor, MASK × K] → embedding [B,K+1,2560]
-```
-
-6 层 Draft 并行计算后丢弃 anchor 行，通过 Target LM head 得到 K 个 proposal。这里的 K 只表示
-proposal 数，不包含 anchor；所以 `K=16` 时 Draft block 有 17 行。
-
-结构、mask 和设备算子分派见 [Draft 模型](DFLASH_V1_DRAFT.md)。
-
-## 6. CPU、GPU、NPU 哪些相同，哪些不同
-
-| 层次 | CPU | CUDA GPU | Ascend NPU |
-|---|---|---|---|
-| Scheduler 与验证规则 | 共用 | 共用 | 共用 |
-| Draft 结构与权重 | 同一官方 6 层 checkpoint | 同左 | 同左 |
-| Target 语义 | Qwen3.5-4B | Qwen3.5-4B | Qwen3.5-4B |
-| Target 实现 | Transformers/PyTorch | 同一代码放到 CUDA | HIAI NPU 实现 |
-| Draft ops | `TorchDFlashOps` | `TorchDFlashOps`，由 CUDA dispatch | `dflash_ascend310p_ops`，由 NPU dispatch |
-| Target 状态 | `use_cache=False` 完整重算 | 同左 | Bridge 每次新建 KV/GDN state |
-| 最终硬门禁 | ordinary 与 DFlash 零 token 差异 | 同左 | 同左，另加 NPU 状态/调用/无 fallback 门禁 |
-
-CPU/GPU 能验证公共 Draft 数学和 Scheduler，但不能代替 NPU Target 验证。NPU 使用另一份设备适配
-Target，feature、状态、kernel 选择和数值误差都可能影响 proposal 接受率。
-
-## 7. “验证通过”到底表示什么
-
-程序不是只看一个布尔值。它依次检查：
-
-1. Target/Draft config、权重 shape、device、dtype 合法。
-2. 相同前缀立即重复运行能稳定复现。
-3. 中间插入不同长度前缀后，原前缀 logits/features 不被 KV/GDN 残留污染。
-4. 打开 feature 不改变 Target logits。
-5. ordinary Target 独立生成一份完整答案。
-6. DFlash 至少真实执行一轮 feature → Draft → Scheduler → Target verify。
-7. DFlash 最终 token IDs、EOS、stop reason 与 ordinary 完全相同。
-8. NPU 上额外检查每次 prepare、Target forward、同步的调用数相互一致，且禁止 fallback。
-
-接受率低不等于生成错误：只要 correction 后最终 token 完全一致，正确性仍然通过，但 DFlash
-可能没有性能收益。每个门禁如何实现、失败时先查什么，见
-[验证流程与报告解读](DFLASH_V1_VALIDATION.md)。
-
-## 8. 推荐阅读和执行顺序
-
-第一次接触建议按这个顺序：
-
-1. 本文：先理解整体数据流。
-2. [Target 与 Feature](DFLASH_V1_TARGET_AND_FEATURE.md)：理解 Target 改动和 NPU state。
-3. [Draft 模型](DFLASH_V1_DRAFT.md)：理解 6 层网络为什么能一次提出 K 个 token。
-4. [调度与 token 验证](DFLASH_V1_SCHEDULER.md)：理解 accept、correction、bonus。
-5. [验证流程与报告解读](DFLASH_V1_VALIDATION.md)：理解程序为什么能判定正确或失败。
-6. [从 V1 到完整 DFlash 与真正提速](DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)：
-   理解单次整块验证、KV/GDN 提交回退和自定义算子改造。
-7. 按设备选择运行文档：
-   - [CPU/Golden](DFLASH_V1_GOLDEN.md)
-   - [CUDA GPU](DFLASH_V1_GPU.md)
-   - [NPU 部署与运行](NPU_DEPLOYMENT.md)
-   - [Ascend 310P 边界](DFLASH_V1_ASCEND310P.md)
-
-## 9. 主要源码地图
-
-| 文件 | 主要职责 |
-|---|---|
-| `dflash_qwen_adapter_v1.py` | 总入口、模型装配、Target/Draft adapter、前置门禁、报告 |
-| `dflash_reference_decode_v1.py` | ordinary greedy、DFlash sequential verify、最终精确比较 |
-| `modeling_dflash.py` | 6 层 Draft 模型 |
-| `dflash_config.py` | Draft shape、层数、K、mask token 等合同 |
-| `dflash_weights.py` | Draft checkpoint 检查和加载 |
-| `dflash_target_features.py` | 8 层 feature 收集与拼接 |
-| `modeling_qwen3_5_dflash.py` | CPU/CUDA feature-enabled Target |
-| `dflash_ops.py` | CPU/CUDA Draft 原语 |
-| `dflash_ascend310p_ops.py` | NPU Draft 原语后端 |
-| `internal_target_loader.py` | NPU Target facade |
-| `../internal_dflash_bridge.py` | NPU 每次 full-prefix 的 fresh KV/GDN state 与 64-token 对齐 |
-| `../modeling_qwen3_5_hiai_nd.py` | NPU Target 与 feature 直接集成 |
-
-## 10. 当前版本不做什么
-
-- 不让 Draft 决定最终答案。
-- 不允许 ordinary/DFlash 最终 token 有任何差异。
-- 不实现投机 KV/GDN 状态提交、回滚或复用。
-- 不因为 CPU/GPU 通过就声称 NPU 已通过。
-- 不因为功能正确就声称已有加速；性能需要单独测量。
-
-后续如何把这些限制逐项变成可验证的增量运行时，见
-[完整 DFlash 与提速路线](DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)。
+CPU 是模拟证据；CUDA 是 framework 设备证据；只有目标 310P 上禁用 fallback 并记录 runtime、
+device、operator package 和实际 kernel trace，才能声明 NPU 路线通过。当前仓库没有该真机证据。

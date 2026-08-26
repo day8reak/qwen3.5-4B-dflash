@@ -16,10 +16,10 @@
 `CausalConv1dMTP`。`CacheUpdateMTP` 和 `FusedInferAttentionMTP` 是否必须新增，要先测现有
 算子的多 token、跨 block 和 mask 能力，不能仅凭算子名判断。
 
-这份文件还不是完整可运行的高性能 DFlash：原仓库的 scheduler/bridge 是完整前缀重算，
-不会传 `accepted_tokens`，也不会跨轮保存 state。要启用真正的单次整块 verify，还必须改
-runtime/bridge、scheduler 和导出 wrapper；这些是状态所有权和调度改造，不应伪装成一个
-kernel 就能解决。
+当前分支已经补上 scheduler、CPU/CUDA transaction、HIAI bridge 和部署 wrapper adapter：
+正式路径执行一次 `T=K+1` 整块 verify，并跨轮保存 state，不再用增长的完整前缀验证。
+它仍是 correctness bring-up，而不是高性能完成态：NPU causal-conv 还是 Tensor golden，
+CacheUpdate 仍逐 row，完整 logits 仍回 host 做 Top-1，而且当前环境没有 310P 全模型证据。
 
 ## 2. 来源与边界
 
@@ -170,7 +170,7 @@ framework reference 使用 `kernel_size-1`。新算子必须复现当前接收�
 | P0 | `CausalConv1dMTP` | 与 GDR 使用同一接受槽，得到每行卷积输出和每行 conv window | 建议 `x [B,T,8192]` 或 `[B,8192,T]` FP16；`weight [8192,4]` FP16；`state [B,T,8192,4]` FP16；`accepted [B]` INT8 | `y` 与 x 对应；`state_bank [B,T,8192,4]` FP16 | **语义确定需要**；修改版已有 Tensor 分解 golden，生产版建议新增融合算子 |
 | P0 | 扩展 `CacheUpdate` 或新增 `CacheUpdateMTP` | 一次写 T 个连续 K/V，正确跨越 64-token block | 单个 cache `[Nblock,64,64,16]` FP16；update 原始 `[B,T,4,256]` 或 packed `[T,64,16]`；`start_pos [B]`/`positions [B,T]`；block table INT32 | 原位 cache 或显式 `cache_out`；必须覆盖位置 62/63/64/65 | **条件需要**；修改版逐 token 复用现有 op 可保正确性。若现有 op 本身支持跨块多行，只需改调用，不要另造 kernel |
 | P0 | 扩展 `adn_fused_infer_attention` 或 `FusedInferAttentionMTP` | 历史 paged KV + 当前 T 行块内 causal attention | packed Q `[B,256,T,16]`；K/V cache list；mask `[B,1,T,kv_max_len]` FP16；block table；真实 Q/KV length | packed output `[B,256,T,16]`，随后还原 `[B,T,4096]` | **条件需要**；先验证现有 op 的 `T=2/5/9/17`、历史长度和跨块行为，失败才改 kernel |
-| P0-runtime | `DFlashStateTransaction`（runtime，不建议先做算子） | 让 24 层 GDR、24 层 conv、8 层 KV cursor、position 和 feature 使用同一 accepted count；失败时整轮丢弃 | 32 层 state handle、`accepted [B]`、`round_start`、T | 新 logical cursor；下一轮 state selector；失败不部分提交 | **确定需要，但不是数学 kernel**；应在 bridge/scheduler 实现 begin/verify/commit 或双 buffer |
+| P0-runtime | `DFlashStateTransaction`（runtime，不建议做成算子） | 让 24 层 GDR、24 层 conv、8 层 KV cursor、position 和 feature 使用同一 accepted count；失败时整轮丢弃 | 32 层 state handle、`accepted [B]`、`round_start`、T | 新 logical cursor；下一轮 state selector；失败不部分提交 | **已在 scheduler/bridge 实现**；CPU/CUDA 用快照恢复，NPU 失败时销毁 session |
 | P0/P1 | `StateBankRebase` | K 动态变化时先 gather 已接受槽，再复制为下一轮 T' 个初始槽 | conv/recurrent bank、`accepted [B]`、`next_T` | 新的 T' 槽 state bank | 固定 K=16 时不需要；修改版已有 Tensor helper，只有图内动态 K/性能受限时才值得自定义 |
 | P1 | `TargetLmHeadTop1Accept` | 避免落地完整 `[B,T,248320]` logits，同时完成 Top-1 和最长连续匹配 | hidden `[B,T,2560]`；LM head `[248320,2560]`；proposal `[B,T-1]` INT；可选 EOS | `top1 [B,T]` INT；`accepted [B]` INT8；correction/bonus token | **性能可选**；先保留普通 LM head + argmax 作为 oracle |
 | P1 | 现有 DynamicQuant/QuantMatmul | 支持 Target 的 T 行量化线性层 | 激活首维包含 `B×T`，权重/scale 沿用当前 ABI | FP16 投影结果 | 不先新增算子；必须验证现有实现不是只支持 decode `T=1` 或 prefill `T=64` |
@@ -201,19 +201,20 @@ kernel。Draft 与 Target 回退是两组不同的算子接线。
 | P2 | RMSNorm/RoPE/SwiGLU 融合 | 减少 6 层 Draft 的小算子 launch | hidden/weight/cos/sin，shape 见 Draft 模型 | 同数学输出 | 不是正确性必需；RMSNorm 必须用 checkpoint 的直接 scale，不能套 Target 的 `1+weight` |
 | P2 | Draft KV cache/crop | 每轮只处理新 context/block，并在 accepted 后裁剪 | 6 层 Draft K/V、logical cursor、accepted | 更新后的 cache | 属于后续性能阶段；当前无 cache 重算版可作为正确性 oracle |
 
-## 7. 还必须改的非算子代码
+## 7. 非算子代码的当前实现
 
-| 组件 | 当前行为 | 完整 DFlash 所需修改 |
+| 组件 | 当前 rollback 行为 | 仍需设备验证/优化 |
 |---|---|---|
-| `internal_dflash_bridge.py` | 每次构造 fresh 32 层 state，并把完整前缀补到 64 后重算 | 改成 persistent transaction bridge；prefill 一次；GDN 分配 state bank；recurrent bank 必须 FP32；保存 logical KV cursor |
-| `dflash_reference_decode_v1.py` | 默认 sequential full-prefix verify；vectorized 只是诊断 | 增加生产 round：Draft K 个 proposal → Target 一次 T=K+1 verify → 得到 a → 原子提交 `1+a` 个输入状态 |
-| Target export wrapper | 只透传原有输入 | 新增 `accepted_tokens`；接受 rank-4 conv bank/rank-5 recurrent bank；固定或声明 T；不得丢弃该输入 |
-| attention mask/position 构造 | fresh prefix 从位置 0 开始 | 每轮从 committed cursor 开始，T 行各自只能看历史和块内左侧；`allQLen`、position、cache position 必须一致 |
-| feature 生命周期 | V1 重算完整 context feature | verify 后只保留 `features[:, :a+1]`；correction/bonus 是下一轮 anchor，不在本轮 state/feature 中 |
-| 失败处理 | call-local state 直接释放 | provisional verify 任一层失败时丢弃整个新 state；不能只保留已更新的前几层 |
+| `dflash_rollback_decode.py` | 一次 T=K+1 verify；最长连续接受；提交 `1+a` 个输入状态；correction/bonus 留作下一 anchor | 多 prompt 全模型零 token mismatch |
+| `dflash_rollback_adapter.py` | CPU/CUDA 持久 `DynamicCache`；KV crop；GDN state restore；仅逐 token 重放 `anchor+accepted` | 证明可安全合并成一次短 chunk 后再优化调用数 |
+| `internal_dflash_bridge.py` | prompt 单 token bootstrap；GDN scalar→bank；K 变化 rebase；logical paged-KV cursor | 32 层真实 kernel trace、block boundary 和故障注入 |
+| rollback wrapper adapter | 构造期临时绑定独立 rollback modeling，复用部署 wrapper 的权重加载，随后恢复原全局类并校验实际类型 | 在目标部署 wrapper 版本上实装检查；若其构造器硬编码类则需显式 wrapper 修改 |
+| mask/position | verify 从 committed cursor 开始；每行只看历史与块内左侧；position/cache position/allQLen 同步推进 | 现有 fused attention 的 T=2/5/9/17 真机能力 |
+| feature 生命周期 | prefill feature 保存一次；每轮只追加 `features[:,:a+1]`；不追加 correction/bonus | 长序列内存和 Draft cache 后续优化 |
+| 失败处理 | CPU/CUDA 恢复后销毁 transaction；HIAI bank 可能部分覆写时销毁整个 session，fail closed | 真机 kernel 失败注入 |
 
-把修改版文件直接放进仓库但不改这些组件，只会继续运行原来的完整前缀 V1；不会自动获得
-state 回退或加速。
+旧 `dflash_reference_decode_v1.py` 不删除，作为完整前缀 sequential oracle；默认 CPU/GPU/NPU CLI
+已切到 `run_rollback.py`。
 
 ## 8. 内存与实现取舍
 
@@ -249,7 +250,11 @@ conv bank 约为：
 - 修改版 `py_compile` 通过；
 - CPU 小尺寸测试通过：state-bank seed/select/rebase；
 - CPU 小尺寸测试通过：卷积 bank 与逐 token reference 完全对齐；
-- 默认普通 GDR 调用仍保留在 `accepted_tokens is None` 分支。
+- 默认普通 GDR 调用仍保留在 `accepted_tokens is None` 分支；
+- Scheduler 边界测试通过：`accepted=0..K`、mismatch、all-match、correction/bonus；
+- CPU/CUDA framework transaction 测试通过：KV crop、GDN restore、bounded token replay；
+- HIAI bridge 模拟测试通过：bank selector、动态 T rebase、拒绝 KV 尾部的 logical cursor 覆写；
+- 兼容 CPU/GPU CLI 与 NPU `run_npu` 已切到 persistent rollback 报告合同。
 
 ### 310P 上必须补齐
 
@@ -268,13 +273,13 @@ conv bank 约为：
 当前环境没有 `torch_npu`、OMC 和 310P 设备，因此本文不声明 target 运行通过、无 fallback
 通过或获得任何加速比。
 
-## 10. 推荐开发顺序
+## 10. 后续开发顺序
 
-1. 先改 bridge/wrapper，让固定 `K=16, T=17` 的 persistent state ABI 跑通；固定 T 可避免
-   state-bank rebase 和动态图复杂度。
-2. 用修改版的分解 conv + 逐 token CacheUpdate 做真机 correctness oracle。
-3. 验证现有 fused attention 的 T=2..17 与 block boundary；只有失败才新增 attention kernel。
-4. 开发 `CausalConv1dMTP`，逐层替换分解 golden。
-5. 若 CacheUpdate launch 成为瓶颈或现有 ABI 无法跨块，再开发 `CacheUpdateMTP`。
-6. 完成 scheduler 的一次整块 verify 和原子 logical commit，做全模型零 token mismatch。
-7. 最后 profile Draft，优先 feature projection、block GQA、LM-head Top-1；再考虑小算子融合和量化。
+1. 在 310P 上先跑 K=1/T=2 的 ordinary incremental 对 rollback，确认 wrapper、GDR 注册、mask、
+   feature 和 cursor；再扩到 K=16/T=17。
+2. 用当前分解 conv + 逐 row CacheUpdate 做 correctness oracle，覆盖 accepted `0/1/K-1/K` 与
+   cursor `62/63/64/65`。
+3. 验证现有 fused attention 的 T=2/5/9/17；只有能力失败才新增/扩展 attention kernel。
+4. 完成全模型、多 prompt、多轮 strict-greedy 零 token mismatch 和无 fallback 证据。
+5. 开发 `CausalConv1dMTP`；若 CacheUpdate launch 成为热点，再开发 `CacheUpdateMTP`。
+6. Profile 完整 logits D2H、Draft feature projection、block GQA、LM-head Top-1；按实测选择融合。
