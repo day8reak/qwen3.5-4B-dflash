@@ -9,9 +9,27 @@ import unittest
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY / "tools" / "run_msprof.sh"
+RUN_DOCUMENT = REPOSITORY / "docs" / "DFLASH_RUN_AND_VALIDATE.md"
 
 
 class MsprofScriptTests(unittest.TestCase):
+    def test_original_main_profile_uses_external_unquantized_inference(self) -> None:
+        document = RUN_DOCUMENT.read_text(encoding="utf-8")
+        section = document.split("### 7.1 原 main 非 DFlash 模型", 1)[1].split(
+            "### 7.2 rollback 内部 ordinary 控制组", 1
+        )[0]
+        command = section.split("~~~bash", 1)[1].split("~~~", 1)[0]
+
+        self.assertIn("python3 inference.py", command)
+        self.assertIn("--config ./config/qwen3.5.ymal", command)
+        self.assertIn("--max_token 32", command)
+        self.assertIn("--no-msproftx", command)
+        self.assertNotIn("--quant_mode", command)
+        self.assertNotIn("--max_token 10", document)
+        self.assertNotIn("--max-new-tokens 10", document)
+        self.assertIn("不在本仓库中", document)
+        self.assertIn("并不是原 main 非 DFlash 模型", document)
+
     def test_wrapper_requires_no_git_checkout_or_vcs_metadata(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         forbidden = (
@@ -26,6 +44,12 @@ class MsprofScriptTests(unittest.TestCase):
                 self.assertNotIn(fragment, source)
         self.assertIn("content_hash_without_vcs_metadata", source)
         self.assertIn("copied source tree", source)
+
+    def test_mstx_is_compatibility_opt_in(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('msproftx="off"', source)
+        self.assertIn("--msproftx)", source)
+        self.assertIn("--no-msproftx)", source)
 
     def test_shell_syntax_and_help(self) -> None:
         syntax = subprocess.run(
@@ -43,6 +67,8 @@ class MsprofScriptTests(unittest.TestCase):
         )
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("--output-dir", help_result.stdout)
+        self.assertIn("--msproftx", help_result.stdout)
+        self.assertIn("default", help_result.stdout)
 
     def test_simulation_profile_is_rejected_before_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

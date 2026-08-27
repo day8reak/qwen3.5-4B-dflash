@@ -221,7 +221,18 @@ config/npu_benchmark_v1.json
 tools/run_msprof.sh
 ~~~
 
-benchmark 在计时前加载 Target/Draft，并执行一次 ordinary 与 DFlash 的 strict-greedy 零差异
+这里必须区分三条运行路径，不能把 rollback 内部的 ordinary 控制组当成原模型基线：
+
+| 对象 | 入口 | 模型源码边界 | 用途 |
+| --- | --- | --- | --- |
+| 原 main 非 DFlash 模型 | `python3 inference.py --config ./config/qwen3.5.ymal --max_token 32` | `main:models/modeling_qwen3_5_hiai_nd.py` | 原部署工程的权威非 DFlash 性能基线 |
+| rollback ordinary 控制组 | `python -B -m models.dflash_v1.benchmark_npu --mode ordinary ...` | rollback persistent receiver | 与 DFlash 使用同一 receiver/门禁的内部 A/B 对照，不代表原 main 实现 |
+| rollback DFlash | `python -B -m models.dflash_v1.benchmark_npu --mode dflash ...` | rollback Draft/verify/commit 路线 | 测量当前 DFlash rollback 性能 |
+
+`inference.py` 和 `./config/qwen3.5.ymal` 属于原部署工程，不在本仓库中；原模型命令应在那个
+工程根目录执行。该基线故意不传 `--quant_mode enable`，也就是以未开启量化的原模型作为对照。
+
+rollback benchmark 在计时前加载 Target/Draft，并执行一次 ordinary 与 DFlash 的 strict-greedy 零差异
 门禁。每个计时迭代只包含一次完整 generation 和末尾设备同步，不包含 checkpoint hash、模型
 加载、tokenizer 或 correctness gate。ordinary 与 DFlash 必须分别启动进程，避免 allocator、
 持久状态和执行先后污染对比。
@@ -277,19 +288,58 @@ aborts 字段计算前后 delta 并要求单调；`persistent_cursor`、`previou
 `rollback audit counter moved backwards: persistent_cursor`，而真正的累计 counter 倒退仍会
 fail closed。
 
-msprof 会改变 latency，只用于热点归因。建议用 1 次 warmup、1 次 measurement，并通过 MSTX
-范围 `qwen35_<mode>_measure_0` 定位正式迭代。marker 只使用 ASCII 字母、数字和下划线，兼容
-部分对 `/` 分隔 message 处理不兼容的 CANN/MSTX 组合。
+msprof 会改变 latency，只用于热点归因。建议用 1 次 warmup、1 次 measurement。由于已在目标机
+观察到合法 marker `qwen35_ordinary_warmup_0` 仍触发 `mstx.range_start failed`，wrapper 默认关闭
+MSTX，只采进程级 AI Core/PipeUtilization/task-time/runtime-api/AscendCL。只有确认目标机的 CANN、
+mstx Python 包与 msprof range 链路兼容时，才显式传 `--msproftx`，再通过
+`qwen35_<mode>_measure_0` 定位正式迭代。marker 只使用 ASCII 字母、数字和下划线。默认关闭
+MSTX 时，msprof 数据覆盖模型加载、correctness gate、warmup 和 measurement 整个进程，适合先找
+主要热点；不能把整段 profile 自动解释为单次 measurement。
 
-原非 DFlash Target 基线使用 `--mode ordinary`；正式分析时选择
-`qwen35_ordinary_measure_0`，该范围内只执行 ordinary incremental generation：
+### 7.1 原 main 非 DFlash 模型
+
+原模型必须从原部署工程根目录运行 `inference.py`，使用 main 分支的
+`models/modeling_qwen3_5_hiai_nd.py`。下面命令刻意不带 `--quant_mode enable`，因此不会开启量化：
+
+~~~bash
+cd /path/to/qwen3.5-main-runtime
+export DFLASH_SOURCE=/path/to/copied-qwen3.5-4B-dflash
+export BENCH_DIR=/path/to/dflash-benchmark
+mkdir -p "$BENCH_DIR"
+
+"$DFLASH_SOURCE/tools/run_msprof.sh" \
+  --label main-original-unquantized \
+  --output-dir "$BENCH_DIR/msprof-main-original-unquantized" \
+  --python python3 \
+  --aic-metrics PipeUtilization \
+  --no-msproftx \
+  -- \
+  python3 inference.py \
+    --config ./config/qwen3.5.ymal \
+    --max_token 32
+~~~
+
+不要在这条原模型基线命令后追加 `--quant_mode enable`。原 `inference.py` 没有
+`benchmark_npu` 的 MSTX measurement marker，所以这里使用 `--no-msproftx`；msprof 的 AI Core、
+PipeUtilization、task-time、runtime-api 和 AscendCL 数据仍会采集。运行时还应保存原部署工程和
+配置文件的内容身份。若要把它与 rollback 报告计算 speedup，必须另外对齐 checkpoint、prompt/
+输入 token、thinking 行为、设备、输出 token 数定义和同步边界；三条路径统一使用 32 token
+预算，但 `--max_token 32` 与 `--max-new-tokens 32` 的名字相似并不自动保证两套 runner 的计时
+语义相同。还必须核对报告中的实际生成 token 数，排除某一路提前 EOS 后工作量不一致。
+
+### 7.2 rollback 内部 ordinary 控制组
+
+`--mode ordinary` 只用于 rollback receiver 内部对照，并不是原 main 非 DFlash 模型。默认先采
+不带 MSTX 的进程级 profile；只有在兼容环境显式启用 `--msproftx` 时，才选择
+`qwen35_ordinary_measure_0` 定位 rollback ordinary incremental generation：
 
 ~~~bash
 tools/run_msprof.sh \
-  --label ordinary-pipe \
-  --output-dir "$BENCH_DIR/msprof-ordinary-pipe" \
+  --label rollback-ordinary-pipe \
+  --output-dir "$BENCH_DIR/msprof-rollback-ordinary-pipe" \
   --python "$MODEL_PYTHON" \
   --aic-metrics PipeUtilization \
+  --no-msproftx \
   -- \
   "$MODEL_PYTHON" -B -m models.dflash_v1.benchmark_npu \
     --mode ordinary \
@@ -300,14 +350,20 @@ tools/run_msprof.sh \
     --prompt-mode chat --enable-thinking \
     --max-new-tokens 32 --block-size 16 \
     --warmup 1 --repetitions 1 --device npu:0 \
-    --report "$BENCH_DIR/msprof-ordinary-pipe/ordinary.json"
+    --report "$BENCH_DIR/msprof-rollback-ordinary-pipe/ordinary.json"
 ~~~
 
-`benchmark_npu` 仍会在计时前加载 Draft 并完成 ordinary/DFlash 正确性门禁；这些动作不在上述
-MSTX measurement 范围内。这样 ordinary profile 与 DFlash profile 使用完全相同的 checkpoint、
-prompt 和正确性前置条件，而测量范围内没有 Draft proposal 或 rollback verify。
+`benchmark_npu` 仍会在计时前加载 Draft 并完成 ordinary/DFlash 正确性门禁；这些动作不计入
+benchmark JSON 的 host latency，但在默认无 MSTX 的进程级 msprof 数据里仍然可见。ordinary 与
+DFlash profile 使用完全相同的 checkpoint、prompt 和正确性前置条件；需要结合事件日志和 task
+timeline 区分阶段。只有成功启用 MSTX 后，`qwen35_ordinary_measure_0` 才精确圈定没有 Draft
+proposal/rollback verify 的 ordinary measurement。该控制组不能替代上一节的原模型
+`inference.py` 基线。
 
-DFlash rollback 使用 `--mode dflash`；正式分析时选择 `qwen35_dflash_measure_0`：
+### 7.3 rollback DFlash
+
+DFlash rollback 使用 `--mode dflash`；MSTX 兼容并显式启用时选择
+`qwen35_dflash_measure_0`，默认则分析整个进程并结合事件日志区分阶段：
 
 ~~~bash
 tools/run_msprof.sh \
@@ -315,6 +371,7 @@ tools/run_msprof.sh \
   --output-dir "$BENCH_DIR/msprof-dflash-pipe" \
   --python "$MODEL_PYTHON" \
   --aic-metrics PipeUtilization \
+  --no-msproftx \
   -- \
   "$MODEL_PYTHON" -B -m models.dflash_v1.benchmark_npu \
     --mode dflash \
@@ -337,10 +394,11 @@ source root，对实际存在的 runtime、bridge、配置、文档和 wrapper �
 `source_tree_sha256`；因此直接复制源码目录到目标机即可运行，manifest 的 identity method 为
 `content_hash_without_vcs_metadata`。
 
-若 safe marker 仍返回 `mstx.range_start failed`，说明该机器的 CANN/mstx profiling 环境不支持
-当前打点，而不是 DFlash 推理失败。可在上述 wrapper 参数中加入 `--no-msproftx`：AI Core、
-PipeUtilization、task-time、runtime-api 和 AscendCL 仍会采集，但报告不再含自定义 measurement
-marker；不要把这种带 profiling 的耗时当作 3+10 latency 基线。
+wrapper 默认等价于 `--no-msproftx`，上述命令仍显式写出该参数以锁定证据语义。若显式
+`--msproftx` 后返回 `mstx.range_start failed`，说明该机器的 CANN/mstx profiling 环境不支持
+当前打点，而不是 DFlash 推理失败；去掉 `--msproftx` 后重新采集即可。AI Core、PipeUtilization、
+task-time、runtime-api 和 AscendCL 仍会采集，但报告不含自定义 measurement marker；不要把
+任何带 profiling 的耗时当作 3+10 latency 基线。
 
 ## 8. 报告门禁
 

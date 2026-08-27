@@ -1,7 +1,7 @@
 {
   "schema_version": 3,
   "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback",
-  "package_revision": "r2",
+  "package_revision": "r3",
   "route_version": "dflash-rollback-incremental-draft-kv-cache",
   "package_layout": {
     "version": 3,
@@ -117,11 +117,11 @@
     "runner_file": "models/dflash_v1/benchmark_npu.py",
     "runner_sha256": "9b0d5f1d84d1ec97ac58e0f83658b276884caf6dbb2281f55ed2a8572554e709",
     "msprof_wrapper_file": "tools/run_msprof.sh",
-    "msprof_wrapper_sha256": "1cedde77603082ea46e69e74667a9ebc8a1bc939fe78bbdd8c546cc5658b92be",
+    "msprof_wrapper_sha256": "a6e8e9f82ecab0c7c9cadf7d0d5713e25d449feb6a6c49a60a71300881392a69",
     "contract_file": "config/npu_benchmark_v1.json",
-    "contract_sha256": "3cf21eb6171f46214e2e028cdcebd33bf0ccc192f4b1b75385145652e5141d4c",
+    "contract_sha256": "874eb70cd3d7ff90a39496296142a8f215a313600a8fb5f1cdeb15f7da49f6f6",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "87051c79301f1da9710fde05c4d4875f5c7b4b4f4035d9ce88489d43cd236d75",
-    "policy": "strict-greedy gate before timing; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only; no CPU fallback"
+    "documentation_sha256": "595ed1ac760afdf714af1501606673d9c55f52d5662b7b65b9d3cb3665d504bc",
+    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use a 32-token comparison budget without quantization; rollback ordinary remains an internal control; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback"
   }
 }

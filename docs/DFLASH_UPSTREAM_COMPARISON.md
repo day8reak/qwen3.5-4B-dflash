@@ -193,7 +193,10 @@ proposal == Target Top-1 才接受
 
 ordinary 对照是当前 bring-up 的必要验收，但它会额外执行一次 Target，不能计入 DFlash
 生产性能。`benchmark_npu` 把 correctness gate 放在计时区间外，并以分进程、设备同步的 3+10
-测量 ordinary/DFlash。单次 `dflash` 运行只用于功能/日常生成，正式性能结论仍来自 benchmark。
+测量 rollback receiver 内部的 ordinary/DFlash；这里的 ordinary 不是 main 分支原部署工程的
+非 DFlash 实现。原模型权威基线仍须运行 `python3 inference.py --config
+./config/qwen3.5.ymal --max_token 32`，且不传 `--quant_mode enable`。单次 `dflash` 运行只用于
+功能/日常生成，正式性能结论仍来自边界对齐后的独立 benchmark。
 
 ## 9. 当前可以怎样表述
 

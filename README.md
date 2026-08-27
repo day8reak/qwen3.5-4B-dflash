@@ -127,6 +127,9 @@ draft_kv_cache_audit.mode = upstream_equivalent_append_then_crop
 只有在 Ascend 310P 上禁用 fallback，并记录 runtime、device、算子包身份、kernel trace 和多轮
 严格 token 对齐后，才能声明目标路线通过；性能结论还需要独立的端到端配对测量。
 
-性能测试使用 `python -B -m models.dflash_v1.benchmark_npu`，ordinary 与 dflash 分别启动进程，
-默认各 3 次 warmup、10 次 measurement。完整命令、报告门禁和 `tools/run_msprof.sh` 用法见
+rollback 内部性能测试使用 `python -B -m models.dflash_v1.benchmark_npu`，ordinary 与 dflash
+分别启动进程，默认各 3 次 warmup、10 次 measurement；其中 ordinary 只是同一 rollback
+receiver 的内部控制组，不等于 main 原模型。原非 DFlash 权威基线从原部署工程运行
+`python3 inference.py --config ./config/qwen3.5.ymal --max_token 32`，并且不传
+`--quant_mode enable`。完整命令、报告门禁和 `tools/run_msprof.sh` 用法见
 [运行和验证第 7 节](docs/DFLASH_RUN_AND_VALIDATE.md#7-npu-性能基准与-msprof)。

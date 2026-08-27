@@ -16,7 +16,8 @@ Options:
   --aic-metrics NAME        AI Core metrics (default: PipeUtilization).
   --task-time LEVEL         msprof task-time value (default: on).
   --msprof-arg ARG          Append one safe msprof option; repeat as needed.
-  --no-msproftx             Disable msproftx and benchmark MSTX ranges.
+  --msproftx                Opt in to msproftx and benchmark MSTX ranges.
+  --no-msproftx             Keep MSTX disabled (default; compatibility option).
   -h, --help                Show this help.
 
 The wrapper requires a real torch_npu device and rejects CPU/operator fallback.
@@ -35,7 +36,7 @@ python_bin="${PYTHON_BIN:-python3}"
 msprof_bin="${MSPROF_BIN:-msprof}"
 aic_metrics="PipeUtilization"
 task_time="on"
-msproftx="on"
+msproftx="off"
 extra_msprof_args=()
 
 while (($#)); do
@@ -79,6 +80,10 @@ while (($#)); do
       esac
       extra_msprof_args+=("$2")
       shift 2
+      ;;
+    --msproftx)
+      msproftx="on"
+      shift
       ;;
     --no-msproftx)
       msproftx="off"
