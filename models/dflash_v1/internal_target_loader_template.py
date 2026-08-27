@@ -69,7 +69,12 @@ PREFILL_CHUNK_SIZE_ATTRIBUTE = "dflash_prefill_chunk_size"
 DECODE_CHUNK_SIZE_ATTRIBUTE = "dflash_decode_chunk_size"
 FACADE_CONTRACT_ID = "qwen3.5-4b-dflash-v1-full-prefix-isolation-r6"
 
-_FORMAL_HIAI_FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
+_FORMAL_HIAI_FEATURE_SOURCES = frozenset(
+    {
+        "package_local:modeling_qwen3_5_hiai_nd.py",
+        "package_local:modeling_qwen3_5_hiai_nd_dflash_rollback.py",
+    }
+)
 _FORMAL_HIAI_CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 _FORMAL_HIAI_FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
 _FORMAL_FULL_PREFIX_EXECUTION_MODE = "fresh_prefill"
@@ -561,10 +566,10 @@ class InternalTargetFacade(nn.Module):
     def _validate_feature_provenance(self, *, formal_npu: bool) -> None:
         if not formal_npu:
             return
-        if self._feature_source != _FORMAL_HIAI_FEATURE_SOURCE:
+        if self._feature_source not in _FORMAL_HIAI_FEATURE_SOURCES:
             raise RuntimeError(
-                "formal NPU target must use the directly integrated "
-                "modeling_qwen3_5_hiai_nd.py feature route"
+                "formal NPU target must use the directly integrated ordinary "
+                "or rollback Qwen3.5 HIAI feature route"
             )
         if self._feature_capture_point != _FORMAL_HIAI_CAPTURE_POINT:
             raise RuntimeError(

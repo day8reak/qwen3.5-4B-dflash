@@ -57,6 +57,9 @@ PREFILL_CHUNK_SIZE_ENV = "DFLASH_HIAI_PREFILL_CHUNK_SIZE"
 DECODE_CHUNK_SIZE_ENV = "DFLASH_HIAI_DECODE_CHUNK_SIZE"
 
 _FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
+_ROLLBACK_FEATURE_SOURCE = (
+    "package_local:modeling_qwen3_5_hiai_nd_dflash_rollback.py"
+)
 _CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 _FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
 
@@ -95,14 +98,21 @@ def _positive_env_int(name: str, default: int) -> int:
 def _prepare_target_contract(target: nn.Module) -> nn.Module:
     """Attach only portable metadata and an explicitly supplied reset hook."""
 
-    source = Path(__file__).resolve().parent.parent / "modeling_qwen3_5_hiai_nd.py"
+    rollback_enabled = bool(getattr(target, "rollback_enabled", False))
+    source_name = (
+        "modeling_qwen3_5_hiai_nd_dflash_rollback.py"
+        if rollback_enabled
+        else "modeling_qwen3_5_hiai_nd.py"
+    )
+    feature_source = _ROLLBACK_FEATURE_SOURCE if rollback_enabled else _FEATURE_SOURCE
+    source = Path(__file__).resolve().parent.parent / source_name
     if source.is_symlink() or not source.is_file():
         raise FileNotFoundError(
-            "embedded NPU layout requires models/modeling_qwen3_5_hiai_nd.py"
+            f"embedded NPU layout requires models/{source_name}"
         )
 
     declared = {
-        FEATURE_SOURCE_ATTRIBUTE: _FEATURE_SOURCE,
+        FEATURE_SOURCE_ATTRIBUTE: feature_source,
         FEATURE_CAPTURE_POINT_ATTRIBUTE: _CAPTURE_POINT,
         FEATURE_CONTRACT_ID_ATTRIBUTE: _FEATURE_CONTRACT_ID,
     }

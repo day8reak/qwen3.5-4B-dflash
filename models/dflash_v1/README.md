@@ -1,87 +1,61 @@
-# DFlash V1 源码索引
+# DFlash rollback 源码索引
 
-本目录整体放在目标工程的 `models/dflash_v1/`。仓库根目录直接提供
-`models/modeling_qwen3_5_hiai_nd.py`；部署时将它放到父目录同名位置。不要用 CPU/CUDA
-target 覆盖它。
+当前默认路线是 persistent incremental rollback；完整历史前缀重算只作为 oracle 保留。
 
-第一次阅读项目建议先看
-[DFlash V1 项目架构与完整实现流程](../../docs/DFLASH_V1_ARCHITECTURE.md)。
-然后按需查看
-[Target 与 Feature](../../docs/DFLASH_V1_TARGET_AND_FEATURE.md)、
-[Draft 模型](../../docs/DFLASH_V1_DRAFT.md)、
-[Scheduler 与 token 验证](../../docs/DFLASH_V1_SCHEDULER.md)以及
-[验证流程与报告解读](../../docs/DFLASH_V1_VALIDATION.md)。
-需要将 correctness-first V1 升级成单次整块验证与增量状态路线时，阅读
-[完整 DFlash 与提速路线](../../docs/DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)。
+## 调度与运行
 
-## 运行与调度
+| 文件 | 职责 |
+| --- | --- |
+| run_rollback.py | CPU、CUDA、NPU 共用入口和报告生成 |
+| run_npu.py | HIAI 固定参数入口 |
+| benchmark_npu.py | rollback 正确性门禁后的 NPU 3 warmup + 10 次同步性能测试 |
+| preflight_target_quant.py | Target-only W8A8 装配、QLinear 数值和 rollback transaction 预检 |
+| dflash_rollback_decode.py | ordinary incremental、T=K+1 verify、accept 和 EOS 调度 |
+| dflash_rollback_adapter.py | framework Target transaction、新增 feature 生命周期和 Draft KV cache adapter |
+| dflash_reference_decode_v1.py | 旧 full-prefix sequential oracle，不是默认执行路径 |
+| diagnose_acceptance.py | 固定 workload 的 proposal、verifier 和接受率诊断 |
 
-- `run_npu.py`：内嵌目录的一键 NPU 入口，自动派生 HIAI source、loader、FP16 和 EOS。
-- `preflight_target_quant.py`：量化分支的 Target-only NPU 预检；不读取 Draft，先验证 QLinear
-  装配、量化输入 provider、feature 零影响和异长 P→Q→P；可自动捕获同一次真实 QLinear
-  activation/output，与 CPU W8A8 公式对照。
-- `diagnose_acceptance.py`：CPU/CUDA/NPU 都对比 cached-incremental 与 fresh-full-prefix
-  Target，并可在相同 greedy 前缀上扫描 K=1/3/5/7/15；支持直接传 UTF-8 prompt/txt、
-  FP16/BF16 A/B、早中后段接受率、逐轮层级指纹、跨报告首个分叉和单轮 oracle tensor
-  bundle，默认不输出 token ID；NPU 诊断可复用 `run_npu` 的 quantizer/三路径/input-provider
-  参数，避免增量侧绕过量化输入。
-- `dflash_qwen_adapter_v1.py`：CPU/CUDA/NPU 完整入口和严格 greedy 验证流程。
-- `dflash_reference_decode_v1.py`：无 cache 的完整前缀 DFlash 调度 golden；默认逐 proposal
-  独立验证，vectorized 整块验证仅保留为诊断模式。
+## Target 与 Draft
 
-## 草稿模型
+| 文件 | 职责 |
+| --- | --- |
+| modeling_qwen3_5_dflash.py | CPU/CUDA feature-enabled Target |
+| ../modeling_qwen3_5_hiai_nd_dflash_rollback.py | 独立 HIAI rollback Target |
+| ../internal_dflash_bridge.py | HIAI state bank 与 logical KV cursor |
+| ../export_model_wrapper_qwen3_5_dflash_rollback.py | 部署 wrapper adapter |
+| modeling_dflash.py | 官方 6 层 Draft、无 cache golden 与 request-local committed KV cache |
+| dflash_config.py、dflash_weights.py | 结构、69 tensor 和 checkpoint identity 门禁 |
+| dflash_ops.py | CPU/CUDA Torch backend |
+| dflash_ascend310p_ops.py | NPU Tensor 分解 backend |
+| target_quant.py | rollback Target quantizer/input-provider ABI 与完整 QLinear 拓扑审计 |
+| w8a8_emulation.py、validate_w8a8_cpu.py | QLinear CPU/CUDA 公式仿真和确定性验证；不是 NPU 整网结论 |
 
-- `modeling_dflash.py`：六层 DFlash 草稿模型。
-- `dflash_config.py`：草稿结构与 shape 合同。
-- `dflash_weights.py`：官方草稿 checkpoint 校验和加载。
+量化路线只替换 Target Linear 并复用量化 embedding/input-provider。rollback modeling 导入原
+HIAI 文件的同一个 `QLinear` 类型，因此已有 converter 不需要切换到另一套量化算子；Draft
+共享的 embedding/LM head 仍由独立 FP16 module 提供。prefill、decode 和 verify 都通过同一个
+input-provider，GDR/GDR-MTP、state bank 和 logical KV 事务保持不变。
 
 本包统一使用官方 DFlash 口径：`block_size` 是包含 clean anchor 的 Draft query/Target verify
 总行数。官方配置 `block_size=16` 因此对应 1 个 anchor 加最多 15 个 proposal，即
 `K=block_size-1=15`。接受率诊断仍显式记录 proposal count K，避免把 K 与 block_size 混用。
 
-## Target 主模型与 feature
+## 文档与检查
 
-- `modeling_qwen3_5_dflash.py`：CPU/CUDA 使用的 Transformers 5.14.1 target。
-- `configuration_qwen3_5.py`：CPU/CUDA target 配置。
-- `dflash_target_features.py`：八层 feature collector 和输出类型。
-- `dflash_hiai_feature_check.py`：只读检查父目录 HIAI target 已直接集成 feature route。
-- `dflash_hiai_feature_runtime.py`：旧 ModelOutput sidecar 兼容代码；本次 HIAI Tensor/tuple
-  主路线不导入它。
-- `../internal_dflash_bridge.py`：复用现有 wrapper，并为每次调用新建 hybrid state。
-- `target_quant.py`：`quant` 分支的已有量化器/input-provider 合同、完整 QLinear 路径审计和
-  FP16 Draft 共享权重门禁；它不实现新的量化 kernel。
-- `w8a8_emulation.py`：从真实量化 Target 导出的同一份 `W_q/scale` 构造 CPU/CUDA
-  correctness-only Linear；严格执行 per-token INT8、INT32 accumulator 和 FP16 输出，不做
-  性能声明，也不代替真实 NPU same-activation parity。
-- `validate_w8a8_cpu.py`：不需要模型权重或 NPU 的确定性 CPU 自检；覆盖 Qwen 投影常见
-  `in_features=2560/9728`、per-tensor/per-channel scale、零输入行、重复执行，并用独立 INT64
-  accumulator 对最终 FP16 输出做逐 bit 校验。
-- `internal_target_loader.py`：把已实现的 bridge 包装成 DFlash target facade。
-- `internal_target_loader_template.py`：facade 合同及自定义 loader 参考。
-- `dflash_target_hook_bridge.py`：仅供 eager/CPU 调试的 hook 方案。
+- [完整框架流程](../../docs/DFLASH_ARCHITECTURE.md)
+- [与官方完整 DFlash 的差异](../../docs/DFLASH_UPSTREAM_COMPARISON.md)
+- [自定义算子表](../../docs/DFLASH_OPERATORS.md)
+- [运行和验证](../../docs/DFLASH_RUN_AND_VALIDATE.md)
 
-## 设备算子 backend
-
-- `dflash_ops.py`：六个草稿原语的统一 Python ABI。
-- `dflash_ascend310p_ops.py`：Ascend/NPU 的分解 PyTorch backend。
-- `dflash_custom_ops_template.py`：接入 fused/custom op 的模板。
-
-## 入口
-
-```bash
+~~~bash
+python -m models.dflash_v1.run_rollback --help
 python -m models.dflash_v1.run_npu --help
+python -m models.dflash_v1.benchmark_npu --help
 python -m models.dflash_v1.preflight_target_quant --help
-python -m models.dflash_v1.validate_w8a8_cpu --help
-python -m models.dflash_v1.diagnose_acceptance --help
-python -m models.dflash_v1.dflash_qwen_adapter_v1 --help
-```
-
-三个入口都接受 `--prompt "文本"` 或 `--prompt-file /path/to/prompt.txt`。默认
-`--prompt-mode chat` 使用本地主模型 tokenizer 的 chat template，默认启用 thinking，并输出
-解码后的 ordinary Target 与 DFlash 文本；`--no-enable-thinking` 可复现非 thinking workload，
-`raw` 模式只做普通 tokenizer 编码。
-
-完整 NPU 部署流程见 [NPU_DEPLOYMENT.md](../../docs/NPU_DEPLOYMENT.md)。
-量化 Target 接入见
-[DFLASH_V1_QUANT_RUNBOOK.md](../../docs/DFLASH_V1_QUANT_RUNBOOK.md)；完整设计边界见
-[DFLASH_V1_NPU_QUANT_DESIGN.md](../../docs/DFLASH_V1_NPU_QUANT_DESIGN.md)。
+python tests/test_dflash_rollback_scheduler.py
+python tests/test_dflash_framework_rollback.py
+python tests/test_internal_dflash_bridge_rollback.py
+python tests/test_dflash_rollback_helpers.py
+python -m pytest -q tests/test_run_npu_modes.py tests/test_dflash_runtime_optimizations.py
+python -m pytest -q tests/test_benchmark_npu.py tests/test_msprof_script.py \
+  tests/test_source_lock_benchmark.py tests/test_rollback_target_quant.py
+~~~

@@ -1,10 +1,10 @@
 {
-  "schema_version": 2,
-  "purpose": "runtime identity contract for Qwen3.5-4B DFlash V1",
-  "package_revision": "r1",
-  "route_version": "dflash-v1-sequential-chunk-aligned-full-prefix-direct-hiai-tensor-tuple",
+  "schema_version": 5,
+  "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback with optional Target-only W8A8 dynamic quantization",
+  "package_revision": "r5",
+  "route_version": "dflash-rollback-target-w8a8-incremental-draft-kv-cache-chunk-prefill",
   "package_layout": {
-    "version": 2,
+    "version": 4,
     "canonical_package": "models.dflash_v1",
     "canonical_source_directory": "models/dflash_v1",
     "hiai_source_file": "models/modeling_qwen3_5_hiai_nd.py",
@@ -12,13 +12,13 @@
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
-    "hiai_bridge_sha256": "b365fd5815d095966798be575af89510ee374ad0d7b8e613179f0dafdc1bbc7b",
-    "hiai_bridge_policy": "loads the package wrapper, rebuilds full-attention block tables, allocates fresh call-local hybrid state, aligns multi-token prefills to 64 physical rows, slices outputs to the logical prefix, and synchronizes before releasing state",
+    "hiai_bridge_sha256": "721e668202dfac8a372e14f5f561e74ec6a88950cbc8cf1f7dfb27440f71110c",
+    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with block-aligned real-token prompt chunks on the unchanged original GDR, last-real-row LM head, at most 16 GDR-MTP verify rows, GDN/conv state banks, provisional paged-KV writes, one logical commit cursor, returned-bank ownership, same-stream ordering without per-call host barriers, and optional deployment-owned Target-only W8A8 conversion plus exact per-block FP16 layer-0 input provisioning through the original deployed wrapper ABI",
     "npu_policy": "keep the HIAI target in models/ and install the complete DFlash package in models/dflash_v1/",
     "namespace_compatibility_file": "models/__init__.py",
     "namespace_compatibility_sha256": "9bf3e37aed93d372ca13b17b9c6dae32efa47f805f32b48628fb5316eae34b6d",
     "compatibility_entry_file": "models/dflash_qwen_adapter_v1.py",
-    "compatibility_entry_sha256": "e3953f3dc2952480b4bc28b58519508653842f88c5212bafc4e0335f670a3611"
+    "compatibility_entry_sha256": "f6fc41736b41928ebfc7d5368fbf31e509b1b3db9c5e9291e51d968080bd046b"
   },
   "target_modeling": {
     "repository": "huggingface/transformers",
@@ -46,7 +46,7 @@
   "dflash_reference": {
     "repository": "z-lab/dflash",
     "revision": "07ebd93db9f472af339b644bb70221ad8428328a",
-    "algorithm": "DFlash V1 target bootstrap plus isolated sequential full-prefix greedy verification"
+    "algorithm": "DFlash V1 draft proposal and strict-greedy Target verification; this package replaces historical-prefix replay with a persistent transactional rollback receiver"
   },
   "target_checkpoint": {
     "repository": "Qwen/Qwen3.5-4B",
@@ -74,37 +74,65 @@
     "ops_file": "models/dflash_v1/dflash_ops.py",
     "ops_sha256": "595a73d68565a009cc7bd9f8523f94e846accff41a9926a9fe3d8e24400fcb94",
     "adapter_file": "models/dflash_v1/dflash_qwen_adapter_v1.py",
-    "adapter_sha256": "fe6034eab4d214ae12c9f8a021170bc283a0e33862ab601a5a8214fb3b605582",
+    "adapter_sha256": "3e036bbafcaca83bb23965e333e8b469fcdebacb4e2b7dcbad973c7486e3b02d",
     "scheduler_file": "models/dflash_v1/dflash_reference_decode_v1.py",
-    "scheduler_sha256": "0f1507fed491dd61ab1e303029b64a167c3337b2d32ecda1ae12a24c2da2b666",
+    "scheduler_sha256": "e7efc6fbfdf049a597f33d37b6e348ae6274c3242e8ad56396e3f1122b911f70",
     "draft_model_file": "models/dflash_v1/modeling_dflash.py",
-    "draft_model_sha256": "ab35fc10016d71fc88a2b32bd68e10dde599a948e02d8cfb16c9ca225fbfd9de",
+    "draft_model_sha256": "c0008151abc7d2132b7a82fe82e073df78bed871fa5a9dc65d54c8f2c61dab26",
+    "draft_cache_contract": "request-local six-layer committed K/V; append only new projected Target features, expose the current block transiently, crop on success, abort without mutating committed state, and construct only incremental RoPE positions",
     "weight_loader_file": "models/dflash_v1/dflash_weights.py",
     "weight_loader_sha256": "c85bcc22620c9108d430e0f23e55b7dd08207e6a7884615e508370644bd653b2",
     "acceptance_diagnostic_file": "models/dflash_v1/diagnose_acceptance.py",
-    "acceptance_diagnostic_sha256": "f6752b215f6191093606d257a6750ff2033a4103962e75295feacd5f42ad4d96"
+    "acceptance_diagnostic_sha256": "8e4dca86289311f0e9756f4fd27d9594e3faea6a931b289f5d89844b2fd27c24"
   },
   "npu_embedded_runtime": {
     "runner_file": "models/dflash_v1/run_npu.py",
-    "runner_sha256": "37cfc9fe07b98144a413601fbdf000812b08cddfdd9ef5beca5d641c307bb512",
+    "runner_sha256": "06c2f6b26dc338035967b8ecd62c6143367683cd78867b4b90edf1e45e8b1883",
     "loader_file": "models/dflash_v1/internal_target_loader.py",
-    "loader_sha256": "fb8a1516d1791ad253a8d0dabbfcddae2db57dccc9e2795d938a511071efa840",
+    "loader_sha256": "b6b586e24e0d48d30cc8011390f8eb73dde955f37f54df69a109494aa4698d83",
     "loader_contract_file": "models/dflash_v1/internal_target_loader_template.py",
-    "loader_contract_sha256": "2a5992d81deb9bce842b84ba5412e75932ce4e42b8ca7d40856228045dd683da",
+    "loader_contract_sha256": "ff3ee81eed31e663fdb5e503a4d2c4ff3e4df0b86d6d66eac7f57078eea10e78",
     "hiai_source_check_file": "models/dflash_v1/dflash_hiai_feature_check.py",
-    "hiai_source_check_sha256": "8ac7406f92f41ee39f5efc61caa4db5017aa0beb9432ccab905724fd9620eb11",
+    "hiai_source_check_sha256": "46224492fac7a769436b50d55042043c375bf5d9fdf412543942520394a580f7",
     "hiai_runtime_file": "models/dflash_v1/dflash_hiai_feature_runtime.py",
     "hiai_runtime_sha256": "46b95a67e2cb74b98e6d3964153fee31b5134b2c27a316c991bc83f41d120d4a",
     "hiai_runtime_policy": "legacy ModelOutput sidecar compatibility only; direct HIAI Tensor/tuple source must not import it",
     "ascend_ops_file": "models/dflash_v1/dflash_ascend310p_ops.py",
-    "ascend_ops_sha256": "8647a900ef99f41b23169b63d45ad5a554051d4c1fb8bc924fa22bd270901ac3",
+    "ascend_ops_sha256": "c75d7ffaba6cbaca46582be8eaa966c4d30798b5759e0af24dd56bdd3be22e8a",
     "target_quant_contract_file": "models/dflash_v1/target_quant.py",
     "target_quant_contract_sha256": "bfe89638e88c1bab47721b520d2702f29016578bcf37754cfc1e6f310b1bf3fd",
     "target_quant_preflight_file": "models/dflash_v1/preflight_target_quant.py",
-    "target_quant_preflight_sha256": "c393862af0ec34cbfb6c48cc26d60374d528ea2383a2fc1d8dcbf13e2d818c71",
+    "target_quant_preflight_sha256": "84e82b04db6a914485f66ee3b509b34cc8dcf66e33f1052461bde2e48e98ba43",
     "w8a8_emulation_file": "models/dflash_v1/w8a8_emulation.py",
     "w8a8_emulation_sha256": "fa604b2778f9e6a5e3c623f76ce714eb028713d5afdecbc52dae46514e070c37",
     "w8a8_cpu_validator_file": "models/dflash_v1/validate_w8a8_cpu.py",
-    "w8a8_cpu_validator_sha256": "1c968eff073cc34d53dddfc60d50354217b773e9e664ed925cab96946976214a"
+    "w8a8_cpu_validator_sha256": "1c968eff073cc34d53dddfc60d50354217b773e9e664ed925cab96946976214a",
+    "target_quant_policy": "conversion is callback-owned and fail-closed; every pre-conversion nn.Linear path must become the original HIAI QLinear with exact K-by-N shape/device buffers; Draft-facing embedding and LM head remain FP16; every prompt chunk, decode row, and verify block receives the provider's final FP16 layer-0 hidden"
+  },
+  "rollback_runtime": {
+    "runner_file": "models/dflash_v1/run_rollback.py",
+    "runner_sha256": "d9730325de93f8373af3d084c569e156843415a78c6c274bef40014b872096c4",
+    "adapter_file": "models/dflash_v1/dflash_rollback_adapter.py",
+    "adapter_sha256": "c00e5e060d15575c27c5fdf7bf48d61e88d0fdbfdf4d9af085de42f8131b0af0",
+    "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
+    "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
+    "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
+    "hiai_modeling_sha256": "14daa181a471629aa37583d8b9c86e15795f76d1c307ed59cd7d5be8833fcc1b",
+    "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
+    "wrapper_sha256": "409e16ccbf8a5ea6c7dc9fd02944b8245c28918a6b4e73bed6d6e1e8f705c0c4",
+    "shared_qlinear_source_file": "models/modeling_qwen3_5_hiai_nd.py",
+    "shared_qlinear_source_sha256": "e02e9818ce4a896e2bd1882f37ba20d7afb3712df69058a6a4f6c0973b6b6851",
+    "policy": "persistent ordinary and DFlash sessions; prefill restores the original multi-token GDR route with 64-row real-token chunks and no padding commit; only the final real prompt row executes the LM head; T=K+1 transactional verification uses the unchanged GDR-MTP; optional Target W8A8 reuses the original QLinear while the Draft stays FP16; incremental Draft KV cache; no historical-prefix replay during verify; strict-greedy zero token mismatch"
+  },
+  "npu_benchmark": {
+    "runner_file": "models/dflash_v1/benchmark_npu.py",
+    "runner_sha256": "09f152ed22db30f2f03c00c4763f70512f7d9efb68f25e08cb6b25e07fe87600",
+    "msprof_wrapper_file": "tools/run_msprof.sh",
+    "msprof_wrapper_sha256": "a6e8e9f82ecab0c7c9cadf7d0d5713e25d449feb6a6c49a60a71300881392a69",
+    "contract_file": "config/npu_benchmark_v1.json",
+    "contract_sha256": "ecf047447cf8bddc2e133ebc2f9b9f1e55ccf6baecb9baeff766487ea376a03d",
+    "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
+    "documentation_sha256": "574dd5a9cd0695dd5ee9de7a11b287f30c28df305b2184af525ea77ef4a0cc73",
+    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same Target callback/artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks on the unchanged original GDR; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback"
   }
 }

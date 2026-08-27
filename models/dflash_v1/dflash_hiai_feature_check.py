@@ -18,9 +18,16 @@ from typing import Any, Sequence
 
 FEATURE_CONTRACT_ID = "qwen3.5-4b-dflash-hiai-feature-source-v1"
 FEATURE_SOURCE = "package_local:modeling_qwen3_5_hiai_nd.py"
+ROLLBACK_FEATURE_SOURCE = (
+    "package_local:modeling_qwen3_5_hiai_nd_dflash_rollback.py"
+)
 CAPTURE_POINT = "decoder_post_layer_pre_final_norm"
 FEATURE_WIDTH = 20480
 EXPECTED_SOURCE_BASENAME = "modeling_qwen3_5_hiai_nd.py"
+SUPPORTED_SOURCE_BASENAMES = {
+    EXPECTED_SOURCE_BASENAME: FEATURE_SOURCE,
+    "modeling_qwen3_5_hiai_nd_dflash_rollback.py": ROLLBACK_FEATURE_SOURCE,
+}
 
 
 class HiaiFeatureContractError(RuntimeError):
@@ -83,10 +90,10 @@ def _literal_class_attribute(owner: ast.ClassDef, name: str) -> object:
     return values[0]
 
 
-def _require_metadata(owner: ast.ClassDef) -> None:
+def _require_metadata(owner: ast.ClassDef, *, feature_source: str) -> None:
     expected = {
         "dflash_feature_contract_id": FEATURE_CONTRACT_ID,
-        "dflash_feature_source": FEATURE_SOURCE,
+        "dflash_feature_source": feature_source,
         "dflash_feature_capture_point": CAPTURE_POINT,
     }
     for name, value in expected.items():
@@ -371,7 +378,12 @@ def _require_causal_route(function: ast.FunctionDef) -> None:
     )
 
 
-def verify_direct_source(source: str, *, source_sha256: str | None = None) -> dict[str, Any]:
+def verify_direct_source(
+    source: str,
+    *,
+    source_sha256: str | None = None,
+    feature_source: str = FEATURE_SOURCE,
+) -> dict[str, Any]:
     """Verify one already modified source string without changing it."""
 
     try:
@@ -381,15 +393,19 @@ def verify_direct_source(source: str, *, source_sha256: str | None = None) -> di
     _require_imports(module)
     text_model = _top_level_class(module, "Qwen3_5TextModel")
     causal_model = _top_level_class(module, "Qwen3_5ForCausalLM")
-    _require_metadata(text_model)
-    _require_metadata(causal_model)
+    if feature_source not in SUPPORTED_SOURCE_BASENAMES.values():
+        raise HiaiFeatureContractError(
+            f"unsupported HIAI feature source: {feature_source!r}"
+        )
+    _require_metadata(text_model, feature_source=feature_source)
+    _require_metadata(causal_model, feature_source=feature_source)
     _require_text_route(_method(text_model, "forward"))
     _require_causal_route(_method(causal_model, "forward"))
     digest = source_sha256 or _sha256_bytes(source.encode("utf-8"))
     return {
         "status": "PASS_DIRECT_SOURCE_CONTRACT",
         "contract_id": FEATURE_CONTRACT_ID,
-        "feature_source": FEATURE_SOURCE,
+        "feature_source": feature_source,
         "capture_point": CAPTURE_POINT,
         "feature_width": FEATURE_WIDTH,
         "output_abi": "Tensor | tuple[Tensor, Tensor]",
@@ -402,9 +418,11 @@ def verify_direct_source_file(path: str | Path) -> dict[str, Any]:
     """Verify a package-local, regular HIAI source file."""
 
     source_path = Path(path)
-    if source_path.name != EXPECTED_SOURCE_BASENAME:
+    feature_source = SUPPORTED_SOURCE_BASENAMES.get(source_path.name)
+    if feature_source is None:
         raise HiaiFeatureContractError(
-            f"expected {EXPECTED_SOURCE_BASENAME}, got {source_path.name}"
+            "expected one of "
+            f"{sorted(SUPPORTED_SOURCE_BASENAMES)}, got {source_path.name}"
         )
     if source_path.is_symlink() or not source_path.is_file():
         raise HiaiFeatureContractError("HIAI source must be a regular file")
@@ -413,7 +431,11 @@ def verify_direct_source_file(path: str | Path) -> dict[str, Any]:
         source = payload.decode("utf-8")
     except UnicodeDecodeError as error:
         raise HiaiFeatureContractError("HIAI source must be UTF-8") from error
-    return verify_direct_source(source, source_sha256=_sha256_bytes(payload))
+    return verify_direct_source(
+        source,
+        source_sha256=_sha256_bytes(payload),
+        feature_source=feature_source,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -434,6 +456,7 @@ __all__ = [
     "CAPTURE_POINT",
     "FEATURE_CONTRACT_ID",
     "FEATURE_SOURCE",
+    "ROLLBACK_FEATURE_SOURCE",
     "FEATURE_WIDTH",
     "HiaiFeatureContractError",
     "verify_direct_source",

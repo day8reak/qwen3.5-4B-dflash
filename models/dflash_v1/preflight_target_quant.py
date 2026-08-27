@@ -1,9 +1,10 @@
 """Target-only NPU preflight for the experimental quant branch.
 
-This command loads the quantized HIAI target and exercises the same fresh
-full-prefix bridge used by DFlash, but deliberately does not hash or load the
-Draft checkpoint.  It is the inexpensive first device gate for converter,
-input-provider, feature-route, and call-local state integration.
+This command loads the quantized rollback HIAI target and exercises both its
+fresh full-prefix diagnostic route and its persistent ordinary/rollback
+transaction, but deliberately does not hash or load the Draft checkpoint.  It
+is the inexpensive first device gate for converter, input-provider,
+feature-route, state-bank, and logical-KV integration.
 """
 
 from __future__ import annotations
@@ -324,9 +325,133 @@ def _run_bounded_probes(
             "features_p_q_p_isolation": feature_isolation,
         },
         "scope": (
-            "bounded full-prefix behavior only; ordinary incremental quant "
-            "target parity and per-operator device trace remain pending"
+            "bounded fresh full-prefix oracle sub-probe; persistent ordinary "
+            "and rollback transactions are checked by rollback_target_probe, "
+            "while per-operator device trace remains pending"
         ),
+    }
+
+
+def _run_rollback_target_probe(
+    target: nn.Module,
+    prefix: Tensor,
+) -> dict[str, object]:
+    """Compare one quantized ordinary step with the rollback state-bank step."""
+
+    controller = getattr(target, "target", None)
+    if not isinstance(controller, nn.Module):
+        raise TypeError("rollback preflight requires the packaged target facade")
+    required = (
+        "begin_ordinary",
+        "advance_ordinary",
+        "begin_rollback",
+        "verify_rollback",
+        "commit_rollback",
+        "abort_rollback",
+    )
+    missing = [name for name in required if not callable(getattr(controller, name, None))]
+    if missing:
+        raise TypeError(
+            "quantized Target lacks rollback transaction methods: "
+            + ", ".join(missing)
+        )
+    config = getattr(controller, "config", None)
+    vocab_size = int(getattr(config, "vocab_size", 0))
+    kv_cache_max_len = int(getattr(controller, "kv_cache_max_len", 0))
+    if vocab_size <= 1:
+        raise ValueError("rollback Target has an invalid vocabulary size")
+    if kv_cache_max_len <= 0:
+        raise ValueError("rollback Target has an invalid kv_cache_max_len")
+    if int(prefix.shape[1]) + 1 > kv_cache_max_len:
+        raise ValueError(
+            "rollback preflight needs one decode row beyond the prompt, but "
+            f"prompt length {int(prefix.shape[1])} reaches kv_cache_max_len "
+            f"{kv_cache_max_len}"
+        )
+    next_token = ((prefix[:, -1:] + 1) % vocab_size).to(torch.long)
+    before_quant = getattr(controller, "dflash_target_quantization_audit", None)
+    if not isinstance(before_quant, Mapping):
+        raise TypeError("rollback Target lacks a quantization audit")
+
+    ordinary_prefill = controller.begin_ordinary(prefix)
+    ordinary_prefill_logits = _field(ordinary_prefill, "logits")
+    ordinary_step = controller.advance_ordinary(next_token)
+    ordinary_step_logits = _field(ordinary_step, "logits")
+    rollback_prefill = controller.begin_rollback(prefix)
+    rollback_prefill_logits = _field(rollback_prefill, "logits")
+    rollback_features = _field(rollback_prefill, "dflash_features")
+    rollback_step = controller.verify_rollback(next_token)
+    rollback_step_logits = _field(rollback_step, "logits")
+    controller.commit_rollback(0)
+
+    tensors = {
+        "ordinary_prefill_logits": ordinary_prefill_logits,
+        "ordinary_step_logits": ordinary_step_logits,
+        "rollback_prefill_logits": rollback_prefill_logits,
+        "rollback_step_logits": rollback_step_logits,
+    }
+    missing_tensors = [name for name, value in tensors.items() if value is None]
+    if missing_tensors:
+        raise TypeError(
+            "rollback Target probe returned no " + ", ".join(missing_tensors)
+        )
+    assert ordinary_prefill_logits is not None
+    assert ordinary_step_logits is not None
+    assert rollback_prefill_logits is not None
+    assert rollback_step_logits is not None
+    if rollback_features is None or tuple(rollback_features.shape[:2]) != tuple(
+        prefix.shape
+    ):
+        raise ValueError("rollback prefill did not return one feature row per token")
+    prefill_parity = _compare_repeatable_tensors(
+        ordinary_prefill_logits,
+        rollback_prefill_logits,
+        require_top1=True,
+    )
+    _require_repeatability_pass(
+        prefill_parity,
+        message="quantized ordinary/rollback prefill logits differ",
+    )
+    step_parity = _compare_repeatable_tensors(
+        ordinary_step_logits,
+        rollback_step_logits,
+        require_top1=True,
+    )
+    _require_repeatability_pass(
+        step_parity,
+        message="quantized ordinary/rollback one-step logits differ",
+    )
+
+    after_quant = getattr(controller, "dflash_target_quantization_audit", None)
+    rollback_audit = getattr(controller, "dflash_rollback_audit", None)
+    if not isinstance(after_quant, Mapping) or not isinstance(rollback_audit, Mapping):
+        raise TypeError("rollback Target audits disappeared during the probe")
+    before_calls = before_quant.get("input_provider_calls")
+    after_calls = after_quant.get("input_provider_calls")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (before_calls, after_calls)
+    ):
+        raise TypeError("input-provider call counters must be integers")
+    assert isinstance(before_calls, int) and isinstance(after_calls, int)
+    prompt_chunks = (int(prefix.shape[1]) + 63) // 64
+    expected_calls = 2 * prompt_chunks + 2
+    if after_calls - before_calls != expected_calls:
+        raise RuntimeError(
+            "rollback quant input-provider calls do not cover ordinary and "
+            f"rollback execution: expected {expected_calls}, got "
+            f"{after_calls - before_calls}"
+        )
+    if rollback_audit.get("historical_prefix_replay_during_verify") is not False:
+        raise RuntimeError("rollback probe unexpectedly replayed the prefix")
+    return {
+        "status": "PASS_QUANTIZED_ROLLBACK_TARGET_TRANSACTION",
+        "input_provider_calls": expected_calls,
+        "prompt_chunks_per_session": prompt_chunks,
+        "ordinary_vs_rollback_prefill": prefill_parity,
+        "ordinary_vs_rollback_one_step": step_parity,
+        "historical_prefix_replay_during_verify": False,
+        "committed_rows": 1,
     }
 
 
@@ -699,6 +824,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         requested_paths=tuple(args.compare_qlinear_path),
     )
     probes = _run_bounded_probes(target, prefix)
+    rollback_probe = _run_rollback_target_probe(target, prefix)
     final_audit, final_quant = _quantization_audit(target)
 
     expected_calls = int(probes["target_forward_calls"]) + int(
@@ -719,16 +845,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             initial_bridge.get("full_prefix_calls"),
             bridge.get("full_prefix_calls"),
         ),
-        (
-            "input_provider_calls",
-            initial_quant.get("input_provider_calls"),
-            final_quant.get("input_provider_calls"),
-        ),
-        (
-            "input_provider_successes",
-            initial_quant.get("input_provider_successes"),
-            final_quant.get("input_provider_successes"),
-        ),
     ):
         if (
             isinstance(initial, bool)
@@ -741,6 +857,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError(
                 f"{label} delta must equal executed target calls {expected_calls}; "
                 f"got initial={initial}, final={final}"
+            )
+    expected_provider_calls = expected_calls + int(
+        rollback_probe["input_provider_calls"]
+    )
+    for label in ("input_provider_calls", "input_provider_successes"):
+        initial = initial_quant.get(label)
+        final = final_quant.get(label)
+        if (
+            isinstance(initial, bool)
+            or not isinstance(initial, int)
+            or isinstance(final, bool)
+            or not isinstance(final, int)
+        ):
+            raise TypeError(f"{label} counters must be integers")
+        if final - initial != expected_provider_calls:
+            raise RuntimeError(
+                f"{label} delta must equal all full-prefix and rollback calls "
+                f"{expected_provider_calls}; got initial={initial}, final={final}"
             )
     initial_failures = initial_quant.get("input_provider_failures")
     final_failures = final_quant.get("input_provider_failures")
@@ -769,7 +903,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.require_qlinear_bitwise and not same_activation_pass
     )
     remaining_gates = [
-        "ordinary_incremental_quant_target_vs_fresh_full_prefix_parity",
         "quant_target_plus_dflash_strict_greedy_exact_match",
         "real_npu_operator_trace_and_no_fallback",
         "acceptance_and_performance_measurement",
@@ -786,11 +919,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     payload: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": (
             "FAIL_SAME_ACTIVATION_QLINEAR_NOT_BITWISE"
             if strict_comparison_failure
-            else "PASS_TARGET_QUANT_ASSEMBLY_AND_BOUNDED_PREFIX_PROBES"
+            else "PASS_TARGET_QUANT_ASSEMBLY_PREFIX_AND_ROLLBACK_PROBES"
         ),
         "classification": "TARGET_ONLY_NO_DFLASH_DRAFT",
         "device": str(device),
@@ -803,6 +936,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "target_isolation_final": final_audit,
         "same_activation_qlinear": same_activation,
         "bounded_probes": probes,
+        "rollback_target_probe": rollback_probe,
         "w8a8_emulation_export": emulation_export,
         "remaining_gates": remaining_gates,
     }

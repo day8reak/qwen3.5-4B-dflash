@@ -1,109 +1,95 @@
-# Qwen3.5-4B DFlash V1（v1-r1）
+# Qwen3.5-4B DFlash rollback
 
-这是 Qwen3.5-4B 的 DFlash V1 PyTorch 实现，包含完整前缀重算调度、六层草稿模型、
-CPU/CUDA 后端，以及 Ascend NPU/HIAI target 所需的检查和 loader。
+这个分支实现了 Qwen3.5-4B 的 strict-greedy DFlash rollback，并在同一条 persistent Target
+路线中支持已有 W8A8 动态量化。每轮只验证 anchor 与 Draft proposal 组成的小块，不再把不断
+增长的历史前缀重新送入 Target。量化只作用于 Target Linear/embedding 输入路线，Draft 的
+embedding、LM head 和 6 层主体仍保持 FP16。
 
-仓库只保留可运行源码、部署工具、许可证和中文使用说明。测试日志、验证报告、发布清单和
-模型权重不放在 GitHub 仓库中。
+当前实现目标是先闭合正确性和状态事务。仓库中的 CPU/reduced-shape 测试不是 Ascend 310P
+真机证据，也不代表已经获得端到端加速。
 
-## 目录
+## 当前框架
 
-- `models/dflash_v1/`：DFlash 调度器、草稿模型、CPU/CUDA/NPU backend 和运行入口。
-- `models/modeling_qwen3_5_hiai_nd.py`：NPU target 的直接集成版本，包含八层 feature
-  collector，并保持默认 forward 返回不变。
-- `models/internal_dflash_bridge.py`：复用现有 HIAI wrapper，并为每次完整前缀调用创建
-  全新的 hybrid KV/GDN state。
-- `models/dflash_qwen_adapter_v1.py`：旧命令兼容入口。
-- `tools/`：自定义算子静态预检工具。
-- `config/`：预检工具使用的算子接口合同。
-- `docs/`：CPU、CUDA 和 Ascend NPU 使用说明。
-- `SOURCE_LOCK.json`：framework 启动和草稿 checkpoint 身份检查所需的精简运行合同。
+| 环节 | 当前实现 |
+| --- | --- |
+| Draft | 官方 6 层、69 tensor；逐层 committed KV cache；`block_size=16` 含 anchor，最多提出 K=15 个 token |
+| Target verify | 一次输入 [anchor, d1, ..., dK]，本轮 T=K+1≤`block_size`，最大 16 |
+| 接受规则 | 只接受从 d1 开始的最长连续匹配前缀 |
+| CPU/CUDA 状态 | 持久 DynamicCache；verify 后恢复 KV/GDN，再只重放 anchor 和已接受 proposal |
+| HIAI/NPU 状态 | GDR MTP recurrent bank、输入 NPU 上的 Torch conv golden、paged-KV logical cursor |
+| Target 精度 | 默认 FP16；显式 `--target-quant-mode w8a8_dynamic` 后复用已有 `QLinear` 与量化 input-provider |
+| 正确性 | `validate` 与独立 ordinary incremental greedy 做零差异门禁；`dflash` 只跑生产路径 |
 
-NPU 部署采用“target 在父包、DFlash 放子目录”的结构：
+~~~mermaid
+flowchart LR
+    P[Prompt prefill] --> A[Target clean anchor]
+    A --> D[Draft: anchor + K masks]
+    D --> Q[K proposals]
+    Q --> V[Target once: T = K + 1]
+    V --> M[Longest contiguous match a]
+    M --> C[Commit anchor + accepted a]
+    M --> N[Correction or bonus becomes next anchor]
+    C --> D
+    N --> D
+~~~
 
-```text
-qwen35-runtime/
-└── models/
-    ├── modeling_qwen3_5_hiai_nd.py   # 本仓库直接提供
-    ├── configuration_qwen3_5.py      # 已有配置文件
-    ├── internal_dflash_bridge.py     # 本仓库已实现，无需手写
-    ├── 其他运行文件
-    └── dflash_v1/                    # 本仓库的 models/dflash_v1 整目录
-```
+一轮结束后的核心不变量是：
 
-不要用 CPU/GPU 的 `modeling_qwen3_5_dflash.py` 覆盖 NPU modeling。部署时将本仓库的
-`models/modeling_qwen3_5_hiai_nd.py` 整体复制到目标工程同名位置。runner 只读校验它的
-feature ABI，不会在运行时 patch 或修改它。
+~~~text
+Target state 与 feature 已处理到 current anchor 之前
+current anchor 已输出，但还没有作为 Target 输入处理
+~~~
 
-## 环境
+因此本轮状态提交长度是 1+a，而 correction 或 all-match bonus 要留作下一轮 anchor。
 
-使用 Python 3.10 和 `transformers==5.14.1`。请先安装与设备匹配的 PyTorch：
+## 代码入口
 
-- CPU：官方 CPU PyTorch；
-- CUDA：对应 CUDA 版本的 PyTorch；
-- NPU：与目标设备匹配的 PyTorch、`torch_npu` 和自定义算子环境。
+| 文件 | 作用 |
+| --- | --- |
+| models/dflash_v1/run_rollback.py | CPU、CUDA、NPU 共用的 rollback CLI |
+| models/dflash_v1/run_npu.py | 固定 HIAI 参数的 NPU 简化入口 |
+| models/dflash_v1/benchmark_npu.py | ordinary/DFlash 独立进程的同步 NPU 性能基准 |
+| models/dflash_v1/preflight_target_quant.py | 不加载 Draft 的量化装配、QLinear 和 rollback transaction 预检 |
+| models/dflash_v1/target_quant.py | 量化 callback、完整 Linear 拓扑和 FP16 Draft 共享权重合同 |
+| models/dflash_v1/dflash_rollback_decode.py | proposal 验证、最长连续接受和输出调度 |
+| models/dflash_v1/dflash_rollback_adapter.py | CPU/CUDA Target transaction 与 Draft 接线 |
+| models/internal_dflash_bridge.py | HIAI persistent state、bank selector 和 logical KV cursor |
+| models/modeling_qwen3_5_hiai_nd_dflash_rollback.py | 独立 rollback HIAI modeling |
+| models/export_model_wrapper_qwen3_5_dflash_rollback.py | 复用部署 wrapper 的 rollback adapter |
 
-然后安装通用依赖：
-
-```bash
-python -m pip install "transformers==5.14.1" safetensors huggingface-hub
-```
+原 models/modeling_qwen3_5_hiai_nd.py 保持不变。代码目录名 dflash_v1 是兼容路径，不代表
+默认调度仍是旧的 full-prefix V1；旧实现只保留为诊断 oracle。
 
 ## 最小运行
 
-准备本地主模型和官方 `z-lab/Qwen3.5-4B-DFlash` 草稿权重：
-主模型目录还必须包含完整 tokenizer 文件；文本输入全程使用本地文件，不联网下载。
+使用 Python 3.10、transformers 5.14.1，并先安装与设备匹配的 PyTorch。主模型和
+z-lab/Qwen3.5-4B-DFlash 权重必须位于本地，仓库不包含权重、cache、ONNX/OM、日志或报告。
 
-```bash
+CPU 或 CUDA：
+
+~~~bash
 export PYTHONPATH="$PWD"
-python -B -m models.dflash_v1.dflash_qwen_adapter_v1 \
+python -B -m models.dflash_v1.run_rollback \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --prompt-mode chat \
-  --max-new-tokens 2 \
-  --block-size 2 \
+  --enable-thinking \
+  --max-new-tokens 32 \
+  --execution-mode validate \
+  --block-size 16 \
   --eos-token-id 248044 \
   --dtype float16 \
-  --device cpu \
-  --report /path/to/run/dflash-v1-cpu.json
-```
+  --device cuda:0 \
+  --report /path/to/run/dflash-rollback.json
+~~~
 
-建议先读主文档，再按问题进入子文档：
+CPU 将 device 改为 cpu，并按环境选择 float32、float16 或 bfloat16。
 
-- [整体架构与完整数据流](docs/DFLASH_V1_ARCHITECTURE.md)
-  - [Target 与 Feature](docs/DFLASH_V1_TARGET_AND_FEATURE.md)
-  - [Draft 模型](docs/DFLASH_V1_DRAFT.md)
-  - [Scheduler 与 token 验证](docs/DFLASH_V1_SCHEDULER.md)
-  - [验证流程与报告解读](docs/DFLASH_V1_VALIDATION.md)
-- [从 V1 到完整 DFlash 与真正提速](docs/DFLASH_FULL_AND_PERFORMANCE_ROADMAP.md)
-- `quant` 分支：
-  - [量化版最快运行与排错指南](docs/DFLASH_V1_QUANT_RUNBOOK.md)
-  - [NPU Quant Target 设计与边界](docs/DFLASH_V1_NPU_QUANT_DESIGN.md)
-- [实现和文件索引](README_DFLASH_V1.md)
-- 运行文档：
-  - [CPU/Golden](docs/DFLASH_V1_GOLDEN.md)
-  - [CUDA GPU](docs/DFLASH_V1_GPU.md)
-  - [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md)
-  - [Ascend 310P 接口与边界](docs/DFLASH_V1_ASCEND310P.md)
+HIAI/NPU：
 
-## NPU 快速入口
-
-下面这条是默认的 **FP16 Target + FP16 Draft** 命令。`quant` 分支不要直接在它后面只追加一个
-权重目录：量化 Target 还必须同时提供 Linear 量化权重、embedding 权重、embedding scale、
-quantizer callback 和 input-provider callback。第一次运行请直接从
-[量化版最快运行步骤](docs/DFLASH_V1_QUANT_RUNBOOK.md#0-最快跑起来按这五步)开始。
-
-先按 [Ascend NPU 部署与运行](docs/NPU_DEPLOYMENT.md) 部署仓库中的
-`modeling_qwen3_5_hiai_nd.py`。bridge 会复用现有
-`Qwen3_5ForCausalLMWrapper`，并按模型配置的 hybrid-cache shape 在每次 target 调用时
-新建状态。`v1-r1` 还会把 `S>1` 的完整前缀在 bridge 内右补齐到 64-token GDN chunk，执行后只
-截回真实 token 行，并在释放本次临时 KV/GDN state 前同步 NPU；同时会按
-`--kv-cache-max-len` 重建所有 full-attention block table，因此不再需要手写 factory/reset：
-
-```bash
-export PYTHONPATH=/path/to/qwen35-runtime
-
+~~~bash
+export PYTHONPATH=/path/to/runtime
 python -B -m models.dflash_v1.run_npu \
   --target-dir /path/to/Qwen3.5-4B \
   --draft-dir /path/to/Qwen3.5-4B-DFlash \
@@ -111,42 +97,68 @@ python -B -m models.dflash_v1.run_npu \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --prompt-mode chat \
   --enable-thinking \
-  --max-new-tokens 2 \
-  --block-size 2 \
+  --max-new-tokens 32 \
+  --execution-mode validate \
+  --block-size 16 \
   --device npu:0 \
-  --report /path/to/run/dflash-v1-npu-smoke.json
-```
+  --report /path/to/run/dflash-rollback-npu.json
+~~~
 
-把 `4096` 替换成部署配置中 `kv_cache_max_len` 的真实值。
-不需要修改 bridge 源码。`run_npu` 会自动固定 FP16、EOS `248044`、内嵌目录、package-local NPU
-backend 和 HIAI source，不再要求 overlay JSON。
+NPU 部署必须已经注册用户完成的 npu_gated_delta_rule_mtp。kv-cache-max-len 要与部署配置一致、
+为正且能被 64 整除。
 
-如果已经能生成但接受率偏低，按
-[NPU 接受率分层诊断](docs/NPU_DEPLOYMENT.md#7-接受率低时的分层诊断) 运行
-`models.dflash_v1.diagnose_acceptance`。它会先判定正常增量 Target 与 DFlash fresh
-full-prefix Target 是否等价，再以逐 proposal 的独立前缀验证统计 K=1/3/5/7/15；旧的一次
-向量化 target 验证只保留为 prefix-invariance 诊断。新版也支持 CUDA FP16/BF16 A/B、逐轮
-无明文层级指纹和两份报告的首个分叉定位，避免把 kernel 随序列长度产生的舍入差异误报为
-BF16 调度错误。
-GPU 的 FP16/BF16 对照命令见 [DFlash V1 GPU 运行说明](docs/DFLASH_V1_GPU.md)。
-量化分支还支持从真实 NPU `QLinear` 导出同一份 `W_q/scale`，在 CPU/CUDA 完整 Target 中
-执行 correctness-only W8A8 公式仿真；Target-only 预检可自动做同一次 activation 的
-NPU/CPU 单层对照，NPU 接受率诊断也会复用量化 input provider。导出、运行和完整排错步骤见
-[量化版运行与排错指南](docs/DFLASH_V1_QUANT_RUNBOOK.md)。设计边界和公式细节另见
-[NPU Quant Target 适配分析](docs/DFLASH_V1_NPU_QUANT_DESIGN.md#13-cpucuda-w8a8-公式仿真)。
-在没有权重和 NPU 的机器上，可以先运行
-`python -B -m models.dflash_v1.validate_w8a8_cpu`；它只验证 CPU 公式和整数累加实现，不能代替
-真实 Linear 量化权重、embedding 权重/scale 输入路径或 NPU 同 activation 对照。
+量化 Target 在同一命令追加以下参数；六项必须一起提供，不能部分启用：
 
-固定文本也可以放进 UTF-8 文件，然后把 `--prompt "..."` 换成
-`--prompt-file /path/to/prompt.txt`。默认 `--prompt-mode chat` 会套用本地主模型 tokenizer 的
-chat template，且默认开启 thinking；只有文件已经包含完整模板文本时才使用
-`--prompt-mode raw`。需要复现非 thinking workload 时显式传 `--no-enable-thinking`。入口会
-直接打印 ordinary Target 和 DFlash 的解码结果。
+~~~bash
+  --target-quant-mode w8a8_dynamic \
+  --target-quantizer your_quant_bridge:quantize_target \
+  --target-quant-weight-path /path/to/linear-quant-artifact \
+  --target-input-provider your_quant_bridge:build_target_inputs \
+  --target-embedding-weight-path /path/to/embedding-weight \
+  --target-embedding-scale-path /path/to/embedding-scale
+~~~
 
-报告中的 `accepted_draft_tokens / drafted_tokens` 不是官方 accept length。更接近官方口径的
-字段是 `mean_emitted_tokens_per_draft_round`（接受 proposal 加 correction/bonus）。接受率仍然
-强依赖 prompt、thinking 模式和生成阶段，不能用一条短文本替代多 workload 评测。
+rollback modeling 直接复用原 `modeling_qwen3_5_hiai_nd.py` 的 `QLinear`；原 GDR 和用户完成的
+GDR-MTP 调用不做替换。input-provider 分别接收真实的 1..64 行 prompt chunk、单行 decode 和
+最多 16 行 verify block，不会重新计算完整历史前缀。
 
-仓库不包含 Qwen3.5-4B 或 DFlash 权重。真实 CUDA 和 Ascend 310P 结果需要在对应服务器上
-执行上述流程确认，CPU 结果不能替代设备验证。
+离线门禁通过后可把 `--execution-mode validate` 改为 `dflash`，从而不再额外运行 ordinary；该
+单跑报告不会把未执行的 ordinary 对照标成 exact-match PASS。
+
+## 文档
+
+- [DFlash 框架与 token/state 流程](docs/DFLASH_ARCHITECTURE.md)
+- [当前 rollback 与官方完整 DFlash 的差异](docs/DFLASH_UPSTREAM_COMPARISON.md)
+- [现有算子与待开发自定义算子](docs/DFLASH_OPERATORS.md)
+- [CPU、CUDA、NPU 运行和验证](docs/DFLASH_RUN_AND_VALIDATE.md)
+- [源码索引](models/dflash_v1/README.md)
+
+正式 rollback 报告至少应满足：
+
+~~~text
+route = qwen3.5-dflash-incremental-rollback
+verification_mode = incremental_transactional_rollback
+historical_prefix_replay_during_verify = false
+strict_greedy_exact_match = true
+draft_kv_cache_audit.mode = upstream_equivalent_append_then_crop
+target_quantization.scheme = disabled 或 w8a8_dynamic
+~~~
+
+启用量化时还必须满足：
+
+~~~text
+target_quantization.status = PASS_ASSEMBLY_CONTRACT_NO_NUMERICAL_CLAIM
+target_quantization.route = rollback
+target_quantization.linear_topology_validation = PASS_EXACT_PATH_SHAPE_BIAS
+target_quantization.input_provider_failures = 0
+~~~
+
+只有在 Ascend 310P 上禁用 fallback，并记录 runtime、device、算子包身份、kernel trace 和多轮
+严格 token 对齐后，才能声明目标路线通过；性能结论还需要独立的端到端配对测量。
+
+rollback 内部性能测试使用 `python -B -m models.dflash_v1.benchmark_npu`，ordinary 与 dflash
+分别启动进程，默认各 3 次 warmup、10 次 measurement；其中 ordinary 只是同一 rollback
+receiver 的内部控制组，不等于 main 原模型。原非 DFlash 权威基线从原部署工程运行
+`python3 inference.py --config ./config/qwen3.5.ymal --max_token 32`，并且不传
+`--quant_mode enable`。完整命令、报告门禁和 `tools/run_msprof.sh` 用法见
+[运行和验证第 7 节](docs/DFLASH_RUN_AND_VALIDATE.md#7-npu-性能基准与-msprof)。

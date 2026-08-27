@@ -1,9 +1,8 @@
-"""Simple NPU entry point for the embedded HIAI layout.
+"""Simple NPU entry point for the embedded HIAI rollback layout.
 
 This command derives the HIAI source and DFlash loader from the colocated
 ``models`` package.  It intentionally exposes only the controls needed for a
-V1 strict-greedy smoke or validation run.  The colocated source tree is
-validated directly; no generated overlay report is needed.
+strict-greedy persistent rollback smoke or validation run.
 """
 
 from __future__ import annotations
@@ -14,6 +13,14 @@ from pathlib import Path
 from typing import Sequence
 
 from .dflash_config import DFLASH_MIN_BLOCK_SIZE, OFFICIAL_DFLASH_BLOCK_SIZE
+from .run_rollback import (
+    DEFAULT_NPU_TARGET_FACTORY,
+    main as _adapter_main,
+)
+from .internal_target_loader import (
+    DECODE_CHUNK_SIZE_ENV,
+    PREFILL_CHUNK_SIZE_ENV,
+)
 from .target_quant import (
     QUANT_MODE_DISABLED,
     SUPPORTED_TARGET_QUANT_MODES,
@@ -28,22 +35,16 @@ from .target_quant import (
     load_callback,
     quantizer_callback_abi,
 )
-from .dflash_qwen_adapter_v1 import main as _adapter_main
-from .internal_target_loader import (
-    DECODE_CHUNK_SIZE_ENV,
-    PREFILL_CHUNK_SIZE_ENV,
-)
 
 
-DEFAULT_TARGET_FACTORY = "models.internal_dflash_bridge:load_qwen35_target"
+DEFAULT_TARGET_FACTORY = DEFAULT_NPU_TARGET_FACTORY
 KV_CACHE_MAX_LEN_ENV = "DFLASH_HIAI_KV_CACHE_MAX_LEN"
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run Qwen3.5-4B DFlash V1 with the original HIAI model in "
-            "models/ and DFlash in models/dflash_v1/"
+            "Run Qwen3.5-4B DFlash with persistent HIAI state-bank rollback"
         )
     )
     parser.add_argument("--target-dir", required=True)
@@ -52,16 +53,15 @@ def _parser() -> argparse.ArgumentParser:
         "--target-factory",
         default=DEFAULT_TARGET_FACTORY,
         help=(
-            "advanced override; default models.internal_dflash_bridge:"
-            "load_qwen35_target reuses Qwen3_5ForCausalLMWrapper and builds "
-            "fresh hybrid state for every target call"
+            "advanced override; the default loads the separate rollback "
+            "modeling through the deployed wrapper adapter"
         ),
     )
     parser.add_argument(
         "--reset-hook",
         help=(
-            "advanced override for a custom target factory; the packaged "
-            "internal_dflash_bridge does not need a reset hook"
+            "unsupported compatibility option; rollback owns state through "
+            "begin/verify/commit/abort"
         ),
     )
     prompt = parser.add_mutually_exclusive_group(required=True)
@@ -83,6 +83,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument(
+        "--execution-mode",
+        choices=("validate", "dflash"),
+        default="validate",
+        help=(
+            "validate runs ordinary plus DFlash exact-match checking; dflash "
+            "runs only the production DFlash session"
+        ),
+    )
+    parser.add_argument(
         "--block-size",
         type=int,
         default=DFLASH_MIN_BLOCK_SIZE,
@@ -95,45 +104,52 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="same kv_cache_max_len used by the existing HIAI inference YAML",
     )
-    parser.add_argument("--prefill-chunk-size", type=int, default=64)
-    parser.add_argument("--decode-chunk-size", type=int, default=1)
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        default=64,
+        help="compatibility setting; the current receiver contract requires 64",
+    )
+    parser.add_argument(
+        "--decode-chunk-size",
+        type=int,
+        default=1,
+        help="compatibility setting; prompt bootstrap/decode require 1",
+    )
     parser.add_argument(
         "--target-quant-mode",
         choices=SUPPORTED_TARGET_QUANT_MODES,
         default=QUANT_MODE_DISABLED,
         help=(
-            "reuse the existing target quantization path; disabled preserves "
-            "the v1-r1 FP16 target"
+            "quantize only the rollback Target with the existing W8A8 path; "
+            "the DFlash Draft embedding/head remain FP16"
         ),
     )
     parser.add_argument(
         "--target-quantizer",
         help=(
-            "MODULE:FUNCTION converting the loaded HIAI execution model and "
-            "returning nn.Module/None or an explicit TargetQuantizationResult"
+            "MODULE:FUNCTION converting the rollback HIAI execution model and "
+            "returning nn.Module/None or TargetQuantizationResult"
         ),
     )
     parser.add_argument(
         "--target-quant-weight-path",
-        help=(
-            "existing Linear quant-weight file or directory consumed by "
-            "--target-quantizer"
-        ),
+        help="existing Target Linear quant-weight file or directory",
     )
     parser.add_argument(
         "--target-input-provider",
         help=(
-            "MODULE:FUNCTION returning the final FP16 layer-0 hidden for the "
-            "quantized target's padded input IDs"
+            "MODULE:FUNCTION returning the final FP16 layer-0 hidden for every "
+            "rollback prefill/decode/verify input block"
         ),
     )
     parser.add_argument(
         "--target-embedding-weight-path",
-        help="existing quantized embedding-weight file or directory",
+        help="existing quantized Target embedding-weight file or directory",
     )
     parser.add_argument(
         "--target-embedding-scale-path",
-        help="existing quantized embedding-scale file or directory",
+        help="existing quantized Target embedding-scale file or directory",
     )
     parser.add_argument("--report")
     parser.add_argument(
@@ -145,6 +161,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _configure_target_quantization(args: argparse.Namespace) -> None:
+    """Freeze the process-local quant route before any checkpoint is loaded."""
+
     values = {
         TARGET_QUANTIZER_ENV: args.target_quantizer,
         TARGET_QUANT_WEIGHT_PATH_ENV: args.target_quant_weight_path,
@@ -166,9 +184,9 @@ def _configure_target_quantization(args: argparse.Namespace) -> None:
 
     if args.target_factory != DEFAULT_TARGET_FACTORY:
         raise ValueError(
-            "target quantization currently requires the packaged "
-            f"--target-factory {DEFAULT_TARGET_FACTORY}; a custom factory "
-            "would bypass the quantization assembly audit"
+            "rollback Target quantization requires the packaged factory "
+            f"{DEFAULT_TARGET_FACTORY}; a custom factory would bypass the "
+            "QLinear and state-transaction audits"
         )
     missing = [name for name, value in values.items() if value is None]
     if missing:
@@ -181,10 +199,6 @@ def _configure_target_quantization(args: argparse.Namespace) -> None:
         assert value is not None
         os.environ[name] = str(value)
 
-    # Fail before the adapter hashes the large Draft checkpoint.  The target
-    # factory repeats these checks and records the callback identities, but a
-    # misspelled module/function or incompatible ABI should be a cheap CLI
-    # preflight error rather than a late model-loading failure.
     request = TargetQuantizationRequest.from_environment()
     assert request.enabled
     assert request.quantizer_spec is not None
@@ -213,12 +227,9 @@ def _configure_target_quantization(args: argparse.Namespace) -> None:
             if overlaps:
                 raise ValueError(
                     "--report must not overwrite or be placed inside any "
-                    "target quantization data path"
+                    "Target quantization data path"
                 )
-    quantizer, _ = load_callback(
-        request.quantizer_spec,
-        label="target quantizer",
-    )
+    quantizer, _ = load_callback(request.quantizer_spec, label="target quantizer")
     input_provider, _ = load_callback(
         request.input_provider_spec,
         label="target input provider",
@@ -231,6 +242,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if not str(args.device).startswith("npu"):
         raise ValueError("run_npu requires --device npu or npu:N")
+    if args.reset_hook is not None:
+        raise ValueError("--reset-hook is not part of the rollback transaction")
     if args.max_new_tokens < 2:
         raise ValueError("NPU DFlash smoke requires --max-new-tokens >= 2")
     if not DFLASH_MIN_BLOCK_SIZE <= args.block_size <= OFFICIAL_DFLASH_BLOCK_SIZE:
@@ -245,14 +258,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         if value <= 0:
             raise ValueError(f"{name} must be positive")
+    if args.prefill_chunk_size != 64 or args.decode_chunk_size != 1:
+        raise ValueError(
+            "rollback HIAI requires prefill-chunk-size=64 and "
+            "decode-chunk-size=1"
+        )
 
     _configure_target_quantization(args)
 
     package_dir = Path(__file__).resolve().parent
-    hiai_source = package_dir.parent / "modeling_qwen3_5_hiai_nd.py"
+    hiai_source = (
+        package_dir.parent / "modeling_qwen3_5_hiai_nd_dflash_rollback.py"
+    )
     if hiai_source.is_symlink() or not hiai_source.is_file():
         raise FileNotFoundError(
-            "expected original HIAI source at models/modeling_qwen3_5_hiai_nd.py"
+            "expected rollback HIAI source at "
+            "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py"
         )
     os.environ[PREFILL_CHUNK_SIZE_ENV] = str(args.prefill_chunk_size)
     os.environ[DECODE_CHUNK_SIZE_ENV] = str(args.decode_chunk_size)
@@ -275,11 +296,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "248044",
         "--max-new-tokens",
         str(args.max_new_tokens),
+        "--execution-mode",
+        args.execution_mode,
         "--block-size",
         str(args.block_size),
     ]
-    if args.reset_hook is not None:
-        adapter_args.extend(["--reset-hook", args.reset_hook])
     if args.prompt_ids is not None:
         adapter_args.extend(["--prompt-ids", args.prompt_ids])
     elif args.prompt_json is not None:

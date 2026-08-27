@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from numbers import Integral, Real
+import os
 
 import torch
 from torch import Tensor
@@ -23,6 +24,38 @@ import torch.nn.functional as F
 
 
 _SUPPORTED_DTYPES = frozenset((torch.float16, torch.bfloat16, torch.float32))
+EXHAUSTIVE_CHECKS_ENV = "DFLASH_ASCEND310P_EXHAUSTIVE_CHECKS"
+_TRUE_ENV_VALUES = frozenset(("1", "true", "yes", "on"))
+_FALSE_ENV_VALUES = frozenset(("0", "false", "no", "off"))
+
+
+def exhaustive_value_checks_enabled(device: torch.device | str) -> bool:
+    """Return whether every intermediate tensor should be scanned for finiteness.
+
+    CPU execution is the reduced-shape diagnostic oracle and keeps the original
+    fail-closed checks.  Accelerator execution defaults to boundary-only checks:
+    shape/device/dtype contracts still run for every primitive, while the final
+    Draft logits remain finite-checked before Top1.  Set
+    ``DFLASH_ASCEND310P_EXHAUSTIVE_CHECKS=1`` only for numerical diagnosis; it
+    intentionally adds a device synchronization for every checked tensor.
+    """
+
+    device_type = (
+        device.type
+        if isinstance(device, torch.device)
+        else str(device).split(":", 1)[0].lower()
+    )
+    if device_type == "cpu":
+        return True
+    raw = os.environ.get(EXHAUSTIVE_CHECKS_ENV, "0").strip().lower()
+    if raw in _TRUE_ENV_VALUES:
+        return True
+    if raw in _FALSE_ENV_VALUES:
+        return False
+    raise ValueError(
+        f"{EXHAUSTIVE_CHECKS_ENV} must be one of "
+        "0/1, false/true, no/yes, or off/on"
+    )
 
 
 def _require_tensor(name: str, value: object) -> Tensor:
@@ -54,9 +87,12 @@ def _require_same_device_dtype(operation: str, *named_tensors: tuple[str, Tensor
             )
 
 
-def _require_finite(name: str, tensor: Tensor) -> None:
-    # ``item`` synchronizes the current device for fail-closed validation; it
-    # does not copy the tensor or execute the numerical operation on CPU.
+def _require_finite(name: str, tensor: Tensor, *, boundary: bool = False) -> None:
+    if not boundary and not exhaustive_value_checks_enabled(tensor.device):
+        return
+    # ``item`` synchronizes the current device.  Keep it at model boundaries
+    # during normal accelerator execution, and at every primitive only in the
+    # explicit exhaustive diagnostic mode.
     if not bool(torch.isfinite(tensor).all().item()):
         raise FloatingPointError(f"{name} contains a non-finite value")
 
@@ -272,7 +308,10 @@ def attention(
                 f"to {tuple(score_shape)}"
             )
         visible = attention_mask.expand(score_shape)
-        if not bool(visible.any(dim=-1).all().item()):
+        if (
+            exhaustive_value_checks_enabled(query.device)
+            and not bool(visible.any(dim=-1).all().item())
+        ):
             raise ValueError("attention_mask contains a fully masked query row")
         scores = scores.masked_fill(~visible, float("-inf"))
 
@@ -313,11 +352,22 @@ def top1(hidden: Tensor, lm_head_weight: Tensor) -> Tensor:
     _require_finite("top1 hidden", hidden)
     _require_finite("top1 lm_head_weight", lm_head_weight)
     logits = F.linear(hidden, lm_head_weight)
-    _require_finite("top1 logits", logits)
+    # Preserve one fail-closed numerical boundary without scanning the shared
+    # 248320x2560 LM-head weight (and every intermediate weight) each round.
+    _require_finite("top1 logits", logits, boundary=True)
     token_ids = torch.argmax(logits, dim=-1)
     if token_ids.dtype != torch.int64:
         raise RuntimeError(f"top1 must return int64 IDs; got {token_ids.dtype}")
     return token_ids
 
 
-__all__ = ("rms_norm", "linear", "rotary", "attention", "swiglu", "top1")
+__all__ = (
+    "EXHAUSTIVE_CHECKS_ENV",
+    "attention",
+    "exhaustive_value_checks_enabled",
+    "linear",
+    "rms_norm",
+    "rotary",
+    "swiglu",
+    "top1",
+)

@@ -65,7 +65,9 @@ from .run_npu import _configure_target_quantization
 from .target_quant import QUANT_MODE_DISABLED, SUPPORTED_TARGET_QUANT_MODES
 
 
-DEFAULT_TARGET_FACTORY = "models.internal_dflash_bridge:load_qwen35_target"
+DEFAULT_TARGET_FACTORY = (
+    "models.internal_dflash_bridge:load_qwen35_rollback_target"
+)
 KV_CACHE_MAX_LEN_ENV = "DFLASH_HIAI_KV_CACHE_MAX_LEN"
 OFFICIAL_EOS_TOKEN_ID = 248_044
 SUPPORTED_DTYPES = {
@@ -2635,10 +2637,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     device_type = str(args.device).split(":", 1)[0].lower()
     dtype = SUPPORTED_DTYPES[args.dtype]
     _configure_target_quantization(args)
-    source_path = package_dir.parent / "modeling_qwen3_5_hiai_nd.py"
+    source_path = (
+        package_dir.parent / "modeling_qwen3_5_hiai_nd_dflash_rollback.py"
+    )
     if device_type == "npu" and (source_path.is_symlink() or not source_path.is_file()):
         raise FileNotFoundError(
-            "expected models/modeling_qwen3_5_hiai_nd.py beside dflash_v1"
+            "expected rollback HIAI modeling beside dflash_v1"
         )
     target_root = Path(args.target_dir).expanduser().resolve()
     draft_root = Path(args.draft_dir).expanduser().resolve()

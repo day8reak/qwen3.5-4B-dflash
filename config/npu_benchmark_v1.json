@@ -1,0 +1,105 @@
+{
+  "schema_version": 5,
+  "contract_id": "qwen3.5-4b-dflash-npu-rollback-benchmark",
+  "scope": "batch-1 strict-greedy rollback receiver ordinary control versus transactional DFlash rollback",
+  "prerequisites": {
+    "real_npu_required": true,
+    "cpu_fallback_allowed": false,
+    "strict_greedy_token_mismatches_allowed": 0,
+    "correctness_gate_runs_before_timing": true,
+    "historical_prefix_replay_during_verify": false
+  },
+  "external_original_main_baseline": {
+    "entrypoint": "python3 inference.py --config ./config/qwen3.5.ymal --max_token 32",
+    "modeling_source": "main:models/modeling_qwen3_5_hiai_nd.py",
+    "source_location": "external original deployment project",
+    "quantization": "disabled by omitting --quant_mode enable",
+    "relationship_to_runner_ordinary": "authoritative original-model performance baseline; benchmark_npu --mode ordinary is only the rollback receiver control"
+  },
+  "comparison_workload": {
+    "requested_output_token_budget": 32,
+    "original_flag": "--max_token 32",
+    "rollback_flag": "--max-new-tokens 32",
+    "actual_generated_token_count_must_match": true,
+    "early_eos_behavior_must_match": true
+  },
+  "case_identity": [
+    "copied source-tree content hash (no VCS metadata required)",
+    "Target and Draft checkpoint hashes",
+    "NPU model and device index",
+    "CANN, driver, firmware, torch and torch_npu versions",
+    "prompt token hash and thinking mode",
+    "max_new_tokens and block_size (anchor included)",
+    "kv_cache_max_len and prefill/decode chunk sizes",
+    "Target quant mode, callback identities, and all three quant artifact identities"
+  ],
+  "target_quantization": {
+    "modes": ["disabled", "w8a8_dynamic"],
+    "scope": "Target Linear and layer-0 embedding input only; DFlash Draft remains FP16",
+    "required_w8a8_options": [
+      "--target-quantizer",
+      "--target-quant-weight-path",
+      "--target-input-provider",
+      "--target-embedding-weight-path",
+      "--target-embedding-scale-path"
+    ],
+    "same_options_required_for_both_modes": true,
+    "preflight": "python -B -m models.dflash_v1.preflight_target_quant",
+    "report_gate": "PASS assembly, route=rollback, exact Linear topology, provider failures=0"
+  },
+  "runner": {
+    "entrypoint": "python -B -m models.dflash_v1.benchmark_npu",
+    "modes": [
+      "ordinary",
+      "dflash"
+    ],
+    "separate_process_per_mode": true,
+    "warmup_iterations": 3,
+    "measured_iterations": 10,
+    "synchronize_before_and_after_each_iteration": true,
+    "stable_result_required_for_every_iteration": true,
+    "retain_all_measurements": true,
+    "latency_summary": [
+      "min",
+      "max",
+      "mean",
+      "median",
+      "p90",
+      "population_stdev"
+    ]
+  },
+  "msprof": {
+    "wrapper": "tools/run_msprof.sh",
+    "diagnostic_not_baseline": true,
+    "recommended_warmup_iterations": 1,
+    "recommended_measured_iterations": 1,
+    "default_options": {
+      "ascendcl": "on",
+      "runtime-api": "on",
+      "task-time": "on",
+      "aicpu": "on",
+      "ai-core": "on",
+      "aic-mode": "task-based",
+      "aic-metrics": "PipeUtilization",
+      "msproftx": "off",
+      "mstx_opt_in_option": "--msproftx",
+      "mstx_range_pattern": "qwen35_<mode>_<phase>_<index>"
+    },
+    "separate_metric_passes": [
+      "PipeUtilization",
+      "Memory",
+      "MemoryUB"
+    ]
+  },
+  "route_boundary": {
+    "ordinary": "rollback receiver internal control using persistent target-state incremental greedy; not the original main deployment",
+    "dflash": "persistent target state with T=K+1 verify, state rollback, and bounded commit",
+    "block_size_contract": "B includes one anchor; B=16 means K=15 proposals",
+    "not_claimed": [
+      "custom causal-conv bank operator performance",
+      "fused full-vocabulary Top-1 head performance",
+      "future fused rollback cache-update performance",
+      "scheduler-only speedup from comparison against an unquantized original-main baseline"
+    ]
+  }
+}
