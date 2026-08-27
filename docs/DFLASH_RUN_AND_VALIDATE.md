@@ -156,9 +156,11 @@ kv-cache-max-len 必须与部署配置一致、为正且能被 64 整除。run_n
 prefill chunk 64、decode chunk 1 和 package-local NPU Draft backend。不要传旧 full-prefix
 reset hook。
 
-Prompt 在 bridge 中逐 token bootstrap；verify 才进入 T=K+1 的 GDR MTP 路线。max-new-tokens
-为 2 时，如果 bootstrap anchor 立即命中 EOS，就没有 Draft round。此时 token 可以正确，但
-报告状态是 INCONCLUSIVE_NO_DRAFT_ROUND，需要换一个固定非立即结束 prompt。
+Prompt 在 bridge 中按 KV block 边界以最多 64 个真实 token 的 chunk bootstrap；多 token chunk
+使用未修改的原版 GDR `chunk_size=64` 路线，verify 才进入 T=K+1 的 GDR MTP 路线。不会为了
+prefill 把 padding 状态提交进 persistent session。max-new-tokens 为 2 时，如果 bootstrap anchor
+立即命中 EOS，就没有 Draft round。此时 token 可以正确，但报告状态是
+INCONCLUSIVE_NO_DRAFT_ROUND，需要换一个固定非立即结束 prompt。
 
 ### 6.1 长运行诊断与当前优化
 
@@ -188,7 +190,8 @@ DFlash decode。
 
 当前热路径已经做了六项 exact 优化：
 
-- prompt 仍按 S=1 更新 Target state，但中间行跳过完整 LM Head，两条 session 都只在最后一行算 logits；
+- prompt 按 KV block 边界使用最多 S=64 的真实 token chunk 更新 Target state，多 token chunk 走
+  原版 GDR chunk 路线；中间 chunk 跳过完整 LM Head，最终 chunk 也只对最后一个真实行算 logits；
 - Target 在设备侧完成 argmax，只回传 T 个 token ID，不再把完整 logits 转 FP32 后搬到 CPU；
 - Target feature 的 `20480→2560 + RMSNorm` 每个 committed token 只执行一次并缓存投影结果；
 - 6 层 Draft 按请求维护 committed K/V；后续轮只计算新增 `1+a` feature 与当轮 block 的 K/V，
@@ -471,6 +474,11 @@ assert audit["kv_policy"] == (
 assert audit["persistent_call_synchronization_policy"] == (
     "same_device_stream_dependencies_no_per_call_host_barrier"
 )
+assert audit["prefill_execution_mode"] == (
+    "block_aligned_real_token_chunks_original_gdr"
+)
+assert audit["prefill_chunk_size"] == 64
+assert audit["prefill_lm_head_policy"] == "last_real_prompt_row_only"
 assert audit["session_invalid"] is False
 assert audit["pending_verify_rows"] is None
 ~~~
@@ -482,6 +490,8 @@ torch_tensor_golden_on_input_device 表示 conv 分解运算跟随输入 tensor 
 
 | 字段 | 含义 |
 | --- | --- |
+| ordinary/rollback_prefill_token_calls | 兼容保留的旧字段名；现在记录真实 Target prefill chunk forward 次数，不再等于 prompt token 数 |
+| ordinary/rollback_prefill_lm_head_skips | 没有执行完整词表 LM Head 的真实 prompt 行数；正常为 prompt_tokens-1 |
 | target_verify_calls | T=K+1 verify 次数 |
 | target_input_tokens_recomputed | 实际送入 Target 的 prompt、增量和 block 行数，不含 verify 历史重放 |
 | drafted_tokens | Draft proposal 总数 |

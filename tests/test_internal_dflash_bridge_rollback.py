@@ -79,6 +79,7 @@ class FakeHIAIModel(nn.Module):
         **kwargs,
     ):
         skip_lm_head = bool(kwargs.pop("dflash_skip_lm_head", False))
+        last_token_only = bool(kwargs.pop("dflash_last_token_only", False))
         del kwargs
         self.calls.append(
             {
@@ -90,6 +91,7 @@ class FakeHIAIModel(nn.Module):
                     else tuple(int(value) for value in accepted_tokens.tolist())
                 ),
                 "skip_lm_head": skip_lm_head,
+                "last_token_only": last_token_only,
             }
         )
         conv_state, recurrent_state = past_key_values[0]
@@ -111,7 +113,7 @@ class FakeHIAIModel(nn.Module):
                 recurrent_state[:, row].copy_(running_recurrent)
 
         rows = input_ids.shape[1]
-        logit_rows = 0 if skip_lm_head else rows
+        logit_rows = 0 if skip_lm_head else (1 if last_token_only else rows)
         logits = torch.zeros((1, logit_rows, 1), dtype=torch.float16).expand(
             1,
             logit_rows,
@@ -145,11 +147,20 @@ def main() -> None:
     ).eval()
     bootstrap = bridge.begin_rollback(torch.tensor([[1, 2]], dtype=torch.long))
     assert tuple(bootstrap["logits"].shape) == (1, 1, VOCAB_SIZE)
-    assert model.calls[0]["skip_lm_head"] is True
-    assert model.calls[1]["skip_lm_head"] is False
+    assert len(model.calls) == 1
+    assert model.calls[0] == {
+        "positions": (0, 1),
+        "all_q_len": (2,),
+        "accepted": None,
+        "skip_lm_head": False,
+        "last_token_only": True,
+    }
     assert bridge.dflash_rollback_audit["persistent_cursor"] == 2
     assert bridge.dflash_rollback_audit["rollback_prefill_lm_head_skips"] == 1
-    assert model.calls[-1]["positions"] == (1,)
+    assert bridge.dflash_rollback_audit["rollback_prefill_token_calls"] == 1
+    assert bridge.dflash_rollback_audit["prefill_execution_mode"] == (
+        "block_aligned_real_token_chunks_original_gdr"
+    )
 
     try:
         bridge._prepare_rollback_state(17)
@@ -175,6 +186,7 @@ def main() -> None:
         "all_q_len": (6,),
         "accepted": (0,),
         "skip_lm_head": False,
+        "last_token_only": False,
     }
     state = bridge._persistent_state
     assert state is not None
@@ -196,6 +208,76 @@ def main() -> None:
     assert failed_audit["session_invalid"] is True
     assert failed_audit["pending_verify_rows"] is None
     assert bridge._persistent_state is None
+
+    # Prefill must preserve real-token boundaries around the receiver's S=64
+    # chunk gear, never issue one call per prompt token, and never commit padding.
+    expected_chunks = {
+        1: (1,),
+        63: (63,),
+        64: (64,),
+        65: (64, 1),
+    }
+    for prompt_length, chunk_lengths in expected_chunks.items():
+        chunk_model = FakeHIAIModel().eval()
+        chunk_bridge = InternalDFlashTarget(
+            FakeWrapper(chunk_model).eval(),
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            kv_cache_max_len=64 if prompt_length <= 64 else 128,
+            rollback_enabled=True,
+        ).eval()
+        prompt = torch.arange(1, prompt_length + 1, dtype=torch.long).view(1, -1)
+        chunk_bootstrap = chunk_bridge.begin_rollback(prompt)
+        assert tuple(chunk_bootstrap["logits"].shape) == (1, 1, VOCAB_SIZE)
+        assert tuple(chunk_bootstrap["dflash_features"].shape) == (
+            1,
+            prompt_length,
+            FEATURE_WIDTH,
+        )
+        expected_positions: list[tuple[int, ...]] = []
+        cursor = 0
+        for chunk_length in chunk_lengths:
+            expected_positions.append(tuple(range(cursor, cursor + chunk_length)))
+            cursor += chunk_length
+        assert [call["positions"] for call in chunk_model.calls] == expected_positions
+        assert [call["skip_lm_head"] for call in chunk_model.calls] == [
+            *([True] * (len(chunk_lengths) - 1)),
+            False,
+        ]
+        assert [call["last_token_only"] for call in chunk_model.calls] == [
+            *([False] * (len(chunk_lengths) - 1)),
+            True,
+        ]
+        chunk_audit = chunk_bridge.dflash_rollback_audit
+        assert chunk_audit["persistent_cursor"] == prompt_length
+        assert chunk_audit["rollback_prefill_token_calls"] == len(chunk_lengths)
+        assert chunk_audit["rollback_prefill_lm_head_skips"] == prompt_length - 1
+
+    ordinary_model = FakeHIAIModel().eval()
+    ordinary_bridge = InternalDFlashTarget(
+        FakeWrapper(ordinary_model).eval(),
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        kv_cache_max_len=64,
+        rollback_enabled=True,
+    ).eval()
+    ordinary = ordinary_bridge.begin_ordinary(
+        torch.tensor([[7, 8, 9]], dtype=torch.long)
+    )
+    assert tuple(ordinary["logits"].shape) == (1, 1, VOCAB_SIZE)
+    assert ordinary_model.calls == [
+        {
+            "positions": (0, 1, 2),
+            "all_q_len": (3,),
+            "accepted": None,
+            "skip_lm_head": False,
+            "last_token_only": True,
+        }
+    ]
+    ordinary_audit = ordinary_bridge.dflash_rollback_audit
+    assert ordinary_audit["persistent_cursor"] == 3
+    assert ordinary_audit["ordinary_prefill_token_calls"] == 1
+    assert ordinary_audit["ordinary_prefill_lm_head_skips"] == 2
     print("PASS: HIAI bridge state-bank selection, rebase, and logical KV cursor")
 
 

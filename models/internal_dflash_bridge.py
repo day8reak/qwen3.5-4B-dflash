@@ -13,10 +13,12 @@ The legacy full-prefix route builds a fresh hybrid cache per call:
   to the real token rows;
 * only ``logits`` and optional ``dflash_features`` cross back to DFlash.
 
-The rollback route instead bootstraps the prompt one token at a time, keeps
-hybrid state across rounds, executes one ``K + 1`` verification block, selects
-GDN state-bank slots, and commits full-attention KV through a logical cursor.
-Its causal-conv bank is currently a Tensor golden on the input device.
+The rollback route bootstraps the prompt in block-aligned chunks of at most 64
+real rows, keeps hybrid state across rounds, executes one ``K + 1`` verification
+block, selects GDN state-bank slots, and commits full-attention KV through a
+logical cursor.  Multi-row prompt chunks therefore retain the receiver's
+ordinary ``chunk_size=64`` GDR path without committing padding state.  Its
+causal-conv bank is currently a Tensor golden on the input device.
 
 The legacy chunk alignment is important for the target GDN kernel: its
 multi-token path uses ``chunk_size=64``.  It is also important that the device
@@ -281,6 +283,15 @@ class InternalDFlashTarget(nn.Module):
             "state_bank_update_policy": "replace_returned_banks_no_copy",
             "persistent_call_synchronization_policy": (
                 "same_device_stream_dependencies_no_per_call_host_barrier"
+            ),
+            "prefill_execution_mode": (
+                "block_aligned_real_token_chunks_original_gdr"
+            ),
+            "prefill_chunk_size": BLOCK_SIZE,
+            "prefill_lm_head_policy": "last_real_prompt_row_only",
+            "prefill_call_counter_semantics": (
+                "legacy *_prefill_token_calls fields count target forwards; "
+                "each forward now contains 1..64 real prompt rows"
             ),
             "kv_policy": "physical_provisional_writes_logical_cursor_commit",
             "persistent_mode": self._persistent_mode,
@@ -599,6 +610,7 @@ class InternalDFlashTarget(nn.Module):
         output_dflash_features: bool,
         accepted_tokens: Tensor | None,
         require_logits: bool = True,
+        last_token_logits_only: bool = False,
     ) -> Mapping[str, Tensor]:
         if not self.rollback_enabled:
             raise RuntimeError(
@@ -618,6 +630,12 @@ class InternalDFlashTarget(nn.Module):
         sequence_length = int(input_ids.shape[1])
         if sequence_length <= 0:
             raise ValueError("persistent HIAI execution requires at least one row")
+        if not isinstance(last_token_logits_only, bool):
+            raise TypeError("last_token_logits_only must be a bool")
+        if last_token_logits_only and not require_logits:
+            raise ValueError(
+                "last_token_logits_only requires the LM head to be enabled"
+            )
         logical_end = start_position + sequence_length
         if start_position < 0 or logical_end > self.kv_cache_max_len:
             raise ValueError("persistent HIAI rows exceed kv_cache_max_len")
@@ -654,6 +672,7 @@ class InternalDFlashTarget(nn.Module):
                     allQLen=[logical_end],
                     output_dflash_features=bool(output_dflash_features),
                     dflash_skip_lm_head=not bool(require_logits),
+                    dflash_last_token_only=last_token_logits_only,
                     accepted_tokens=accepted_tokens,
                 )
             logits, features = _unwrap_logits_and_features(
@@ -662,7 +681,9 @@ class InternalDFlashTarget(nn.Module):
             )
             expected_logits = (
                 1,
-                sequence_length if require_logits else 0,
+                1 if last_token_logits_only else (
+                    sequence_length if require_logits else 0
+                ),
                 VOCAB_SIZE,
             )
             if tuple(logits.shape) != expected_logits:
@@ -759,24 +780,26 @@ class InternalDFlashTarget(nn.Module):
         )
 
     def begin_ordinary(self, prompt_ids: Tensor) -> Mapping[str, Tensor]:
-        """Prefill once with the receiver's single-token incremental path."""
+        """Prefill with block-aligned real-token chunks on the original GDR."""
 
         self._reset_persistent_session("ordinary")
         last_output: Mapping[str, Tensor] | None = None
         prompt_length = int(prompt_ids.shape[1])
-        for index in range(prompt_length):
-            require_logits = index == prompt_length - 1
+        for start in range(0, prompt_length, BLOCK_SIZE):
+            end = min(start + BLOCK_SIZE, prompt_length)
+            final_chunk = end == prompt_length
+            chunk_length = end - start
             last_output = self._execute_incremental_rows(
-                prompt_ids[:, index : index + 1],
-                start_position=index,
+                prompt_ids[:, start:end],
+                start_position=start,
                 output_dflash_features=False,
                 accepted_tokens=None,
-                require_logits=require_logits,
+                require_logits=final_chunk,
+                last_token_logits_only=final_chunk,
             )
-            self._persistent_cursor += 1
+            self._persistent_cursor += chunk_length
             self._ordinary_prefill_token_calls += 1
-            if not require_logits:
-                self._ordinary_prefill_lm_head_skips += 1
+            self._ordinary_prefill_lm_head_skips += chunk_length - int(final_chunk)
         if last_output is None:
             raise ValueError("ordinary prefill requires a non-empty prompt")
         return last_output
@@ -798,7 +821,7 @@ class InternalDFlashTarget(nn.Module):
         return output
 
     def begin_rollback(self, prompt_ids: Tensor) -> Mapping[str, Tensor]:
-        """Initialize scalar GDN state and retain prompt feature history."""
+        """Chunk-prefill scalar GDN state and retain real prompt features."""
 
         if not self.rollback_enabled:
             raise RuntimeError("rollback factory must be used for this route")
@@ -806,22 +829,24 @@ class InternalDFlashTarget(nn.Module):
         last_logits: Tensor | None = None
         features: list[Tensor] = []
         prompt_length = int(prompt_ids.shape[1])
-        for index in range(prompt_length):
-            require_logits = index == prompt_length - 1
+        for start in range(0, prompt_length, BLOCK_SIZE):
+            end = min(start + BLOCK_SIZE, prompt_length)
+            final_chunk = end == prompt_length
+            chunk_length = end - start
             output = self._execute_incremental_rows(
-                prompt_ids[:, index : index + 1],
-                start_position=index,
+                prompt_ids[:, start:end],
+                start_position=start,
                 output_dflash_features=True,
                 accepted_tokens=None,
-                require_logits=require_logits,
+                require_logits=final_chunk,
+                last_token_logits_only=final_chunk,
             )
-            if require_logits:
+            if final_chunk:
                 last_logits = output["logits"]
             features.append(output["dflash_features"])
-            self._persistent_cursor += 1
+            self._persistent_cursor += chunk_length
             self._rollback_prefill_token_calls += 1
-            if not require_logits:
-                self._rollback_prefill_lm_head_skips += 1
+            self._rollback_prefill_lm_head_skips += chunk_length - int(final_chunk)
         if last_logits is None:
             raise ValueError("rollback prefill requires a non-empty prompt")
         return {

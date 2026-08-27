@@ -1468,6 +1468,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         export_flag=False,
         output_dflash_features: bool = False,
         dflash_skip_lm_head: bool = False,
+        dflash_last_token_only: bool = False,
         accepted_tokens: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1507,14 +1508,22 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
 
         if not isinstance(dflash_skip_lm_head, bool):
             raise TypeError("dflash_skip_lm_head must be a bool")
+        if not isinstance(dflash_last_token_only, bool):
+            raise TypeError("dflash_last_token_only must be a bool")
+        if dflash_skip_lm_head and dflash_last_token_only:
+            raise ValueError(
+                "dflash_skip_lm_head and dflash_last_token_only are mutually exclusive"
+            )
         if dflash_skip_lm_head:
-            # Prompt bootstrap still needs every decoder/state/feature row, but
-            # only the final prompt row is ever sampled.  Preserve the output
-            # ABI with a zero-row Tensor while avoiding the 248320-way head on
-            # intermediate S=1 calls.
+            # Earlier prompt chunks still need every decoder/state/feature row,
+            # but no logits. Preserve the output ABI with a zero-row Tensor.
             logits = hidden_states.new_empty(
                 (hidden_states.shape[0], 0, self.vocab_size)
             )
+        elif dflash_last_token_only:
+            # The final prompt chunk keeps all real rows for persistent state
+            # and DFlash feature capture, while only its last real row is sampled.
+            logits = self.lm_head(hidden_states[:, -1:, :])
         else:
             logits = self.lm_head(hidden_states)
         if dflash_features is None:

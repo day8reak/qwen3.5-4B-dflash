@@ -248,10 +248,12 @@ NPU 的 accepted_tokens 表示上一轮接受长度，用来选择上一轮 stat
 后的 scalar state 建立 T 个槽；下一轮 K 改变时先选择已提交槽，再 rebase 到新的 T。Paged KV
 可以保留拒绝尾部的物理内容，但 mask 和有效长度不能读取它，下一轮从 logical cursor 覆写。
 
-Prompt 在 NPU bridge 中逐 token bootstrap，避免把 64-row padding 写入 persistent GDN state。
-中间 prompt 行仍执行全部 decoder/state/feature 计算，但不再执行 LM Head；ordinary 与 rollback
-各自只在最后一行计算一次 248320 词表 logits。任一 verify 失败后 session 整体失效，不能带着
-部分更新的 32 层状态继续。
+Prompt 在 NPU bridge 中按 KV block 边界拆成最多 64 个真实 token 的 chunk，不把 padding 写入
+persistent GDN/conv/KV state。多 token chunk 继续调用原版
+`npu_chunk_gated_delta_rule`，由原 modeling 的 `seq_len > 1` 分支选择 `chunk_size=64`；只有真实的
+单 token 尾块才走 `chunk_size=1`。所有真实 prompt 行仍执行 decoder/state/feature 计算，ordinary
+与 rollback 都只对最后一个真实 prompt 行计算一次 248320 词表 logits。任一 verify 失败后
+session 整体失效，不能带着部分更新的 32 层状态继续。
 
 ## 7. Feature、EOS 和长度边界
 

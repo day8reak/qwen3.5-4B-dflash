@@ -10,6 +10,22 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 class BenchmarkSourceLockTests(unittest.TestCase):
+    def test_package_layout_files_match_source_lock(self) -> None:
+        lock = json.loads((REPOSITORY / "SOURCE_LOCK.json").read_text("utf-8"))
+        layout = lock["package_layout"]
+        pairs = (
+            ("hiai_source_file", "hiai_source_sha256"),
+            ("hiai_bridge_file", "hiai_bridge_sha256"),
+            ("namespace_compatibility_file", "namespace_compatibility_sha256"),
+            ("compatibility_entry_file", "compatibility_entry_sha256"),
+        )
+        for path_key, hash_key in pairs:
+            with self.subTest(path=layout[path_key]):
+                path = REPOSITORY / layout[path_key]
+                self.assertTrue(path.is_file())
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.assertEqual(actual, layout[hash_key])
+
     def test_benchmark_files_match_source_lock(self) -> None:
         lock = json.loads((REPOSITORY / "SOURCE_LOCK.json").read_text("utf-8"))
         benchmark = lock["npu_benchmark"]
