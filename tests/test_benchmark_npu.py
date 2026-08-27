@@ -2,15 +2,22 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import sys
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from models.dflash_v1.benchmark_npu import (
     BenchmarkConfig,
     BenchmarkInvocation,
+    _benchmark_range_label,
     _dflash_invocation,
+    _draft_kv_cache_invocation_audit,
+    _mstx_range_factory,
     _ordinary_invocation,
+    _target_audit_delta,
     run_benchmark,
 )
 from models.dflash_v1.dflash_reference_decode_v1 import (
@@ -139,9 +146,9 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(
             ranges,
             [
-                "qwen35/ordinary/warmup/0",
-                "qwen35/ordinary/measure/0",
-                "qwen35/ordinary/measure/1",
+                "qwen35_ordinary_warmup_0",
+                "qwen35_ordinary_measure_0",
+                "qwen35_ordinary_measure_1",
             ],
         )
         self.assertEqual(report["target_forward_calls"], 6)
@@ -150,6 +157,40 @@ class BenchmarkHarnessTests(unittest.TestCase):
             report["summary"]["aggregate_output_tokens_per_second"],
             0,
         )
+
+    def test_mstx_labels_use_conservative_characters_and_close_ranges(self) -> None:
+        calls: list[tuple[str, object]] = []
+        ended: list[int] = []
+        fake_mstx = SimpleNamespace(
+            range_start=lambda label, stream: (
+                calls.append((label, stream)) or 17
+            ),
+            range_end=lambda range_id: ended.append(range_id),
+        )
+        with patch.dict(sys.modules, {"mstx": fake_mstx}):
+            factory, source = _mstx_range_factory(True)
+            assert factory is not None
+            label = _benchmark_range_label("dflash", "measure", 3)
+            with factory(label):
+                pass
+
+        self.assertEqual(label, "qwen35_dflash_measure_3")
+        self.assertRegex(label, r"^[A-Za-z0-9_]+$")
+        self.assertEqual(calls, [(label, None)])
+        self.assertEqual(ended, [17])
+        self.assertEqual(source, "mstx.range_start/range_end")
+
+    def test_mstx_marker_failure_explains_no_msproftx_fallback(self) -> None:
+        fake_mstx = SimpleNamespace(
+            range_start=lambda _label, _stream: 0,
+            range_end=lambda _range_id: None,
+        )
+        with patch.dict(sys.modules, {"mstx": fake_mstx}):
+            factory, _ = _mstx_range_factory(True)
+            assert factory is not None
+            with self.assertRaisesRegex(RuntimeError, "--no-msproftx"):
+                with factory("qwen35_dflash_warmup_0"):
+                    pass
 
     def test_output_change_fails_closed(self) -> None:
         expected = _result((2, 3))
@@ -196,6 +237,85 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(dflash.target_forward_calls, 2)
         self.assertEqual(dflash.adapter_stats["rollback_verify_calls"], 1)
         self.assertGreater(dflash.adapter_stats["draft_calls"], 0)
+
+    def test_session_cursor_reset_is_not_treated_as_counter_regression(self) -> None:
+        counter_fields = (
+            "ordinary_prefill_token_calls",
+            "ordinary_decode_calls",
+        )
+        before = {
+            "cumulative_counter_fields": counter_fields,
+            "ordinary_prefill_token_calls": 100,
+            "ordinary_decode_calls": 30,
+            "persistent_mode": "rollback",
+            "persistent_cursor": 128,
+        }
+        after = {
+            "cumulative_counter_fields": counter_fields,
+            "ordinary_prefill_token_calls": 112,
+            "ordinary_decode_calls": 62,
+            "persistent_mode": "ordinary",
+            "persistent_cursor": 44,
+        }
+
+        delta = _target_audit_delta(before, after)
+
+        self.assertEqual(delta["ordinary_prefill_token_calls"], 12)
+        self.assertEqual(delta["ordinary_decode_calls"], 32)
+        self.assertEqual(delta["target_execution_calls"], 44)
+        self.assertEqual(
+            delta["session_state_after"],
+            {"persistent_mode": "ordinary", "persistent_cursor": 44},
+        )
+
+    def test_real_audit_counter_regression_still_fails_closed(self) -> None:
+        before = {
+            "cumulative_counter_fields": ("rollback_verify_calls",),
+            "rollback_verify_calls": 9,
+            "persistent_cursor": 128,
+        }
+        after = {
+            "cumulative_counter_fields": ("rollback_verify_calls",),
+            "rollback_verify_calls": 8,
+            "persistent_cursor": 44,
+        }
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "counter moved backwards: rollback_verify_calls",
+        ):
+            _target_audit_delta(before, after)
+
+    def test_draft_cache_invocation_reports_counter_delta_and_state(self) -> None:
+        before = {
+            "rounds": 4,
+            "aborted_rounds": 1,
+            "crop_calls": 0,
+            "tokens_appended": 20,
+            "tokens_reused": 30,
+            "context_tokens": 12,
+        }
+        after = {
+            "rounds": 6,
+            "aborted_rounds": 1,
+            "crop_calls": 0,
+            "tokens_appended": 25,
+            "tokens_reused": 54,
+            "context_tokens": 17,
+        }
+
+        audit = _draft_kv_cache_invocation_audit(before, after)
+
+        self.assertEqual(audit["context_tokens"], 17)
+        self.assertEqual(
+            audit["invocation_counter_delta"],
+            {
+                "rounds": 2,
+                "aborted_rounds": 0,
+                "crop_calls": 0,
+                "tokens_appended": 5,
+                "tokens_reused": 24,
+            },
+        )
 
     def test_invalid_configuration_is_rejected(self) -> None:
         invalid = (

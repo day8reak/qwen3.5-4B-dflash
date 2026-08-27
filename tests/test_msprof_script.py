@@ -12,6 +12,21 @@ SCRIPT = REPOSITORY / "tools" / "run_msprof.sh"
 
 
 class MsprofScriptTests(unittest.TestCase):
+    def test_wrapper_requires_no_git_checkout_or_vcs_metadata(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        forbidden = (
+            "git -C",
+            "git_commit",
+            "git_branch",
+            "git_dirty",
+            '"repository":',
+        )
+        for fragment in forbidden:
+            with self.subTest(fragment=fragment):
+                self.assertNotIn(fragment, source)
+        self.assertIn("content_hash_without_vcs_metadata", source)
+        self.assertIn("copied source tree", source)
+
     def test_shell_syntax_and_help(self) -> None:
         syntax = subprocess.run(
             ["bash", "-n", str(SCRIPT)],

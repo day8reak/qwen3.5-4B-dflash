@@ -12,6 +12,8 @@ GDR MTP 外，哪些位置还需要或可能需要自定义算子。
 - full-attention KV 逐 row 复用 npu_cache_update_；
 - attention 先复用 adn_fused_infer_attention；
 - Top-1 先用普通 LM head 和设备侧 argmax，只把 T 个 ID 搬回 host 做连续 accept scan。
+- Draft 6 层 committed K/V 已由 request-local Torch cache 实现，当前 block 成功后裁掉、异常时
+  abort；它不再是 correctness 缺口。
 
 因此当前 correctness bring-up 的最小外部依赖仍只有已经完成并注册的
 npu_gated_delta_rule_mtp。面向生产性能，最先建议开发 CausalConv1dMTP。CacheUpdateMTP 和
@@ -20,6 +22,7 @@ FusedInferAttentionMTP 必须先做现有算子能力测试；TargetLmHeadTop1Ac
 | 分类 | 算子 | 当前决定 |
 | --- | --- | --- |
 | 已完成 | GatedDeltaRuleMTP | 已接入，补 24 层、多轮真机证据 |
+| 已完成 golden | Draft KV cache/crop | 语义与官方 append-then-crop 对齐；真机 profile 后决定是否做 cache-aware GQA |
 | 生产优先 | CausalConv1dMTP | 建议新增，替换 Tensor 分解 golden |
 | 条件新增 | CacheUpdateMTP | 现有多行/跨块能力或性能不足时新增 |
 | 条件新增 | FusedInferAttentionMTP | 现有 T=2/4/6/8/16 能力失败时扩展或新增 |
@@ -220,19 +223,27 @@ DynamicQuant 和 quant matmul 先做 T 行能力检查。如果现有实现支�
 
 | 优先级 | 候选 | 输入 | 输出 | 目的 |
 | --- | --- | --- | --- | --- |
-| P2 | DFlashFeatureProjection | 新增 feature [B,1+a,20480]；weight [2560,20480] | [B,1+a,2560] | 当前每个 token 只算一次；profile 显示仍热时再融合 |
-| P1 | DFlashBlockGQA | Q [B,32,T,128]；K/V [B,8,C+T,128]；mask | [B,32,T,128] | 融合 5 层 causal sliding 与末层 block non-causal attention |
+| P2 | DFlashFeatureProjection | 新增 feature [B,1+a,20480]；weight [2560,20480] | [B,1+a,2560] | 当前每个 token 只算一次，输出被 KV cache 消费后释放；profile 显示仍热时再融合 |
+| P1 | DFlashBlockGQA | Q [B,32,T,128]；committed K/V [B,8,C,128]；new K/V [B,8,1+a+T,128]；mask | [B,32,T,128] | 避免显式 cache concat，并融合 5 层 causal sliding 与末层 block non-causal attention |
 | P1 | DFlashDraftLmHeadTop1 | hidden [B,K,2560]；weight [248320,2560] | IDs [B,K] | 避免 Draft 完整 vocab logits 落地 |
 | P2 | RMSNorm、RoPE、SwiGLU 融合 | 各层 hidden 与参数 | 同数学输出 | 减少小算子 launch |
-| P2 | Draft KV cache/crop | 6 层 K/V、cursor、accepted | 更新后 cache | 避免每轮重算全部 feature context |
+| P2 | DraftKVAppendCrop | 6 层 committed K/V、new context K/V、transient block K/V | 更新后 committed cache | 当前 Torch golden 已避免历史 K/V projection；仅在 concat/分配成为热点时开发 |
 
 Draft RMSNorm 使用 checkpoint 的直接 scale，不能套用 Target 的 1+weight 语义。最后一层
 attention 的 block non-causal mask 也不能被统一改成前五层的 causal mask。
+
+`DraftKVAppendCrop` 不接收 Target accepted count：进入下一轮 Draft 的 feature 本身已经只包含
+Target 提交的 `1+a` 行。算子应在一次 Draft forward 内让 attention 看见 old+new+block，并在
+返回前只提交 old+new。失败时旧 cache 必须保持可复用；无 cache `forward_projected` 是 golden。
 
 ## 10. 内存取舍
 
 T=16、B=1 时，单层 recurrent bank 为 32 MiB，24 层为 768 MiB；单层 conv bank 为
 1 MiB，24 层为 24 MiB。两者合计约 792 MiB，还未包含 KV、权重和 workspace。
+
+Draft committed KV 的 FP16 逻辑大小为每 token 24 KiB（6 层、K/V、8 KV heads、head dim
+128），C=2048 时约 48 MiB；当前轮 transient block 最多再增加 16 行。它远小于 Target state
+bank，但 benchmark 仍应同时记录 allocator peak，防止 cache 拼接造成隐藏的双份峰值。
 
 需要在真机比较：
 

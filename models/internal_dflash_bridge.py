@@ -288,6 +288,16 @@ class InternalDFlashTarget(nn.Module):
             "previous_accepted": self._previous_accepted,
             "pending_verify_rows": self._pending_verify_rows,
             "session_invalid": self._rollback_invalid,
+            "cumulative_counter_fields": (
+                "ordinary_prefill_token_calls",
+                "ordinary_prefill_lm_head_skips",
+                "ordinary_decode_calls",
+                "rollback_prefill_token_calls",
+                "rollback_prefill_lm_head_skips",
+                "rollback_verify_calls",
+                "rollback_commit_calls",
+                "rollback_aborts",
+            ),
             "ordinary_prefill_token_calls": self._ordinary_prefill_token_calls,
             "ordinary_prefill_lm_head_skips": (
                 self._ordinary_prefill_lm_head_skips

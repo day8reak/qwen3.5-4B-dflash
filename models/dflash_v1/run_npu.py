@@ -69,6 +69,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument(
+        "--execution-mode",
+        choices=("validate", "dflash"),
+        default="validate",
+        help=(
+            "validate runs ordinary plus DFlash exact-match checking; dflash "
+            "runs only the production DFlash session"
+        ),
+    )
+    parser.add_argument(
         "--block-size",
         type=int,
         default=DFLASH_MIN_BLOCK_SIZE,
@@ -158,6 +167,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "248044",
         "--max-new-tokens",
         str(args.max_new_tokens),
+        "--execution-mode",
+        args.execution_mode,
         "--block-size",
         str(args.block_size),
     ]

@@ -49,6 +49,7 @@ python -B -m models.dflash_v1.run_rollback \
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 32 \
+  --execution-mode validate \
   --block-size 16 \
   --eos-token-id 248044 \
   --dtype float16 \
@@ -145,6 +146,7 @@ mkdir -p "$RUN_DIR"
   --prompt-mode chat \
   --enable-thinking \
   --max-new-tokens 2 \
+  --execution-mode validate \
   --block-size 2 \
   --device npu:0 \
   --report "$RUN_DIR/dflash-rollback-npu-smoke.json"
@@ -160,16 +162,37 @@ Prompt 在 bridge 中逐 token bootstrap；verify 才进入 T=K+1 的 GDR MTP �
 
 ### 6.1 长运行诊断与当前优化
 
-`run_npu` 是 correctness validator：同一进程先跑 ordinary，再跑独立 DFlash session。因此请求
-总时长不能直接当成纯 DFlash latency。进度日志现在会输出 `ordinary_decode_end`、每个
-`dflash_round_end` 和 `dflash_decode_end`，报告的 `timings_seconds` 进一步拆分 checkpoint hash、
-Target load、Draft load、ordinary decode 与 DFlash decode。
+`--execution-mode validate` 是 correctness validator：同一进程先跑 ordinary，再跑独立 DFlash
+session。因此请求总时长不能直接当成纯 DFlash latency。进度日志会输出
+`ordinary_decode_end`、每个 `dflash_round_end` 和 `dflash_decode_end`，报告的
+`timings_seconds` 进一步拆分 checkpoint hash、Target load、Draft load、ordinary decode 与
+DFlash decode。
 
-当前热路径已经做了五项 exact 优化：
+离线验证通过后，日常只跑 DFlash 的命令是在相同参数中改为：
+
+~~~bash
+"$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+  --target-dir /path/to/Qwen3.5-4B \
+  --draft-dir /path/to/Qwen3.5-4B-DFlash \
+  --kv-cache-max-len 2048 \
+  --prompt "请用一句话解释为什么天空是蓝色的。" \
+  --prompt-mode chat --enable-thinking \
+  --max-new-tokens 32 --block-size 16 \
+  --execution-mode dflash --device npu:0 \
+  --report "$RUN_DIR/dflash-only.json"
+~~~
+
+该模式只省掉 ordinary 对照，不跳过 Draft/Target checkpoint、source identity 和设备/算子审计。
+报告中 `strict_greedy_exact_match` 为 null，`correctness_gate.status` 为
+`NOT_RUN_DFLASH_ONLY`；正式正确性证据仍来自同 revision、同 checkpoint 的 validate 报告。
+
+当前热路径已经做了六项 exact 优化：
 
 - prompt 仍按 S=1 更新 Target state，但中间行跳过完整 LM Head，两条 session 都只在最后一行算 logits；
 - Target 在设备侧完成 argmax，只回传 T 个 token ID，不再把完整 logits 转 FP32 后搬到 CPU；
 - Target feature 的 `20480→2560 + RMSNorm` 每个 committed token 只执行一次并缓存投影结果；
+- 6 层 Draft 按请求维护 committed K/V；后续轮只计算新增 `1+a` feature 与当轮 block 的 K/V，
+  RoPE position 也只构造新增 tail；成功后裁掉 transient block，异常时放弃整轮 staged cache；
 - 任一 Draft round 接受数为 0 后，本请求切到同一 transaction 的 S=1 Target-only continuation。
 - persistent Target 调用依赖同一设备流排序，不再在每个 prompt/decode row 后执行全设备 host
   barrier；runner 和 benchmark 仍在阶段/计时边界显式同步，full-prefix oracle 释放 call-local
@@ -225,9 +248,10 @@ for MODE in ordinary dflash; do
 done
 ~~~
 
-两份报告必须锁定同一 Git revision、checkpoint、设备、prompt token hash、thinking、生成长度、
-`block_size`、KV 长度和 chunk 配置。`block_size=16` 是 B=16 总行数，proposal 数 K=15；即使
-ordinary 不使用 proposal，它仍属于 case identity 和进程内 correctness gate。
+两份报告必须锁定同一 copied source-tree hash、checkpoint、设备、prompt token hash、thinking、
+生成长度、`block_size`、KV 长度和 chunk 配置，不要求运行目录包含 `.git`。`block_size=16` 是
+B=16 总行数，proposal 数 K=15；即使 ordinary 不使用 proposal，它仍属于 case identity 和
+进程内 correctness gate。
 
 正式比较至少检查：
 
@@ -242,11 +266,48 @@ assert report["benchmark"]["summary"]["count"] == 10
 
 比较 `benchmark.summary.latency_ms`、`aggregate_output_tokens_per_second` 和
 `accelerator_memory`，同时保留全部 10 条 measurement；不要只报告最小值。每条 measurement
-还记录 replay stats、adapter stats 和 receiver audit delta，可直接判断是否首轮零接受后进入
-Target-only、实际调用了多少 Draft/verify，以及投影了多少 feature token。
+还记录 replay stats、adapter stats、Draft KV cache audit 和 receiver audit delta，可直接判断
+是否首轮零接受后进入 Target-only、实际调用了多少 Draft/verify、追加/复用了多少 Draft cache
+token，以及投影了多少 feature token。
+
+Receiver audit 已把 `cumulative_counter_fields` 与 session state 分开。只有声明的累计 calls/skips/
+aborts 字段计算前后 delta 并要求单调；`persistent_cursor`、`previous_accepted`、
+`pending_verify_rows` 等每次 `begin_*` 都会重置，measurement 只记录其 `session_state_after`，不能
+做单调计数。这样 correctness gate 留下的较大 cursor 不会导致下一次 workload 误报
+`rollback audit counter moved backwards: persistent_cursor`，而真正的累计 counter 倒退仍会
+fail closed。
 
 msprof 会改变 latency，只用于热点归因。建议用 1 次 warmup、1 次 measurement，并通过 MSTX
-范围 `qwen35/<mode>/measure/0` 定位正式迭代：
+范围 `qwen35_<mode>_measure_0` 定位正式迭代。marker 只使用 ASCII 字母、数字和下划线，兼容
+部分对 `/` 分隔 message 处理不兼容的 CANN/MSTX 组合。
+
+原非 DFlash Target 基线使用 `--mode ordinary`；正式分析时选择
+`qwen35_ordinary_measure_0`，该范围内只执行 ordinary incremental generation：
+
+~~~bash
+tools/run_msprof.sh \
+  --label ordinary-pipe \
+  --output-dir "$BENCH_DIR/msprof-ordinary-pipe" \
+  --python "$MODEL_PYTHON" \
+  --aic-metrics PipeUtilization \
+  -- \
+  "$MODEL_PYTHON" -B -m models.dflash_v1.benchmark_npu \
+    --mode ordinary \
+    --target-dir /path/to/Qwen3.5-4B \
+    --draft-dir /path/to/Qwen3.5-4B-DFlash \
+    --kv-cache-max-len 2048 \
+    --prompt "请用一句话解释为什么天空是蓝色的。" \
+    --prompt-mode chat --enable-thinking \
+    --max-new-tokens 32 --block-size 16 \
+    --warmup 1 --repetitions 1 --device npu:0 \
+    --report "$BENCH_DIR/msprof-ordinary-pipe/ordinary.json"
+~~~
+
+`benchmark_npu` 仍会在计时前加载 Draft 并完成 ordinary/DFlash 正确性门禁；这些动作不在上述
+MSTX measurement 范围内。这样 ordinary profile 与 DFlash profile 使用完全相同的 checkpoint、
+prompt 和正确性前置条件，而测量范围内没有 Draft proposal 或 rollback verify。
+
+DFlash rollback 使用 `--mode dflash`；正式分析时选择 `qwen35_dflash_measure_0`：
 
 ~~~bash
 tools/run_msprof.sh \
@@ -271,9 +332,19 @@ tools/run_msprof.sh \
 device 和 operator fallback，且要求输出目录在源码仓库外；profile 下的 host latency 不能替代
 上面的未 profiling 3+10 基线。
 
+`run_msprof.sh` 不调用 Git，也不读取 commit、branch 或 dirty 状态。它把脚本父目录当作复制后的
+source root，对实际存在的 runtime、bridge、配置、文档和 wrapper 内容计算
+`source_tree_sha256`；因此直接复制源码目录到目标机即可运行，manifest 的 identity method 为
+`content_hash_without_vcs_metadata`。
+
+若 safe marker 仍返回 `mstx.range_start failed`，说明该机器的 CANN/mstx profiling 环境不支持
+当前打点，而不是 DFlash 推理失败。可在上述 wrapper 参数中加入 `--no-msproftx`：AI Core、
+PipeUtilization、task-time、runtime-api 和 AscendCL 仍会采集，但报告不再含自定义 measurement
+marker；不要把这种带 profiling 的耗时当作 3+10 latency 基线。
+
 ## 8. 报告门禁
 
-通用字段：
+validate 模式字段：
 
 ~~~python
 import json
@@ -282,6 +353,8 @@ with open("/path/to/run/dflash-rollback.json", encoding="utf-8") as stream:
     report = json.load(stream)
 
 assert report["route"] == "qwen3.5-dflash-incremental-rollback"
+assert report["execution_mode"] == "validate"
+assert report["correctness_gate"]["status"] == "PASS"
 assert report["strict_greedy_exact_match"] is True
 assert report["verification_mode"] == "incremental_transactional_rollback"
 assert report["historical_prefix_replay_during_verify"] is False
@@ -292,6 +365,21 @@ assert report["ordinary"]["reached_eos"] == report["dflash"]["reached_eos"]
 assert report["ordinary"]["stop_reason"] == report["dflash"]["stop_reason"]
 assert report["dflash_execution_gate"]["status"] == "PASS"
 assert report["dflash_execution_gate"]["target_verify_calls"] > 0
+draft_cache = report["draft_kv_cache_audit"]
+assert draft_cache["enabled"] is True
+assert draft_cache["mode"] == "upstream_equivalent_append_then_crop"
+assert draft_cache["active_round"] is False
+assert draft_cache["rounds"] > 0
+~~~
+
+`dflash` 单跑模式必须按不同语义检查，不能要求不存在的 ordinary 结果：
+
+~~~python
+assert report["execution_mode"] == "dflash"
+assert report["ordinary"] is None
+assert report["strict_greedy_exact_match"] is None
+assert report["correctness_gate"]["status"] == "NOT_RUN_DFLASH_ONLY"
+assert report["dflash_execution_gate"]["status"] == "PASS"
 ~~~
 
 CUDA/NPU 还应满足：
@@ -346,6 +434,10 @@ torch_tensor_golden_on_input_device 表示 conv 分解运算跟随输入 tensor 
 | speculation_disable_events | 首次零接受后关闭本请求 Draft 的次数，最多为 1 |
 | target_only_fallback_rounds | 关闭 Draft 后执行的 S=1 Target-only round 数 |
 | draft_feature_tokens_projected | 实际做过 20480→2560 投影的 committed token 数 |
+| draft_kv_cache_rounds | 完成并提交 Draft KV 的轮数 |
+| draft_kv_cache_tokens_appended | 新投影为逐层 K/V 的 context token 数 |
+| draft_kv_cache_tokens_reused | 未重新做 K/V projection 的历史 context token 数 |
+| draft_kv_cache_peak_tokens | 本请求 Draft committed KV 的峰值逻辑长度 |
 | rollback_commit_replay_calls | CPU/CUDA 为提交状态执行的有界单 token 调用数 |
 
 接受率只描述 Draft 质量。mean_emitted_tokens_per_draft_round 更接近每轮推进量，但两者都不能
@@ -359,6 +451,7 @@ PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_framework_rollback.py
 PYTHONDONTWRITEBYTECODE=1 python tests/test_internal_dflash_bridge_rollback.py
 PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_rollback_helpers.py
 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
+  tests/test_run_npu_modes.py \
   tests/test_dflash_runtime_optimizations.py \
   tests/test_benchmark_npu.py \
   tests/test_msprof_script.py \
@@ -371,8 +464,9 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
 | test_dflash_framework_rollback.py | DynamicCache crop、GDN restore、有界 commit replay |
 | test_internal_dflash_bridge_rollback.py | bank select/rebase、logical KV cursor、失败状态 |
 | test_dflash_rollback_helpers.py | causal-conv bank 与逐 token reference |
-| test_dflash_runtime_optimizations.py | feature projection cache 等价性与 NPU finite policy |
-| test_benchmark_npu.py | 同步区间、3+10 合同、稳定输出和 rollback invocation |
+| test_run_npu_modes.py | NPU 简化入口把 validate/dflash 模式正确传给共享 runner |
+| test_dflash_runtime_optimizations.py | 两轮 cached-vs-golden、mixed attention、异常 abort、adapter 增量 feature 和 NPU finite policy |
+| test_benchmark_npu.py | 同步区间、3+10 合同、稳定输出、cursor reset 与真实 counter 单调性 |
 | test_msprof_script.py | shell 语法、simulation/CPU/fallback fail-closed |
 | test_source_lock_benchmark.py | benchmark 与 rollback runtime 文件 hash 身份 |
 
@@ -423,8 +517,8 @@ python -B -m models.dflash_v1.diagnose_acceptance \
 2. 第二轮开始 mismatch：检查 1+a cursor、上一轮 bank slot a 和 correction 是否仍为未处理 anchor。
 3. K 改变后 mismatch：检查先 select 已提交槽，再 rebase 到新 T。
 4. 63/64 附近失败：检查 CacheUpdate block/offset、mask 和实际 KV length。
-5. token 正确但慢：profile 完整 logits D2H、逐 row CacheUpdate、conv Tensor 分解、Draft context
-   重算和同步。
+5. token 正确但慢：profile 完整 LM head、逐 row CacheUpdate、conv Tensor 分解、Draft cache
+   拼接/attention、commit replay 和同步。
 
 一条短 prompt 不能代表平均接受长度。比较接受率时必须锁定 tokenizer、chat template、thinking、
 dtype、K、checkpoint 和生成阶段，并使用多条代表性 workload。
@@ -437,6 +531,7 @@ dtype、K、checkpoint 和生成阶段，并使用多条代表性 workload。
 - ordinary 与 DFlash strict-greedy 全 token、EOS、stop reason 零差异；
 - 拒绝后继续至少一个 token，完整状态仍与 ordinary 对齐；
 - 24 层 GDR/conv、8 层 KV、position 和 feature 共用同一个 accepted count；
+- Draft 6 层 KV 只提交 current anchor 之前的 context，拒绝/异常 block 不污染下一轮；
 - 310P 无 fallback，运行身份和 kernel trace 可审计；
 - 多 prompt、多轮和 block boundary 重复稳定。
 

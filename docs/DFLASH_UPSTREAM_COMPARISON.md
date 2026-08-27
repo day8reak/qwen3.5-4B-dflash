@@ -15,7 +15,7 @@
 
 ## 1. 一句话结论
 
-当前 CPU/GPU/NPU 代码不是官方仓库的逐行复制，也还不是官方完整功能集。准确定位是：
+当前 CPU/GPU/NPU 代码不是官方仓库的逐行复制，也还不是官方全部 sampling 功能集。准确定位是：
 
 ~~~text
 官方 Qwen3.5-4B DFlash Draft 图和 checkpoint 合同
@@ -24,8 +24,8 @@
 + 强制 ordinary 对照的 strict-greedy 验证层
 ~~~
 
-Draft 数学主体与官方 checkpoint 对齐；Target state、Draft cache、sampling、backend 和运行接口
-存在明确差异。
+Draft 数学主体和 KV cache 的 committed/transient 生命周期与官方对齐；Target state、sampling、
+backend 和运行接口仍存在明确差异。
 
 ## 2. 先区分官方两个本地 backend
 
@@ -53,13 +53,13 @@ Draft 数学主体与官方 checkpoint 对齐；Target state、Draft cache、sam
 | Target full-attention KV | crop/trim rejected tail | CPU/CUDA crop 后 replay；NPU logical cursor commit | 结果目标相同，实现不同 |
 | Target GDN recurrent | MLX 捕获输入，拒绝后只重算 accepted+1 状态 | CPU/CUDA 恢复后逐 token replay；NPU GDR MTP state bank | 语义等价目标，实现不同 |
 | Target conv state | MLX 从捕获的 conv input 恢复接受位置窗口 | CPU/CUDA snapshot/replay；NPU conv state bank golden | 语义等价目标，实现不同 |
-| Draft KV cache | 官方 Transformers 与 MLX 都跨轮维护并 trim/crop | 当前没有 Draft KV cache，每轮重算 6 层 context K/V | 当前缺失 |
-| Feature 生命周期 | 依赖 Draft cache，只保留下一轮需要的 accepted feature rows | 每个 committed feature 只做一次 20480→2560 投影，并累积投影后 history | 部分优化，仍无 KV cache |
+| Draft KV cache | 官方 Transformers 与 MLX 都跨轮维护并 trim/crop | 6 层 request-local K/V；只追加新增 committed feature，当前 block 为 transient，成功后 crop | 语义对齐，cache 类为本项目重写 |
+| Feature 生命周期 | 依赖 Draft cache，只保留下一轮需要的 accepted feature rows | prompt 或新提交的 1+a 行只投影一次；被 cache 消费后释放，不累积完整投影 history | 对齐 |
 | Sampling | 支持 temperature、top-p、top-k 和 rejection sampling | 只支持 temperature=0 strict greedy | 当前缺失 |
 | Ordinary 基线 | 正常 generate 不额外跑 ordinary 对照 | validator 先跑 ordinary，再独立跑 DFlash 并零差异比较 | 当前新增验证层 |
-| API | generate/stream 与 acceptance、TPS 统计 | validation CLI、同步 NPU benchmark、JSON audit 和 fail-closed transaction | 工程接口不同 |
+| API | generate/stream 与 acceptance、TPS 统计 | `dflash` 单跑、`validate` 对照、同步 NPU benchmark、JSON audit 和 fail-closed transaction | 工程接口不同 |
 | Backend | PyTorch Qwen3/LLaMA；MLX Qwen3.5 等 | PyTorch Qwen3.5 CPU/CUDA；HIAI/NPU | 当前新增 port |
-| 性能定位 | 使用 Draft cache，并提供本地生成/性能统计 | correctness bring-up；ordinary 对照不属于生产热路径 | 当前不能直接比较 TPS |
+| 性能定位 | 使用 Draft cache，并提供本地生成/性能统计 | 已有 Draft cache 和单跑模式；310P 同边界实测仍待完成 | 尚不能声称达到官方 TPS |
 
 ## 4. block_size 口径已对齐
 
@@ -93,25 +93,27 @@ T          = 2 / 4 / 6 / 8 / 16
 可以直接与官方相同 block_size 档位比较，不再存在额外的 17-row 扩展档。生成尾轮或 proposal
 遇到 EOS 时，本轮有效 K/T 可以更小，但始终满足 K≤block_size-1、T≤block_size。
 
-## 5. Draft cache 是当前最大的功能差异
+## 5. Draft cache 已补齐的语义与实现差异
 
 官方 Transformers 路线创建 past_key_values_draft，官方 MLX 路线创建 draft_cache。每轮 Draft
 只把新 Target feature 和当前 block 接到已提交 Draft cache 上；完成 proposal 后再把 cache
 trim/crop 到 committed boundary。
 
-当前 Qwen35DFlashRollbackAdapter 已缓存投影后的 Target feature history，但没有跨轮 Draft KV：
+当前 `DFlashDraftKVCache` 复现相同生命周期：
 
 ~~~text
-官方：已提交 Draft KV + 新 accepted feature + 当前 block
-当前：投影后 committed feature history + 当前 block，全 6 层 context K/V 重新计算
+round 输入 = 已提交 Draft KV + 新 accepted feature + 当前 block
+attention 可见 = old committed + new committed + transient block
+round 结束 = 只保留 old committed + new committed
 ~~~
 
-这不会改变 strict-greedy 的 Target 权威性，但会导致：
+具体差异是当前没有直接复用 Transformers `DynamicCache` 或 MLX cache 类，而是使用独立、
+request-local、逐层 `[B,Hkv,C,D]` cache，并增加 staged round、异常 abort 和 audit。无 cache 路线
+保留为 golden。两轮 reduced-shape 测试同时覆盖 sliding causal 层和 final full-attention 层。
 
-- Draft 计算随已生成长度增长；
-- 投影后 feature history 常驻内存仍随上下文增长，但宽度已从 20480 降到 2560；
-- 当前端到端性能不能代表官方完整缓存路线；
-- 后续加入 Draft cache 时还要验证拒绝尾部 crop、sliding window 和最后一层 non-causal block。
+已经消除的是 6 层历史 context 的 K/V projection 和完整投影 feature history。仍未消除的是
+attention 对 C+T 个 K/V 的读取以及当前 PyTorch cache 拼接；是否需要 paged/static Draft cache
+或融合 GQA，必须由 NPU profile 决定。
 
 ## 6. Target rollback 的实现不同
 
@@ -181,19 +183,17 @@ proposal == Target Top-1 才接受
 
 ## 8. 验证模式也不同
 
-官方 generate 直接执行 DFlash，并输出 tokens、acceptance 和性能统计。当前 run_rollback 是
-验证工具：
+官方 generate 直接执行 DFlash，并输出 tokens、acceptance 和性能统计。当前 `run_rollback` /
+`run_npu` 有两种模式：
 
-1. 新建 ordinary persistent session；
-2. 生成权威 greedy token stream；
-3. 再新建独立 DFlash session；
-4. 严格比较 token ID、EOS 和 stop reason；
-5. 写出 state、route、fallback 和 source identity audit。
+1. `--execution-mode validate` 新建 ordinary persistent session，生成权威 greedy stream，再新建
+   DFlash session并严格比较 token ID、EOS 和 stop reason；
+2. `--execution-mode dflash` 只执行 DFlash session，避免生产请求额外跑 ordinary；报告明确写
+   `NOT_RUN_DFLASH_ONLY`，不能作为本次 exact-match 证据。
 
 ordinary 对照是当前 bring-up 的必要验收，但它会额外执行一次 Target，不能计入 DFlash
 生产性能。`benchmark_npu` 把 correctness gate 放在计时区间外，并以分进程、设备同步的 3+10
-测量 ordinary/DFlash；它是测量工具，不会把当前无 Draft KV 的实现变成官方完整性能路线。
-以后若增加 production generate 入口，仍应保留 validator 作为离线门禁。
+测量 ordinary/DFlash。单次 `dflash` 运行只用于功能/日常生成，正式性能结论仍来自 benchmark。
 
 ## 9. 当前可以怎样表述
 
@@ -203,7 +203,7 @@ ordinary 对照是当前 bring-up 的必要验收，但它会额外执行一次 
 | greedy DFlash 核心 proposal/verify/accept 算法对齐 | 是 | 最长连续匹配和 1+a commit 通过 |
 | 官方完整 CPU/GPU 实现 | 否 | 当前是 Qwen3.5 PyTorch port |
 | 官方 block_size=16 原样对齐 | 是 | 默认 B=16/K=15/T=16 |
-| 完整官方 generation 功能 | 否 | 缺 Draft cache 和 sampling |
+| 完整官方 generation 功能 | 否 | greedy 与 Draft cache 已有；仍缺 temperature/top-p/top-k rejection sampling |
 | Qwen3.5 transactional rollback port | 是 | CPU/CUDA/NPU 各自状态门禁通过 |
 | 已达到官方性能 | 否 | 当前没有同边界配对性能证据 |
 
@@ -212,13 +212,14 @@ ordinary 对照是当前 bring-up 的必要验收，但它会额外执行一次 
 1. 保持默认 `block_size=16`，即 K=15/T=16、temperature=0。
 2. 对每轮比较 Draft proposal、Target Top-1、accepted、bonus 和 emitted token。
 3. 比较拒绝后下一 token 的完整 Target state，而不只比较当前输出。
-4. 实现 Draft KV cache 和 accepted-boundary trim/crop；保持无 cache 路线作为 golden。
-5. 增加不运行 ordinary 对照的 production generate 入口，但 validator 继续保留。
-6. 如果确实需要官方 sampling，再实现概率输出、rejection sampling 和 residual correction。
-7. 最后用相同 checkpoint、prompt、K/T、dtype、warmup 和输出长度比较端到端性能。
+4. 已实现 Draft KV cache 和 committed-boundary trim/crop；继续保持无 cache 路线作为 golden。
+5. 已增加不运行 ordinary 对照的 `dflash` 入口；validator 继续保留。
+6. 在 310P 上先做 cache on/off 等价、稳定性和相同边界 benchmark。
+7. 如果确实需要官方 sampling，再实现概率输出、rejection sampling 和 residual correction。
+8. 最后用相同 checkpoint、prompt、K/T、dtype、warmup 和输出长度比较端到端性能。
 
-在第 4 步前，当前路线可以证明 Target rollback 正确，但不能代表官方完整 DFlash 的计算量。
-在第 6 步前，只能声明 greedy DFlash，不应笼统写成支持官方全部解码模式。
+在第 7 步前，只能声明 greedy DFlash，不应笼统写成支持官方全部解码模式。Draft cache 的代码和
+CPU reduced-shape 门禁已经完成，但在真机 cache 等价和 profile 完成前仍不能声称性能闭合。
 
 ## 11. 文件映射
 
@@ -226,11 +227,11 @@ ordinary 对照是当前 bring-up 的必要验收，但它会额外执行一次 
 | --- | --- |
 | dflash/model.py 的 dflash_generate | models/dflash_v1/dflash_rollback_decode.py |
 | dflash/model.py 的 DFlashDraftModel | models/dflash_v1/modeling_dflash.py |
-| dflash/model.py 的 Draft/Target DynamicCache | 当前只有 Target DynamicCache transaction |
+| dflash/model.py 的 Draft/Target DynamicCache | DFlashDraftKVCache；Target DynamicCache transaction / NPU logical cursor |
 | dflash/model_mlx.py 的 GDN capture/rollback | dflash_rollback_adapter.py 的 snapshot/replay；HIAI state bank |
-| dflash/model_mlx.py 的 draft_cache | 当前缺失 |
+| dflash/model_mlx.py 的 draft_cache | modeling_dflash.py 的 DFlashDraftKVCache |
 | dflash/model.py 的 rejection sampling | 当前缺失 |
-| 官方直接 generate/stream | run_rollback.py 的 ordinary-vs-DFlash validator |
+| 官方直接 generate/stream | run_rollback.py / run_npu.py 的 `dflash` 单跑；`validate` 为额外门禁 |
 
 当前仓库中的 dflash_reference_decode_v1.py 是本项目早期 full-prefix correctness oracle，不是
 官方完整 DFlash 的同义词，也不应拿它代表 z-lab/dflash 的正式 cache/rollback 实现。

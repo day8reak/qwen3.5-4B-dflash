@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "contract_id": "qwen3.5-4b-dflash-npu-rollback-benchmark",
   "scope": "batch-1 strict-greedy ordinary incremental versus transactional DFlash rollback",
   "prerequisites": {
@@ -10,7 +10,7 @@
     "historical_prefix_replay_during_verify": false
   },
   "case_identity": [
-    "Git revision and source hashes",
+    "copied source-tree content hash (no VCS metadata required)",
     "Target and Draft checkpoint hashes",
     "NPU model and device index",
     "CANN, driver, firmware, torch and torch_npu versions",
@@ -52,7 +52,8 @@
       "ai-core": "on",
       "aic-mode": "task-based",
       "aic-metrics": "PipeUtilization",
-      "msproftx": "on"
+      "msproftx": "on",
+      "mstx_range_pattern": "qwen35_<mode>_<phase>_<index>"
     },
     "separate_metric_passes": [
       "PipeUtilization",

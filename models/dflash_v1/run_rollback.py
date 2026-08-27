@@ -1,10 +1,10 @@
 """CPU, CUDA, and HIAI entry point for incremental DFlash rollback.
 
-The ordinary baseline and DFlash validation both keep persistent target state.
-No formal verification call receives the historical prefix.  CPU/CUDA use a
+``validate`` compares independent ordinary and DFlash sessions. ``dflash`` runs
+only the production generation path.  Both keep persistent Target state and no
+verification call receives the historical prefix.  CPU/CUDA use a
 ``DynamicCache`` transaction with GDN-state restore plus bounded commit replay;
-the HIAI route delegates state-bank and logical-KV commit to the receiver
-bridge.
+the HIAI route delegates state-bank and logical-KV commit to the receiver bridge.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from .dflash_rollback_adapter import (
     Qwen35DFlashRollbackAdapter,
     validate_qwen35_dflash_rollback,
 )
+from .dflash_rollback_decode import dflash_rollback_greedy
 from .dflash_weights import require_official_dflash_checkpoint
 from .modeling_dflash import DFlashDraftModel
 
@@ -42,10 +43,19 @@ _ROLLBACK_WRAPPER_SOURCE = "export_model_wrapper_qwen3_5_dflash_rollback.py"
 def _parser():
     parser = _legacy._parser()
     parser.description = (
-        "Validate Qwen3.5 DFlash with persistent CPU/CUDA/NPU target state, "
-        "T=K+1 verification, rollback, and bounded commit"
+        "Run or validate Qwen3.5 DFlash with persistent CPU/CUDA/NPU target "
+        "state, T=K+1 verification, rollback, and bounded commit"
     )
     parser.set_defaults(target_factory=None, hiai_source=None)
+    parser.add_argument(
+        "--execution-mode",
+        choices=("validate", "dflash"),
+        default="validate",
+        help=(
+            "validate runs ordinary then DFlash and requires exact tokens; "
+            "dflash runs only the production DFlash session"
+        ),
+    )
     rollback_help = {
         "target_loader": (
             "CPU/CUDA only: optional MODULE:FUNCTION returning a framework "
@@ -200,7 +210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--max-new-tokens must be non-negative")
     if device_type in {"cuda", "npu"} and args.max_new_tokens < 2:
         raise ValueError(
-            "accelerator rollback validation needs at least two new tokens"
+            "accelerator rollback execution needs at least two new tokens"
         )
     if args.block_size is not None and not (
         DFLASH_MIN_BLOCK_SIZE <= args.block_size <= OFFICIAL_DFLASH_BLOCK_SIZE
@@ -311,42 +321,97 @@ def main(argv: Sequence[str] | None = None) -> int:
         else args.block_size
     )
 
+    progress_fields = {
+        "execution_mode": args.execution_mode,
+        "prompt_tokens": len(prompt_ids),
+        "max_new_tokens": args.max_new_tokens,
+        "block_size": effective_block_size,
+        "proposal_capacity": effective_block_size - 1,
+        "historical_prefix_replay": False,
+        "draft_kv_cache": True,
+    }
     _legacy._emit_progress(
         args.progress,
-        "rollback_validation_begin",
-        {
-            "prompt_tokens": len(prompt_ids),
-            "max_new_tokens": args.max_new_tokens,
-            "block_size": effective_block_size,
-            "proposal_capacity": effective_block_size - 1,
-            "historical_prefix_replay": False,
-        },
+        "rollback_execution_begin",
+        progress_fields,
     )
-    result = validate_qwen35_dflash_rollback(
-        adapter,
-        prompt_ids,
-        max_new_tokens=args.max_new_tokens,
-        block_size=effective_block_size,
-        eos_token_ids=args.eos_token_id,
-        progress_callback=lambda event, fields: _legacy._emit_progress(
-            args.progress,
-            event,
-            fields,
-        ),
-    )
-    validation_seconds = (
-        result.ordinary_elapsed_seconds + result.dflash_elapsed_seconds
-    )
+    if args.execution_mode == "validate":
+        validation = validate_qwen35_dflash_rollback(
+            adapter,
+            prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            block_size=effective_block_size,
+            eos_token_ids=args.eos_token_id,
+            progress_callback=lambda event, fields: _legacy._emit_progress(
+                args.progress,
+                event,
+                fields,
+            ),
+        )
+        ordinary_result = validation.ordinary
+        ordinary_stats = validation.ordinary_adapter_stats
+        ordinary_elapsed_seconds: float | None = (
+            validation.ordinary_elapsed_seconds
+        )
+        dflash_result = validation.dflash
+        dflash_stats = validation.dflash_adapter_stats
+        dflash_elapsed_seconds = validation.dflash_elapsed_seconds
+        validation_seconds: float | None = (
+            ordinary_elapsed_seconds + dflash_elapsed_seconds
+        )
+        target_rollback_audit = dict(validation.target_rollback_audit)
+        draft_kv_cache_audit = dict(validation.draft_kv_cache_audit)
+        correctness_gate = {
+            "status": "PASS",
+            "ordinary_comparison_executed": True,
+            "strict_greedy_exact_match": True,
+        }
+    else:
+        adapter.reset_rollback_stats()
+        _synchronize_device(adapter.device)
+        dflash_started = perf_counter()
+        dflash_result = dflash_rollback_greedy(
+            adapter,
+            prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            block_size=effective_block_size,
+            eos_token_ids=args.eos_token_id,
+            input_device=adapter.device,
+            progress_callback=lambda event, fields: _legacy._emit_progress(
+                args.progress,
+                event,
+                fields,
+            ),
+        )
+        _synchronize_device(adapter.device)
+        dflash_elapsed_seconds = perf_counter() - dflash_started
+        dflash_stats = adapter.snapshot_rollback_stats()
+        ordinary_result = None
+        ordinary_stats = None
+        ordinary_elapsed_seconds = None
+        validation_seconds = None
+        raw_target_audit = getattr(adapter.target, "dflash_rollback_audit", None)
+        target_rollback_audit = (
+            dict(raw_target_audit) if isinstance(raw_target_audit, Mapping) else {}
+        )
+        draft_kv_cache_audit = dict(adapter.dflash_draft_cache_audit)
+        correctness_gate = {
+            "status": "NOT_RUN_DFLASH_ONLY",
+            "ordinary_comparison_executed": False,
+            "strict_greedy_exact_match": None,
+            "validation_command": "rerun with --execution-mode validate",
+        }
     source_identity_after = _rollback_runtime_identity(package_dir)
     if source_identity_after != source_identity_before:
-        raise RuntimeError("rollback runtime source identity changed during validation")
+        raise RuntimeError("rollback runtime source identity changed during execution")
 
-    draft_round_executed = result.dflash.stats.draft_calls > 0
+    draft_round_executed = dflash_result.stats.draft_calls > 0
     execution_gate = {
         "status": "PASS" if draft_round_executed else "INCONCLUSIVE_NO_DRAFT_ROUND",
         "draft_round_executed": draft_round_executed,
-        "target_verify_calls": result.dflash.stats.target_verify_calls,
+        "target_verify_calls": dflash_result.stats.target_verify_calls,
         "historical_prefix_replay_during_verify": False,
+        "draft_kv_cache": True,
     }
     if device_type == "npu":
         state_policy = (
@@ -395,15 +460,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     request_to_report_seconds = perf_counter() - request_started
 
     report = {
-        "schema_version": 3,
+        "schema_version": 4,
         "route": "qwen3.5-dflash-incremental-rollback",
         "classification": {
-            "cpu": "CPU/framework rollback simulation",
-            "cuda": "CUDA/framework rollback validation",
-            "npu": "HIAI/NPU rollback execution; complete device gate remains external",
+            "cpu": f"CPU/framework rollback simulation ({args.execution_mode})",
+            "cuda": f"CUDA/framework rollback execution ({args.execution_mode})",
+            "npu": (
+                "HIAI/NPU rollback execution "
+                f"({args.execution_mode}); complete device gate remains external"
+            ),
         }.get(device_type, "framework rollback execution"),
-        "strict_greedy_exact_match": True,
-        "verification_mode": result.verification_mode,
+        "execution_mode": args.execution_mode,
+        "decode_policy": "strict_greedy",
+        "strict_greedy_exact_match": correctness_gate[
+            "strict_greedy_exact_match"
+        ],
+        "correctness_gate": correctness_gate,
+        "verification_mode": "incremental_transactional_rollback",
         "historical_prefix_replay_during_verify": False,
         "state_policy": state_policy,
         "device": str(adapter.device),
@@ -413,11 +486,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "ops_backend": backend,
         "draft_value_check_policy": draft_value_check_policy,
         "target_route": target_route,
-        "target_rollback_audit": dict(result.target_rollback_audit),
+        "target_rollback_audit": target_rollback_audit,
+        "draft_kv_cache_audit": draft_kv_cache_audit,
         "target_operator_policy": target_operator_policy,
         "dflash_execution_gate": execution_gate,
         "operator_fallback_enabled": bool(args.allow_op_fallback),
-        "performance_claim": "NONE_CORRECTNESS_BRINGUP",
+        "performance_claim": (
+            "NONE_CORRECTNESS_BRINGUP"
+            if args.execution_mode == "validate"
+            else "UNMEASURED_SINGLE_DFLASH_RUN"
+        ),
         "target_dir": str(target_root),
         "target_checkpoint": target_checkpoint,
         "draft_dir": str(Path(args.draft_dir).expanduser().resolve()),
@@ -430,16 +508,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             effective_block_size=effective_block_size,
             prompt_token_ids=prompt_ids,
         ),
-        "ordinary": _legacy._decode_payload(result.ordinary, tokenizer=tokenizer),
-        "dflash": _legacy._decode_payload(result.dflash, tokenizer=tokenizer),
-        "ordinary_adapter_stats": asdict(result.ordinary_adapter_stats),
-        "dflash_adapter_stats": asdict(result.dflash_adapter_stats),
+        "ordinary": (
+            None
+            if ordinary_result is None
+            else _legacy._decode_payload(ordinary_result, tokenizer=tokenizer)
+        ),
+        "dflash": _legacy._decode_payload(dflash_result, tokenizer=tokenizer),
+        "ordinary_adapter_stats": (
+            None if ordinary_stats is None else asdict(ordinary_stats)
+        ),
+        "dflash_adapter_stats": asdict(dflash_stats),
         "timings_seconds": {
             "draft_checkpoint_audit": checkpoint_audit_seconds,
             "target_load": target_load_seconds,
             "draft_load": draft_load_seconds,
-            "ordinary_decode": result.ordinary_elapsed_seconds,
-            "dflash_decode": result.dflash_elapsed_seconds,
+            "ordinary_decode": ordinary_elapsed_seconds,
+            "dflash_decode": dflash_elapsed_seconds,
             "validation_decode_total": validation_seconds,
             "request_to_report_build": request_to_report_seconds,
         },
@@ -449,16 +533,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         _atomic_report(args.report, serialized)
     _legacy._emit_progress(
         args.progress,
-        "rollback_validation_end",
+        "rollback_execution_end",
         {
             "status": "PASS",
+            "execution_mode": args.execution_mode,
             "draft_round_executed": draft_round_executed,
-            "strict_greedy_exact_match": True,
+            "strict_greedy_exact_match": correctness_gate[
+                "strict_greedy_exact_match"
+            ],
         },
     )
     if tokenizer is not None:
-        print("\n=== Ordinary Target 输出 ===", file=sys.stderr)
-        print(report["ordinary"]["generated_text"], file=sys.stderr)
+        if report["ordinary"] is not None:
+            print("\n=== Ordinary Target 输出 ===", file=sys.stderr)
+            print(report["ordinary"]["generated_text"], file=sys.stderr)
         print("\n=== DFlash rollback 输出 ===", file=sys.stderr)
         print(report["dflash"]["generated_text"], file=sys.stderr)
         print(file=sys.stderr)

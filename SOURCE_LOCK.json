@@ -1,10 +1,10 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback",
-  "package_revision": "r1",
-  "route_version": "dflash-rollback-incremental-transactional-upstream-block-size",
+  "package_revision": "r2",
+  "route_version": "dflash-rollback-incremental-draft-kv-cache",
   "package_layout": {
-    "version": 2,
+    "version": 3,
     "canonical_package": "models.dflash_v1",
     "canonical_source_directory": "models/dflash_v1",
     "hiai_source_file": "models/modeling_qwen3_5_hiai_nd.py",
@@ -12,8 +12,8 @@
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
-    "hiai_bridge_sha256": "d236cb66b8d9409661b845bce2018d10b631e561df86544f17477b7078b482d3",
-    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with at most 16 verify rows, GDN/conv state banks, provisional paged-KV writes, one logical commit cursor, returned-bank ownership, and same-stream ordering without per-call host barriers",
+    "hiai_bridge_sha256": "423c9824a7e926f1c731b75a27238d4c6a71c83c9ef019849bffa566898f6de0",
+    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with at most 16 verify rows, GDN/conv state banks, provisional paged-KV writes, one logical commit cursor, returned-bank ownership, same-stream ordering without per-call host barriers, and an explicit cumulative-counter audit schema",
     "npu_policy": "keep the HIAI target in models/ and install the complete DFlash package in models/dflash_v1/",
     "namespace_compatibility_file": "models/__init__.py",
     "namespace_compatibility_sha256": "9bf3e37aed93d372ca13b17b9c6dae32efa47f805f32b48628fb5316eae34b6d",
@@ -78,7 +78,8 @@
     "scheduler_file": "models/dflash_v1/dflash_reference_decode_v1.py",
     "scheduler_sha256": "e7efc6fbfdf049a597f33d37b6e348ae6274c3242e8ad56396e3f1122b911f70",
     "draft_model_file": "models/dflash_v1/modeling_dflash.py",
-    "draft_model_sha256": "f99ae9fd26306d903150ae7ba08707554aaf0ee465f478128582a1031e459847",
+    "draft_model_sha256": "c0008151abc7d2132b7a82fe82e073df78bed871fa5a9dc65d54c8f2c61dab26",
+    "draft_cache_contract": "request-local six-layer committed K/V; append only new projected Target features, expose the current block transiently, crop on success, abort without mutating committed state, and construct only incremental RoPE positions",
     "weight_loader_file": "models/dflash_v1/dflash_weights.py",
     "weight_loader_sha256": "c85bcc22620c9108d430e0f23e55b7dd08207e6a7884615e508370644bd653b2",
     "acceptance_diagnostic_file": "models/dflash_v1/diagnose_acceptance.py",
@@ -86,7 +87,7 @@
   },
   "npu_embedded_runtime": {
     "runner_file": "models/dflash_v1/run_npu.py",
-    "runner_sha256": "188c00a7cae8582b09cf98fc9fad68dd0c229be5618b5621b48f6a21a4e6314c",
+    "runner_sha256": "a6f4bcb9bdd558e512de46e2a2153173332c563309cc78d1a37fe644464e2aa7",
     "loader_file": "models/dflash_v1/internal_target_loader.py",
     "loader_sha256": "fb8a1516d1791ad253a8d0dabbfcddae2db57dccc9e2795d938a511071efa840",
     "loader_contract_file": "models/dflash_v1/internal_target_loader_template.py",
@@ -101,26 +102,26 @@
   },
   "rollback_runtime": {
     "runner_file": "models/dflash_v1/run_rollback.py",
-    "runner_sha256": "d1697d152d52a8152c7d00f5cb9ec6021d65ef5d2e9c8940b7bc37642df8deec",
+    "runner_sha256": "9aa87848f810014014fa97d2b1b5f4659191f9b077a362543f76430f8a1e10ea",
     "adapter_file": "models/dflash_v1/dflash_rollback_adapter.py",
-    "adapter_sha256": "bc06fc4b3497b71c26764fe957eebb34ae40b614c8824ea04c274921cc616b67",
+    "adapter_sha256": "c00e5e060d15575c27c5fdf7bf48d61e88d0fdbfdf4d9af085de42f8131b0af0",
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
     "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
     "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
     "hiai_modeling_sha256": "396e00056ca8080d35b69cd8797225422bab136bc730ed14b71927d6fd7d33f0",
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
     "wrapper_sha256": "3386eaa219d1442e9548a2a0277f714b8ffcbfaa55d915cf47e6ecf2df11f0c5",
-    "policy": "persistent ordinary and DFlash sessions; T=K+1 transactional verification; no historical-prefix replay during verify; strict-greedy zero token mismatch"
+    "policy": "persistent ordinary and DFlash sessions; validate or DFlash-only execution; T=K+1 transactional verification; incremental Draft KV cache; no historical-prefix replay during verify; strict-greedy zero token mismatch"
   },
   "npu_benchmark": {
     "runner_file": "models/dflash_v1/benchmark_npu.py",
-    "runner_sha256": "711cfaabcee59a3284070fa9c51f962463d71d3dae16e457ec07c5d8a6e05951",
+    "runner_sha256": "9b0d5f1d84d1ec97ac58e0f83658b276884caf6dbb2281f55ed2a8572554e709",
     "msprof_wrapper_file": "tools/run_msprof.sh",
-    "msprof_wrapper_sha256": "6093d495120cc42031c61afa8d76eab0d1087f27be2baa0340086dea293fec36",
+    "msprof_wrapper_sha256": "1cedde77603082ea46e69e74667a9ebc8a1bc939fe78bbdd8c546cc5658b92be",
     "contract_file": "config/npu_benchmark_v1.json",
-    "contract_sha256": "b1de1dd23da62f4a68d0043875826f267854c5c9132aa369b704c698135dd945",
+    "contract_sha256": "3cf21eb6171f46214e2e028cdcebd33bf0ccc192f4b1b75385145652e5141d4c",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "a606b037b9f7b430edae3da82827dd893e3667ff3fa2ac0526d627ac770cc4cc",
-    "policy": "strict-greedy gate before timing; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; msprof diagnostic only; no CPU fallback"
+    "documentation_sha256": "87051c79301f1da9710fde05c4d4875f5c7b4b4f4035d9ce88489d43cd236d75",
+    "policy": "strict-greedy gate before timing; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only; no CPU fallback"
   }
 }

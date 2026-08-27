@@ -4,8 +4,9 @@
 Draft proposal、Target verify 和状态提交如何对齐。旧 full-prefix sequential 路线只用于定位，
 不属于默认 CPU、CUDA 或 NPU 流程。
 
-当前实现的 `block_size` 口径已与官方锁定 Transformers/MLX runner 对齐；Draft cache、sampling
-和 Target rollback 实现差异见[官方完整 DFlash 对照](DFLASH_UPSTREAM_COMPARISON.md)。
+当前实现的 `block_size` 和 Draft KV cache 生命周期已与官方锁定 Transformers/MLX runner
+对齐；sampling 和 Target rollback 的实现差异见
+[官方完整 DFlash 对照](DFLASH_UPSTREAM_COMPARISON.md)。
 
 ## 1. 固定术语与不变量
 
@@ -31,10 +32,10 @@ proposal，共 1+a 行；correction 或 bonus 是下一轮 anchor，不能在本
 | 组件 | 主要职责 | 不拥有的职责 |
 | --- | --- | --- |
 | Scheduler | 组织 bootstrap、Draft、verify、连续接受、EOS 和长度停止 | 不直接修改 Target 内部 cache |
-| Draft adapter | 用已提交 feature history 构造 anchor 加 K 个 mask，返回 K 个 proposal | 不决定 token 是否接受 |
+| Draft adapter | 维护已提交的逐层 KV，只投影本轮新增 feature，构造 anchor 加 K 个 mask并返回 proposal | 不决定 token 是否接受 |
 | Target transaction | 维护 committed state，执行 provisional verify，并提交或放弃一轮状态 | 不修改接受规则 |
 | Feature collector | 收集八个锁定层的 Target hidden，按 token 与 committed boundary 对齐 | 不保存拒绝尾部 |
-| Validator CLI | 分别运行 ordinary 与 DFlash session，比较最终 token、EOS、stop reason | ordinary 对照不属于生产热路径 |
+| Runner / validator | `dflash` 只跑生产路径；`validate` 分别运行 ordinary 与 DFlash 并比较 token、EOS、stop reason | 单跑模式不能声称本次已完成 ordinary 对照 |
 
 各设备实现：
 
@@ -50,8 +51,12 @@ proposal，共 1+a 行；correction 或 bonus 是下一轮 anchor，不能在本
 
 ## 3. 一次完整请求
 
-当前验证 CLI 先运行一个独立 ordinary incremental session，再从相同 prompt 新建 DFlash
-session。两条流最终必须逐 token 完全相同。
+CLI 有两个显式执行模式：
+
+- `--execution-mode validate`：先运行独立 ordinary incremental session，再从相同 prompt 新建
+  DFlash session；两条流最终必须逐 token 完全相同。
+- `--execution-mode dflash`：只运行一次 DFlash session，用于已经通过离线门禁后的正常生成；
+  报告把 correctness gate 标成 `NOT_RUN_DFLASH_ONLY`，不伪造 exact-match PASS。
 
 ~~~mermaid
 flowchart TD
@@ -91,7 +96,7 @@ DFlash session 的行为是：
 Draft 不是另一个独立语言模型。它使用两类输入：
 
 ~~~text
-Target 已提交 feature history
+Draft 已提交的逐层 K/V + 本轮新增 Target feature
 [current anchor, MASK × K] 的共享 embedding
 ~~~
 
@@ -121,9 +126,24 @@ norm 之前：
 前五层是 causal sliding attention，最后一层允许 Draft block 内 non-causal 可见。最后经过共享
 Target LM head，只取 mask 对应的 K 行 Top-1。
 
-当前 adapter 会在 feature 首次提交时执行一次 `20480→2560 + RMSNorm`，之后只保存投影后的
-`[B,C,2560]` history；新增的 1+a 行也只投影一次。Draft 自身仍没有跨轮 KV cache，因此 6 层
-attention 的 context K/V 仍会每轮重新计算。这不影响 rollback 正确性，但仍是主要性能差异。
+当前 adapter 会在 feature 首次提交时执行一次 `20480→2560 + RMSNorm`。首轮只投影 prompt，
+后续只投影新提交的 `1+a` 行；投影结果在下一次 Draft 消费后立即释放，不再累积完整
+`[B,C,2560]` history。
+
+Draft 为 6 层分别维护 committed K/V。设上一轮 cache 长度为 `C_old`、本轮新增 Target
+feature 为 `Δ=1+a`（首轮为 prompt 长度）、当前 Draft block 为 T 行：
+
+~~~text
+每层只投影 K/V(new feature Δ + transient block T)
+attention 读取 [cached K/V C_old, new K/V Δ, transient K/V T]
+proposal 完成后只保留前 C_old+Δ 行
+block 的 T 行无论接受多少都不会进入下一轮 Draft cache
+RoPE 只构造 Δ+T 行绝对 position；旧 C_old 行沿用 cache 中已旋转的 K
+~~~
+
+这与官方 `DynamicCache.update()` 后 crop、MLX draft cache 后 trim 的边界相同。异常发生在任意
+Draft 层或 final norm 时，本轮 staged K/V 整体放弃，旧 committed cache 不变。无 cache 的
+`forward_projected` 路线继续作为数值 golden。
 
 ## 5. Target 如何验证 token
 
@@ -199,7 +219,7 @@ sequenceDiagram
     T-->>S: clean anchor
 
     loop 未到 EOS 或长度上限
-        S->>D: feature history + anchor + K masks
+        S->>D: committed KV + new feature + anchor + K masks
         D-->>S: d1 ... dK
         S->>X: begin round at committed cursor
         S->>T: verify anchor + d1 ... dK
@@ -235,12 +255,16 @@ Prompt 在 NPU bridge 中逐 token bootstrap，避免把 64-row padding 写入 p
 
 ## 7. Feature、EOS 和长度边界
 
-每轮接受 a 个 proposal 后，feature history 只追加 anchor 和已接受 proposal 对应的 1+a 行。
-Correction 或 bonus 不追加，因为它还没有作为 Target 输入执行。下一轮 Draft 前必须满足：
+每轮接受 a 个 proposal 后，只生成 anchor 和已接受 proposal 对应的 `1+a` 行 pending feature。
+Correction 或 bonus 不加入，因为它还没有作为 Target 输入执行。下一轮 Draft 前必须满足：
 
 ~~~text
-feature_history_length = committed_token_length - 1
+draft_kv_cache_length + pending_feature_length = committed_token_length - 1
 ~~~
+
+Draft forward 成功后，pending feature 被转换为各层 K/V 并清空；因此稳态 host/model tensor 不再
+保存完整 feature history。FP16 下 6 层 cache 的逻辑大小约为每个 committed token 24 KiB，
+上下文 2048 时约 48 MiB，不包含当轮最多 16 行 transient K/V 和 allocator workspace。
 
 Draft proposal 中出现 EOS 时，EOS 后面的固定宽度槽不再验证。输出 accepted token 或
 correction/bonus 时遇到 EOS 立即停止。达到 max_new_tokens 时，已计算但未输出的 bonus 不能进入
@@ -259,13 +283,17 @@ ordinary.stop_reason          == dflash.stop_reason
 没有文本级宽松比较或浮点容差。整块 verify 若因 kernel、position、mask 或状态选择产生 Top-1
 分叉，必须定位原因，不能通过放宽接受规则掩盖。
 
-报告用下面三个字段确认已走新框架：
+报告用下面字段确认已走新框架和 cache：
 
 ~~~text
 route = qwen3.5-dflash-incremental-rollback
 verification_mode = incremental_transactional_rollback
 historical_prefix_replay_during_verify = false
+draft_kv_cache_audit.mode = upstream_equivalent_append_then_crop
 ~~~
+
+只有 `execution_mode=validate` 且 `correctness_gate.status=PASS` 时，
+`strict_greedy_exact_match` 才为 true；`execution_mode=dflash` 的该字段为 null。
 
 CPU 是模拟证据；CUDA 是 framework 设备证据。Ascend 310P 还必须禁用 fallback，并记录真实
 runtime、device、算子包和 kernel trace，才能声明 Target rollback 通过。
@@ -277,7 +305,8 @@ runtime、device、算子包和 kernel trace，才能声明 Target rollback 通�
 - CPU/CUDA commit 的最多 K+1 次单 token replay；
 - NPU causal-conv Tensor 分解和逐 row CacheUpdate；
 - Target 与 Draft 仍计算完整词表 logits；当前只把设备侧 Top-1 ID 搬回 host；
-- Draft 已缓存 feature projection，但 6 层 context K/V 仍每轮重算，尚无跨轮 Draft KV cache；
+- Draft attention 仍读取长度 C+T 的 K/V，当前 cache 拼接和 attention 仍随上下文增长；但 6 层
+  历史 context K/V projection 已消除；
 - state bank 的峰值内存；stage/benchmark 边界仍需要 host/device 同步。
 
 GDR/conv 返回的新 state bank 会直接替换 persistent state 引用，不再额外 `copy_` 回旧 bank；这减少

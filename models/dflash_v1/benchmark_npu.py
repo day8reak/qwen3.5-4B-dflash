@@ -56,6 +56,57 @@ BenchmarkMode = Literal["ordinary", "dflash"]
 Synchronize = Callable[[], None]
 RangeFactory = Callable[[str], ContextManager[None]]
 
+_TARGET_AUDIT_COUNTER_FIELDS = frozenset(
+    {
+        # HIAI receiver counters.
+        "ordinary_prefill_token_calls",
+        "ordinary_prefill_lm_head_skips",
+        "ordinary_decode_calls",
+        "rollback_prefill_token_calls",
+        "rollback_prefill_lm_head_skips",
+        "rollback_verify_calls",
+        "rollback_commit_calls",
+        "rollback_aborts",
+        # Framework transaction counters.
+        "ordinary_prefill_calls",
+        "rollback_prefill_calls",
+        "rollback_commit_transactions",
+        "rollback_commit_replay_calls",
+    }
+)
+_TARGET_AUDIT_SESSION_FIELDS = (
+    "persistent_mode",
+    "persistent_cursor",
+    "previous_accepted",
+    "pending_verify_rows",
+    "session_invalid",
+    "pending_transaction",
+    "cache_sequence_length",
+)
+_DRAFT_KV_CACHE_COUNTER_FIELDS = (
+    "rounds",
+    "aborted_rounds",
+    "crop_calls",
+    "tokens_appended",
+    "tokens_reused",
+)
+
+
+def _benchmark_range_label(
+    mode: BenchmarkMode,
+    phase: Literal["warmup", "measure"],
+    index: int,
+) -> str:
+    """Build a conservative MSTX message accepted by older CANN releases."""
+
+    if mode not in {"ordinary", "dflash"}:
+        raise ValueError(f"unsupported benchmark range mode: {mode!r}")
+    if phase not in {"warmup", "measure"}:
+        raise ValueError(f"unsupported benchmark range phase: {phase!r}")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("benchmark range index must be a non-negative integer")
+    return f"qwen35_{mode}_{phase}_{index}"
+
 
 @dataclass(frozen=True)
 class BenchmarkConfig:
@@ -93,6 +144,7 @@ class BenchmarkInvocation:
     result: ReplayDecodeResult
     adapter_stats: Mapping[str, object]
     target_audit_delta: Mapping[str, object] = field(default_factory=dict)
+    draft_kv_cache_audit: Mapping[str, object] = field(default_factory=dict)
 
     @property
     def target_forward_calls(self) -> int:
@@ -184,7 +236,7 @@ def run_benchmark(
 
     for index in range(config.warmup):
         synchronize()
-        with make_range(f"qwen35/{config.mode}/warmup/{index}"):
+        with make_range(_benchmark_range_label(config.mode, "warmup", index)):
             invocation = run_once()
             synchronize()
         _require_expected_result(
@@ -201,7 +253,7 @@ def run_benchmark(
     measured_target_forward_calls = 0
     for index in range(config.repetitions):
         synchronize()
-        with make_range(f"qwen35/{config.mode}/measure/{index}"):
+        with make_range(_benchmark_range_label(config.mode, "measure", index)):
             started_ns = time.perf_counter_ns()
             invocation = run_once()
             synchronize()
@@ -228,6 +280,7 @@ def run_benchmark(
                 "replay_stats": _replay_stats(invocation.result),
                 "adapter_stats": dict(invocation.adapter_stats),
                 "target_audit_delta": dict(invocation.target_audit_delta),
+                "draft_kv_cache_audit": dict(invocation.draft_kv_cache_audit),
                 "target_forward_calls": invocation.target_forward_calls,
             }
         )
@@ -235,7 +288,7 @@ def run_benchmark(
     generated_tokens = len(expected.generated_token_ids)
     total_seconds = sum(elapsed_seconds)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "PASS",
         "mode": config.mode,
         "configuration": {
@@ -256,8 +309,9 @@ def run_benchmark(
         },
         "ranges": {
             "source": range_source,
-            "warmup_pattern": f"qwen35/{config.mode}/warmup/<index>",
-            "measurement_pattern": f"qwen35/{config.mode}/measure/<index>",
+            "message_character_policy": "ASCII letters, digits, and underscore",
+            "warmup_pattern": f"qwen35_{config.mode}_warmup_<index>",
+            "measurement_pattern": f"qwen35_{config.mode}_measure_<index>",
         },
         "expected_result": _result_identity(expected),
         "warmup": {
@@ -296,22 +350,87 @@ def _target_audit(target: object) -> dict[str, object]:
     return dict(raw) if isinstance(raw, Mapping) else {}
 
 
+def _draft_kv_cache_audit(adapter: object) -> dict[str, object]:
+    raw = getattr(adapter, "dflash_draft_cache_audit", None)
+    return dict(raw) if isinstance(raw, Mapping) else {}
+
+
+def _draft_kv_cache_invocation_audit(
+    before: Mapping[str, object],
+    after: Mapping[str, object],
+) -> dict[str, object]:
+    if not after:
+        return {}
+    audit = dict(after)
+    counter_delta: dict[str, int] = {}
+    for name in _DRAFT_KV_CACHE_COUNTER_FIELDS:
+        before_value = before.get(name, 0)
+        after_value = after.get(name)
+        if (
+            not isinstance(before_value, int)
+            or isinstance(before_value, bool)
+            or not isinstance(after_value, int)
+            or isinstance(after_value, bool)
+        ):
+            raise TypeError(f"Draft KV cache audit counter must be integer: {name}")
+        if after_value < before_value:
+            raise RuntimeError(f"Draft KV cache counter moved backwards: {name}")
+        counter_delta[name] = after_value - before_value
+    audit["invocation_counter_delta"] = counter_delta
+    return audit
+
+
 def _target_audit_delta(
     before: Mapping[str, object],
     after: Mapping[str, object],
 ) -> dict[str, object]:
+    """Subtract cumulative counters while snapshotting resettable session state."""
+
     delta: dict[str, object] = {}
-    for name, after_value in after.items():
+    declared_after = after.get("cumulative_counter_fields")
+    declared_before = before.get("cumulative_counter_fields")
+    if declared_after is None:
+        counter_fields = sorted(
+            name
+            for name in _TARGET_AUDIT_COUNTER_FIELDS
+            if name in before and name in after
+        )
+    else:
+        if not isinstance(declared_after, (tuple, list)) or not all(
+            isinstance(name, str) for name in declared_after
+        ):
+            raise TypeError(
+                "rollback audit cumulative_counter_fields must be a string sequence"
+            )
+        if declared_before is not None and tuple(declared_before) != tuple(
+            declared_after
+        ):
+            raise RuntimeError("rollback audit counter schema changed during invocation")
+        counter_fields = list(declared_after)
+
+    for name in counter_fields:
+        if name not in before or name not in after:
+            raise RuntimeError(f"rollback audit counter is missing: {name}")
+        after_value = after[name]
         before_value = before.get(name)
         if (
-            isinstance(after_value, int)
-            and not isinstance(after_value, bool)
-            and isinstance(before_value, int)
-            and not isinstance(before_value, bool)
+            not isinstance(after_value, int)
+            or isinstance(after_value, bool)
+            or not isinstance(before_value, int)
+            or isinstance(before_value, bool)
         ):
-            if after_value < before_value:
-                raise RuntimeError(f"rollback audit counter moved backwards: {name}")
-            delta[name] = after_value - before_value
+            raise TypeError(f"rollback audit counter must be an integer: {name}")
+        if after_value < before_value:
+            raise RuntimeError(f"rollback audit counter moved backwards: {name}")
+        delta[name] = after_value - before_value
+
+    session_state_after = {
+        name: after[name]
+        for name in _TARGET_AUDIT_SESSION_FIELDS
+        if name in after
+    }
+    if session_state_after:
+        delta["session_state_after"] = session_state_after
     execution_keys = (
         "ordinary_prefill_token_calls",
         "ordinary_decode_calls",
@@ -333,6 +452,7 @@ def _ordinary_invocation(
 ) -> BenchmarkInvocation:
     adapter.reset_rollback_stats()
     before = _target_audit(adapter.target)
+    draft_before = _draft_kv_cache_audit(adapter)
     result = ordinary_incremental_greedy(
         adapter,
         prompt_token_ids,
@@ -341,10 +461,15 @@ def _ordinary_invocation(
         input_device=adapter.device,
     )
     after = _target_audit(adapter.target)
+    draft_after = _draft_kv_cache_audit(adapter)
     return BenchmarkInvocation(
         result=result,
         adapter_stats=asdict(adapter.snapshot_rollback_stats()),
         target_audit_delta=_target_audit_delta(before, after),
+        draft_kv_cache_audit=_draft_kv_cache_invocation_audit(
+            draft_before,
+            draft_after,
+        ),
     )
 
 
@@ -358,6 +483,7 @@ def _dflash_invocation(
 ) -> BenchmarkInvocation:
     adapter.reset_rollback_stats()
     before = _target_audit(adapter.target)
+    draft_before = _draft_kv_cache_audit(adapter)
     result = dflash_rollback_greedy(
         adapter,
         prompt_token_ids,
@@ -367,10 +493,15 @@ def _dflash_invocation(
         input_device=adapter.device,
     )
     after = _target_audit(adapter.target)
+    draft_after = _draft_kv_cache_audit(adapter)
     return BenchmarkInvocation(
         result=result,
         adapter_stats=asdict(adapter.snapshot_rollback_stats()),
         target_audit_delta=_target_audit_delta(before, after),
+        draft_kv_cache_audit=_draft_kv_cache_invocation_audit(
+            draft_before,
+            draft_after,
+        ),
     )
 
 
@@ -392,7 +523,11 @@ def _mstx_range_factory(enabled: bool) -> tuple[RangeFactory | None, str]:
     def traced(label: str):
         range_id = mstx.range_start(label, None)
         if range_id in (None, 0):
-            raise RuntimeError(f"mstx.range_start failed for {label!r}")
+            raise RuntimeError(
+                f"mstx.range_start failed for safe marker {label!r}; verify the "
+                "CANN/mstx profiling environment or rerun run_msprof.sh with "
+                "--no-msproftx"
+            )
         try:
             yield
         finally:
@@ -726,7 +861,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise RuntimeError("benchmark source identity changed during benchmark")
 
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "PASS",
         "route": "qwen3.5-dflash-npu-incremental-rollback-benchmark",
         "classification": "real NPU synchronized rollback execution",
@@ -761,6 +896,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "ordinary_adapter_stats": asdict(validation.ordinary_adapter_stats),
             "dflash_adapter_stats": asdict(validation.dflash_adapter_stats),
+            "draft_kv_cache_audit": dict(validation.draft_kv_cache_audit),
         },
         "benchmark": benchmark,
         "accelerator_memory": memory,

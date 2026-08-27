@@ -8,7 +8,7 @@ Usage:
 
 Required:
   --label NAME              Stable case label.
-  --output-dir DIR          Evidence root outside this Git repository.
+  --output-dir DIR          Evidence root outside this copied source tree.
 
 Options:
   --python PATH             Python used for preflight/manifest (default: python3).
@@ -146,12 +146,12 @@ fi
 command -v npu-smi >/dev/null 2>&1 || fail "npu-smi was not found in PATH"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-repo_root="$(git -C "$script_dir/.." rev-parse --show-toplevel)"
+source_root="$(cd -- "$script_dir/.." && pwd -P)"
 output_root="$($python_bin -B -c \
   'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' \
   "$output_dir")"
-if [[ "$output_root" == "$repo_root" || "$output_root" == "$repo_root/"* ]]; then
-  fail "--output-dir must be outside the source repository: $repo_root"
+if [[ "$output_root" == "$source_root" || "$output_root" == "$source_root/"* ]]; then
+  fail "--output-dir must be outside the copied source tree: $source_root"
 fi
 
 profile_dir="$output_root/profile/msprof/$label"
@@ -221,12 +221,6 @@ npu-smi info >"$device_log" 2>&1 || {
 
 msprof_version="$($msprof_bin --version 2>&1 || true)"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-git_commit="$(git -C "$repo_root" rev-parse HEAD)"
-git_branch="$(git -C "$repo_root" branch --show-current)"
-git_dirty="false"
-if [[ -n "$(git -C "$repo_root" status --porcelain)" ]]; then
-  git_dirty="true"
-fi
 
 msprof_args=(
   "--output=$profile_dir"
@@ -250,8 +244,8 @@ write_manifest() {
   "$python_bin" -B - \
     "$manifest_path" "$run_status" "$exit_code" "$started_at" "$finished_at" \
     "$label" "$profile_dir" "$runtime_log" "$preflight_log" "$device_log" \
-    "$msprof_bin" "$msprof_version" "$repo_root" "$git_commit" "$git_branch" \
-    "$git_dirty" "$aic_metrics" "$task_time" "$msproftx" "$requested_device" \
+    "$msprof_bin" "$msprof_version" "$source_root" "$aic_metrics" "$task_time" \
+    "$msproftx" "$requested_device" \
     "${#msprof_args[@]}" "${msprof_args[@]}" \
     "${#application[@]}" "${application[@]}" <<'PY'
 import hashlib
@@ -263,10 +257,10 @@ values = sys.argv[1:]
 (
     manifest_path, run_status, exit_code, started_at, finished_at, label,
     profile_dir, runtime_log, preflight_log, device_log, msprof_bin,
-    msprof_version, repo_root, git_commit, git_branch, git_dirty,
-    aic_metrics, task_time, msproftx, requested_device,
-) = values[:20]
-cursor = 20
+    msprof_version, source_root, aic_metrics, task_time, msproftx,
+    requested_device,
+) = values[:17]
+cursor = 17
 msprof_count = int(values[cursor])
 cursor += 1
 msprof_args = values[cursor:cursor + msprof_count]
@@ -283,7 +277,7 @@ for index, argument in enumerate(redacted_application):
     if argument.startswith("--prompt="):
         redacted_application[index] = "--prompt=<redacted-inline-prompt>"
 
-root = Path(repo_root)
+root = Path(source_root)
 source_hasher = hashlib.sha256()
 source_files = 0
 source_paths = [
@@ -311,17 +305,15 @@ for path in sorted(set(expanded)):
     source_files += 1
 
 payload = {
-    "schema_version": 2,
+    "schema_version": 3,
     "status": run_status,
     "exit_code": int(exit_code),
     "label": label,
     "started_at": started_at,
     "finished_at": finished_at or None,
     "source": {
-        "repository": repo_root,
-        "git_commit": git_commit,
-        "git_branch": git_branch,
-        "git_dirty": git_dirty == "true",
+        "source_root": source_root,
+        "identity_method": "content_hash_without_vcs_metadata",
         "source_tree_sha256": source_hasher.hexdigest(),
         "source_files": source_files,
     },
