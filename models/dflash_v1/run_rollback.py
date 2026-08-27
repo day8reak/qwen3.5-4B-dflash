@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -83,6 +84,8 @@ def _rollback_runtime_identity(package_dir: Path) -> dict[str, object]:
     files = {
         "scheduler": package_dir / "dflash_rollback_decode.py",
         "adapter": package_dir / "dflash_rollback_adapter.py",
+        "draft_modeling": package_dir / "modeling_dflash.py",
+        "draft_npu_ops": package_dir / "dflash_ascend310p_ops.py",
         "runner": package_dir / "run_rollback.py",
         "bridge": parent / "internal_dflash_bridge.py",
         "wrapper": parent / _ROLLBACK_WRAPPER_SOURCE,
@@ -173,7 +176,24 @@ def _atomic_report(path: str, serialized: str) -> None:
             temporary.unlink()
 
 
+def _synchronize_device(device: str | torch.device) -> None:
+    requested = torch.device(device)
+    if requested.type == "cpu":
+        return
+    backend = getattr(torch, requested.type, None)
+    synchronize = getattr(backend, "synchronize", None)
+    if not callable(synchronize):
+        raise RuntimeError(
+            f"{requested.type} backend lacks synchronize(); cannot time model load"
+        )
+    try:
+        synchronize(requested)
+    except TypeError:
+        synchronize()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    request_started = perf_counter()
     args = _parser().parse_args(argv)
     device_type = str(args.device).split(":", 1)[0].lower()
     if args.max_new_tokens < 0:
@@ -227,6 +247,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     target_root = Path(args.target_dir).expanduser().resolve()
     target_checkpoint = _legacy._audit_target_config(target_root)
     prompt_ids, tokenizer = _legacy._resolve_prompt(args, target_root=target_root)
+    checkpoint_audit_started = perf_counter()
     _legacy._emit_progress(
         args.progress,
         "draft_checkpoint_audit_begin",
@@ -236,6 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.draft_dir,
         verify_model_hash=True,
     )
+    checkpoint_audit_seconds = perf_counter() - checkpoint_audit_started
     _legacy._emit_progress(
         args.progress,
         "draft_checkpoint_audit_end",
@@ -245,23 +267,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             "model_bytes": draft_checkpoint["model_bytes"],
         },
     )
-    draft_memory_preflight = _legacy._draft_device_memory_preflight(
-        args.device,
-        dtype,
-        draft_checkpoint,
-    )
-
     _legacy._emit_progress(
         args.progress,
         "target_load_begin",
         {"device": args.device, "dtype": args.dtype},
     )
+    target_load_started = perf_counter()
     target, target_route = _load_transactional_target(args, dtype=dtype)
+    _synchronize_device(args.device)
+    target_load_seconds = perf_counter() - target_load_started
     _legacy._emit_progress(
         args.progress,
         "target_load_end",
         {"route": target_route, "transactional": True},
     )
+    # Query free memory after the Target is resident.  Running this check
+    # before Target load can report enough space for the Draft and then OOM
+    # immediately because the multi-gigabyte Target allocation was omitted.
+    draft_memory_preflight = _legacy._draft_device_memory_preflight(
+        args.device,
+        dtype,
+        draft_checkpoint,
+    )
+    draft_load_started = perf_counter()
     ops, backend = _legacy._select_draft_ops(
         device=args.device,
         ops_backend=args.ops_backend,
@@ -274,6 +302,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=args.device,
         dtype=dtype,
     )
+    _synchronize_device(args.device)
+    draft_load_seconds = perf_counter() - draft_load_started
     adapter = Qwen35DFlashRollbackAdapter(target, draft)
     effective_block_size = (
         adapter.max_block_size
@@ -298,6 +328,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_new_tokens=args.max_new_tokens,
         block_size=effective_block_size,
         eos_token_ids=args.eos_token_id,
+        progress_callback=lambda event, fields: _legacy._emit_progress(
+            args.progress,
+            event,
+            fields,
+        ),
+    )
+    validation_seconds = (
+        result.ordinary_elapsed_seconds + result.dflash_elapsed_seconds
     )
     source_identity_after = _rollback_runtime_identity(package_dir)
     if source_identity_after != source_identity_before:
@@ -333,6 +371,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             "historical_prefix_replay_during_verify": False,
         }
 
+    ops_module = getattr(ops, "module", None)
+    exhaustive_checks = getattr(
+        ops_module,
+        "exhaustive_value_checks_enabled",
+        None,
+    )
+    if callable(exhaustive_checks):
+        draft_value_check_policy = {
+            "mode": (
+                "exhaustive_intermediate_and_boundary"
+                if exhaustive_checks(adapter.device)
+                else "boundary_only"
+            ),
+            "boundary_logits_finite_check": True,
+        }
+    else:
+        draft_value_check_policy = {
+            "mode": "backend_default",
+            "boundary_logits_finite_check": True,
+        }
+
+    request_to_report_seconds = perf_counter() - request_started
+
     report = {
         "schema_version": 3,
         "route": "qwen3.5-dflash-incremental-rollback",
@@ -350,6 +411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "runtime_identity": _legacy._runtime_identity(adapter.device),
         "rollback_runtime_identity": source_identity_after,
         "ops_backend": backend,
+        "draft_value_check_policy": draft_value_check_policy,
         "target_route": target_route,
         "target_rollback_audit": dict(result.target_rollback_audit),
         "target_operator_policy": target_operator_policy,
@@ -372,6 +434,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "dflash": _legacy._decode_payload(result.dflash, tokenizer=tokenizer),
         "ordinary_adapter_stats": asdict(result.ordinary_adapter_stats),
         "dflash_adapter_stats": asdict(result.dflash_adapter_stats),
+        "timings_seconds": {
+            "draft_checkpoint_audit": checkpoint_audit_seconds,
+            "target_load": target_load_seconds,
+            "draft_load": draft_load_seconds,
+            "ordinary_decode": result.ordinary_elapsed_seconds,
+            "dflash_decode": result.dflash_elapsed_seconds,
+            "validation_decode_total": validation_seconds,
+            "request_to_report_build": request_to_report_seconds,
+        },
     }
     serialized = json.dumps(report, indent=2, sort_keys=True)
     if args.report:

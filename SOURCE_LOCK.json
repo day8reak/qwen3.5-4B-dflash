@@ -12,8 +12,8 @@
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
-    "hiai_bridge_sha256": "72ab9d853345e3b2ddc1416aa5c581d482270cad65143e7f39ef1d004862a241",
-    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with at most 16 verify rows, GDN/conv state banks, provisional paged-KV writes, one logical commit cursor, and synchronized state ownership",
+    "hiai_bridge_sha256": "d236cb66b8d9409661b845bce2018d10b631e561df86544f17477b7078b482d3",
+    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with at most 16 verify rows, GDN/conv state banks, provisional paged-KV writes, one logical commit cursor, returned-bank ownership, and same-stream ordering without per-call host barriers",
     "npu_policy": "keep the HIAI target in models/ and install the complete DFlash package in models/dflash_v1/",
     "namespace_compatibility_file": "models/__init__.py",
     "namespace_compatibility_sha256": "9bf3e37aed93d372ca13b17b9c6dae32efa47f805f32b48628fb5316eae34b6d",
@@ -76,9 +76,9 @@
     "adapter_file": "models/dflash_v1/dflash_qwen_adapter_v1.py",
     "adapter_sha256": "5b72c23f2e261264abeb271c60d93add18494d4dc2c930730b1260c0990e4043",
     "scheduler_file": "models/dflash_v1/dflash_reference_decode_v1.py",
-    "scheduler_sha256": "0f1507fed491dd61ab1e303029b64a167c3337b2d32ecda1ae12a24c2da2b666",
+    "scheduler_sha256": "e7efc6fbfdf049a597f33d37b6e348ae6274c3242e8ad56396e3f1122b911f70",
     "draft_model_file": "models/dflash_v1/modeling_dflash.py",
-    "draft_model_sha256": "ab35fc10016d71fc88a2b32bd68e10dde599a948e02d8cfb16c9ca225fbfd9de",
+    "draft_model_sha256": "f99ae9fd26306d903150ae7ba08707554aaf0ee465f478128582a1031e459847",
     "weight_loader_file": "models/dflash_v1/dflash_weights.py",
     "weight_loader_sha256": "c85bcc22620c9108d430e0f23e55b7dd08207e6a7884615e508370644bd653b2",
     "acceptance_diagnostic_file": "models/dflash_v1/diagnose_acceptance.py",
@@ -97,6 +97,30 @@
     "hiai_runtime_sha256": "46b95a67e2cb74b98e6d3964153fee31b5134b2c27a316c991bc83f41d120d4a",
     "hiai_runtime_policy": "legacy ModelOutput sidecar compatibility only; direct HIAI Tensor/tuple source must not import it",
     "ascend_ops_file": "models/dflash_v1/dflash_ascend310p_ops.py",
-    "ascend_ops_sha256": "8647a900ef99f41b23169b63d45ad5a554051d4c1fb8bc924fa22bd270901ac3"
+    "ascend_ops_sha256": "c75d7ffaba6cbaca46582be8eaa966c4d30798b5759e0af24dd56bdd3be22e8a"
+  },
+  "rollback_runtime": {
+    "runner_file": "models/dflash_v1/run_rollback.py",
+    "runner_sha256": "d1697d152d52a8152c7d00f5cb9ec6021d65ef5d2e9c8940b7bc37642df8deec",
+    "adapter_file": "models/dflash_v1/dflash_rollback_adapter.py",
+    "adapter_sha256": "bc06fc4b3497b71c26764fe957eebb34ae40b614c8824ea04c274921cc616b67",
+    "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
+    "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
+    "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
+    "hiai_modeling_sha256": "396e00056ca8080d35b69cd8797225422bab136bc730ed14b71927d6fd7d33f0",
+    "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
+    "wrapper_sha256": "3386eaa219d1442e9548a2a0277f714b8ffcbfaa55d915cf47e6ecf2df11f0c5",
+    "policy": "persistent ordinary and DFlash sessions; T=K+1 transactional verification; no historical-prefix replay during verify; strict-greedy zero token mismatch"
+  },
+  "npu_benchmark": {
+    "runner_file": "models/dflash_v1/benchmark_npu.py",
+    "runner_sha256": "711cfaabcee59a3284070fa9c51f962463d71d3dae16e457ec07c5d8a6e05951",
+    "msprof_wrapper_file": "tools/run_msprof.sh",
+    "msprof_wrapper_sha256": "6093d495120cc42031c61afa8d76eab0d1087f27be2baa0340086dea293fec36",
+    "contract_file": "config/npu_benchmark_v1.json",
+    "contract_sha256": "b1de1dd23da62f4a68d0043875826f267854c5c9132aa369b704c698135dd945",
+    "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
+    "documentation_sha256": "a606b037b9f7b430edae3da82827dd893e3667ff3fa2ac0526d627ac770cc4cc",
+    "policy": "strict-greedy gate before timing; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; msprof diagnostic only; no CPU fallback"
   }
 }

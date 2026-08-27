@@ -57,7 +57,7 @@ python -B -m models.dflash_v1.run_rollback \
 ~~~
 
 CPU 将 device 改为 cpu，并按环境选择 dtype。真实 4B Target 和 Draft 在 CPU 上开销很大，日常
-辅助逻辑验证优先运行第 8 节的 reduced-shape 测试。
+辅助逻辑验证优先运行第 9 节的 reduced-shape 测试。
 
 CUDA 路线不要传 HIAI factory、source、reset hook 或 NPU ops backend。它使用
 FrameworkDFlashRollbackTarget、DynamicCache 和 TorchDFlashOps。CUDA 不可用时必须直接失败，
@@ -158,7 +158,120 @@ Prompt 在 bridge 中逐 token bootstrap；verify 才进入 T=K+1 的 GDR MTP �
 为 2 时，如果 bootstrap anchor 立即命中 EOS，就没有 Draft round。此时 token 可以正确，但
 报告状态是 INCONCLUSIVE_NO_DRAFT_ROUND，需要换一个固定非立即结束 prompt。
 
-## 7. 报告门禁
+### 6.1 长运行诊断与当前优化
+
+`run_npu` 是 correctness validator：同一进程先跑 ordinary，再跑独立 DFlash session。因此请求
+总时长不能直接当成纯 DFlash latency。进度日志现在会输出 `ordinary_decode_end`、每个
+`dflash_round_end` 和 `dflash_decode_end`，报告的 `timings_seconds` 进一步拆分 checkpoint hash、
+Target load、Draft load、ordinary decode 与 DFlash decode。
+
+当前热路径已经做了五项 exact 优化：
+
+- prompt 仍按 S=1 更新 Target state，但中间行跳过完整 LM Head，两条 session 都只在最后一行算 logits；
+- Target 在设备侧完成 argmax，只回传 T 个 token ID，不再把完整 logits 转 FP32 后搬到 CPU；
+- Target feature 的 `20480→2560 + RMSNorm` 每个 committed token 只执行一次并缓存投影结果；
+- 任一 Draft round 接受数为 0 后，本请求切到同一 transaction 的 S=1 Target-only continuation。
+- persistent Target 调用依赖同一设备流排序，不再在每个 prompt/decode row 后执行全设备 host
+  barrier；runner 和 benchmark 仍在阶段/计时边界显式同步，full-prefix oracle 释放 call-local
+  state 前仍同步。
+
+NPU Draft primitive 默认采用 boundary-only finite policy：shape/device/dtype 始终检查，最终 Draft
+logits 仍做 finite gate，但不再为每个 linear 重复扫描整块 weight 和中间 tensor。只有诊断 NaN/Inf
+时才临时启用下面的同步密集模式：
+
+~~~bash
+DFLASH_ASCEND310P_EXHAUSTIVE_CHECKS=1 "$MODEL_PYTHON" -B \
+  -m models.dflash_v1.run_npu ...
+~~~
+
+`block_size=16` 只在接受率足以摊薄 Draft/verify 时有收益。若报告显示首轮零接受，后续会自动
+S=1 fallback；若持续低但非零接受，应使用相同 prompt 对比 B=2/4/8/16，而不是只看 B=16。
+
+## 7. NPU 性能基准与 msprof
+
+`benchmark` 分支原有的独立进程、同步计时、稳定输出检查、peak-memory 和 msprof 能力已经接到
+当前 rollback 路线：
+
+~~~text
+models/dflash_v1/benchmark_npu.py
+config/npu_benchmark_v1.json
+tools/run_msprof.sh
+~~~
+
+benchmark 在计时前加载 Target/Draft，并执行一次 ordinary 与 DFlash 的 strict-greedy 零差异
+门禁。每个计时迭代只包含一次完整 generation 和末尾设备同步，不包含 checkpoint hash、模型
+加载、tokenizer 或 correctness gate。ordinary 与 DFlash 必须分别启动进程，避免 allocator、
+持久状态和执行先后污染对比。
+
+~~~bash
+export BENCH_DIR=/path/to/dflash-benchmark
+mkdir -p "$BENCH_DIR"
+
+for MODE in ordinary dflash; do
+  "$MODEL_PYTHON" -B -m models.dflash_v1.benchmark_npu \
+    --mode "$MODE" \
+    --target-dir /path/to/Qwen3.5-4B \
+    --draft-dir /path/to/Qwen3.5-4B-DFlash \
+    --kv-cache-max-len 2048 \
+    --prompt "请用一句话解释为什么天空是蓝色的。" \
+    --prompt-mode chat \
+    --enable-thinking \
+    --max-new-tokens 32 \
+    --block-size 16 \
+    --warmup 3 \
+    --repetitions 10 \
+    --device npu:0 \
+    --report "$BENCH_DIR/$MODE.json"
+done
+~~~
+
+两份报告必须锁定同一 Git revision、checkpoint、设备、prompt token hash、thinking、生成长度、
+`block_size`、KV 长度和 chunk 配置。`block_size=16` 是 B=16 总行数，proposal 数 K=15；即使
+ordinary 不使用 proposal，它仍属于 case identity 和进程内 correctness gate。
+
+正式比较至少检查：
+
+~~~python
+assert report["status"] == "PASS"
+assert report["strict_greedy_exact_match"] is True
+assert report["historical_prefix_replay_during_verify"] is False
+assert report["operator_fallback_enabled"] is False
+assert report["benchmark"]["status"] == "PASS"
+assert report["benchmark"]["summary"]["count"] == 10
+~~~
+
+比较 `benchmark.summary.latency_ms`、`aggregate_output_tokens_per_second` 和
+`accelerator_memory`，同时保留全部 10 条 measurement；不要只报告最小值。每条 measurement
+还记录 replay stats、adapter stats 和 receiver audit delta，可直接判断是否首轮零接受后进入
+Target-only、实际调用了多少 Draft/verify，以及投影了多少 feature token。
+
+msprof 会改变 latency，只用于热点归因。建议用 1 次 warmup、1 次 measurement，并通过 MSTX
+范围 `qwen35/<mode>/measure/0` 定位正式迭代：
+
+~~~bash
+tools/run_msprof.sh \
+  --label dflash-pipe \
+  --output-dir "$BENCH_DIR/msprof-dflash-pipe" \
+  --python "$MODEL_PYTHON" \
+  --aic-metrics PipeUtilization \
+  -- \
+  "$MODEL_PYTHON" -B -m models.dflash_v1.benchmark_npu \
+    --mode dflash \
+    --target-dir /path/to/Qwen3.5-4B \
+    --draft-dir /path/to/Qwen3.5-4B-DFlash \
+    --kv-cache-max-len 2048 \
+    --prompt "请用一句话解释为什么天空是蓝色的。" \
+    --prompt-mode chat --enable-thinking \
+    --max-new-tokens 32 --block-size 16 \
+    --warmup 1 --repetitions 1 --device npu:0 \
+    --report "$BENCH_DIR/msprof-dflash-pipe/dflash.json"
+~~~
+
+建议把 `PipeUtilization`、`Memory`、`MemoryUB` 分开采集。wrapper 会拒绝 simulation-only、CPU
+device 和 operator fallback，且要求输出目录在源码仓库外；profile 下的 host latency 不能替代
+上面的未 profiling 3+10 基线。
+
+## 8. 报告门禁
 
 通用字段：
 
@@ -209,6 +322,9 @@ assert audit["conv_bank_backend"] == "torch_tensor_golden_on_input_device"
 assert audit["kv_policy"] == (
     "physical_provisional_writes_logical_cursor_commit"
 )
+assert audit["persistent_call_synchronization_policy"] == (
+    "same_device_stream_dependencies_no_per_call_host_barrier"
+)
 assert audit["session_invalid"] is False
 assert audit["pending_verify_rows"] is None
 ~~~
@@ -227,18 +343,26 @@ torch_tensor_golden_on_input_device 表示 conv 分解运算跟随输入 tensor 
 | rejected_draft_tokens | 未提交 proposal 总数 |
 | fallback_tokens | bootstrap、correction 或 bonus token 数 |
 | acceptance_rate | accepted_draft_tokens 除以 drafted_tokens |
+| speculation_disable_events | 首次零接受后关闭本请求 Draft 的次数，最多为 1 |
+| target_only_fallback_rounds | 关闭 Draft 后执行的 S=1 Target-only round 数 |
+| draft_feature_tokens_projected | 实际做过 20480→2560 投影的 committed token 数 |
 | rollback_commit_replay_calls | CPU/CUDA 为提交状态执行的有界单 token 调用数 |
 
 接受率只描述 Draft 质量。mean_emitted_tokens_per_draft_round 更接近每轮推进量，但两者都不能
 替代端到端 latency。
 
-## 8. 自动化检查
+## 9. 自动化检查
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_rollback_scheduler.py
 PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_framework_rollback.py
 PYTHONDONTWRITEBYTECODE=1 python tests/test_internal_dflash_bridge_rollback.py
 PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_rollback_helpers.py
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
+  tests/test_dflash_runtime_optimizations.py \
+  tests/test_benchmark_npu.py \
+  tests/test_msprof_script.py \
+  tests/test_source_lock_benchmark.py
 ~~~
 
 | 测试 | 覆盖 |
@@ -247,10 +371,14 @@ PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_rollback_helpers.py
 | test_dflash_framework_rollback.py | DynamicCache crop、GDN restore、有界 commit replay |
 | test_internal_dflash_bridge_rollback.py | bank select/rebase、logical KV cursor、失败状态 |
 | test_dflash_rollback_helpers.py | causal-conv bank 与逐 token reference |
+| test_dflash_runtime_optimizations.py | feature projection cache 等价性与 NPU finite policy |
+| test_benchmark_npu.py | 同步区间、3+10 合同、稳定输出和 rollback invocation |
+| test_msprof_script.py | shell 语法、simulation/CPU/fallback fail-closed |
+| test_source_lock_benchmark.py | benchmark 与 rollback runtime 文件 hash 身份 |
 
 这些测试是 CPU/reduced-shape 证据。
 
-## 9. Ascend 310P 分阶段门禁
+## 10. Ascend 310P 分阶段门禁
 
 | 阶段 | 至少覆盖 |
 | --- | --- |
@@ -267,7 +395,7 @@ PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_rollback_helpers.py
 先跑 K=1，再扩 K=15（`block_size=16`）；先证明正确性，再测性能。现有 CacheUpdate 或
 fused attention 能力通过时应直接复用，不因名称不同而提前重写 kernel。
 
-## 10. 接受率和分叉诊断
+## 11. 接受率和分叉诊断
 
 diagnose_acceptance 保留 sequential full-prefix oracle，用来定位 proposal、Target prefix
 invariance 和 dtype 分叉；它不是默认 rollback 运行入口。
@@ -301,7 +429,7 @@ python -B -m models.dflash_v1.diagnose_acceptance \
 一条短 prompt 不能代表平均接受长度。比较接受率时必须锁定 tokenizer、chat template、thinking、
 dtype、K、checkpoint 和生成阶段，并使用多条代表性 workload。
 
-## 11. 完成标准
+## 12. 完成标准
 
 目标路线通过需要同时满足：
 

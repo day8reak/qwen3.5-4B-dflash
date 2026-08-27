@@ -20,7 +20,7 @@ replays the historical prefix during proposal verification.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 import operator
 from typing import Any, Protocol
 
@@ -155,10 +155,15 @@ def _top1_rows(
         )
     if not torch.is_floating_point(logits):
         raise TypeError(f"{source} logits must use a floating-point dtype")
-    rows = logits.detach().float().cpu()
-    if not bool(torch.isfinite(rows).all()):
+    rows = logits.detach()
+    # Validate on the producer device, then transfer only T token IDs.  The old
+    # path cast and copied the complete [1,T,248320] tensor to CPU before
+    # argmax, which made every rollback round a multi-megabyte synchronous D2H
+    # transfer.
+    if not bool(torch.isfinite(rows).all().item()):
         raise FloatingPointError(f"{source} logits contain non-finite values")
-    return [int(value) for value in rows[0].argmax(dim=-1).tolist()]
+    token_ids = torch.argmax(rows, dim=-1)
+    return [int(value) for value in token_ids[0].cpu().tolist()]
 
 
 def _normalize_proposals(
@@ -253,6 +258,7 @@ def dflash_rollback_greedy(
     block_size: int,
     eos_token_ids: Iterable[int] = (),
     input_device: str | torch.device | None = None,
+    progress_callback: Callable[[str, Mapping[str, object]], None] | None = None,
 ) -> ReplayDecodeResult:
     """Run one-block target verification with transactional state rollback."""
 
@@ -286,6 +292,7 @@ def dflash_rollback_greedy(
     generated = [bootstrap_token]
     committed = [*prompt, bootstrap_token]
     reached_eos = bootstrap_token in eos
+    speculation_enabled = True
     rounds.append(
         ReplayRound(
             committed_prefix_length=len(prompt),
@@ -299,19 +306,26 @@ def dflash_rollback_greedy(
 
     while len(generated) < maximum and not reached_eos:
         remaining = maximum - len(generated)
-        proposal_limit = min(proposal_capacity, remaining)
         prefix_length = len(committed)
-        raw_proposals = adapter.propose_rollback(
-            _input_ids(committed, device),
-            proposal_limit,
-        )
-        stats.draft_calls += 1
-        proposals = _normalize_proposals(
-            raw_proposals,
-            proposal_limit=proposal_limit,
-            eos_token_ids=eos,
-        )
-        stats.drafted_tokens += len(proposals)
+        if speculation_enabled:
+            proposal_limit = min(proposal_capacity, remaining)
+            raw_proposals = adapter.propose_rollback(
+                _input_ids(committed, device),
+                proposal_limit,
+            )
+            stats.draft_calls += 1
+            proposals = _normalize_proposals(
+                raw_proposals,
+                proposal_limit=proposal_limit,
+                eos_token_ids=eos,
+            )
+            stats.drafted_tokens += len(proposals)
+        else:
+            # Exact target-only continuation in the existing rollback session.
+            # A one-row verify consumes the current anchor and returns the next
+            # authoritative token without restarting or replaying history.
+            proposals = []
+            stats.target_only_fallback_rounds += 1
 
         block = [committed[-1], *proposals]
         try:
@@ -334,6 +348,10 @@ def dflash_rollback_greedy(
             accepted_count = (
                 len(proposals) if mismatch is None else mismatch
             )
+            if proposals and accepted_count == 0:
+                disable = getattr(adapter, "disable_speculation", None)
+                if callable(disable):
+                    disable()
             adapter.commit_rollback(accepted_count)
         except Exception:
             adapter.abort_rollback()
@@ -345,6 +363,9 @@ def dflash_rollback_greedy(
         stats.target_rows_read += len(block)
         stats.accepted_draft_tokens += accepted_count
         stats.rejected_draft_tokens += len(proposals) - accepted_count
+        if speculation_enabled and proposals and accepted_count == 0:
+            speculation_enabled = False
+            stats.speculation_disable_events += 1
 
         accepted = proposals[:accepted_count]
         emitted_this_round: list[int] = []
@@ -379,6 +400,19 @@ def dflash_rollback_greedy(
                 emitted_token_ids=tuple(emitted_this_round),
             )
         )
+        if progress_callback is not None:
+            progress_callback(
+                "dflash_round_end",
+                {
+                    "round": len(rounds) - 1,
+                    "proposed_tokens": len(proposals),
+                    "accepted_tokens": accepted_count,
+                    "emitted_tokens": len(emitted_this_round),
+                    "generated_tokens": len(generated),
+                    "target_rows": len(block),
+                    "speculation_enabled_next_round": speculation_enabled,
+                },
+            )
 
     return ReplayDecodeResult(
         mode="dflash-incremental-rollback-strict-greedy",

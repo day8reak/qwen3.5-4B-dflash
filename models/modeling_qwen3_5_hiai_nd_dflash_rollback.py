@@ -254,12 +254,13 @@ def torch_dflash_causal_conv1d_mtp(
         groups=channels,
     )
     output = F.silu(convolution[:, :, -sequence_length:])
-    next_state_bank = torch.stack(
-        [
-            history[:, :, token_index + 1 : token_index + 1 + state_length]
-            for token_index in range(sequence_length)
-        ],
-        dim=1,
+    # ``unfold`` creates every rolling Kc window in one tensor operation.  Drop
+    # window zero (the round-start state) so slot i remains the state after
+    # consuming input rows 0..i.  This replaces T Python slices plus stack.
+    next_state_bank = (
+        history.unfold(-1, state_length, 1)[..., 1:, :]
+        .permute(0, 2, 1, 3)
+        .contiguous()
     )
     return output.to(hidden_states.dtype), next_state_bank.to(hidden_states.dtype)
 
@@ -1154,7 +1155,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 accepted_tokens,
                 self.activation,
             )
-            conv_state.copy_(next_conv_state)
+            conv_state = next_conv_state
             mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
             mixed_qkv,
@@ -1190,7 +1191,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     use_qk_l2norm_in_kernel=True,
                 )
             )
-            recurrent_state.copy_(last_recurrent_state.to(torch.float16))
+            recurrent_state = last_recurrent_state.to(torch.float16)
         else:
             core_attn_out, next_recurrent_state = _npu_gated_delta_rule_mtp(
                 query,
@@ -1209,13 +1210,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 raise TypeError(
                     "npu_gated_delta_rule_mtp state output must use FP32"
                 )
-            recurrent_state.copy_(next_recurrent_state)
+            recurrent_state = next_recurrent_state
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
         output = self.out_proj(core_attn_out)
-        return output, cache_params
+        return output, (conv_state, recurrent_state)
 
 
 class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
@@ -1413,6 +1414,8 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
+            if past_key_values is not None:
+                past_key_values[idx] = layer_outputs[1]
             if dflash_collector is not None:
                 dflash_collector.capture(idx, hidden_states)
 
@@ -1464,6 +1467,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         token_count=0,
         export_flag=False,
         output_dflash_features: bool = False,
+        dflash_skip_lm_head: bool = False,
         accepted_tokens: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1501,7 +1505,18 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             hidden_states = text_output
             dflash_features = None
 
-        logits = self.lm_head(hidden_states)
+        if not isinstance(dflash_skip_lm_head, bool):
+            raise TypeError("dflash_skip_lm_head must be a bool")
+        if dflash_skip_lm_head:
+            # Prompt bootstrap still needs every decoder/state/feature row, but
+            # only the final prompt row is ever sampled.  Preserve the output
+            # ABI with a zero-row Tensor while avoiding the 248320-way head on
+            # intermediate S=1 calls.
+            logits = hidden_states.new_empty(
+                (hidden_states.shape[0], 0, self.vocab_size)
+            )
+        else:
+            logits = self.lm_head(hidden_states)
         if dflash_features is None:
             return logits
         return logits, dflash_features

@@ -245,8 +245,10 @@ class InternalDFlashTarget(nn.Module):
         self._pending_verify_output: Mapping[str, Tensor] | None = None
         self._rollback_invalid = False
         self._ordinary_prefill_token_calls = 0
+        self._ordinary_prefill_lm_head_skips = 0
         self._ordinary_decode_calls = 0
         self._rollback_prefill_token_calls = 0
+        self._rollback_prefill_lm_head_skips = 0
         self._rollback_verify_calls = 0
         self._rollback_commit_calls = 0
         self._rollback_aborts = 0
@@ -276,6 +278,10 @@ class InternalDFlashTarget(nn.Module):
             "historical_prefix_replay_during_verify": False,
             "conv_bank_backend": "torch_tensor_golden_on_input_device",
             "gdr_backend": "npu_gated_delta_rule_mtp",
+            "state_bank_update_policy": "replace_returned_banks_no_copy",
+            "persistent_call_synchronization_policy": (
+                "same_device_stream_dependencies_no_per_call_host_barrier"
+            ),
             "kv_policy": "physical_provisional_writes_logical_cursor_commit",
             "persistent_mode": self._persistent_mode,
             "persistent_cursor": self._persistent_cursor,
@@ -283,8 +289,14 @@ class InternalDFlashTarget(nn.Module):
             "pending_verify_rows": self._pending_verify_rows,
             "session_invalid": self._rollback_invalid,
             "ordinary_prefill_token_calls": self._ordinary_prefill_token_calls,
+            "ordinary_prefill_lm_head_skips": (
+                self._ordinary_prefill_lm_head_skips
+            ),
             "ordinary_decode_calls": self._ordinary_decode_calls,
             "rollback_prefill_token_calls": self._rollback_prefill_token_calls,
+            "rollback_prefill_lm_head_skips": (
+                self._rollback_prefill_lm_head_skips
+            ),
             "rollback_verify_calls": self._rollback_verify_calls,
             "rollback_commit_calls": self._rollback_commit_calls,
             "rollback_aborts": self._rollback_aborts,
@@ -576,6 +588,7 @@ class InternalDFlashTarget(nn.Module):
         start_position: int,
         output_dflash_features: bool,
         accepted_tokens: Tensor | None,
+        require_logits: bool = True,
     ) -> Mapping[str, Tensor]:
         if not self.rollback_enabled:
             raise RuntimeError(
@@ -630,13 +643,18 @@ class InternalDFlashTarget(nn.Module):
                     output_pos=None,
                     allQLen=[logical_end],
                     output_dflash_features=bool(output_dflash_features),
+                    dflash_skip_lm_head=not bool(require_logits),
                     accepted_tokens=accepted_tokens,
                 )
             logits, features = _unwrap_logits_and_features(
                 raw_output,
                 feature_enabled=bool(output_dflash_features),
             )
-            expected_logits = (1, sequence_length, VOCAB_SIZE)
+            expected_logits = (
+                1,
+                sequence_length if require_logits else 0,
+                VOCAB_SIZE,
+            )
             if tuple(logits.shape) != expected_logits:
                 raise ValueError(
                     f"persistent HIAI logits must have shape {expected_logits}"
@@ -651,7 +669,12 @@ class InternalDFlashTarget(nn.Module):
                         f"{expected_features}"
                     )
                 result["dflash_features"] = features
-            self._synchronize_call_local_state()
+            # Persistent state remains owned by this bridge and the next call
+            # consumes it on the same device stream.  Stream dependencies keep
+            # that ordering without a host-visible device barrier after every
+            # prompt/decode row.  Runner and benchmark stage boundaries still
+            # synchronize explicitly; the full-prefix oracle still barriers
+            # before releasing its genuinely call-local state.
             return result
         except Exception:
             if accepted_tokens is not None:
@@ -730,15 +753,20 @@ class InternalDFlashTarget(nn.Module):
 
         self._reset_persistent_session("ordinary")
         last_output: Mapping[str, Tensor] | None = None
-        for index in range(int(prompt_ids.shape[1])):
+        prompt_length = int(prompt_ids.shape[1])
+        for index in range(prompt_length):
+            require_logits = index == prompt_length - 1
             last_output = self._execute_incremental_rows(
                 prompt_ids[:, index : index + 1],
                 start_position=index,
                 output_dflash_features=False,
                 accepted_tokens=None,
+                require_logits=require_logits,
             )
             self._persistent_cursor += 1
             self._ordinary_prefill_token_calls += 1
+            if not require_logits:
+                self._ordinary_prefill_lm_head_skips += 1
         if last_output is None:
             raise ValueError("ordinary prefill requires a non-empty prompt")
         return last_output
@@ -753,6 +781,7 @@ class InternalDFlashTarget(nn.Module):
             start_position=self._persistent_cursor,
             output_dflash_features=False,
             accepted_tokens=None,
+            require_logits=True,
         )
         self._persistent_cursor += 1
         self._ordinary_decode_calls += 1
@@ -766,17 +795,23 @@ class InternalDFlashTarget(nn.Module):
         self._reset_persistent_session("rollback")
         last_logits: Tensor | None = None
         features: list[Tensor] = []
-        for index in range(int(prompt_ids.shape[1])):
+        prompt_length = int(prompt_ids.shape[1])
+        for index in range(prompt_length):
+            require_logits = index == prompt_length - 1
             output = self._execute_incremental_rows(
                 prompt_ids[:, index : index + 1],
                 start_position=index,
                 output_dflash_features=True,
                 accepted_tokens=None,
+                require_logits=require_logits,
             )
-            last_logits = output["logits"]
+            if require_logits:
+                last_logits = output["logits"]
             features.append(output["dflash_features"])
             self._persistent_cursor += 1
             self._rollback_prefill_token_calls += 1
+            if not require_logits:
+                self._rollback_prefill_lm_head_skips += 1
         if last_logits is None:
             raise ValueError("rollback prefill requires a non-empty prompt")
         return {
@@ -798,6 +833,7 @@ class InternalDFlashTarget(nn.Module):
             start_position=self._persistent_cursor,
             output_dflash_features=True,
             accepted_tokens=accepted,
+            require_logits=True,
         )
         self._pending_verify_rows = verify_tokens
         self._pending_verify_output = output

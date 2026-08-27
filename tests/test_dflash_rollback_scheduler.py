@@ -85,6 +85,59 @@ class FailingVerifyAdapter(BoundaryAdapter):
         raise RuntimeError("injected verify failure")
 
 
+class ZeroAcceptanceAdapter:
+    """Target stream that rejects the first Draft token and then continues S=1."""
+
+    def __init__(self) -> None:
+        self.target_rows = [10, 11, 12, 13, 99]
+        self.ordinary_index = 0
+        self.rollback_index = 1
+        self.pending_rows = 0
+        self.verify_shapes: list[tuple[int, int]] = []
+        self.propose_calls = 0
+        self.disable_calls = 0
+
+    def begin_ordinary(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+        del prompt_ids
+        self.ordinary_index = 0
+        return logits([self.target_rows[0]])
+
+    def advance_ordinary(self, input_ids: torch.Tensor) -> torch.Tensor:
+        del input_ids
+        self.ordinary_index += 1
+        return logits([self.target_rows[self.ordinary_index]])
+
+    def begin_rollback(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+        del prompt_ids
+        self.rollback_index = 1
+        return logits([self.target_rows[0]])
+
+    def propose_rollback(
+        self,
+        prefix_ids: torch.Tensor,
+        proposal_limit: int,
+    ) -> torch.Tensor:
+        del prefix_ids
+        self.propose_calls += 1
+        return torch.full((1, proposal_limit), 77, dtype=torch.long)
+
+    def verify_rollback(self, block_ids: torch.Tensor) -> torch.Tensor:
+        rows = int(block_ids.shape[1])
+        self.pending_rows = rows
+        self.verify_shapes.append(tuple(block_ids.shape))
+        return logits(self.target_rows[self.rollback_index : self.rollback_index + rows])
+
+    def disable_speculation(self) -> None:
+        self.disable_calls += 1
+
+    def commit_rollback(self, accepted_draft_tokens: int) -> None:
+        self.rollback_index += accepted_draft_tokens + 1
+        self.pending_rows = 0
+
+    def abort_rollback(self) -> None:
+        self.pending_rows = 0
+
+
 def check_acceptance_boundary(accepted: int, proposal_count: int) -> None:
     eos = 99
     anchor = 20
@@ -158,6 +211,29 @@ def main() -> None:
         raise AssertionError("injected verify failure was not propagated")
     assert failing.abort_calls == 1
     assert failing.pending_block is None
+
+    zero_accept = ZeroAcceptanceAdapter()
+    ordinary_zero_accept = ordinary_incremental_greedy(
+        zero_accept,
+        [1],
+        max_new_tokens=5,
+        eos_token_ids=[99],
+    )
+    rollback_zero_accept = dflash_rollback_greedy(
+        zero_accept,
+        [1],
+        max_new_tokens=5,
+        block_size=4,
+        eos_token_ids=[99],
+    )
+    assert rollback_zero_accept.generated_token_ids == (
+        ordinary_zero_accept.generated_token_ids
+    )
+    assert zero_accept.propose_calls == 1
+    assert zero_accept.disable_calls == 1
+    assert zero_accept.verify_shapes == [(1, 4), (1, 1), (1, 1), (1, 1)]
+    assert rollback_zero_accept.stats.speculation_disable_events == 1
+    assert rollback_zero_accept.stats.target_only_fallback_rounds == 3
     print("PASS: rollback scheduler accepted=0..K and correction/bonus alignment")
 
 

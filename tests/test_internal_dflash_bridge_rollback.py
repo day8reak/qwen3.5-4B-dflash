@@ -78,6 +78,7 @@ class FakeHIAIModel(nn.Module):
         accepted_tokens: torch.Tensor | None,
         **kwargs,
     ):
+        skip_lm_head = bool(kwargs.pop("dflash_skip_lm_head", False))
         del kwargs
         self.calls.append(
             {
@@ -88,6 +89,7 @@ class FakeHIAIModel(nn.Module):
                     if accepted_tokens is None
                     else tuple(int(value) for value in accepted_tokens.tolist())
                 ),
+                "skip_lm_head": skip_lm_head,
             }
         )
         conv_state, recurrent_state = past_key_values[0]
@@ -109,9 +111,10 @@ class FakeHIAIModel(nn.Module):
                 recurrent_state[:, row].copy_(running_recurrent)
 
         rows = input_ids.shape[1]
-        logits = torch.zeros((1, rows, 1), dtype=torch.float16).expand(
+        logit_rows = 0 if skip_lm_head else rows
+        logits = torch.zeros((1, logit_rows, 1), dtype=torch.float16).expand(
             1,
-            rows,
+            logit_rows,
             VOCAB_SIZE,
         )
         if not output_dflash_features:
@@ -140,8 +143,12 @@ def main() -> None:
         kv_cache_max_len=64,
         rollback_enabled=True,
     ).eval()
-    bridge.begin_rollback(torch.tensor([[1, 2]], dtype=torch.long))
+    bootstrap = bridge.begin_rollback(torch.tensor([[1, 2]], dtype=torch.long))
+    assert tuple(bootstrap["logits"].shape) == (1, 1, VOCAB_SIZE)
+    assert model.calls[0]["skip_lm_head"] is True
+    assert model.calls[1]["skip_lm_head"] is False
     assert bridge.dflash_rollback_audit["persistent_cursor"] == 2
+    assert bridge.dflash_rollback_audit["rollback_prefill_lm_head_skips"] == 1
     assert model.calls[-1]["positions"] == (1,)
 
     try:
@@ -167,6 +174,7 @@ def main() -> None:
         "positions": (4, 5),
         "all_q_len": (6,),
         "accepted": (0,),
+        "skip_lm_head": False,
     }
     state = bridge._persistent_state
     assert state is not None
@@ -178,6 +186,10 @@ def main() -> None:
     assert audit["rollback_verify_calls"] == 2
     assert audit["rollback_commit_calls"] == 2
     assert audit["historical_prefix_replay_during_verify"] is False
+    assert audit["persistent_call_synchronization_policy"] == (
+        "same_device_stream_dependencies_no_per_call_host_barrier"
+    )
+    assert bridge.dflash_full_prefix_bridge_audit["device_synchronizations"] == 0
     bridge.verify_rollback(torch.tensor([[6, 7]], dtype=torch.long))
     bridge.abort_rollback()
     failed_audit = bridge.dflash_rollback_audit

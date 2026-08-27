@@ -405,14 +405,45 @@ class DFlashDraftModel(nn.Module):
         position_ids: Tensor,
         attention_mask: Tensor | None = None,
     ) -> Tensor:
-        if target_hidden.ndim != 3 or noise_embedding.ndim != 3:
-            raise ValueError("target_hidden and noise_embedding must be rank-3")
-        if target_hidden.shape[0] != noise_embedding.shape[0]:
-            raise ValueError("target and noise batches differ")
+        projected = self.project_target_hidden(target_hidden)
+        return self.forward_projected(
+            projected,
+            noise_embedding,
+            position_ids,
+            attention_mask,
+        )
+
+    def project_target_hidden(self, target_hidden: Tensor) -> Tensor:
+        """Project raw eight-layer Target features exactly once per token."""
+
+        if target_hidden.ndim != 3:
+            raise ValueError("target_hidden must be rank-3")
         if target_hidden.shape[-1] != self.config.feature_size:
             raise ValueError(
                 f"target feature width must be {self.config.feature_size}, "
                 f"got {target_hidden.shape[-1]}"
+            )
+        return self.hidden_norm(self.fc(target_hidden))
+
+    def forward_projected(
+        self,
+        projected_target_hidden: Tensor,
+        noise_embedding: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Run the Draft block from cached ``[B,C,hidden_size]`` features."""
+
+        if projected_target_hidden.ndim != 3 or noise_embedding.ndim != 3:
+            raise ValueError(
+                "projected_target_hidden and noise_embedding must be rank-3"
+            )
+        if projected_target_hidden.shape[0] != noise_embedding.shape[0]:
+            raise ValueError("target and noise batches differ")
+        if projected_target_hidden.shape[-1] != self.config.hidden_size:
+            raise ValueError(
+                f"projected target width must be {self.config.hidden_size}, "
+                f"got {projected_target_hidden.shape[-1]}"
             )
         if noise_embedding.shape[-1] != self.config.hidden_size:
             raise ValueError(
@@ -427,7 +458,9 @@ class DFlashDraftModel(nn.Module):
             raise ValueError(
                 f"noise length must be in [1, {maximum_query_rows}]"
             )
-        expected_positions = target_hidden.shape[1] + noise_embedding.shape[1]
+        expected_positions = (
+            projected_target_hidden.shape[1] + noise_embedding.shape[1]
+        )
         if position_ids.ndim != 2 or position_ids.shape != (
             noise_embedding.shape[0],
             expected_positions,
@@ -435,16 +468,17 @@ class DFlashDraftModel(nn.Module):
             raise ValueError(
                 "position_ids must cover target context followed by the draft block"
             )
-        if target_hidden.dtype != noise_embedding.dtype:
+        if projected_target_hidden.dtype != noise_embedding.dtype:
             raise ValueError("target_hidden and noise_embedding dtypes differ")
+        if projected_target_hidden.device != noise_embedding.device:
+            raise ValueError("target_hidden and noise_embedding devices differ")
 
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
         hidden_states = noise_embedding
         cosine, sine = self.rotary(position_ids, hidden_states.dtype)
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states,
-                target_hidden,
+                projected_target_hidden,
                 cosine,
                 sine,
                 attention_mask,
@@ -462,6 +496,22 @@ class DFlashDraftModel(nn.Module):
             raise ValueError("a DFlash draft needs one anchor and at least one mask token")
         return self(
             target_hidden,
+            noise_embedding,
+            position_ids,
+            attention_mask,
+        )[:, 1:, :]
+
+    def draft_hidden_projected(
+        self,
+        projected_target_hidden: Tensor,
+        noise_embedding: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        if noise_embedding.shape[1] < 2:
+            raise ValueError("a DFlash draft needs one anchor and at least one mask token")
+        return self.forward_projected(
+            projected_target_hidden,
             noise_embedding,
             position_ids,
             attention_mask,
@@ -491,6 +541,22 @@ class DFlashDraftModel(nn.Module):
         )
         # Positive scaling and tanh softcapping are monotonic, so they cannot
         # change Top1. This boundary permits a fused LM-head + argmax operator.
+        return self.ops.top1(hidden, lm_head_weight)
+
+    def draft_top1_projected(
+        self,
+        projected_target_hidden: Tensor,
+        noise_embedding: Tensor,
+        position_ids: Tensor,
+        lm_head_weight: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        hidden = self.draft_hidden_projected(
+            projected_target_hidden,
+            noise_embedding,
+            position_ids,
+            attention_mask,
+        )
         return self.ops.top1(hidden, lm_head_weight)
 
     def embed_block(self, block_ids: Tensor, embedding_weight: Tensor) -> Tensor:

@@ -121,8 +121,9 @@ norm 之前：
 前五层是 causal sliding attention，最后一层允许 Draft block 内 non-causal 可见。最后经过共享
 Target LM head，只取 mask 对应的 K 行 Top-1。
 
-当前 adapter 保存 Target feature history，但 Draft 自身还没有跨轮 KV cache；每轮仍会重新处理
-已保存的 feature context。这不影响 rollback 正确性，但属于后续性能优化点。
+当前 adapter 会在 feature 首次提交时执行一次 `20480→2560 + RMSNorm`，之后只保存投影后的
+`[B,C,2560]` history；新增的 1+a 行也只投影一次。Draft 自身仍没有跨轮 KV cache，因此 6 层
+attention 的 context K/V 仍会每轮重新计算。这不影响 rollback 正确性，但仍是主要性能差异。
 
 ## 5. Target 如何验证 token
 
@@ -150,6 +151,10 @@ correction          = top1[a]
 committed inputs    = input[:a+1]
 next anchor         = correction
 ~~~
+
+如果某轮 `a=0`，当前请求后续关闭 Draft，继续在同一个 rollback transaction 中用单行 Target
+verify。这个 exact fallback 不重放历史前缀，也不改变输出 token；它避免低匹配 prompt 连续执行
+昂贵的 16-row Draft/verify。
 
 如果 K 个 proposal 全部命中，则 a=K，top1[K] 是 bonus。错误 proposal 右侧的 logits 不参与
 决策；块内 causal mask 必须保证较早行看不到右侧 proposal。
@@ -212,7 +217,7 @@ sequenceDiagram
 | 状态 | CPU/CUDA | HIAI/NPU |
 | --- | --- | --- |
 | Full-attention KV | verify 前记住长度；commit 前 crop，再有界重放 | provisional 物理写入；logical cursor 只推进 1+a |
-| GDN recurrent | clone round-start state；恢复后逐 token 重放 | npu_gated_delta_rule_mtp 输出 T 槽 FP32 state bank |
+| GDN recurrent | clone round-start state；恢复后逐 token 重放 | npu_gated_delta_rule_mtp 输出 T 槽 FP32 state bank，model 直接接管返回 bank |
 | GDN causal-conv | clone round-start window；恢复后逐 token 重放 | Torch Tensor golden 输出 T 槽 conv bank |
 | Target feature | 使用 commit replay 的 1+a 行 | 只截取 verify feature 的前 1+a 行 |
 
@@ -224,7 +229,9 @@ NPU 的 accepted_tokens 表示上一轮接受长度，用来选择上一轮 stat
 可以保留拒绝尾部的物理内容，但 mask 和有效长度不能读取它，下一轮从 logical cursor 覆写。
 
 Prompt 在 NPU bridge 中逐 token bootstrap，避免把 64-row padding 写入 persistent GDN state。
-任一 verify 失败后 session 整体失效，不能带着部分更新的 32 层状态继续。
+中间 prompt 行仍执行全部 decoder/state/feature 计算，但不再执行 LM Head；ordinary 与 rollback
+各自只在最后一行计算一次 248320 词表 logits。任一 verify 失败后 session 整体失效，不能带着
+部分更新的 32 层状态继续。
 
 ## 7. Feature、EOS 和长度边界
 
@@ -269,9 +276,20 @@ runtime、device、算子包和 kernel trace，才能声明 Target rollback 通�
 
 - CPU/CUDA commit 的最多 K+1 次单 token replay；
 - NPU causal-conv Tensor 分解和逐 row CacheUpdate；
-- Target 与 Draft 的完整词表 logits/Top-1；
-- Draft 每轮重算 feature context，尚无跨轮 Draft KV cache；
-- state bank 的峰值内存和 host/device 同步。
+- Target 与 Draft 仍计算完整词表 logits；当前只把设备侧 Top-1 ID 搬回 host；
+- Draft 已缓存 feature projection，但 6 层 context K/V 仍每轮重算，尚无跨轮 Draft KV cache；
+- state bank 的峰值内存；stage/benchmark 边界仍需要 host/device 同步。
+
+GDR/conv 返回的新 state bank 会直接替换 persistent state 引用，不再额外 `copy_` 回旧 bank；这减少
+B16 每轮约 768 MiB recurrent bank 加 24 MiB conv bank 的目的端复制，但不改变 bank 本身的峰值
+容量。
+
+Persistent rollback 调用通过同一设备流依赖串联，不再在每个 prompt/decode row 后插入全设备
+host barrier；full-prefix oracle 的 state 是 call-local，释放前仍保留同步。
+
+NPU Draft backend 默认只在最终 logits 边界做 finite 检查；shape/device/dtype 检查始终启用。
+`DFLASH_ASCEND310P_EXHAUSTIVE_CHECKS=1` 会恢复每个 primitive 的中间 tensor/weight 扫描，仅用于
+数值诊断，因为每次 `.item()` 都会形成设备同步。
 
 这些优化必须在 strict-greedy 和拒绝后下一 token 状态都完全对齐后逐项引入。详细算子边界见
 [自定义算子文档](DFLASH_OPERATORS.md)。

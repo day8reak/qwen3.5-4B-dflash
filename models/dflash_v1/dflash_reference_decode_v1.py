@@ -56,6 +56,8 @@ class ReplayDecodeStats:
     accepted_draft_tokens: int = 0
     rejected_draft_tokens: int = 0
     fallback_tokens: int = 0
+    speculation_disable_events: int = 0
+    target_only_fallback_rounds: int = 0
 
     @property
     def acceptance_rate(self) -> float:

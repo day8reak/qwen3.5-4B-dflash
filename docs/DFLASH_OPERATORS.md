@@ -11,7 +11,7 @@ GDR MTP 外，哪些位置还需要或可能需要自定义算子。
 - GDN causal-conv state 由输入 NPU device 上的 Torch Tensor golden 实现；
 - full-attention KV 逐 row 复用 npu_cache_update_；
 - attention 先复用 adn_fused_infer_attention；
-- Top-1 和 accept 先用普通 LM head、argmax 和 host scan。
+- Top-1 先用普通 LM head 和设备侧 argmax，只把 T 个 ID 搬回 host 做连续 accept scan。
 
 因此当前 correctness bring-up 的最小外部依赖仍只有已经完成并注册的
 npu_gated_delta_rule_mtp。面向生产性能，最先建议开发 CausalConv1dMTP。CacheUpdateMTP 和
@@ -24,7 +24,7 @@ FusedInferAttentionMTP 必须先做现有算子能力测试；TargetLmHeadTop1Ac
 | 条件新增 | CacheUpdateMTP | 现有多行/跨块能力或性能不足时新增 |
 | 条件新增 | FusedInferAttentionMTP | 现有 T=2/4/6/8/16 能力失败时扩展或新增 |
 | 性能优先 | TargetLmHeadTop1Accept | correctness 不依赖，但可消除完整 logits 落地和 D2H |
-| Profiling 后 | Draft projection、GQA、Draft Top-1 | Draft 热点确认后逐项融合 |
+| Profiling 后 | Draft GQA、Draft Top-1、projection | Draft 热点确认后逐项融合；projection 已按 token 缓存 |
 
 ## 2. Target 尺寸和状态
 
@@ -83,6 +83,9 @@ accepted_tokens 是上一轮接受长度，不是当前 verify 尚未得出的�
 row 0 到 row i 后的状态。当前还需要的工作是目标设备上覆盖 24 层、连续多轮、accepted
 为 0、1、K-1、K，以及 K 改变时的 select/rebase。
 
+当前 modeling 直接接管算子返回的 `state_bank` 并更新 persistent state list，不再把完整 FP32
+bank `copy_` 回旧 tensor；B16 下可省去约 768 MiB/轮的额外目的端写入。
+
 ## 4. 生产优先：CausalConv1dMTP
 
 ### 功能
@@ -109,8 +112,8 @@ GDN 的 causal-conv window 也包含前缀历史。算子必须与 GDR 使用同
 
 models/modeling_qwen3_5_hiai_nd_dflash_rollback.py 中的
 torch_dflash_causal_conv1d_mtp 已实现同一数学语义。输入是 NPU tensor 时，分解运算仍在 NPU
-上执行，因此它不是 CPU fallback；但它包含 concat、grouped conv、逐位置 slice 和 stack，
-不适合作为最终性能实现。
+上执行，因此它不是 CPU fallback；rolling state 已改为一次 unfold/permute，但仍包含 concat、
+grouped conv 和中间 tensor，不适合作为最终性能实现。
 
 ### 验收
 
@@ -174,8 +177,8 @@ torch_dflash_causal_conv1d_mtp 已实现同一数学语义。输入是 NPU tenso
 
 ## 7. 高价值性能算子：TargetLmHeadTop1Accept
 
-当前 Target 先生成 [B,T,248320] 完整 logits，Scheduler 再搬到 host 做 argmax 和连续匹配。
-它数学正确，但可能产生大输出、D2H 和同步。
+当前 Target 仍生成 `[B,T,248320]` 完整 logits，但 argmax 已在设备上执行，只把 T 个 token ID
+搬到 host 做连续匹配。大 logits 的计算/落地和边界同步仍存在，但不再有完整 logits D2H。
 
 建议功能：
 
@@ -217,7 +220,7 @@ DynamicQuant 和 quant matmul 先做 T 行能力检查。如果现有实现支�
 
 | 优先级 | 候选 | 输入 | 输出 | 目的 |
 | --- | --- | --- | --- | --- |
-| P1 | DFlashFeatureProjection | feature [B,C,20480]；weight [2560,20480] | [B,C,2560] | 优化 Draft 最大单个 GEMM 候选 |
+| P2 | DFlashFeatureProjection | 新增 feature [B,1+a,20480]；weight [2560,20480] | [B,1+a,2560] | 当前每个 token 只算一次；profile 显示仍热时再融合 |
 | P1 | DFlashBlockGQA | Q [B,32,T,128]；K/V [B,8,C+T,128]；mask | [B,32,T,128] | 融合 5 层 causal sliding 与末层 block non-causal attention |
 | P1 | DFlashDraftLmHeadTop1 | hidden [B,K,2560]；weight [248320,2560] | IDs [B,K] | 避免 Draft 完整 vocab logits 落地 |
 | P2 | RMSNorm、RoPE、SwiGLU 融合 | 各层 hidden 与参数 | 同数学输出 | 减少小算子 launch |
@@ -245,6 +248,7 @@ T=16、B=1 时，单层 recurrent bank 为 32 MiB，24 层为 768 MiB；单层 c
 2. 扩到 `block_size=16`（K=15/T=16），覆盖 accepted 0、1、K-1、K 和 cursor 62、63、64、65。
 3. 证明 ordinary 与 DFlash 多 prompt、多轮 strict-greedy 零 token mismatch，且无 fallback。
 4. 开发 CausalConv1dMTP，并逐 row、逐 state slot 对齐 golden。
-5. Profile CacheUpdate、attention、完整 logits D2H 和 Draft 热点。
+5. Profile CacheUpdate、attention、完整词表 LM head/Top-1 和 Draft 热点；当前完整 logits D2H
+   已消除，只剩 T 个 Top-1 ID 回传。
 6. 只对实测热点开发 CacheUpdateMTP、TargetLmHeadTop1Accept 或 Draft 融合算子。
 7. 每替换一个算子，重新跑拒绝后下一 token 状态门禁和端到端 token 门禁。

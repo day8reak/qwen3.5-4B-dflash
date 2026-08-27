@@ -53,11 +53,11 @@ Draft 数学主体与官方 checkpoint 对齐；Target state、Draft cache、sam
 | Target full-attention KV | crop/trim rejected tail | CPU/CUDA crop 后 replay；NPU logical cursor commit | 结果目标相同，实现不同 |
 | Target GDN recurrent | MLX 捕获输入，拒绝后只重算 accepted+1 状态 | CPU/CUDA 恢复后逐 token replay；NPU GDR MTP state bank | 语义等价目标，实现不同 |
 | Target conv state | MLX 从捕获的 conv input 恢复接受位置窗口 | CPU/CUDA snapshot/replay；NPU conv state bank golden | 语义等价目标，实现不同 |
-| Draft KV cache | 官方 Transformers 与 MLX 都跨轮维护并 trim/crop | 当前没有 Draft KV cache，每轮重算 feature context | 当前缺失 |
-| Feature 生命周期 | 依赖 Draft cache，只保留下一轮需要的 accepted feature rows | 累积完整 committed feature history | 功能可用，内存/计算路径不同 |
+| Draft KV cache | 官方 Transformers 与 MLX 都跨轮维护并 trim/crop | 当前没有 Draft KV cache，每轮重算 6 层 context K/V | 当前缺失 |
+| Feature 生命周期 | 依赖 Draft cache，只保留下一轮需要的 accepted feature rows | 每个 committed feature 只做一次 20480→2560 投影，并累积投影后 history | 部分优化，仍无 KV cache |
 | Sampling | 支持 temperature、top-p、top-k 和 rejection sampling | 只支持 temperature=0 strict greedy | 当前缺失 |
 | Ordinary 基线 | 正常 generate 不额外跑 ordinary 对照 | validator 先跑 ordinary，再独立跑 DFlash 并零差异比较 | 当前新增验证层 |
-| API | generate/stream 与 acceptance、TPS 统计 | validation CLI、JSON audit 和 fail-closed transaction | 工程接口不同 |
+| API | generate/stream 与 acceptance、TPS 统计 | validation CLI、同步 NPU benchmark、JSON audit 和 fail-closed transaction | 工程接口不同 |
 | Backend | PyTorch Qwen3/LLaMA；MLX Qwen3.5 等 | PyTorch Qwen3.5 CPU/CUDA；HIAI/NPU | 当前新增 port |
 | 性能定位 | 使用 Draft cache，并提供本地生成/性能统计 | correctness bring-up；ordinary 对照不属于生产热路径 | 当前不能直接比较 TPS |
 
@@ -99,17 +99,17 @@ T          = 2 / 4 / 6 / 8 / 16
 只把新 Target feature 和当前 block 接到已提交 Draft cache 上；完成 proposal 后再把 cache
 trim/crop 到 committed boundary。
 
-当前 Qwen35DFlashRollbackAdapter 只保存完整 Target feature history，没有跨轮 Draft KV：
+当前 Qwen35DFlashRollbackAdapter 已缓存投影后的 Target feature history，但没有跨轮 Draft KV：
 
 ~~~text
 官方：已提交 Draft KV + 新 accepted feature + 当前 block
-当前：完整 committed feature history + 当前 block，全 6 层重新计算
+当前：投影后 committed feature history + 当前 block，全 6 层 context K/V 重新计算
 ~~~
 
 这不会改变 strict-greedy 的 Target 权威性，但会导致：
 
 - Draft 计算随已生成长度增长；
-- feature history 常驻内存增长；
+- 投影后 feature history 常驻内存仍随上下文增长，但宽度已从 20480 降到 2560；
 - 当前端到端性能不能代表官方完整缓存路线；
 - 后续加入 Draft cache 时还要验证拒绝尾部 crop、sliding window 和最后一层 non-causal block。
 
@@ -191,7 +191,9 @@ proposal == Target Top-1 才接受
 5. 写出 state、route、fallback 和 source identity audit。
 
 ordinary 对照是当前 bring-up 的必要验收，但它会额外执行一次 Target，不能计入 DFlash
-生产性能。以后若增加 production generate 入口，仍应保留 validator 作为离线门禁。
+生产性能。`benchmark_npu` 把 correctness gate 放在计时区间外，并以分进程、设备同步的 3+10
+测量 ordinary/DFlash；它是测量工具，不会把当前无 Draft KV 的实现变成官方完整性能路线。
+以后若增加 production generate 入口，仍应保留 validator 作为离线门禁。
 
 ## 9. 当前可以怎样表述
 

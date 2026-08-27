@@ -46,6 +46,7 @@ current anchor 已输出，但还没有作为 Target 输入处理
 | --- | --- |
 | models/dflash_v1/run_rollback.py | CPU、CUDA、NPU 共用的 rollback CLI |
 | models/dflash_v1/run_npu.py | 固定 HIAI 参数的 NPU 简化入口 |
+| models/dflash_v1/benchmark_npu.py | ordinary/DFlash 独立进程的同步 NPU 性能基准 |
 | models/dflash_v1/dflash_rollback_decode.py | proposal 验证、最长连续接受和输出调度 |
 | models/dflash_v1/dflash_rollback_adapter.py | CPU/CUDA Target transaction 与 Draft 接线 |
 | models/internal_dflash_bridge.py | HIAI persistent state、bank selector 和 logical KV cursor |
@@ -119,3 +120,7 @@ strict_greedy_exact_match = true
 
 只有在 Ascend 310P 上禁用 fallback，并记录 runtime、device、算子包身份、kernel trace 和多轮
 严格 token 对齐后，才能声明目标路线通过；性能结论还需要独立的端到端配对测量。
+
+性能测试使用 `python -B -m models.dflash_v1.benchmark_npu`，ordinary 与 dflash 分别启动进程，
+默认各 3 次 warmup、10 次 measurement。完整命令、报告门禁和 `tools/run_msprof.sh` 用法见
+[运行和验证第 7 节](docs/DFLASH_RUN_AND_VALIDATE.md#7-npu-性能基准与-msprof)。

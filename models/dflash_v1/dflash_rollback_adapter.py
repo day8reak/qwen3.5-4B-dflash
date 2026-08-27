@@ -13,8 +13,9 @@ and a logical paged-KV cursor, so the scheduler below it is backend-neutral.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -377,6 +378,9 @@ class Qwen35RollbackAdapterStats:
     draft_context_tokens_reused: int = 0
     draft_block_tokens: int = 0
     proposed_tokens: int = 0
+    draft_feature_projection_calls: int = 0
+    draft_feature_tokens_projected: int = 0
+    speculation_disabled: bool = False
 
 
 class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
@@ -403,8 +407,9 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
                 "transactional target is missing methods: " + ", ".join(missing)
             )
         self.rollback_stats = Qwen35RollbackAdapterStats()
-        self._rollback_features: Tensor | None = None
+        self._rollback_projected_features: Tensor | None = None
         self._pending_verify_rows: int | None = None
+        self._drafting_disabled = False
 
     def reset_rollback_stats(self) -> None:
         self.rollback_stats = Qwen35RollbackAdapterStats()
@@ -449,8 +454,9 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
             vocab_size=self.vocab_size,
             name="ordinary incremental prompt_ids",
         )
-        self._rollback_features = None
+        self._rollback_projected_features = None
         self._pending_verify_rows = None
+        self._drafting_disabled = False
         output = self.target.begin_ordinary(prompt_ids)
         logits, _ = self._validated_output(
             output,
@@ -481,6 +487,9 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
             vocab_size=self.vocab_size,
             name="rollback prompt_ids",
         )
+        self._rollback_projected_features = None
+        self._pending_verify_rows = None
+        self._drafting_disabled = False
         output = self.target.begin_rollback(prompt_ids)
         logits, features = self._validated_output(
             output,
@@ -490,9 +499,23 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
         assert features is not None
         if features.shape[1] != prompt_ids.shape[1]:
             raise ValueError("rollback prefill features must cover the prompt once")
-        self._rollback_features = features.detach().clone()
+        with torch.inference_mode():
+            projected = self.draft.project_target_hidden(features.detach())
+        expected_projected = (
+            1,
+            int(prompt_ids.shape[1]),
+            int(self.draft.config.hidden_size),
+        )
+        if tuple(projected.shape) != expected_projected:
+            raise RuntimeError("Draft returned invalid projected prompt features")
+        self._rollback_projected_features = projected
         self._pending_verify_rows = None
+        self._drafting_disabled = False
         self.rollback_stats.rollback_prefill_calls += 1
+        self.rollback_stats.draft_feature_projection_calls += 1
+        self.rollback_stats.draft_feature_tokens_projected += int(
+            prompt_ids.shape[1]
+        )
         return logits
 
     def propose_rollback(self, prefix_ids: Tensor, proposal_limit: int) -> Tensor:
@@ -506,14 +529,16 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
             proposal_limit,
             maximum=self.max_proposal_tokens,
         )
-        target_hidden = self._rollback_features
+        if self._drafting_disabled:
+            raise RuntimeError("Draft proposal requested after speculation was disabled")
+        target_hidden = self._rollback_projected_features
         if target_hidden is None:
             raise RuntimeError("begin_rollback() must run before drafting")
         expected_context = int(prefix_ids.shape[1]) - 1
         expected_features = (
             1,
             expected_context,
-            int(self.draft.config.feature_size),
+            int(self.draft.config.hidden_size),
         )
         if tuple(target_hidden.shape) != expected_features:
             raise RuntimeError(
@@ -542,7 +567,7 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
             device=self.device,
         ).unsqueeze(0)
         with torch.inference_mode():
-            proposed = self.draft.draft_top1(
+            proposed = self.draft.draft_top1_projected(
                 target_hidden,
                 noise_embedding,
                 position_ids,
@@ -555,6 +580,13 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
         self.rollback_stats.draft_block_tokens += block_length
         self.rollback_stats.proposed_tokens += proposal_count
         return proposed
+
+    def disable_speculation(self) -> None:
+        """Stop maintaining Draft-only feature state after a zero-accept round."""
+
+        self._drafting_disabled = True
+        self._rollback_projected_features = None
+        self.rollback_stats.speculation_disabled = True
 
     def verify_rollback(self, block_ids: Tensor) -> Tensor:
         block_ids = _validate_token_tensor(
@@ -598,12 +630,20 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
             features=True,
         )
         assert committed_features is not None
-        if self._rollback_features is None:
-            raise RuntimeError("rollback feature history was lost")
-        self._rollback_features = torch.cat(
-            (self._rollback_features, committed_features.detach().clone()),
-            dim=1,
-        )
+        if not self._drafting_disabled:
+            cached = self._rollback_projected_features
+            if cached is None:
+                raise RuntimeError("rollback projected feature history was lost")
+            with torch.inference_mode():
+                projected = self.draft.project_target_hidden(
+                    committed_features.detach()
+                )
+            self._rollback_projected_features = torch.cat(
+                (cached, projected),
+                dim=1,
+            )
+            self.rollback_stats.draft_feature_projection_calls += 1
+            self.rollback_stats.draft_feature_tokens_projected += committed_rows
         self._pending_verify_rows = None
         self.rollback_stats.rollback_commit_calls += 1
         self.rollback_stats.rollback_committed_input_tokens += committed_rows
@@ -611,6 +651,7 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
     def abort_rollback(self) -> None:
         self.target.abort_rollback()
         self._pending_verify_rows = None
+        self._rollback_projected_features = None
 
 
 @dataclass(frozen=True)
@@ -620,6 +661,8 @@ class Qwen35RollbackValidation:
     ordinary_adapter_stats: Qwen35RollbackAdapterStats
     dflash_adapter_stats: Qwen35RollbackAdapterStats
     target_rollback_audit: Mapping[str, object]
+    ordinary_elapsed_seconds: float
+    dflash_elapsed_seconds: float
     verification_mode: str = "incremental_transactional_rollback"
 
 
@@ -630,6 +673,7 @@ def validate_qwen35_dflash_rollback(
     max_new_tokens: int,
     block_size: int | None = None,
     eos_token_ids: Iterable[int] = (),
+    progress_callback: Callable[[str, Mapping[str, object]], None] | None = None,
 ) -> Qwen35RollbackValidation:
     """Compare ordinary and DFlash incremental streams with zero mismatch."""
 
@@ -639,6 +683,7 @@ def validate_qwen35_dflash_rollback(
         else _block_size(block_size, maximum=adapter.max_block_size)
     )
     adapter.reset_rollback_stats()
+    ordinary_started = perf_counter()
     ordinary = ordinary_incremental_greedy(
         adapter,
         prompt_token_ids,
@@ -646,8 +691,18 @@ def validate_qwen35_dflash_rollback(
         eos_token_ids=eos_token_ids,
         input_device=adapter.device,
     )
+    ordinary_elapsed_seconds = perf_counter() - ordinary_started
+    if progress_callback is not None:
+        progress_callback(
+            "ordinary_decode_end",
+            {
+                "elapsed_seconds": ordinary_elapsed_seconds,
+                "generated_tokens": len(ordinary.generated_token_ids),
+            },
+        )
     ordinary_stats = adapter.snapshot_rollback_stats()
     adapter.reset_rollback_stats()
+    dflash_started = perf_counter()
     dflash = dflash_rollback_greedy(
         adapter,
         prompt_token_ids,
@@ -655,7 +710,18 @@ def validate_qwen35_dflash_rollback(
         block_size=effective_block_size,
         eos_token_ids=eos_token_ids,
         input_device=adapter.device,
+        progress_callback=progress_callback,
     )
+    dflash_elapsed_seconds = perf_counter() - dflash_started
+    if progress_callback is not None:
+        progress_callback(
+            "dflash_decode_end",
+            {
+                "elapsed_seconds": dflash_elapsed_seconds,
+                "generated_tokens": len(dflash.generated_token_ids),
+                "draft_rounds": dflash.stats.draft_calls,
+            },
+        )
     dflash_stats = adapter.snapshot_rollback_stats()
     assert_exact_greedy_match(ordinary, dflash)
     raw_audit = getattr(adapter.target, "dflash_rollback_audit", None)
@@ -666,6 +732,8 @@ def validate_qwen35_dflash_rollback(
         ordinary_adapter_stats=ordinary_stats,
         dflash_adapter_stats=dflash_stats,
         target_rollback_audit=audit,
+        ordinary_elapsed_seconds=ordinary_elapsed_seconds,
+        dflash_elapsed_seconds=dflash_elapsed_seconds,
     )
 
 
@@ -682,6 +750,10 @@ def rollback_validation_payload(
         "ordinary_adapter_stats": asdict(result.ordinary_adapter_stats),
         "dflash_adapter_stats": asdict(result.dflash_adapter_stats),
         "target_rollback_audit": dict(result.target_rollback_audit),
+        "timings_seconds": {
+            "ordinary_decode": result.ordinary_elapsed_seconds,
+            "dflash_decode": result.dflash_elapsed_seconds,
+        },
     }
 
 

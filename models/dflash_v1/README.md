@@ -8,6 +8,7 @@
 | --- | --- |
 | run_rollback.py | CPU、CUDA、NPU 共用入口和报告生成 |
 | run_npu.py | HIAI 固定参数入口 |
+| benchmark_npu.py | rollback 正确性门禁后的 NPU 3 warmup + 10 次同步性能测试 |
 | dflash_rollback_decode.py | ordinary incremental、T=K+1 verify、accept 和 EOS 调度 |
 | dflash_rollback_adapter.py | framework Target transaction、feature history 和 Draft adapter |
 | dflash_reference_decode_v1.py | 旧 full-prefix sequential oracle，不是默认执行路径 |
@@ -40,8 +41,12 @@
 ~~~bash
 python -m models.dflash_v1.run_rollback --help
 python -m models.dflash_v1.run_npu --help
+python -m models.dflash_v1.benchmark_npu --help
 python tests/test_dflash_rollback_scheduler.py
 python tests/test_dflash_framework_rollback.py
 python tests/test_internal_dflash_bridge_rollback.py
 python tests/test_dflash_rollback_helpers.py
+python -m pytest -q tests/test_dflash_runtime_optimizations.py
+python -m pytest -q tests/test_benchmark_npu.py tests/test_msprof_script.py \
+  tests/test_source_lock_benchmark.py
 ~~~
