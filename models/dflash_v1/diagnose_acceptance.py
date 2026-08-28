@@ -61,8 +61,12 @@ from .internal_target_loader import (
     TARGET_FACTORY_ENV,
 )
 from .modeling_dflash import DFlashDraftModel
-from .run_npu import _configure_target_quantization
-from .target_quant import QUANT_MODE_DISABLED, SUPPORTED_TARGET_QUANT_MODES
+from .run_npu import (
+    ORIGINAL_QUANT_DISABLE,
+    ORIGINAL_QUANT_ENABLE,
+    _configure_target_quantization,
+)
+from .target_quant import QUANT_MODE_DISABLED, load_original_quant_config
 
 
 DEFAULT_TARGET_FACTORY = (
@@ -378,10 +382,11 @@ def _direct_target_call(
 ) -> tuple[Tensor, Tensor]:
     target_inputs = getattr(controller, "_target_inputs")
     if not callable(target_inputs):
-        raise TypeError("DFlash controller lost its target input provider")
+        raise TypeError("DFlash controller lost its target embedding route")
     # This is deliberately the same input path used by fresh full-prefix
-    # replay.  In W8A8 mode it invokes the receiver's quant input provider;
-    # using get_input_embeddings() here would compare two different targets.
+    # replay.  In W8A8 mode it indexes the original raw INT8 embedding and
+    # FP32 scale artifacts; using get_input_embeddings() here would compare
+    # two different targets.
     inputs_embeds = target_inputs(input_ids)
     execution_model = getattr(controller, "dflash_execution_model")
     if not isinstance(execution_model, nn.Module):
@@ -820,30 +825,30 @@ def compare_target_paths(
     )
     quant_after = _npu_target_quantization_audit(target)
     scheme = quant_after.get("scheme", QUANT_MODE_DISABLED)
-    before_calls = quant_before.get("input_provider_calls")
-    after_calls = quant_after.get("input_provider_calls")
+    before_calls = quant_before.get("embedding_lookup_calls")
+    after_calls = quant_after.get("embedding_lookup_calls")
     if any(
         isinstance(value, bool) or not isinstance(value, int)
         for value in (before_calls, after_calls)
     ):
-        raise TypeError("target input-provider counters must be integers")
+        raise TypeError("target quantized-embedding counters must be integers")
     assert isinstance(before_calls, int) and isinstance(after_calls, int)
-    provider_delta = after_calls - before_calls
+    embedding_delta = after_calls - before_calls
     expected_delta = 2 * len(snapshots) if scheme != QUANT_MODE_DISABLED else 0
-    quant_reconciled = provider_delta == expected_delta
+    quant_reconciled = embedding_delta == expected_delta
     result["target_quantization"] = {
         "scheme": scheme,
-        "input_provider_call_delta": provider_delta,
-        "expected_input_provider_call_delta": expected_delta,
-        "input_provider_calls_reconciled": quant_reconciled,
+        "embedding_lookup_call_delta": embedding_delta,
+        "expected_embedding_lookup_call_delta": expected_delta,
+        "embedding_lookup_calls_reconciled": quant_reconciled,
         "input_path": (
-            "receiver_quant_input_provider"
+            "original_int8_embedding_mul_fp32_scale"
             if scheme != QUANT_MODE_DISABLED
             else "ordinary_fp16_embedding"
         ),
     }
     if not quant_reconciled:
-        result["status"] = "FAIL_QUANT_INPUT_PROVIDER_CALL_RECONCILIATION"
+        result["status"] = "FAIL_QUANT_EMBEDDING_CALL_RECONCILIATION"
         result["all_top1_match"] = False
     return result
 
@@ -2257,30 +2262,19 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--target-quant-mode",
-        choices=SUPPORTED_TARGET_QUANT_MODES,
-        default=QUANT_MODE_DISABLED,
-        help="NPU only: reuse the same target quantization mode as run_npu",
+        "--config",
+        help=(
+            "NPU quant only: original inference YAML containing quanted_pth, "
+            "embedding_weight_path, and embedding_scale_path"
+        ),
     )
     parser.add_argument(
-        "--target-quantizer",
-        help="NPU only: MODULE:FUNCTION used by the deployed quant Target",
-    )
-    parser.add_argument(
-        "--target-quant-weight-path",
-        help="NPU only: deployed Linear quant-weight file or directory",
-    )
-    parser.add_argument(
-        "--target-input-provider",
-        help="NPU only: MODULE:FUNCTION producing the quant Target layer-0 input",
-    )
-    parser.add_argument(
-        "--target-embedding-weight-path",
-        help="NPU only: deployed quantized embedding-weight file or directory",
-    )
-    parser.add_argument(
-        "--target-embedding-scale-path",
-        help="NPU only: deployed quantized embedding-scale file or directory",
+        "--quant_mode",
+        "--quant-mode",
+        dest="quant_mode",
+        choices=(ORIGINAL_QUANT_ENABLE, ORIGINAL_QUANT_DISABLE),
+        default=ORIGINAL_QUANT_DISABLE,
+        help="same enable/disable switch as the original inference.py",
     )
     parser.add_argument(
         "--kv-cache-max-len",
@@ -2394,12 +2388,7 @@ def _validate_args(args: argparse.Namespace) -> tuple[int, ...]:
                 "--target-w8a8-emulation-artifact must be a real artifact directory"
             )
     if device_type != "npu" and (
-        args.target_quant_mode != QUANT_MODE_DISABLED
-        or args.target_quantizer is not None
-        or args.target_quant_weight_path is not None
-        or args.target_input_provider is not None
-        or args.target_embedding_weight_path is not None
-        or args.target_embedding_scale_path is not None
+        args.quant_mode != ORIGINAL_QUANT_DISABLE or args.config is not None
     ):
         raise ValueError(
             "NPU target quantization options are not valid on CPU/CUDA; use "
@@ -2436,7 +2425,7 @@ def _print_summary(report: Mapping[str, object]) -> None:
             quantization.get("status"),
             f"scheme={quantization.get('scheme')}",
             f"qlinear={quantization.get('qlinear_count', 0)}",
-            f"provider_failures={quantization.get('input_provider_failures')}",
+            f"embedding_failures={quantization.get('embedding_lookup_failures')}",
         )
     print(
         "Target 增量 vs full-prefix:",
@@ -2654,14 +2643,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.target_w8a8_emulation_artifact is None
         else Path(args.target_w8a8_emulation_artifact).expanduser().resolve()
     )
-    quantization_paths = tuple(
-        Path(value).expanduser().resolve()
-        for value in (
-            args.target_quant_weight_path,
-            args.target_embedding_weight_path,
-            args.target_embedding_scale_path,
+    quant_config = (
+        load_original_quant_config(args.config)
+        if device_type == "npu" and args.quant_mode == ORIGINAL_QUANT_ENABLE
+        else None
+    )
+    quantization_paths = (
+        ()
+        if quant_config is None
+        else (
+            quant_config.config_path,
+            quant_config.quant_weight_path,
+            quant_config.embedding_weight_path,
+            quant_config.embedding_scale_path,
         )
-        if value is not None
     )
     protected_roots = tuple(
         path

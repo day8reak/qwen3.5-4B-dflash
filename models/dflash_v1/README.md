@@ -27,13 +27,15 @@
 | dflash_config.py、dflash_weights.py | 结构、69 tensor 和 checkpoint identity 门禁 |
 | dflash_ops.py | CPU/CUDA Torch backend |
 | dflash_ascend310p_ops.py | NPU Tensor 分解 backend |
-| target_quant.py | rollback Target quantizer/input-provider ABI 与完整 QLinear 拓扑审计 |
+| original_quant.py | 用户原 `utils.py` 的 key 映射、blocked-ZN 与 QLinear 替换实现 |
+| target_quant.py | 原 inference YAML、量化 embedding 与完整 QLinear 拓扑审计 |
 | w8a8_emulation.py、validate_w8a8_cpu.py | QLinear CPU/CUDA 公式仿真和确定性验证；不是 NPU 整网结论 |
 
-量化路线只替换 Target Linear 并复用量化 embedding/input-provider。rollback modeling 导入原
-HIAI 文件的同一个 `QLinear` 类型，因此已有 converter 不需要切换到另一套量化算子；Draft
-共享的 embedding/LM head 仍由独立 FP16 module 提供。prefill、decode 和 verify 都通过同一个
-input-provider，GDR/GDR-MTP、state bank 和 logical KV 事务保持不变。
+量化路线只替换 Target Linear，并按原 YAML 索引 INT8 embedding weight 与 FP32 scale。
+rollback modeling 导入原 HIAI 文件的同一个 `QLinear` 类型，因此没有第二套量化算子；Draft
+共享的 embedding/LM head 仍由独立 FP16 module 提供。CLI 只需 `--config ... --quant_mode
+enable`，prefill、decode 和 verify 都走内置 embedding 路径；GDR/GDR-MTP、state bank 和
+logical KV 事务保持不变。
 
 本包统一使用官方 DFlash 口径：`block_size` 是包含 clean anchor 的 Draft query/Target verify
 总行数。官方配置 `block_size=16` 因此对应 1 个 anchor 加最多 15 个 proposal，即

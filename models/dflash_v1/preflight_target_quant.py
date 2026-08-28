@@ -3,8 +3,9 @@
 This command loads the quantized rollback HIAI target and exercises both its
 fresh full-prefix diagnostic route and its persistent ordinary/rollback
 transaction, but deliberately does not hash or load the Draft checkpoint.  It
-is the inexpensive first device gate for converter, input-provider,
-feature-route, state-bank, and logical-KV integration.
+is the inexpensive first device gate for the original quant converter,
+quantized embedding route, feature route, state bank, and logical-KV
+integration.
 """
 
 from __future__ import annotations
@@ -32,9 +33,10 @@ from .internal_target_loader import (
 from .run_npu import (
     DEFAULT_TARGET_FACTORY,
     KV_CACHE_MAX_LEN_ENV,
+    ORIGINAL_QUANT_ENABLE,
     _configure_target_quantization,
 )
-from .target_quant import QUANT_MODE_W8A8_DYNAMIC
+from .target_quant import load_original_quant_config
 
 
 _ASSEMBLY_PASS = "PASS_ASSEMBLY_CONTRACT_NO_NUMERICAL_CLAIM"
@@ -55,11 +57,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--kv-cache-max-len", type=int, required=True)
-    parser.add_argument("--target-quantizer", required=True)
-    parser.add_argument("--target-quant-weight-path", required=True)
-    parser.add_argument("--target-input-provider", required=True)
-    parser.add_argument("--target-embedding-weight-path", required=True)
-    parser.add_argument("--target-embedding-scale-path", required=True)
+    parser.add_argument(
+        "--config",
+        required=True,
+        help=(
+            "original inference YAML containing quanted_pth, "
+            "embedding_weight_path, and embedding_scale_path"
+        ),
+    )
     comparison = parser.add_mutually_exclusive_group()
     comparison.add_argument(
         "--compare-first-qlinear",
@@ -426,19 +431,19 @@ def _run_rollback_target_probe(
     rollback_audit = getattr(controller, "dflash_rollback_audit", None)
     if not isinstance(after_quant, Mapping) or not isinstance(rollback_audit, Mapping):
         raise TypeError("rollback Target audits disappeared during the probe")
-    before_calls = before_quant.get("input_provider_calls")
-    after_calls = after_quant.get("input_provider_calls")
+    before_calls = before_quant.get("embedding_lookup_calls")
+    after_calls = after_quant.get("embedding_lookup_calls")
     if any(
         isinstance(value, bool) or not isinstance(value, int)
         for value in (before_calls, after_calls)
     ):
-        raise TypeError("input-provider call counters must be integers")
+        raise TypeError("quantized embedding call counters must be integers")
     assert isinstance(before_calls, int) and isinstance(after_calls, int)
     prompt_chunks = (int(prefix.shape[1]) + 63) // 64
     expected_calls = 2 * prompt_chunks + 2
     if after_calls - before_calls != expected_calls:
         raise RuntimeError(
-            "rollback quant input-provider calls do not cover ordinary and "
+            "rollback quantized embedding calls do not cover ordinary and "
             f"rollback execution: expected {expected_calls}, got "
             f"{after_calls - before_calls}"
         )
@@ -446,7 +451,7 @@ def _run_rollback_target_probe(
         raise RuntimeError("rollback probe unexpectedly replayed the prefix")
     return {
         "status": "PASS_QUANTIZED_ROLLBACK_TARGET_TRANSACTION",
-        "input_provider_calls": expected_calls,
+        "embedding_lookup_calls": expected_calls,
         "prompt_chunks_per_session": prompt_chunks,
         "ordinary_vs_rollback_prefill": prefill_parity,
         "ordinary_vs_rollback_one_step": step_parity,
@@ -762,20 +767,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise FileNotFoundError(f"target directory does not exist: {target_root}")
 
     quant_args = argparse.Namespace(
-        target_quant_mode=QUANT_MODE_W8A8_DYNAMIC,
+        quant_mode=ORIGINAL_QUANT_ENABLE,
         target_factory=DEFAULT_TARGET_FACTORY,
-        target_quantizer=args.target_quantizer,
-        target_quant_weight_path=args.target_quant_weight_path,
-        target_input_provider=args.target_input_provider,
-        target_embedding_weight_path=args.target_embedding_weight_path,
-        target_embedding_scale_path=args.target_embedding_scale_path,
+        config=args.config,
         report=args.report,
     )
     _configure_target_quantization(quant_args)
+    quant_config = load_original_quant_config(args.config)
     quantization_paths = (
-        Path(args.target_quant_weight_path).expanduser().resolve(),
-        Path(args.target_embedding_weight_path).expanduser().resolve(),
-        Path(args.target_embedding_scale_path).expanduser().resolve(),
+        quant_config.config_path,
+        quant_config.quant_weight_path,
+        quant_config.embedding_weight_path,
+        quant_config.embedding_scale_path,
     )
     report_destination = (
         None
@@ -858,10 +861,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{label} delta must equal executed target calls {expected_calls}; "
                 f"got initial={initial}, final={final}"
             )
-    expected_provider_calls = expected_calls + int(
-        rollback_probe["input_provider_calls"]
+    expected_embedding_calls = expected_calls + int(
+        rollback_probe["embedding_lookup_calls"]
     )
-    for label in ("input_provider_calls", "input_provider_successes"):
+    for label in ("embedding_lookup_calls", "embedding_lookup_successes"):
         initial = initial_quant.get(label)
         final = final_quant.get(label)
         if (
@@ -871,22 +874,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             or not isinstance(final, int)
         ):
             raise TypeError(f"{label} counters must be integers")
-        if final - initial != expected_provider_calls:
+        if final - initial != expected_embedding_calls:
             raise RuntimeError(
                 f"{label} delta must equal all full-prefix and rollback calls "
-                f"{expected_provider_calls}; got initial={initial}, final={final}"
+                f"{expected_embedding_calls}; got initial={initial}, final={final}"
             )
-    initial_failures = initial_quant.get("input_provider_failures")
-    final_failures = final_quant.get("input_provider_failures")
+    initial_failures = initial_quant.get("embedding_lookup_failures")
+    final_failures = final_quant.get("embedding_lookup_failures")
     if (
         isinstance(initial_failures, bool)
         or not isinstance(initial_failures, int)
         or isinstance(final_failures, bool)
         or not isinstance(final_failures, int)
     ):
-        raise TypeError("input_provider_failures counters must be integers")
+        raise TypeError("embedding_lookup_failures counters must be integers")
     if final_failures - initial_failures != 0:
-        raise RuntimeError("quant target input provider reported new failures")
+        raise RuntimeError("quant target embedding lookup reported new failures")
 
     emulation_export: dict[str, object] | None = None
     if export_destination is not None:

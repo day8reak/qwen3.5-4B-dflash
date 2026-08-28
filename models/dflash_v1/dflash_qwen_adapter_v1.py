@@ -1633,9 +1633,9 @@ def _target_integration_audit(
                         "target quantization scheme must be disabled or w8a8_dynamic"
                     )
                 for field in (
-                    "input_provider_calls",
-                    "input_provider_successes",
-                    "input_provider_failures",
+                    "embedding_lookup_calls",
+                    "embedding_lookup_successes",
+                    "embedding_lookup_failures",
                 ):
                     value = quantization.get(field)
                     if (
@@ -1654,13 +1654,14 @@ def _target_integration_audit(
                     if any(
                         quantization[field] != 0
                         for field in (
-                            "input_provider_calls",
-                            "input_provider_successes",
-                            "input_provider_failures",
+                            "embedding_lookup_calls",
+                            "embedding_lookup_successes",
+                            "embedding_lookup_failures",
                         )
                     ):
                         raise RuntimeError(
-                            "disabled target quantization executed an input provider"
+                            "disabled target quantization executed a quantized "
+                            "embedding lookup"
                         )
                 else:
                     if (
@@ -1680,11 +1681,11 @@ def _target_integration_audit(
                             "W8A8 target must report a positive QLinear count"
                         )
                     if (
-                        quantization.get("input_provider_output_contract")
-                        != "final_fp16_layer0_hidden"
+                        quantization.get("embedding_output_contract")
+                        != "original_int8_mul_fp32_scale_then_fp16"
                     ):
                         raise RuntimeError(
-                            "W8A8 target input provider has the wrong output contract"
+                            "W8A8 target embedding route has the wrong output contract"
                         )
                     if (
                         quantization.get("linear_topology_validation")
@@ -1854,19 +1855,25 @@ def _target_integration_audit(
                 if isinstance(quantization, Mapping):
                     scheme = quantization.get("scheme")
                     if scheme == "w8a8_dynamic":
-                        if quantization.get("input_provider_calls") != forward_calls:
+                        if (
+                            quantization.get("embedding_lookup_calls")
+                            != forward_calls
+                        ):
                             raise RuntimeError(
-                                "quantized target input-provider and forward "
+                                "quantized target embedding and forward "
                                 "call counts differ"
                             )
-                        if quantization.get("input_provider_successes") != forward_calls:
+                        if (
+                            quantization.get("embedding_lookup_successes")
+                            != forward_calls
+                        ):
                             raise RuntimeError(
-                                "one or more quantized target input-provider "
+                                "one or more quantized target embedding "
                                 "calls did not complete"
                             )
-                        if quantization.get("input_provider_failures") != 0:
+                        if quantization.get("embedding_lookup_failures") != 0:
                             raise RuntimeError(
-                                "quantized target input provider reported failures"
+                                "quantized target embedding lookup reported failures"
                             )
 
     return {

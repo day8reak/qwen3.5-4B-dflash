@@ -22,23 +22,25 @@ from .internal_target_loader import (
     PREFILL_CHUNK_SIZE_ENV,
 )
 from .target_quant import (
+    ORIGINAL_QUANTIZER_SPEC,
     QUANT_MODE_DISABLED,
-    SUPPORTED_TARGET_QUANT_MODES,
+    QUANT_MODE_W8A8_DYNAMIC,
     TARGET_EMBEDDING_SCALE_PATH_ENV,
     TARGET_EMBEDDING_WEIGHT_PATH_ENV,
-    TARGET_INPUT_PROVIDER_ENV,
+    TARGET_QUANT_CONFIG_ENV,
     TARGET_QUANT_MODE_ENV,
     TARGET_QUANT_WEIGHT_PATH_ENV,
-    TARGET_QUANTIZER_ENV,
     TargetQuantizationRequest,
-    input_provider_callback_abi,
     load_callback,
+    load_original_quant_config,
     quantizer_callback_abi,
 )
 
 
 DEFAULT_TARGET_FACTORY = DEFAULT_NPU_TARGET_FACTORY
 KV_CACHE_MAX_LEN_ENV = "DFLASH_HIAI_KV_CACHE_MAX_LEN"
+ORIGINAL_QUANT_ENABLE = "enable"
+ORIGINAL_QUANT_DISABLE = "disable"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -117,39 +119,22 @@ def _parser() -> argparse.ArgumentParser:
         help="compatibility setting; prompt bootstrap/decode require 1",
     )
     parser.add_argument(
-        "--target-quant-mode",
-        choices=SUPPORTED_TARGET_QUANT_MODES,
-        default=QUANT_MODE_DISABLED,
+        "--config",
         help=(
-            "quantize only the rollback Target with the existing W8A8 path; "
-            "the DFlash Draft embedding/head remain FP16"
+            "original inference YAML containing quanted_pth, "
+            "embedding_weight_path, and embedding_scale_path"
         ),
     )
     parser.add_argument(
-        "--target-quantizer",
+        "--quant_mode",
+        "--quant-mode",
+        dest="quant_mode",
+        choices=(ORIGINAL_QUANT_ENABLE, ORIGINAL_QUANT_DISABLE),
+        default=ORIGINAL_QUANT_DISABLE,
         help=(
-            "MODULE:FUNCTION converting the rollback HIAI execution model and "
-            "returning nn.Module/None or TargetQuantizationResult"
+            "same switch as inference.py; enable uses built-in "
+            "original quant_model and the three paths from --config"
         ),
-    )
-    parser.add_argument(
-        "--target-quant-weight-path",
-        help="existing Target Linear quant-weight file or directory",
-    )
-    parser.add_argument(
-        "--target-input-provider",
-        help=(
-            "MODULE:FUNCTION returning the final FP16 layer-0 hidden for every "
-            "rollback prefill/decode/verify input block"
-        ),
-    )
-    parser.add_argument(
-        "--target-embedding-weight-path",
-        help="existing quantized Target embedding-weight file or directory",
-    )
-    parser.add_argument(
-        "--target-embedding-scale-path",
-        help="existing quantized Target embedding-scale file or directory",
     )
     parser.add_argument("--report")
     parser.add_argument(
@@ -161,24 +146,17 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _configure_target_quantization(args: argparse.Namespace) -> None:
-    """Freeze the process-local quant route before any checkpoint is loaded."""
+    """Mirror the original YAML + ``utils.quant_model`` route."""
 
-    values = {
-        TARGET_QUANTIZER_ENV: args.target_quantizer,
-        TARGET_QUANT_WEIGHT_PATH_ENV: args.target_quant_weight_path,
-        TARGET_INPUT_PROVIDER_ENV: args.target_input_provider,
-        TARGET_EMBEDDING_WEIGHT_PATH_ENV: args.target_embedding_weight_path,
-        TARGET_EMBEDDING_SCALE_PATH_ENV: args.target_embedding_scale_path,
-    }
-    if args.target_quant_mode == QUANT_MODE_DISABLED:
-        supplied = [name for name, value in values.items() if value is not None]
-        if supplied:
-            raise ValueError(
-                "quantization options require --target-quant-mode "
-                "w8a8_dynamic: " + ", ".join(supplied)
-            )
+    environment_names = (
+        TARGET_QUANT_CONFIG_ENV,
+        TARGET_QUANT_WEIGHT_PATH_ENV,
+        TARGET_EMBEDDING_WEIGHT_PATH_ENV,
+        TARGET_EMBEDDING_SCALE_PATH_ENV,
+    )
+    if args.quant_mode == ORIGINAL_QUANT_DISABLE:
         os.environ[TARGET_QUANT_MODE_ENV] = QUANT_MODE_DISABLED
-        for name in values:
+        for name in environment_names:
             os.environ.pop(name, None)
         return
 
@@ -188,22 +166,25 @@ def _configure_target_quantization(args: argparse.Namespace) -> None:
             f"{DEFAULT_TARGET_FACTORY}; a custom factory would bypass the "
             "QLinear and state-transaction audits"
         )
-    missing = [name for name, value in values.items() if value is None]
-    if missing:
+    if args.config is None:
         raise ValueError(
-            f"--target-quant-mode {args.target_quant_mode} requires "
-            + ", ".join(missing)
+            "--quant_mode enable requires the original inference --config YAML"
         )
-    os.environ[TARGET_QUANT_MODE_ENV] = args.target_quant_mode
-    for name, value in values.items():
-        assert value is not None
-        os.environ[name] = str(value)
+    config = load_original_quant_config(args.config)
+    os.environ[TARGET_QUANT_MODE_ENV] = QUANT_MODE_W8A8_DYNAMIC
+    os.environ[TARGET_QUANT_CONFIG_ENV] = str(config.config_path)
+    os.environ[TARGET_QUANT_WEIGHT_PATH_ENV] = str(config.quant_weight_path)
+    os.environ[TARGET_EMBEDDING_WEIGHT_PATH_ENV] = str(
+        config.embedding_weight_path
+    )
+    os.environ[TARGET_EMBEDDING_SCALE_PATH_ENV] = str(
+        config.embedding_scale_path
+    )
 
     request = TargetQuantizationRequest.from_environment()
     assert request.enabled
-    assert request.quantizer_spec is not None
-    assert request.input_provider_spec is not None
     protected_paths = (
+        request.config_path,
         request.quant_weight_path,
         request.embedding_weight_path,
         request.embedding_scale_path,
@@ -229,13 +210,14 @@ def _configure_target_quantization(args: argparse.Namespace) -> None:
                     "--report must not overwrite or be placed inside any "
                     "Target quantization data path"
                 )
-    quantizer, _ = load_callback(request.quantizer_spec, label="target quantizer")
-    input_provider, _ = load_callback(
-        request.input_provider_spec,
-        label="target input provider",
+    quantizer, _ = load_callback(
+        ORIGINAL_QUANTIZER_SPEC,
+        label="packaged original utils.quant_model",
     )
-    quantizer_callback_abi(quantizer)
-    input_provider_callback_abi(input_provider)
+    if quantizer_callback_abi(quantizer) != "simple":
+        raise TypeError(
+            "packaged quant_model must accept (model, quant_weight_path)"
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

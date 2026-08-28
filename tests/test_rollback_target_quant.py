@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -13,7 +14,7 @@ import torch
 from torch import nn
 
 from models import internal_dflash_bridge as bridge_module
-from models.dflash_v1 import benchmark_npu, run_npu
+from models.dflash_v1 import benchmark_npu, original_quant, run_npu
 from models.dflash_v1.dflash_hiai_feature_check import (
     FEATURE_SOURCE,
     ROLLBACK_FEATURE_SOURCE,
@@ -23,19 +24,23 @@ from models.dflash_v1.target_quant import (
     QUANT_MODE_W8A8_DYNAMIC,
     TARGET_EMBEDDING_SCALE_PATH_ENV,
     TARGET_EMBEDDING_WEIGHT_PATH_ENV,
-    TARGET_INPUT_PROVIDER_ENV,
+    TARGET_QUANT_CONFIG_ENV,
     TARGET_QUANT_MODE_ENV,
     TARGET_QUANT_WEIGHT_PATH_ENV,
-    TARGET_QUANTIZER_ENV,
-    TargetQuantizationResult,
 )
 
 
 class FakeQLinear(nn.Module):
-    def __init__(self, weight: torch.Tensor, scale: torch.Tensor) -> None:
+    def __init__(
+        self,
+        W_q: torch.Tensor,
+        scale: torch.Tensor,
+        idx: int,
+    ) -> None:
         super().__init__()
-        self.register_buffer("W_q", weight)
+        self.register_buffer("W_q", W_q)
         self.register_buffer("scale", scale)
+        self.idx = idx
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return torch.zeros(
@@ -43,9 +48,6 @@ class FakeQLinear(nn.Module):
             device=value.device,
             dtype=torch.float16,
         )
-
-
-PROVIDER_WRAPPERS: list[nn.Module] = []
 
 
 class FakeRollbackModel(nn.Module):
@@ -73,7 +75,6 @@ class FakeRollbackWrapper(nn.Module):
         super().__init__()
         del args, kwargs
         self.model = FakeRollbackModel().eval()
-        self.provider_owner = nn.Module()
         self.replace_calls = 0
 
     def replace_dflash_execution_model(self, model: nn.Module) -> None:
@@ -82,63 +83,48 @@ class FakeRollbackWrapper(nn.Module):
         self.model = model
         self.replace_calls += 1
 
-    def dflash_target_input_provider_wrapper(self) -> nn.Module:
-        return self.provider_owner
 
-
-def fake_quantizer(
-    model: nn.Module,
-    quant_weight_path: str,
-    *,
-    device: torch.device,
-    output_dtype: torch.dtype,
-) -> TargetQuantizationResult:
-    del quant_weight_path
+def fake_quant_model(model: nn.Module, quant_weight_path: str) -> nn.Module:
     if type(model) is not FakeRollbackModel:
         raise TypeError("wrong model supplied to quantizer")
-    original_head = model.lm_head
+    if not Path(quant_weight_path).is_dir():
+        raise ValueError("wrong quant artifact path")
     model.lm_head = FakeQLinear(
-        torch.zeros((2, 8), dtype=torch.int8, device=device),
-        torch.ones((8,), dtype=output_dtype, device=device),
+        W_q=torch.zeros((2, 8), dtype=torch.int8),
+        scale=torch.ones((8,), dtype=torch.float32),
+        idx=15,
     )
-    return TargetQuantizationResult(
-        execution_model=model,
-        expected_qlinear_paths=("lm_head",),
-        profile={"test": True},
-        draft_input_embeddings=model.embedding,
-        draft_output_embeddings=original_head,
-    )
-
-
-def fake_input_provider(
-    model_wrapper: nn.Module,
-    input_ids: torch.Tensor,
-    *,
-    embedding_weight_path: str,
-    embedding_scale_path: str,
-    device: torch.device,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    PROVIDER_WRAPPERS.append(model_wrapper)
-    del embedding_weight_path, embedding_scale_path
-    return torch.zeros(
-        (1, int(input_ids.shape[1]), 2),
-        device=device,
-        dtype=output_dtype,
-    )
+    return model
 
 
 class RollbackTargetQuantTests(unittest.TestCase):
     def _artifacts(self, root: Path) -> dict[str, str]:
-        result: dict[str, str] = {}
-        for name in ("linear", "embedding", "embedding-scale"):
-            path = root / f"{name}.bin"
-            path.write_bytes(name.encode("utf-8"))
-            result[name] = str(path)
-        return result
+        quant = root / "linear"
+        quant.mkdir()
+        weight = root / "embedding_weight.bin"
+        weight.write_bytes(bytes(range(16)))
+        scale = root / "embedding_scale.bin"
+        scale.write_bytes(struct.pack("<8f", *([0.5] * 8)))
+        config = root / "qwen3.5.yaml"
+        config.write_text(
+            "\n".join(
+                (
+                    f"quanted_pth: {quant}",
+                    f"embedding_weight_path: {weight}",
+                    f"embedding_scale_path: {scale}",
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "config": str(config),
+            "linear": str(quant),
+            "embedding": str(weight),
+            "embedding-scale": str(scale),
+        }
 
-    def test_loader_quantizes_rollback_model_and_retains_fp16_draft_views(self) -> None:
-        PROVIDER_WRAPPERS.clear()
+    def test_loader_uses_original_yaml_and_builtin_embedding_route(self) -> None:
         wrapper_module_name = "tests_fake_rollback_wrapper"
         hiai_module_name = "tests_fake_rollback_hiai"
         wrapper_module = ModuleType(wrapper_module_name)
@@ -147,17 +133,14 @@ class RollbackTargetQuantTests(unittest.TestCase):
         hiai_module = ModuleType(hiai_module_name)
         hiai_module.Qwen3_5ForCausalLM = FakeRollbackModel
         hiai_module.QLinear = FakeQLinear
-        callback_module = sys.modules[__name__]
-        callback_prefix = callback_module.__name__
 
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = self._artifacts(Path(temporary))
             environment = {
                 bridge_module.KV_CACHE_MAX_LEN_ENV: "64",
                 TARGET_QUANT_MODE_ENV: QUANT_MODE_W8A8_DYNAMIC,
-                TARGET_QUANTIZER_ENV: f"{callback_prefix}:fake_quantizer",
+                TARGET_QUANT_CONFIG_ENV: artifacts["config"],
                 TARGET_QUANT_WEIGHT_PATH_ENV: artifacts["linear"],
-                TARGET_INPUT_PROVIDER_ENV: f"{callback_prefix}:fake_input_provider",
                 TARGET_EMBEDDING_WEIGHT_PATH_ENV: artifacts["embedding"],
                 TARGET_EMBEDDING_SCALE_PATH_ENV: artifacts["embedding-scale"],
             }
@@ -167,6 +150,10 @@ class RollbackTargetQuantTests(unittest.TestCase):
                     wrapper_module_name: wrapper_module,
                     hiai_module_name: hiai_module,
                 },
+            ), patch.object(
+                original_quant,
+                "quant_model",
+                fake_quant_model,
             ), patch.dict(os.environ, environment, clear=True):
                 target = bridge_module._load_qwen35_target_impl(
                     temporary,
@@ -181,8 +168,12 @@ class RollbackTargetQuantTests(unittest.TestCase):
                 )
 
         self.assertTrue(target.rollback_enabled)
-        self.assertEqual(tuple(inputs.shape), (1, 2, 2))
-        self.assertEqual(PROVIDER_WRAPPERS, [target.model_wrapper.provider_owner])
+        torch.testing.assert_close(
+            inputs,
+            torch.tensor([[[1.0, 1.5], [2.0, 2.5]]], dtype=torch.float16),
+            rtol=0,
+            atol=0,
+        )
         self.assertEqual(target.model_wrapper.replace_calls, 1)
         self.assertIsInstance(target.dflash_execution_model.lm_head, FakeQLinear)
         self.assertIsInstance(target.get_output_embeddings(), nn.Linear)
@@ -190,20 +181,46 @@ class RollbackTargetQuantTests(unittest.TestCase):
         self.assertEqual(audit["scheme"], QUANT_MODE_W8A8_DYNAMIC)
         self.assertEqual(audit["route"], "rollback")
         self.assertEqual(audit["qlinear_paths"], ["lm_head"])
-        self.assertEqual(audit["linear_topology_validation"], "PASS_EXACT_PATH_SHAPE_BIAS")
+        self.assertEqual(
+            audit["linear_topology_validation"],
+            "PASS_EXACT_PATH_SHAPE_BIAS",
+        )
+        self.assertEqual(audit["embedding_lookup_calls"], 1)
+        self.assertEqual(audit["embedding_lookup_failures"], 0)
 
-    def test_run_npu_quant_configuration_is_fail_closed(self) -> None:
-        callback_prefix = sys.modules[__name__].__name__
+    def test_builtin_converter_keeps_original_key_and_zn_contract(self) -> None:
+        model = nn.Module()
+        model.add_module("language_model", nn.Module())
+        model.language_model.add_module(
+            "proj",
+            nn.Linear(32, 16, bias=False),
+        )
+        state = {
+            "model.proj_quant_weight": torch.arange(
+                16 * 32,
+                dtype=torch.int16,
+            ).to(torch.int8).reshape(16, 32),
+            "model.proj_quant_scale": torch.ones(16, dtype=torch.float32),
+        }
+        with patch.object(
+            original_quant,
+            "_qlinear_class",
+            return_value=FakeQLinear,
+        ):
+            converted = original_quant.replace_linear_to_qlinear(model, state)
+        self.assertIs(converted, model)
+        self.assertIsInstance(model.language_model.proj, FakeQLinear)
+        self.assertEqual(tuple(model.language_model.proj.W_q.shape), (32, 16))
+        self.assertEqual(model.language_model.proj.idx, 15)
+        self.assertEqual(state, {})
+
+    def test_run_npu_quant_configuration_uses_only_original_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = self._artifacts(Path(temporary))
             args = argparse.Namespace(
-                target_quant_mode=QUANT_MODE_W8A8_DYNAMIC,
+                quant_mode=run_npu.ORIGINAL_QUANT_ENABLE,
                 target_factory=run_npu.DEFAULT_TARGET_FACTORY,
-                target_quantizer=f"{callback_prefix}:fake_quantizer",
-                target_quant_weight_path=artifacts["linear"],
-                target_input_provider=f"{callback_prefix}:fake_input_provider",
-                target_embedding_weight_path=artifacts["embedding"],
-                target_embedding_scale_path=artifacts["embedding-scale"],
+                config=artifacts["config"],
                 report=str(Path(temporary) / "report.json"),
             )
             with patch.dict(os.environ, {}, clear=True):
@@ -212,11 +229,15 @@ class RollbackTargetQuantTests(unittest.TestCase):
                     os.environ[TARGET_QUANT_MODE_ENV],
                     QUANT_MODE_W8A8_DYNAMIC,
                 )
+                self.assertEqual(
+                    os.environ[TARGET_QUANT_CONFIG_ENV],
+                    str(Path(artifacts["config"]).resolve()),
+                )
                 args.target_factory = "custom:factory"
                 with self.assertRaisesRegex(ValueError, "packaged factory"):
                     run_npu._configure_target_quantization(args)
 
-    def test_benchmark_parser_accepts_same_quant_contract(self) -> None:
+    def test_benchmark_parser_accepts_original_inference_switches(self) -> None:
         args = benchmark_npu._parser().parse_args(
             [
                 "--mode",
@@ -233,22 +254,14 @@ class RollbackTargetQuantTests(unittest.TestCase):
                 "2048",
                 "--report",
                 "/tmp/report.json",
-                "--target-quant-mode",
-                "w8a8_dynamic",
-                "--target-quantizer",
-                "callbacks:quantize",
-                "--target-quant-weight-path",
-                "/quant",
-                "--target-input-provider",
-                "callbacks:inputs",
-                "--target-embedding-weight-path",
-                "/embedding",
-                "--target-embedding-scale-path",
-                "/embedding-scale",
+                "--config",
+                "/data/qwen3.5.yaml",
+                "--quant_mode",
+                "enable",
             ]
         )
-        self.assertEqual(args.target_quant_mode, QUANT_MODE_W8A8_DYNAMIC)
-        self.assertEqual(args.target_quantizer, "callbacks:quantize")
+        self.assertEqual(args.quant_mode, run_npu.ORIGINAL_QUANT_ENABLE)
+        self.assertEqual(args.config, "/data/qwen3.5.yaml")
 
     def test_feature_source_checker_accepts_original_and_rollback_files(self) -> None:
         repository = Path(__file__).resolve().parents[1]

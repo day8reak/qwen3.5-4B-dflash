@@ -42,7 +42,12 @@ from .dflash_rollback_decode import (
 from .dflash_weights import require_official_dflash_checkpoint
 from .internal_target_loader import DECODE_CHUNK_SIZE_ENV, PREFILL_CHUNK_SIZE_ENV
 from .modeling_dflash import DFlashDraftModel
-from .run_npu import KV_CACHE_MAX_LEN_ENV, _configure_target_quantization
+from .run_npu import (
+    KV_CACHE_MAX_LEN_ENV,
+    ORIGINAL_QUANT_DISABLE,
+    ORIGINAL_QUANT_ENABLE,
+    _configure_target_quantization,
+)
 from .run_rollback import (
     DEFAULT_NPU_TARGET_FACTORY,
     _atomic_report,
@@ -50,7 +55,6 @@ from .run_rollback import (
     _rollback_runtime_identity,
     _synchronize_device,
 )
-from .target_quant import QUANT_MODE_DISABLED, SUPPORTED_TARGET_QUANT_MODES
 
 
 BenchmarkMode = Literal["ordinary", "dflash"]
@@ -681,16 +685,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefill-chunk-size", type=int, default=64)
     parser.add_argument("--decode-chunk-size", type=int, default=1)
     parser.add_argument(
-        "--target-quant-mode",
-        choices=SUPPORTED_TARGET_QUANT_MODES,
-        default=QUANT_MODE_DISABLED,
-        help="quantize only the rollback Target; keep the DFlash Draft FP16",
+        "--config",
+        help="original inference YAML used when --quant_mode enable",
     )
-    parser.add_argument("--target-quantizer")
-    parser.add_argument("--target-quant-weight-path")
-    parser.add_argument("--target-input-provider")
-    parser.add_argument("--target-embedding-weight-path")
-    parser.add_argument("--target-embedding-scale-path")
+    parser.add_argument(
+        "--quant_mode",
+        "--quant-mode",
+        dest="quant_mode",
+        choices=(ORIGINAL_QUANT_ENABLE, ORIGINAL_QUANT_DISABLE),
+        default=ORIGINAL_QUANT_DISABLE,
+        help="same Target quantization switch as inference.py",
+    )
     parser.add_argument("--report", required=True)
     parser.add_argument(
         "--mstx",

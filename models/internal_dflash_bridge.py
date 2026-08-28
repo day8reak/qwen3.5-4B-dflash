@@ -20,11 +20,12 @@ logical cursor.  Multi-row prompt chunks therefore retain the receiver's
 ordinary ``chunk_size=64`` GDR path without committing padding state.  Its
 causal-conv bank is currently a Tensor golden on the input device.
 
-Both routes can reuse the deployment-owned W8A8 Target conversion.  The
-quantizer replaces Target ``nn.Linear`` modules with the existing ``QLinear``
-primitive, while a required input-provider supplies the exact FP16 layer-0
-hidden used by the quantized Target.  Draft embedding and LM-head modules stay
-FP16 and are audited independently.
+Both routes can reuse the original ``inference.py --quant_mode enable`` W8A8
+Target conversion.  The packaged copy of ``utils.quant_model`` replaces
+Target ``nn.Linear`` modules with the existing ``QLinear`` primitive; the
+three artifact paths come from the same YAML.  Quantized embedding rows are
+dequantized at the bridge boundary for only the current token block.  Draft
+embedding and LM-head modules stay FP16 and are audited independently.
 
 The legacy chunk alignment is important for the target GDN kernel: its
 multi-token path uses ``chunk_size=64``.  It is also important that the device
@@ -43,21 +44,21 @@ from __future__ import annotations
 from collections.abc import Mapping
 import importlib
 import os
-from typing import Any
 
 import torch
 from torch import Tensor, nn
 
 from .dflash_v1.target_quant import (
+    ORIGINAL_QUANTIZER_SPEC,
     QUANT_MODE_DISABLED,
+    OriginalQuantizedEmbedding,
     TargetQuantizationRequest,
     audit_quantized_target,
-    invoke_input_provider,
     invoke_quantizer,
     load_callback,
+    load_original_quantized_embedding,
     normalize_quantizer_result,
     preconversion_linear_topology,
-    validate_input_provider_output,
 )
 
 
@@ -220,8 +221,7 @@ class InternalDFlashTarget(nn.Module):
         draft_input_embeddings: nn.Module | None = None,
         draft_output_embeddings: nn.Module | None = None,
         quantization_request: TargetQuantizationRequest | None = None,
-        target_input_provider: Any = None,
-        target_input_provider_identity: Mapping[str, object] | None = None,
+        quantized_embedding: OriginalQuantizedEmbedding | None = None,
         target_quantization_audit: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
@@ -240,18 +240,18 @@ class InternalDFlashTarget(nn.Module):
         self.quantization_request = (
             quantization_request or TargetQuantizationRequest.from_environment()
         )
-        if self.quantization_request.enabled and not callable(target_input_provider):
+        if self.quantization_request.enabled and not isinstance(
+            quantized_embedding,
+            OriginalQuantizedEmbedding,
+        ):
             raise TypeError(
-                "quantized target requires a callable target input provider"
+                "quantized target requires the original INT8 embedding artifacts"
             )
-        if not self.quantization_request.enabled and target_input_provider is not None:
+        if not self.quantization_request.enabled and quantized_embedding is not None:
             raise ValueError(
-                "disabled target quantization must not install an input provider"
+                "disabled target quantization must not install quantized embedding"
             )
-        self._target_input_provider = target_input_provider
-        self._target_input_provider_identity = dict(
-            target_input_provider_identity or {}
-        )
+        self._target_quantized_embedding = quantized_embedding
         self._target_quantization_static_audit = dict(
             target_quantization_audit
             or {
@@ -310,9 +310,9 @@ class InternalDFlashTarget(nn.Module):
         self._rollback_verify_calls = 0
         self._rollback_commit_calls = 0
         self._rollback_aborts = 0
-        self._target_input_provider_calls = 0
-        self._target_input_provider_successes = 0
-        self._target_input_provider_failures = 0
+        self._target_embedding_calls = 0
+        self._target_embedding_successes = 0
+        self._target_embedding_failures = 0
 
     def _execution_input_embeddings(self) -> nn.Module:
         getter = getattr(self.dflash_execution_model, "get_input_embeddings", None)
@@ -334,12 +334,11 @@ class InternalDFlashTarget(nn.Module):
     def dflash_target_quantization_audit(self) -> Mapping[str, object]:
         return {
             **self._target_quantization_static_audit,
-            "input_provider_identity": dict(self._target_input_provider_identity),
-            "input_provider_calls": self._target_input_provider_calls,
-            "input_provider_successes": self._target_input_provider_successes,
-            "input_provider_failures": self._target_input_provider_failures,
-            "input_provider_output_contract": (
-                "final_fp16_layer0_hidden"
+            "embedding_lookup_calls": self._target_embedding_calls,
+            "embedding_lookup_successes": self._target_embedding_successes,
+            "embedding_lookup_failures": self._target_embedding_failures,
+            "embedding_output_contract": (
+                "original_int8_mul_fp32_scale_then_fp16"
                 if self.quantization_request.enabled
                 else "ordinary_fp16_embedding"
             ),
@@ -437,19 +436,6 @@ class InternalDFlashTarget(nn.Module):
     def get_output_embeddings(self) -> nn.Module:
         return self._draft_output_embeddings
 
-    def _target_input_provider_wrapper(self) -> nn.Module:
-        resolver = getattr(
-            self.model_wrapper,
-            "dflash_target_input_provider_wrapper",
-            None,
-        )
-        owner = resolver() if callable(resolver) else self.model_wrapper
-        if not isinstance(owner, nn.Module):
-            raise TypeError(
-                "dflash_target_input_provider_wrapper() must return nn.Module"
-            )
-        return owner
-
     def _target_inputs(self, input_ids: Tensor) -> Tensor:
         if not self.quantization_request.enabled:
             embeddings = self.get_input_embeddings()
@@ -466,37 +452,34 @@ class InternalDFlashTarget(nn.Module):
                 )
             return inputs_embeds
 
-        provider = self._target_input_provider
-        assert callable(provider)
-        embedding_weight_path = self.quantization_request.embedding_weight_path
-        embedding_scale_path = self.quantization_request.embedding_scale_path
-        assert embedding_weight_path is not None
-        assert embedding_scale_path is not None
-        self._target_input_provider_calls += 1
+        embedding = self._target_quantized_embedding
+        assert isinstance(embedding, OriginalQuantizedEmbedding)
+        self._target_embedding_calls += 1
         try:
-            value = invoke_input_provider(
-                provider,
-                self._target_input_provider_wrapper(),
-                input_ids,
-                embedding_weight_path,
-                embedding_scale_path,
-                device=self.requested_device,
-                output_dtype=self.requested_dtype,
-            )
-            inputs_embeds = validate_input_provider_output(
-                value,
-                sequence_length=int(input_ids.shape[1]),
-                hidden_size=_positive_int(
+            inputs_embeds = embedding(input_ids)
+            expected = (
+                1,
+                int(input_ids.shape[1]),
+                _positive_int(
                     getattr(self.config, "hidden_size", None),
                     name="config.hidden_size",
                 ),
-                device=self.requested_device,
-                dtype=self.requested_dtype,
             )
+            if tuple(inputs_embeds.shape) != expected:
+                raise ValueError(
+                    f"quantized embedding output must have shape {expected}"
+                )
+            if (
+                inputs_embeds.device != self.requested_device
+                or inputs_embeds.dtype != self.requested_dtype
+            ):
+                raise ValueError(
+                    "quantized embedding output has the wrong device or dtype"
+                )
         except Exception:
-            self._target_input_provider_failures += 1
+            self._target_embedding_failures += 1
             raise
-        self._target_input_provider_successes += 1
+        self._target_embedding_successes += 1
         return inputs_embeds
 
     def _rebuild_full_attention_block_tables(self) -> int:
@@ -1250,25 +1233,19 @@ def _load_qwen35_target_impl(
             "for the DFlash Draft"
         )
 
-    input_provider = None
-    input_provider_identity: Mapping[str, object] | None = None
+    quantized_embedding: OriginalQuantizedEmbedding | None = None
     quantization_audit: Mapping[str, object] = {
         "status": "DISABLED",
         "scheme": QUANT_MODE_DISABLED,
     }
     if quantization_request.enabled:
-        assert quantization_request.quantizer_spec is not None
-        assert quantization_request.input_provider_spec is not None
+        assert quantization_request.config_path is not None
         assert quantization_request.quant_weight_path is not None
         assert quantization_request.embedding_weight_path is not None
         assert quantization_request.embedding_scale_path is not None
         quantizer, quantizer_identity = load_callback(
-            quantization_request.quantizer_spec,
-            label="target quantizer",
-        )
-        input_provider, input_provider_identity = load_callback(
-            quantization_request.input_provider_spec,
-            label="target input provider",
+            ORIGINAL_QUANTIZER_SPEC,
+            label="original utils.quant_model",
         )
         original_linear_topology = preconversion_linear_topology(execution_model)
         raw_result = invoke_quantizer(
@@ -1322,10 +1299,27 @@ def _load_qwen35_target_impl(
                 name="config.hidden_size",
             ),
         )
+        quantized_embedding = load_original_quantized_embedding(
+            quantization_request.embedding_weight_path,
+            quantization_request.embedding_scale_path,
+            vocab_size=_positive_int(
+                getattr(wrapper.model.config, "vocab_size", None),
+                name="config.vocab_size",
+            ),
+            hidden_size=_positive_int(
+                getattr(wrapper.model.config, "hidden_size", None),
+                name="config.hidden_size",
+            ),
+            device=torch.device(device),
+            output_dtype=dtype,
+        )
         quantization_audit = {
             **assembly,
+            **dict(quantized_embedding.audit),
             "route": "rollback" if rollback_enabled else "full_prefix",
+            "config_path": str(quantization_request.config_path),
             "quantizer_identity": quantizer_identity,
+            "quantizer_contract": "utils.quant_model(model, quanted_pth)",
             "quant_weight_path": str(quantization_request.quant_weight_path),
             "quant_weight_path_kind": (
                 "directory"
@@ -1335,19 +1329,11 @@ def _load_qwen35_target_impl(
             "embedding_weight_path": str(
                 quantization_request.embedding_weight_path
             ),
-            "embedding_weight_path_kind": (
-                "directory"
-                if quantization_request.embedding_weight_path.is_dir()
-                else "file"
-            ),
+            "embedding_weight_path_kind": "file",
             "embedding_scale_path": str(
                 quantization_request.embedding_scale_path
             ),
-            "embedding_scale_path_kind": (
-                "directory"
-                if quantization_request.embedding_scale_path.is_dir()
-                else "file"
-            ),
+            "embedding_scale_path_kind": "file",
             "numerical_validation": "PENDING_REAL_NPU_ROLLBACK_PARITY",
         }
     else:
@@ -1369,8 +1355,7 @@ def _load_qwen35_target_impl(
         draft_input_embeddings=draft_input_embeddings,
         draft_output_embeddings=draft_output_embeddings,
         quantization_request=quantization_request,
-        target_input_provider=input_provider,
-        target_input_provider_identity=input_provider_identity,
+        quantized_embedding=quantized_embedding,
         target_quantization_audit=quantization_audit,
     )
     return target.eval()

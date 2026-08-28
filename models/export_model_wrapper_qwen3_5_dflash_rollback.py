@@ -87,11 +87,6 @@ class Qwen3_5ForCausalLMWrapper(nn.Module):
         if getattr(self.delegate, "model", None) is not model:
             raise RuntimeError("deployed wrapper rejected the quantized Target")
 
-    def dflash_target_input_provider_wrapper(self) -> nn.Module:
-        """Expose the deployed wrapper expected by existing input providers."""
-
-        return self.delegate
-
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.delegate(*args, **kwargs)
 

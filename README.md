@@ -17,7 +17,7 @@ embedding、LM head 和 6 层主体仍保持 FP16。
 | 接受规则 | 只接受从 d1 开始的最长连续匹配前缀 |
 | CPU/CUDA 状态 | 持久 DynamicCache；verify 后恢复 KV/GDN，再只重放 anchor 和已接受 proposal |
 | HIAI/NPU 状态 | GDR MTP recurrent bank、输入 NPU 上的 Torch conv golden、paged-KV logical cursor |
-| Target 精度 | 默认 FP16；显式 `--target-quant-mode w8a8_dynamic` 后复用已有 `QLinear` 与量化 input-provider |
+| Target 精度 | 默认 FP16；`--config ... --quant_mode enable` 后复用原 `utils.py` 的 QLinear 转换与 embedding artifact |
 | 正确性 | `validate` 与独立 ordinary incremental greedy 做零差异门禁；`dflash` 只跑生产路径 |
 
 ~~~mermaid
@@ -107,20 +107,19 @@ python -B -m models.dflash_v1.run_npu \
 NPU 部署必须已经注册用户完成的 npu_gated_delta_rule_mtp。kv-cache-max-len 要与部署配置一致、
 为正且能被 64 整除。
 
-量化 Target 在同一命令追加以下参数；六项必须一起提供，不能部分启用：
+量化 Target 与原 `inference.py` 使用同一组参数：
 
 ~~~bash
-  --target-quant-mode w8a8_dynamic \
-  --target-quantizer your_quant_bridge:quantize_target \
-  --target-quant-weight-path /path/to/linear-quant-artifact \
-  --target-input-provider your_quant_bridge:build_target_inputs \
-  --target-embedding-weight-path /path/to/embedding-weight \
-  --target-embedding-scale-path /path/to/embedding-scale
+  --config ./config/qwen3.5.yaml \
+  --quant_mode enable
 ~~~
 
-rollback modeling 直接复用原 `modeling_qwen3_5_hiai_nd.py` 的 `QLinear`；原 GDR 和用户完成的
-GDR-MTP 调用不做替换。input-provider 分别接收真实的 1..64 行 prompt chunk、单行 decode 和
-最多 16 行 verify block，不会重新计算完整历史前缀。
+YAML 仍使用原来的三个字段：`quanted_pth` 指向包含 `data*.safetensors` 的 Linear 量化目录，
+`embedding_weight_path` 指向原 inference 导出的 INT8 raw 文件，`embedding_scale_path` 指向
+FP32 raw scale 文件。分支内置了用户给出的 `utils.quant_model` 等价实现，不再要求填写
+`MODULE:FUNCTION`。rollback modeling 直接复用原 `modeling_qwen3_5_hiai_nd.py` 的 `QLinear`；
+原 GDR 和用户完成的 GDR-MTP 调用不做替换。bridge 只索引当前真实的 1..64 行 prompt chunk、
+单行 decode 或最多 16 行 verify block，不会重新计算完整历史前缀。
 
 离线门禁通过后可把 `--execution-mode validate` 改为 `dflash`，从而不再额外运行 ordinary；该
 单跑报告不会把未执行的 ordinary 对照标成 exact-match PASS。
@@ -150,7 +149,7 @@ target_quantization.scheme = disabled 或 w8a8_dynamic
 target_quantization.status = PASS_ASSEMBLY_CONTRACT_NO_NUMERICAL_CLAIM
 target_quantization.route = rollback
 target_quantization.linear_topology_validation = PASS_EXACT_PATH_SHAPE_BIAS
-target_quantization.input_provider_failures = 0
+target_quantization.embedding_lookup_failures = 0
 ~~~
 
 只有在 Ascend 310P 上禁用 fallback，并记录 runtime、device、算子包身份、kernel trace 和多轮

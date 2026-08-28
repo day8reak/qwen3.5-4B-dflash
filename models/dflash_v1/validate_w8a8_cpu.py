@@ -229,7 +229,7 @@ def validate_cpu_w8a8_formula(*, seed: int = _DEFAULT_SEED) -> dict[str, object]
         "cases": cases,
         "not_proven": [
             "deployment_quant_artifact_layout_or_coverage",
-            "quantized_embedding_or_input_provider_semantics",
+            "quantized_embedding_artifact_semantics",
             "real_npu_dynamic_quant_rounding_or_quant_matmul_parity",
             "whole_target_token_or_feature_parity",
             "dflash_acceptance_rate_or_performance",

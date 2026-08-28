@@ -1,10 +1,11 @@
-"""Contracts for reusing an existing quantized NPU target in DFlash V1.
+"""Original ``inference.py --quant_mode enable`` contracts for DFlash.
 
-This module does not quantize weights and does not implement a replacement
-kernel.  The deployment-owned quantizer remains responsible for interpreting
-its artifact and for constructing the existing ``QLinear`` modules.  DFlash
-uses the helpers below to load that callback, validate its result, and require
-the exact FP16 layer-0 input consumed by the quantized target.
+The deployment route is fixed rather than user-pluggable: the original
+``utils.quant_model(model, quanted_pth)`` converts Target linears, while the
+same YAML supplies raw INT8 embedding weights and FP32 row scales.  DFlash
+loads those artifacts, applies the original ``INT8 * FP32 -> FP16`` embedding
+boundary to each current token block, and audits the resulting ``QLinear``
+topology.  No quantizer or input-provider callback is exposed on the CLI.
 """
 
 from __future__ import annotations
@@ -17,16 +18,17 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 
 
 TARGET_QUANT_MODE_ENV = "DFLASH_TARGET_QUANT_MODE"
-TARGET_QUANTIZER_ENV = "DFLASH_TARGET_QUANTIZER"
+TARGET_QUANT_CONFIG_ENV = "DFLASH_TARGET_QUANT_CONFIG"
 TARGET_QUANT_WEIGHT_PATH_ENV = "DFLASH_TARGET_QUANT_WEIGHT_PATH"
 TARGET_EMBEDDING_WEIGHT_PATH_ENV = "DFLASH_TARGET_EMBEDDING_WEIGHT_PATH"
 TARGET_EMBEDDING_SCALE_PATH_ENV = "DFLASH_TARGET_EMBEDDING_SCALE_PATH"
-TARGET_INPUT_PROVIDER_ENV = "DFLASH_TARGET_INPUT_PROVIDER"
+ORIGINAL_QUANTIZER_SPEC = "models.dflash_v1.original_quant:quant_model"
 
 QUANT_MODE_DISABLED = "disabled"
 QUANT_MODE_W8A8_DYNAMIC = "w8a8_dynamic"
@@ -41,9 +43,8 @@ class TargetQuantizationRequest:
     """Normalized process-local request consumed by the target factory."""
 
     mode: str
-    quantizer_spec: str | None
+    config_path: Path | None
     quant_weight_path: Path | None
-    input_provider_spec: str | None
     embedding_weight_path: Path | None
     embedding_scale_path: Path | None
 
@@ -59,12 +60,9 @@ class TargetQuantizationRequest:
                 f"{TARGET_QUANT_MODE_ENV} must be one of "
                 f"{SUPPORTED_TARGET_QUANT_MODES}; got {mode!r}"
             )
-        quantizer_spec = _optional_text(os.environ.get(TARGET_QUANTIZER_ENV))
+        config_text = _optional_text(os.environ.get(TARGET_QUANT_CONFIG_ENV))
         quant_weight_text = _optional_text(
             os.environ.get(TARGET_QUANT_WEIGHT_PATH_ENV)
-        )
-        input_provider_spec = _optional_text(
-            os.environ.get(TARGET_INPUT_PROVIDER_ENV)
         )
         embedding_weight_text = _optional_text(
             os.environ.get(TARGET_EMBEDDING_WEIGHT_PATH_ENV)
@@ -76,9 +74,8 @@ class TargetQuantizationRequest:
             stale = [
                 name
                 for name, value in (
-                    (TARGET_QUANTIZER_ENV, quantizer_spec),
+                    (TARGET_QUANT_CONFIG_ENV, config_text),
                     (TARGET_QUANT_WEIGHT_PATH_ENV, quant_weight_text),
-                    (TARGET_INPUT_PROVIDER_ENV, input_provider_spec),
                     (TARGET_EMBEDDING_WEIGHT_PATH_ENV, embedding_weight_text),
                     (TARGET_EMBEDDING_SCALE_PATH_ENV, embedding_scale_text),
                 )
@@ -89,14 +86,13 @@ class TargetQuantizationRequest:
                     "target quantization is disabled but quantization settings "
                     "remain configured: " + ", ".join(stale)
                 )
-            return cls(mode, None, None, None, None, None)
+            return cls(mode, None, None, None, None)
 
         missing = [
             name
             for name, value in (
-                (TARGET_QUANTIZER_ENV, quantizer_spec),
+                (TARGET_QUANT_CONFIG_ENV, config_text),
                 (TARGET_QUANT_WEIGHT_PATH_ENV, quant_weight_text),
-                (TARGET_INPUT_PROVIDER_ENV, input_provider_spec),
                 (TARGET_EMBEDDING_WEIGHT_PATH_ENV, embedding_weight_text),
                 (TARGET_EMBEDDING_SCALE_PATH_ENV, embedding_scale_text),
             )
@@ -106,26 +102,39 @@ class TargetQuantizationRequest:
             raise ValueError(
                 f"{mode} requires " + ", ".join(missing)
             )
+        assert config_text is not None
         assert quant_weight_text is not None
         assert embedding_weight_text is not None
         assert embedding_scale_text is not None
         return cls(
             mode=mode,
-            quantizer_spec=quantizer_spec,
-            quant_weight_path=_validated_data_path(
+            config_path=_validated_regular_file(
+                config_text,
+                label="original inference YAML",
+            ),
+            quant_weight_path=_validated_directory(
                 quant_weight_text,
                 label="target quantization weight path",
             ),
-            input_provider_spec=input_provider_spec,
-            embedding_weight_path=_validated_data_path(
+            embedding_weight_path=_validated_regular_file(
                 embedding_weight_text,
                 label="target embedding weight path",
             ),
-            embedding_scale_path=_validated_data_path(
+            embedding_scale_path=_validated_regular_file(
                 embedding_scale_text,
                 label="target embedding scale path",
             ),
         )
+
+
+@dataclass(frozen=True)
+class OriginalQuantConfig:
+    """Three artifact paths read from the original inference YAML."""
+
+    config_path: Path
+    quant_weight_path: Path
+    embedding_weight_path: Path
+    embedding_scale_path: Path
 
 
 @dataclass(frozen=True)
@@ -186,6 +195,99 @@ def _validated_data_path(value: str, *, label: str) -> Path:
     return path.resolve()
 
 
+def _validated_regular_file(value: str, *, label: str) -> Path:
+    path = _validated_data_path(value, label=label)
+    if not path.is_file():
+        raise ValueError(f"{label} must be a regular file")
+    return path
+
+
+def _validated_directory(value: str, *, label: str) -> Path:
+    path = _validated_data_path(value, label=label)
+    if not path.is_dir():
+        raise ValueError(f"{label} must be a directory")
+    return path
+
+
+def _resolve_yaml_data_path(
+    value: object,
+    *,
+    config_path: Path,
+    label: str,
+    regular_file: bool,
+) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise TypeError(f"{label} in {config_path} must be a non-empty path")
+    raw = Path(value.strip()).expanduser()
+    candidates = (
+        [raw]
+        if raw.is_absolute()
+        else [Path.cwd() / raw, config_path.parent / raw]
+    )
+    unique: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    for candidate in unique:
+        if candidate.exists():
+            validator = (
+                _validated_regular_file
+                if regular_file
+                else _validated_data_path
+            )
+            return validator(str(candidate), label=label)
+    searched = ", ".join(str(candidate) for candidate in unique)
+    raise FileNotFoundError(f"{label} does not exist; searched: {searched}")
+
+
+def load_original_quant_config(value: str | Path) -> OriginalQuantConfig:
+    """Load the exact three quant fields consumed by the original inference."""
+
+    config_path = _validated_regular_file(
+        str(value),
+        label="original inference YAML",
+    )
+    try:
+        import yaml
+    except ImportError as error:
+        raise RuntimeError("PyYAML is required to read --config") from error
+    with config_path.open("r", encoding="utf-8") as stream:
+        payload = yaml.safe_load(stream)
+    if not isinstance(payload, Mapping):
+        raise TypeError("original inference YAML must contain a mapping")
+    required = ("quanted_pth", "embedding_weight_path", "embedding_scale_path")
+    missing = [name for name in required if name not in payload]
+    if missing:
+        raise ValueError(
+            "original inference YAML is missing " + ", ".join(missing)
+        )
+    quant_weight_path = _resolve_yaml_data_path(
+        payload["quanted_pth"],
+        config_path=config_path,
+        label="config.quanted_pth",
+        regular_file=False,
+    )
+    if not quant_weight_path.is_dir():
+        raise ValueError("config.quanted_pth must be a directory")
+    return OriginalQuantConfig(
+        config_path=config_path,
+        quant_weight_path=quant_weight_path,
+        embedding_weight_path=_resolve_yaml_data_path(
+            payload["embedding_weight_path"],
+            config_path=config_path,
+            label="config.embedding_weight_path",
+            regular_file=True,
+        ),
+        embedding_scale_path=_resolve_yaml_data_path(
+            payload["embedding_scale_path"],
+            config_path=config_path,
+            label="config.embedding_scale_path",
+            regular_file=True,
+        ),
+    )
+
+
 def load_callback(
     specification: str,
     *,
@@ -234,7 +336,7 @@ def _select_callback_abi(
 
 
 def quantizer_callback_abi(function: Callable[..., Any]) -> str:
-    """Validate and identify the existing target-quantizer callback ABI."""
+    """Validate the fixed original ``quant_model`` callable ABI."""
 
     return _select_callback_abi(
         function,
@@ -247,26 +349,6 @@ def quantizer_callback_abi(function: Callable[..., Any]) -> str:
         expected=(
             "(model, quant_weight_path) or (model, quant_weight_path, *, "
             "device, output_dtype)"
-        ),
-    )
-
-
-def input_provider_callback_abi(function: Callable[..., Any]) -> str:
-    """Validate and identify the quantized-target input-provider ABI."""
-
-    return _select_callback_abi(
-        function,
-        positional=(object(), object()),
-        extended_keywords={
-            "embedding_weight_path": "embedding-weight-path",
-            "embedding_scale_path": "embedding-scale-path",
-            "device": torch.device("cpu"),
-            "output_dtype": torch.float16,
-        },
-        label="target input provider",
-        expected=(
-            "(model_wrapper, input_ids) or the same arguments plus "
-            "embedding_weight_path/embedding_scale_path/device/output_dtype"
         ),
     )
 
@@ -322,30 +404,6 @@ def invoke_quantizer(
         return function(*positional)
     return function(
         *positional,
-        device=device,
-        output_dtype=output_dtype,
-    )
-
-
-def invoke_input_provider(
-    function: Callable[..., Any],
-    model_wrapper: nn.Module,
-    input_ids: Tensor,
-    embedding_weight_path: Path,
-    embedding_scale_path: Path,
-    *,
-    device: torch.device,
-    output_dtype: torch.dtype,
-) -> object:
-    """Call a simple existing provider or the extended DFlash provider ABI."""
-
-    positional = (model_wrapper, input_ids)
-    if input_provider_callback_abi(function) == "simple":
-        return function(*positional)
-    return function(
-        *positional,
-        embedding_weight_path=str(embedding_weight_path),
-        embedding_scale_path=str(embedding_scale_path),
         device=device,
         output_dtype=output_dtype,
     )
@@ -581,66 +639,121 @@ def audit_quantized_target(
     }
 
 
-def validate_input_provider_output(
-    value: object,
+class OriginalQuantizedEmbedding(nn.Module):
+    """Raw embedding artifacts used by the original ``quant_mode=enable``."""
+
+    def __init__(
+        self,
+        quant_weight: Tensor,
+        quant_scale: Tensor,
+        *,
+        output_dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        if quant_weight.ndim != 2 or quant_weight.dtype is not torch.int8:
+            raise TypeError("quantized embedding weight must be INT8 [V,H]")
+        if quant_scale.ndim != 2 or quant_scale.dtype is not torch.float32:
+            raise TypeError("quantized embedding scale must be FP32 [V,S]")
+        if quant_scale.shape[0] != quant_weight.shape[0]:
+            raise ValueError("embedding weight and scale vocabulary sizes differ")
+        if quant_scale.shape[1] not in {1, quant_weight.shape[1]}:
+            raise ValueError("embedding scale width must be 1 or hidden_size")
+        if output_dtype is not torch.float16:
+            raise TypeError("original HIAI quant embedding output must be FP16")
+        if not bool(torch.isfinite(quant_scale).all()):
+            raise FloatingPointError("quantized embedding scale is non-finite")
+        self.register_buffer("quant_weight", quant_weight.contiguous())
+        self.register_buffer("quant_scale", quant_scale.contiguous())
+        self.output_dtype = output_dtype
+
+    @property
+    def audit(self) -> Mapping[str, object]:
+        return {
+            "embedding_input_backend": "builtin_original_inference",
+            "embedding_weight_shape": list(self.quant_weight.shape),
+            "embedding_weight_dtype": str(self.quant_weight.dtype),
+            "embedding_scale_shape": list(self.quant_scale.shape),
+            "embedding_scale_dtype": str(self.quant_scale.dtype),
+            "embedding_dequantization": "int8_mul_fp32_scale_then_fp16",
+        }
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("quantized embedding input_ids must have shape [1,T]")
+        if input_ids.dtype != torch.long:
+            raise TypeError("quantized embedding input_ids must use torch.long")
+        if input_ids.device != self.quant_weight.device:
+            raise ValueError("input_ids and quantized embedding must share a device")
+        quant_rows = self.quant_weight[input_ids]
+        scale_rows = self.quant_scale[input_ids]
+        hidden = quant_rows.to(torch.float32) * scale_rows
+        return hidden.to(self.output_dtype)
+
+
+def load_original_quantized_embedding(
+    weight_path: Path,
+    scale_path: Path,
     *,
-    sequence_length: int,
+    vocab_size: int,
     hidden_size: int,
     device: torch.device,
-    dtype: torch.dtype,
-) -> Tensor:
-    """Require the final FP16 layer-0 hidden, never an ambiguous scale tuple."""
+    output_dtype: torch.dtype,
+) -> OriginalQuantizedEmbedding:
+    """Load the raw ``np.tofile`` artifacts produced by ``inference.py``."""
 
-    if isinstance(value, Mapping):
-        unknown = set(value) - {"inputs_embeds"}
-        if unknown:
-            raise ValueError(
-                "target input provider returned unsupported fields: "
-                + ", ".join(sorted(str(item) for item in unknown))
-            )
-        value = value.get("inputs_embeds")
-    if not isinstance(value, Tensor):
-        raise TypeError(
-            "target input provider must return a Tensor or "
-            "{'inputs_embeds': Tensor}"
-        )
-    expected = (1, int(sequence_length), int(hidden_size))
-    if tuple(value.shape) != expected:
+    weight_path = _validated_regular_file(
+        str(weight_path),
+        label="config.embedding_weight_path",
+    )
+    scale_path = _validated_regular_file(
+        str(scale_path),
+        label="config.embedding_scale_path",
+    )
+    expected_weight_values = int(vocab_size) * int(hidden_size)
+    if weight_path.stat().st_size != expected_weight_values:
         raise ValueError(
-            f"target input provider output must have shape {expected}; "
-            f"got {tuple(value.shape)}"
+            "INT8 embedding file size does not match "
+            f"[{vocab_size},{hidden_size}]"
         )
-    if value.device != device or value.dtype != dtype:
-        raise ValueError(
-            "target input provider must return the final layer-0 hidden on "
-            f"{device} with dtype {dtype}; got {value.device}/{value.dtype}"
-        )
-    if not bool(torch.isfinite(value).all()):
-        raise FloatingPointError("target input provider returned non-finite values")
-    return value
+    if scale_path.stat().st_size % (int(vocab_size) * 4):
+        raise ValueError("FP32 embedding scale file cannot reshape to [vocab,-1]")
+    scale_width = scale_path.stat().st_size // (int(vocab_size) * 4)
+    if scale_width not in {1, int(hidden_size)}:
+        raise ValueError("embedding scale width must be 1 or hidden_size")
+    weight_array = np.fromfile(weight_path, dtype=np.int8)
+    scale_array = np.fromfile(scale_path, dtype=np.float32)
+    weight = torch.from_numpy(weight_array).reshape(vocab_size, hidden_size)
+    scale = torch.from_numpy(scale_array).reshape(vocab_size, scale_width)
+    module = OriginalQuantizedEmbedding(
+        weight,
+        scale,
+        output_dtype=output_dtype,
+    )
+    return module.to(device).eval()
 
 
 __all__ = [
     "QUANT_MODE_DISABLED",
     "QUANT_MODE_W8A8_DYNAMIC",
+    "ORIGINAL_QUANTIZER_SPEC",
     "SUPPORTED_TARGET_QUANT_MODES",
     "TARGET_EMBEDDING_SCALE_PATH_ENV",
     "TARGET_EMBEDDING_WEIGHT_PATH_ENV",
-    "TARGET_INPUT_PROVIDER_ENV",
+    "TARGET_QUANT_CONFIG_ENV",
     "TARGET_QUANT_MODE_ENV",
     "TARGET_QUANT_WEIGHT_PATH_ENV",
-    "TARGET_QUANTIZER_ENV",
+    "OriginalQuantConfig",
+    "OriginalQuantizedEmbedding",
     "TargetQuantizationRequest",
     "TargetQuantizationResult",
     "LinearTopologyEntry",
     "audit_quantized_target",
-    "input_provider_callback_abi",
-    "invoke_input_provider",
     "invoke_quantizer",
     "load_callback",
+    "load_original_quant_config",
+    "load_original_quantized_embedding",
     "normalize_quantizer_result",
     "preconversion_linear_paths",
     "preconversion_linear_topology",
     "quantizer_callback_abi",
-    "validate_input_provider_output",
 ]

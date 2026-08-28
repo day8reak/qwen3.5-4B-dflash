@@ -215,8 +215,8 @@ S=1 fallback；若持续低但非零接受，应使用相同 prompt 对比 B=2/4
 
 ### 6.2 W8A8 rollback Target
 
-量化 artifact 和 callback 均由部署工程提供。本仓库不重新量化权重，也不复制量化文件。先运行
-不加载 Draft 的 Target-only 预检：
+量化 artifact 仍由部署工程提供，本仓库不重新量化权重，也不复制量化文件。接口与原
+`inference.py` 一致，只读取同一 YAML。先运行不加载 Draft 的 Target-only 预检：
 
 ~~~bash
 "$MODEL_PYTHON" -B -m models.dflash_v1.preflight_target_quant \
@@ -224,35 +224,50 @@ S=1 fallback；若持续低但非零接受，应使用相同 prompt 对比 B=2/4
   --prompt-ids 1,2,3,4 \
   --device npu:0 \
   --kv-cache-max-len 2048 \
-  --target-quantizer your_quant_bridge:quantize_target \
-  --target-quant-weight-path /path/to/linear-quant-artifact \
-  --target-input-provider your_quant_bridge:build_target_inputs \
-  --target-embedding-weight-path /path/to/embedding-weight \
-  --target-embedding-scale-path /path/to/embedding-scale \
+  --config ./config/qwen3.5.yaml \
   --compare-first-qlinear \
   --report "$RUN_DIR/target-quant-rollback-preflight.json"
 ~~~
 
 预检同时覆盖：完整 Linear→QLinear 装配、同 activation 的 QLinear/CPU 公式诊断、full-prefix
 隔离探针、真实多 token prefill、ordinary S=1、rollback GDR-MTP S=1、commit，以及这些调用的
-input-provider 计数。它不加载 Draft，所以仍不能替代整网 strict-greedy 门禁。
+quantized-embedding lookup 计数。它不加载 Draft，所以仍不能替代整网 strict-greedy 门禁。
 
 预检通过后，在第 6 节 `run_npu` 命令追加同一组参数：
 
 ~~~bash
-  --target-quant-mode w8a8_dynamic \
-  --target-quantizer your_quant_bridge:quantize_target \
-  --target-quant-weight-path /path/to/linear-quant-artifact \
-  --target-input-provider your_quant_bridge:build_target_inputs \
-  --target-embedding-weight-path /path/to/embedding-weight \
-  --target-embedding-scale-path /path/to/embedding-scale
+  --config ./config/qwen3.5.yaml \
+  --quant_mode enable
 ~~~
 
-六项必须一起出现。启用量化后，rollback wrapper 只替换 Target execution model；Draft-facing
-embedding/LM head 必须仍是 NPU 上的 FP16 `[248320,2560]` module。input-provider 对每个真实
-prompt chunk、decode token 和 verify block 各调用一次。任何 callback、artifact、QLinear
-coverage、shape、device 或 provider 输出错误都会在模型执行前 fail closed。
-provider 收到的第一个参数仍是原部署 wrapper，而不是 rollback 的外层组合适配器。
+YAML 必须包含原来的 `quanted_pth`、`embedding_weight_path`、`embedding_scale_path`。内置
+converter 按用户 `utils.py` 的 key 映射、权重转置、blocked-ZN 和 `QLinear(idx=15...)` 规则工作，
+不再填写回调。启用量化后，rollback wrapper 只替换 Target execution model；Draft-facing
+embedding/LM head 必须仍是 NPU 上的 FP16 `[248320,2560]` module。bridge 对每个真实 prompt
+chunk、decode token 和 verify block 各索引一次 INT8 weight/FP32 scale。artifact、QLinear
+coverage、shape、device 或 embedding 输出错误都会在模型执行前 fail closed。
+
+例如部署目录为：
+
+~~~text
+/data/qwen35-w8a8/
+├── linear/
+│   ├── data-00000-of-00002.safetensors
+│   └── data-00001-of-00002.safetensors
+├── embedding_weight.bin
+└── embedding_scale.bin
+~~~
+
+则 `./config/qwen3.5.yaml` 中写：
+
+~~~yaml
+quanted_pth: /data/qwen35-w8a8/linear
+embedding_weight_path: /data/qwen35-w8a8/embedding_weight.bin
+embedding_scale_path: /data/qwen35-w8a8/embedding_scale.bin
+~~~
+
+`quanted_pth` 是目录，不是某一个 safetensors 文件；两个 embedding 字段是原 `numpy.tofile`
+生成的 raw 文件。路径可写绝对路径，也可写相对当前运行目录或 YAML 所在目录的路径。
 
 ## 7. NPU 性能基准与 msprof
 
@@ -303,16 +318,12 @@ for MODE in ordinary dflash; do
 done
 ~~~
 
-测量 W8A8 rollback 时，`ordinary` 和 `dflash` 两个独立进程必须追加完全相同的六个量化参数：
+测量 W8A8 rollback 时，`ordinary` 和 `dflash` 两个独立进程必须使用完全相同的 YAML：
 
 ~~~bash
 QUANT_ARGS=(
-  --target-quant-mode w8a8_dynamic
-  --target-quantizer your_quant_bridge:quantize_target
-  --target-quant-weight-path /path/to/linear-quant-artifact
-  --target-input-provider your_quant_bridge:build_target_inputs
-  --target-embedding-weight-path /path/to/embedding-weight
-  --target-embedding-scale-path /path/to/embedding-scale
+  --config ./config/qwen3.5.yaml
+  --quant_mode enable
 )
 
 for MODE in ordinary dflash; do
@@ -357,7 +368,7 @@ assert quant["status"] == "PASS_ASSEMBLY_CONTRACT_NO_NUMERICAL_CLAIM"
 assert quant["scheme"] == "w8a8_dynamic"
 assert quant["route"] == "rollback"
 assert quant["qlinear_count"] > 0
-assert quant["input_provider_failures"] == 0
+assert quant["embedding_lookup_failures"] == 0
 ~~~
 
 比较 `benchmark.summary.latency_ms`、`aggregate_output_tokens_per_second` 和
@@ -575,8 +586,8 @@ assert quant["route"] == "rollback"
 assert quant["qlinear_count"] > 0
 assert quant["linear_topology_validation"] == "PASS_EXACT_PATH_SHAPE_BIAS"
 assert quant["quantized_weight_layout"] == "K_by_N"
-assert quant["input_provider_calls"] == quant["input_provider_successes"]
-assert quant["input_provider_failures"] == 0
+assert quant["embedding_lookup_calls"] == quant["embedding_lookup_successes"]
+assert quant["embedding_lookup_failures"] == 0
 assert audit["target_quantization"] == quant
 ~~~
 
@@ -638,7 +649,7 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
 | test_benchmark_npu.py | 同步区间、3+10 合同、稳定输出、cursor reset 与真实 counter 单调性 |
 | test_msprof_script.py | shell 语法、simulation/CPU/fallback fail-closed |
 | test_source_lock_benchmark.py | core runtime、Target quant、benchmark 与 rollback 文件 hash 身份 |
-| test_rollback_target_quant.py | rollback model 量化替换、原部署 wrapper provider ABI、FP16 Draft 共享权重、双 HIAI source 与 CLI/benchmark 量化合同 |
+| test_rollback_target_quant.py | 原 utils key/blocked-ZN 规则、YAML artifact、内置 embedding、FP16 Draft 共享权重、双 HIAI source 与 CLI/benchmark 量化合同 |
 
 这些测试是 CPU/reduced-shape 证据。
 
@@ -706,7 +717,7 @@ dtype、K、checkpoint 和生成阶段，并使用多条代表性 workload。
 - 多 prompt、多轮和 block boundary 重复稳定。
 
 若发布 W8A8 Target，还需量化 preflight 的 rollback transaction PASS、完整 QLinear 拓扑/shape/
-scale/device 门禁、同 activation 数值对照、所有 provider 调用成功，并用相同量化 Target 完成上述
+scale/device 门禁、同 activation 数值对照、所有 embedding lookup 成功，并用相同量化 Target 完成上述
 整网 token/state 门禁。FP16 rollback 通过不能代替量化 rollback 通过。
 
 端到端提速是独立门禁：使用相同设备、prompt、输出长度和 warmup，分别报告 prefill、Draft、

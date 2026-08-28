@@ -22,6 +22,7 @@ from models.internal_dflash_bridge import (  # noqa: E402
 )
 from models.dflash_v1.target_quant import (  # noqa: E402
     QUANT_MODE_W8A8_DYNAMIC,
+    OriginalQuantizedEmbedding,
     TargetQuantizationRequest,
 )
 
@@ -302,35 +303,19 @@ def test_bridge_rollback_contract() -> None:
     main()
 
 
-def test_quant_input_provider_covers_chunk_prefill_and_verify() -> None:
-    provider_rows: list[int] = []
-
-    def provider(
-        model_wrapper,
-        input_ids,
-        *,
-        embedding_weight_path,
-        embedding_scale_path,
-        device,
-        output_dtype,
-    ):
-        del model_wrapper, embedding_weight_path, embedding_scale_path
-        provider_rows.append(int(input_ids.shape[1]))
-        return torch.full(
-            (1, int(input_ids.shape[1]), 2),
-            3.0,
-            device=device,
-            dtype=output_dtype,
-        )
-
+def test_quant_embedding_covers_chunk_prefill_and_verify() -> None:
     request = TargetQuantizationRequest(
         mode=QUANT_MODE_W8A8_DYNAMIC,
-        quantizer_spec="test:quantizer",
+        config_path=Path("qwen3.5.yaml"),
         quant_weight_path=Path("quant.safetensors"),
-        input_provider_spec="test:provider",
         embedding_weight_path=Path("embedding.safetensors"),
         embedding_scale_path=Path("embedding-scale.safetensors"),
     )
+    quantized_embedding = OriginalQuantizedEmbedding(
+        torch.full((VOCAB_SIZE, 2), 6, dtype=torch.int8),
+        torch.full((VOCAB_SIZE, 1), 0.5, dtype=torch.float32),
+        output_dtype=torch.float16,
+    ).eval()
     model = QuantInputFakeHIAIModel().eval()
     bridge = InternalDFlashTarget(
         FakeWrapper(model).eval(),
@@ -339,8 +324,7 @@ def test_quant_input_provider_covers_chunk_prefill_and_verify() -> None:
         kv_cache_max_len=128,
         rollback_enabled=True,
         quantization_request=request,
-        target_input_provider=provider,
-        target_input_provider_identity={"specification": "test:provider"},
+        quantized_embedding=quantized_embedding,
         target_quantization_audit={
             "status": "PASS_ASSEMBLY_CONTRACT_NO_NUMERICAL_CLAIM",
             "scheme": QUANT_MODE_W8A8_DYNAMIC,
@@ -352,13 +336,12 @@ def test_quant_input_provider_covers_chunk_prefill_and_verify() -> None:
     bridge.verify_rollback(torch.tensor([[66, 67]], dtype=torch.long))
     bridge.commit_rollback(0)
 
-    assert provider_rows == [64, 1, 2]
     assert model.quant_input_markers == [3.0, 3.0, 3.0]
     quant_audit = bridge.dflash_target_quantization_audit
     assert quant_audit["scheme"] == QUANT_MODE_W8A8_DYNAMIC
-    assert quant_audit["input_provider_calls"] == 3
-    assert quant_audit["input_provider_successes"] == 3
-    assert quant_audit["input_provider_failures"] == 0
+    assert quant_audit["embedding_lookup_calls"] == 3
+    assert quant_audit["embedding_lookup_successes"] == 3
+    assert quant_audit["embedding_lookup_failures"] == 0
     assert bridge.dflash_rollback_audit["target_quantization"] == quant_audit
 
 

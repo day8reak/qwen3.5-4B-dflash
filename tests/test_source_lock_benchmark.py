@@ -48,6 +48,7 @@ class BenchmarkSourceLockTests(unittest.TestCase):
             ("hiai_runtime_file", "hiai_runtime_sha256"),
             ("ascend_ops_file", "ascend_ops_sha256"),
             ("target_quant_contract_file", "target_quant_contract_sha256"),
+            ("original_quant_file", "original_quant_sha256"),
             ("target_quant_preflight_file", "target_quant_preflight_sha256"),
             ("w8a8_emulation_file", "w8a8_emulation_sha256"),
             ("w8a8_cpu_validator_file", "w8a8_cpu_validator_sha256"),
@@ -95,7 +96,7 @@ class BenchmarkSourceLockTests(unittest.TestCase):
 
     def test_lock_declares_rollback_target_only_quant_scope(self) -> None:
         lock = json.loads((REPOSITORY / "SOURCE_LOCK.json").read_text("utf-8"))
-        self.assertEqual(lock["schema_version"], 5)
+        self.assertEqual(lock["schema_version"], 6)
         self.assertIn("Target-only W8A8", lock["purpose"])
         self.assertIn("original multi-token GDR", lock["rollback_runtime"]["policy"])
         self.assertIn("Draft stays FP16", lock["rollback_runtime"]["policy"])

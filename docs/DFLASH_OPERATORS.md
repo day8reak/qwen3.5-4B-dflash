@@ -219,10 +219,10 @@ DynamicQuant 和 quant matmul 先做 T 行能力检查。如果现有实现支�
 
 当前 quant 分支复用原 HIAI modeling 中同一个 `QLinear`：`npu_dynamic_quant` 接收当前
 `[B,T,K]` 激活，`npu_quant_matmul` 输出 FP16 `[B,T,N]`。rollback modeling 不复制第二套
-QLinear，也不改变其公式。量化 embedding/input-provider 是部署数据准备与第 0 层输入 ABI，
-不是新的自定义算子；它必须分别覆盖真实 prompt chunk `T=1..64`、decode `T=1` 和 verify
-`T=1..16`。若其中任一 T 不支持，应先修现有量化路径的 shape contract，不能回退到完整前缀
-或逐 token prefill 来掩盖。
+QLinear，也不改变其公式。Linear artifact 由内置的原 `utils.quant_model` 兼容实现读取；量化
+embedding 是 YAML 指定 raw INT8 weight 与 FP32 scale 的索引/反量化边界，不是新的自定义算子。
+它必须分别覆盖真实 prompt chunk `T=1..64`、decode `T=1` 和 verify `T=1..16`。若其中任一 T
+不支持，应先修现有量化路径的 shape contract，不能回退到完整前缀或逐 token prefill 来掩盖。
 
 ## 9. Draft 侧候选
 

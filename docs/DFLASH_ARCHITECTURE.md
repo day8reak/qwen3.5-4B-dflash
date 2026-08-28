@@ -51,34 +51,35 @@ proposal，共 1+a 行；correction 或 bonus 是下一轮 anchor，不能在本
 
 ### 2.1 Target W8A8 路线
 
-量化是 rollback Target 的可选执行后端，不是另一套 scheduler。默认 `disabled` 保留 FP16
-对照；显式启用 `w8a8_dynamic` 时，装配顺序是：
+量化是 rollback Target 的可选执行后端，不是另一套 scheduler。默认不传
+`--quant_mode enable` 时保留 FP16 对照；显式启用时，装配顺序是：
 
 ~~~text
 rollback HIAI FP16 model
   → 冻结全部 nn.Linear path/shape/bias
-  → 部署方 quantizer 读取已有 artifact
+  → 从原 YAML 读取 quanted_pth 与两个 embedding raw 文件
+  → 内置原 utils.quant_model 读取 data*.safetensors
   → Target Linear 替换为原 HIAI QLinear
   → 审计 QLinear 完整覆盖、W_q/scale layout/device
   → 保留独立 FP16 Draft embedding 与 LM head
 ~~~
 
 rollback modeling 直接导入原 `modeling_qwen3_5_hiai_nd.py` 中的 `QLinear`。因此 quant 分支没有
-新增或修改量化 matmul 算子，也没有改原 GDR；用户已有 converter 仍面对同一个 QLinear 类型。
+新增或修改量化 matmul 算子，也没有改原 GDR；内置 converter 的 key 映射、转置、blocked-ZN
+和 `idx=15` 起始规则与用户给出的 `utils.py` 相同。
 
-量化 embedding 由单独 input-provider 返回最终 FP16 layer-0 hidden：
+量化 embedding 不再要求外部 provider。bridge 直接索引 YAML 指定的 raw artifact，并在第 0 层
+边界完成与原 wrapper 相同的 `INT8 × FP32 scale → FP16`：
 
 ~~~text
 真实 prompt chunk [1,1..64] ─┐
-decode token       [1,1]      ├→ input-provider → FP16 [1,T,2560]
-verify block       [1,1..16] ─┘                    → rollback Target
+decode token       [1,1]      ├→ artifact lookup/dequant → FP16 [1,T,2560]
+verify block       [1,1..16] ─┘                           → rollback Target
 ~~~
 
-provider 只处理当前真实输入行，不接收完整历史前缀，也不补写 padding。后续 position、GDR/GDR-MTP、
-feature、paged KV 和 state-bank commit 与 FP16 rollback 完全共用。Target 量化不会改变 Draft
-checkpoint：Draft 六层、embedding 和完整词表 LM head 仍为 FP16。
-rollback 外层 wrapper 会把底层原部署 wrapper 传给已有 provider，因此 provider 的第一个参数 ABI
-与非 rollback 量化路线一致；它不需要适配组合 wrapper。
+该路径只处理当前真实输入行，不接收完整历史前缀，也不补写 padding。后续 position、
+GDR/GDR-MTP、feature、paged KV 和 state-bank commit 与 FP16 rollback 完全共用。Target 量化
+不会改变 Draft checkpoint：Draft 六层、embedding 和完整词表 LM head 仍为 FP16。
 
 ## 3. 一次完整请求
 
@@ -326,7 +327,7 @@ draft_kv_cache_audit.mode = upstream_equivalent_append_then_crop
 target_quantization.scheme = disabled 或 w8a8_dynamic
 ~~~
 
-启用 W8A8 时还要求 `target_quantization.route=rollback`、完整 Linear 拓扑审计 PASS、input-provider
+启用 W8A8 时还要求 `target_quantization.route=rollback`、完整 Linear 拓扑审计 PASS、embedding lookup
 调用全部成功，并在同一量化 Target 上完成 ordinary 与 DFlash strict-greedy 零 token 差异。
 
 只有 `execution_mode=validate` 且 `correctness_gate.status=PASS` 时，

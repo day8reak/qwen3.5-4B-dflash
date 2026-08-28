@@ -1,5 +1,5 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "contract_id": "qwen3.5-4b-dflash-npu-rollback-benchmark",
   "scope": "batch-1 strict-greedy rollback receiver ordinary control versus transactional DFlash rollback",
   "prerequisites": {
@@ -31,21 +31,18 @@
     "prompt token hash and thinking mode",
     "max_new_tokens and block_size (anchor included)",
     "kv_cache_max_len and prefill/decode chunk sizes",
-    "Target quant mode, callback identities, and all three quant artifact identities"
+    "Target quant mode, original YAML identity, and all three quant artifact identities"
   ],
   "target_quantization": {
     "modes": ["disabled", "w8a8_dynamic"],
     "scope": "Target Linear and layer-0 embedding input only; DFlash Draft remains FP16",
     "required_w8a8_options": [
-      "--target-quantizer",
-      "--target-quant-weight-path",
-      "--target-input-provider",
-      "--target-embedding-weight-path",
-      "--target-embedding-scale-path"
+      "--config",
+      "--quant_mode enable"
     ],
     "same_options_required_for_both_modes": true,
     "preflight": "python -B -m models.dflash_v1.preflight_target_quant",
-    "report_gate": "PASS assembly, route=rollback, exact Linear topology, provider failures=0"
+    "report_gate": "PASS assembly, route=rollback, exact Linear topology, embedding lookup failures=0"
   },
   "runner": {
     "entrypoint": "python -B -m models.dflash_v1.benchmark_npu",
