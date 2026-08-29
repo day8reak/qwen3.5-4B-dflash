@@ -9,6 +9,15 @@
       "tensor_count": 738,
       "tensor_bytes": 9319737856,
       "shards": 2
+    },
+    {
+      "role": "dflash-checkpoint",
+      "asset_id": "qwen3.5-4b-dflash",
+      "manifest_sha256": "87b92703b8d233c3a495171148fb129122bc5a57d58a8567d82a660e2703986d",
+      "source_revision": "9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf",
+      "tensor_count": 69,
+      "tensor_bytes": 1268851712,
+      "shards": 1
     }
   ],
   "weights_in_repository": false

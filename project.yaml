@@ -36,6 +36,7 @@
     "specs/mtp-contract.json",
     "specs/dflash-contract.json",
     "specs/dflash-target-feature-contract.json",
+    "specs/dflash-deployment-contract.json",
     "specs/fp16-experiment.json"
   ],
   "skills": {
@@ -48,7 +49,7 @@
   "dependencies": {
     "target_profiles": ["ascend310p-local"],
     "environments": {"model": "qwen3.5-py310"},
-    "data": ["qwen3.5-4b"]
+    "data": ["qwen3.5-4b", "qwen3.5-4b-dflash"]
   },
   "artifact_namespace": "qwen3.5-4b",
   "release_namespace": "qwen3.5-4b"

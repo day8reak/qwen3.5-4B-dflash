@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "contract_id": "qwen3.5-4b-dflash-ascend310p-deployment-v1",
+  "objective": "locked Qwen3.5 target plus official DFlash -> integrated PyTorch graph -> TorchAir AIR -> ATC OM -> Ascend 310P strict-greedy prompt inference with synchronized stage timing",
+  "target": {
+    "target_id": "ascend310p",
+    "target_profile": "ascend310p-local",
+    "target_dtype": "FP16 approved experiment; not promoted without target accuracy evidence",
+    "batch": 1,
+    "generation": "text-only strict greedy",
+    "ordinary_authority": "target_top1 remains authoritative for every committed token",
+    "initial_state_policy": "recompute committed prefixes; no cache commit/rollback claim"
+  },
+  "locked_inputs": {
+    "target_asset_id": "qwen3.5-4b",
+    "target_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+    "draft_asset_id": "qwen3.5-4b-dflash",
+    "draft_revision": "9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf",
+    "draft_base_revision_must_equal_target": true,
+    "target_layer_ids": [1, 5, 9, 13, 17, 21, 25, 29]
+  },
+  "integrated_graph": {
+    "factory": "qwen35_dflash.ascend310p.factories:create_integrated_recompute_graph",
+    "role": "generation-recompute",
+    "inputs": {
+      "input_ids": "int64 [1,S], right padded",
+      "attention_mask": "int64 [1,S], contiguous valid prefix"
+    },
+    "outputs": {
+      "target_top1": "int64 [1,S]",
+      "draft_top1": "int64 [1,15] for the locked block_size=16 checkpoint"
+    },
+    "block_semantics": "row zero is the already committed anchor; target features end before the anchor; rows 1: are proposals",
+    "capacity": "prompt_tokens + max_new_tokens - 1 <= S"
+  },
+  "build": {
+    "fail_fast_preflight": "before checkpoint construction require a concrete 310P ATC SoC variant, executable ATC, the workspace-declared strict --require-atc/--require-device preflight and importable TorchAir; the built-in graph additionally requires torch_npu and an explicit NPU factory device; the preferred runtime requires a startable hash-locked AscendCL C++ runner, while the Python reference runtime requires pyACL",
+    "air_export": "torchair.dynamo_export of the integrated AirGraphSpec",
+    "air_external_weights": "retain and hash every exported payload beside the AIR until ATC completes",
+    "om_compile": "ATC mode=0, framework=1, exact soc_version",
+    "artifact_integrity": "verify all AIR payload hashes before ATC and record the OM SHA-256",
+    "output_root": "$AI_RUN_DIR only"
+  },
+  "runtime_backend": {
+    "preferred_executor": "qwen35_dflash_acl_runner: native AscendCL C++ with one loaded OM, pinned host memory, persistent device buffers/datasets and one stream",
+    "reference_factory": "qwen35_dflash.ascend310p.recompute_backend:create_backend",
+    "reference_executor": "static-shape pyACL AclOmRuntime",
+    "abi_binding": "manifest-declared ordered names alias OM runtime tensor names by index",
+    "fallback": "metadata.cpu_fallback must be false",
+    "device_identity": "target_id, concrete product, device ID, CANN, driver, firmware and pyACL identity",
+    "artifact_identity": "all loaded OM hashes",
+    "modes": ["ordinary-greedy", "dflash-strict-greedy"],
+    "paired_config_gate": "the C++ runner executes both modes in one process/model/device and alternates measurement order; the Python reference configs are byte-semantically identical except for ordinary_only true/false"
+  },
+  "orchestration": {
+    "preferred_command": "python -m qwen35_dflash.ascend310p run-e2e-cpp",
+    "reference_command": "python -m qwen35_dflash.ascend310p run-e2e",
+    "order": [
+      "fail-fast target prerequisite validation",
+      "AIR export",
+      "ATC OM compilation",
+      "ordinary-greedy and DFlash strict-greedy paired 3+10 in one loaded C++ process",
+      "hash-complete PASS summary"
+    ],
+    "preferred_outputs": ["runner-raw.json", "summary.json"],
+    "reference_outputs": ["ordinary.json", "dflash.json", "summary.json"],
+    "summary": "prompt output text/token IDs, device/runtime/compiler identity, AIR/OM/report hashes, parity, prefill/decode/model-total/end-to-end distributions and median ratios",
+    "failure_policy": "never write a PASS summary unless every preceding build, identity, stability and parity gate passes"
+  },
+  "timing": {
+    "clock": "time.perf_counter_ns on the host",
+    "synchronization": "device synchronization immediately before and after every measured backend call",
+    "tokenize": "prompt string to token IDs",
+    "prefill": "one synchronized integrated-OM call, including first committed target token",
+    "decode": "sum of synchronized proposal and target-verification calls",
+    "model_total": "prefill plus decode",
+    "detokenize": "generated token IDs to text",
+    "end_to_end": "tokenization through detokenization",
+    "baseline": "exactly 3 warmups plus 10 raw measurements per mode; preferred C++ path alternates ordinary and DFlash order in one loaded process"
+  },
+  "gates": {
+    "build": "non-empty AIR and OM plus hash-complete manifests",
+    "runtime": "no CPU fallback and concrete Ascend 310P identity",
+    "ordinary_reference": "same OM bundle, tokenizer, prompt, device and runtime identities in ordinary-greedy mode",
+    "accuracy": "zero final token-ID and EOS mismatch against the ordinary report",
+    "stability": "10/10 measured repetitions return identical token IDs and stop reason",
+    "performance": "retain every raw prefill/decode/model-total/end-to-end measurement"
+  },
+  "closed_runtime_comparison": {
+    "abi": "targets/ascend310p/abi/closed-runtime-baseline-v1.json",
+    "tool": "targets/ascend310p/scripts/compare_cpp_closed_runtime.py",
+    "policy": "same device/model/gear/prompt tokens/output tokens and synchronized model-loop scope; median and p90 ratio thresholds must be explicitly approved before comparison"
+  },
+  "current_evidence_boundary": "real locked FP16 checkpoint integrated PyTorch graph, C++ scheduler tests, fake-ACL production-source integration and Python orchestration regressions pass; the declared simulation-only profile still has no real CANN/AscendCL link, AIR, OM or Ascend 310P latency"
+}

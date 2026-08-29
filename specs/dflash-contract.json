@@ -25,14 +25,26 @@
       "RoPE, GQA, SwiGLU and final RMSNorm",
       "shared target embedding/LM-head helpers",
       "strict replaceable primitive operator interface",
-      "official checkpoint tensor audit and streaming load"
+      "official checkpoint tensor audit and streaming load",
+      "manifest-driven TorchAir AIR export and ATC framework-1 OM build control plane",
+      "hash-locked static-shape pyACL OM executor",
+      "locked target plus DFlash integrated fixed-gear recompute graph",
+      "ordinary target verification with exact greedy commit/correction and EOS handling",
+      "built-in recompute OM backend and ordered ABI alias mapping",
+      "ordinary-versus-DFlash zero-token/EOS-mismatch report gate",
+      "strict prompt runner with synchronized prefill/decode/end-to-end timing",
+      "fail-fast one-command AIR-to-OM ordinary/DFlash 3+10 target orchestration and hash-complete summary",
+      "native AscendCL C++ OM hot path with persistent pinned/device buffers and one stream",
+      "single-process interleaved ordinary/DFlash 3+10 timing with C++ OM SHA-256 verification",
+      "explicit-threshold same-device closed-runtime median/p90 comparison",
+      "real-checkpoint FP16 CPU integrated-graph smoke"
     ],
     "not_implemented": [
       "draft KV cache",
-      "target verifier integration",
       "Gated DeltaNet/full-attention transactional state commit or rollback",
       "sampling or rejection sampling",
-      "Ascend graph conversion or on-board execution",
+      "validated AIR/OM artifacts for the complete integrated target plus DFlash graph",
+      "Ascend 310P on-board execution",
       "performance or acceptance-rate claim"
     ]
   },

@@ -9,9 +9,9 @@
 - `z-lab/Qwen3.5-4B-DFlash@9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf`；
 - 69 个 tensor、634425856 个 BF16 参数。
 
-第一版只实现无 cache 的 draft core，允许用完整已提交前缀重新构建 target feature。
-它不包含 target verify、接受率统计或 Qwen3.5 Gated DeltaNet 状态回滚，因此只能作为
-CPU/custom-op 数值 golden，不能标记为 310P 性能或端到端通过。
+draft core 本身仍是无 cache 数值 golden；部署层现已增加整段前缀重算的一体图、普通
+target verify、严格 greedy 接受/纠错和 acceptance 计数。它仍不实现 Qwen3.5 Gated
+DeltaNet/KV 的增量状态事务，因此 CPU 结果不能标记为 310P 性能或端到端通过。
 
 ## 对共享方案的两个修正
 
@@ -78,6 +78,11 @@ draft_hidden = draft.draft_hidden(
 draft_top1 = draft.ops.top1(draft_hidden, target_lm_head_weight)
 ```
 
+这里的 `target_outputs` 必须只覆盖 clean anchor 之前的 context；anchor 只放在
+`block_ids[:,0]`。如果为了静态右补齐而让 target feature tensor 仍物理包含 anchor/pad
+row，必须通过 `context_attention_mask` 隐藏它们并用逻辑 position IDs。把 anchor 同时
+放进 target context 和 draft block 会造成 proposal 整体错一位。
+
 上面的 `output_hidden_states` 路径只用于未改 target 时的诊断。按现有 torch_npu 工程接入
 时，应使用选择性 `output_dflash_features=True` 接口，避免保留全部 32 层；具体三个
 插入点见 [DFLASH_TARGET_INTEGRATION.md](DFLASH_TARGET_INTEGRATION.md)。
@@ -141,5 +146,6 @@ PYTHONPATH=model python -m qwen35_dflash run-case \
 `case.npz` 必须包含 `target_hidden`、`noise_embedding`、`position_ids`。用内部算子时
 增加 `--ops-backend internal_dflash_ops`，不要增加 `--allow-op-fallback`。
 
-下一阶段才接 strict greedy target verifier，并覆盖 block `4/8/16`、拒绝位置
-`accepted=0..D-1`、full-attention KV 和 Gated DeltaNet recurrent/conv state。
+当前 host scheduler 已覆盖全接受、target bonus、部分拒绝、target correction、EOS 和
+静态档位边界。后续增量阶段才需要覆盖 block `4/8/16` 的 target/full-attention KV 与
+Gated DeltaNet recurrent/conv state 在 `accepted=0..D-1` 的提交/回滚。

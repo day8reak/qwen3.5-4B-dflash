@@ -3,8 +3,8 @@
   "model_id": "qwen3.5-4b",
   "target": "ascend310p",
   "hardware_reference_policy": "use",
-  "active_phase": "reference",
-  "run_id": "20260819T015109Z-5594-199c17",
+  "active_phase": "target-plan",
+  "run_id": "20260829T062557Z-8879-f4312c",
   "phases": [
     {
       "id": "contract",
@@ -20,6 +20,8 @@
       "evidence": [
         ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/out/contract/checkpoint-audit.json",
         "specs/mtp-contract.json",
+        "specs/dflash-deployment-contract.json",
+        "targets/ascend310p/abi/dflash-deployment-v1.json",
         "docs/ACCURACY_CONTRACT.md"
       ],
       "experience_audit": {
@@ -36,7 +38,7 @@
     {
       "id": "reference",
       "owner": "model",
-      "status": "in_progress",
+      "status": "passed",
       "evidence": [
         ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/log/unit-tests-final.log",
         ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/out/contract/real-mtp-smoke.json",
@@ -56,9 +58,18 @@
         ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/log/test-dflash-exact-layout-config.log",
         ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/log/qwen3_5-overlay-manifest-final.log",
         ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/log/test-dflash-archive-layout-final.log",
-        ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/out/qwen3_5-dflash-phase1-overlay.tar.gz"
+        ".work/qwen3.5-4b/20260819T015109Z-5594-199c17/out/qwen3_5-dflash-phase1-overlay.tar.gz",
+        ".work/qwen3.5-4b/20260829T035013Z-5333-47dea9/log/unit-tests-dflash-deployment-final.log",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/out/reference/dflash-checkpoint-audit.json",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/out/reference/integrated-fp16-s2.json",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/unit-tests-final.log",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/ascend310p-preflight-capabilities.log",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/ascend310p-preflight-strict.log",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/metadata-validation.log",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/dflash-integrated-source-sha256.txt",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/unit-tests-final.log",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/run-e2e-readiness.json"
       ],
-      "blocker": "The user's modified torch_npu target source is external, so bitwise target logits/cache and selective-feature parity gates remain pending; the earlier real-weight multi-prompt ordinary/MTP paired set is also incomplete",
       "experience_audit": {
         "captured": [
           "Approved BF16-to-FP16 range loss must be reported and judged by frozen numerical/token gates, not by an invented exact-roundtrip gate",
@@ -69,7 +80,15 @@
           "Phase-1 target integration needs only post-layer capture at decoder IDs 1,5,9,13,17,21,25,29; it must not introduce speculative cache semantics",
           "The local Qwen3.5 base output can carry fields such as rope_deltas, so DFlash integration must extend the existing output dataclass instead of replacing it with a generic BaseModelOutputWithPast",
           "An accuracy-first preallocated [B,S,20480] feature buffer isolates captured values from in-place custom operators without retaining eight clones plus a second concatenation buffer",
-          "Workspace-internal model/qwen35_dflash paths must be translated into an additive qwen3_5-rooted overlay for the user's existing project; they are not a requested repository migration"
+          "Workspace-internal model/qwen35_dflash paths must be translated into an additive qwen3_5-rooted overlay for the user's existing project; they are not a requested repository migration",
+          "AIR/OM lifecycle, hash checks, pyACL execution and timing can be generic, but any future incremental target KV/Gated-DeltaNet state ABI must remain target-owned",
+          "A target timing report needs device synchronization around each prefill/decode call and separate tokenize, model-total and end-to-end scopes",
+          "Official DFlash block row zero is the committed anchor; its target hidden feature must be excluded from context or proposals shift by one",
+          "A static recompute gear needs prompt_tokens + max_new_tokens - 1 rows because the final token is returned from the last processed row",
+          "One integrated OM avoids a second resident copy of 4B target weights, at the cost of unused DFlash computation in ordinary and verify calls",
+          "TorchAir derives internal tensor names, so the deployment manifest must bind logical ABI names by ordered OM index",
+          "A target DFlash performance report is invalid without a 3+10 ordinary report from the same OM, device, runtime, tokenizer and prompt",
+          "The locked real-checkpoint integrated FP16 smoke, official reduced-source parity and full regression suite close the reproducible non-target DFlash reference scope; prompt/device gates remain owned by later phases"
         ],
         "destination": [
           "docs/ACCURACY_CONTRACT.md",
@@ -79,15 +98,20 @@
           "model/qwen35_dflash",
           "docs/DFLASH_GOLDEN.md",
           "docs/DFLASH_TARGET_INTEGRATION.md",
+          "docs/DFLASH_ASCEND310P_FRAMEWORK.md",
           "specs/dflash-contract.json",
-          "specs/dflash-target-feature-contract.json"
+          "specs/dflash-target-feature-contract.json",
+          "specs/dflash-deployment-contract.json",
+          "targets/ascend310p/abi/dflash-deployment-v1.json",
+          "model/qwen35_dflash/ascend310p"
         ],
         "skills_changed": [],
         "rejected_promotions": [
           "The shared context/noise concatenation design was rejected because it does not match the official per-layer K/V injection graph",
-          "The cache-free draft-core was not promoted or described as a complete end-to-end DFlash decoder",
+          "The cache-free draft-core alone was not promoted as an end-to-end DFlash decoder; strict scheduling lives in the separate recompute backend",
           "Replacing the user's modified modeling_qwen3_5.py with a newer generated Transformers file was rejected",
-          "output_hidden_states=True and an unimplemented speculative_mode flag were rejected for the phase-1 production interface"
+          "An unimplemented speculative_mode flag was rejected; the all-hidden-state adapter is explicitly a portable recompute route, while a modified production target should use selective capture",
+          "The real FP16 CPU integrated-graph PASS was not promoted to AIR, OM, Ascend 310P accuracy or target latency evidence"
         ],
         "remaining_hypotheses": [
           "The candidate remains within frozen gates over a representative multi-prompt set",
@@ -95,25 +119,106 @@
           "The DFlash FP16 draft-core matches frozen PyTorch cases on Ascend 310P",
           "A transactional verifier/cache implementation preserves ordinary Qwen3.5 final token IDs",
           "The user's real torch_npu target produces bitwise-identical logits and all cache/state tensors with selective feature capture enabled",
-          "The user's selected features exactly match one diagnostic all-hidden-state run"
+          "The user's selected features exactly match one diagnostic all-hidden-state run",
+          "The built-in integrated target+DFlash recompute module exports through TorchAir without graph breaks",
+          "ATC framework=1 compiles every exported AIR payload for the exact 310P SoC",
+          "The built-in pyACL recompute backend executes without fallback and reports stable synchronized prefill/decode timing",
+          "Ordinary and DFlash 3+10 target reports have zero token-ID and EOS mismatch"
         ]
       },
-      "next_command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python -m pytest -q -p no:cacheprovider tests/test_target_feature.py && run the three real-target gates in docs/DFLASH_TARGET_INTEGRATION.md"
+      "next_command": null
     },
     {
       "id": "target-plan",
       "owner": "model",
-      "status": "pending",
+      "status": "in_progress",
       "evidence": [
         "docs/ASCEND310P_INTEGRATION.md",
         "targets/ascend310p/abi/runtime-v1.json",
+        "targets/ascend310p/abi/dflash-deployment-v1.json",
+        "specs/dflash-deployment-contract.json",
+        "docs/DFLASH_ASCEND310P_FRAMEWORK.md",
+        ".work/qwen3.5-4b/20260829T035013Z-5333-47dea9/log/ascend310p-preflight.log",
+        ".work/qwen3.5-4b/20260829T035013Z-5333-47dea9/log/test-dflash-ascend310p-final-v2.log",
+        ".work/qwen3.5-4b/20260829T035013Z-5333-47dea9/log/dflash-runtime-module-probe.json",
+        ".work/qwen3.5-4b/20260829T035013Z-5333-47dea9/log/dflash-deployment-source-sha256.txt",
         "specs/fp16-experiment.json",
         ".work/qwen3.5-4b/20260818T100410Z-21321-0118d3/out/approvals/ascend310p-fp16-precision-proposal.json",
         ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/out/approvals/ascend310p-fp16-precision-approval.json",
-        ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/out/fp16/onnx/qwen35-4b-mtp-core-s1-p1-fp16-validation-v2.json"
+        ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/out/fp16/onnx/qwen35-4b-mtp-core-s1-p1-fp16-validation-v2.json",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/out/reference/integrated-fp16-s2.json",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/unit-tests-final.log",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/ascend310p-preflight-capabilities.log",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/ascend310p-preflight-strict.log",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/metadata-validation.log",
+        ".work/qwen3.5-4b/20260829T041726Z-11379-ad68cc/log/dflash-integrated-source-sha256.txt",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/unit-tests-final.log",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/ascend310p-preflight-capabilities.log",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/ascend310p-preflight-strict.log",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/ascend310p-direct-capability-probe.log",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/ascend310p-knowledge-search.json",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/dflash-run-e2e-preflight.log",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/run-e2e-readiness.json",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/run-e2e-help.log",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/metadata-validation.log",
+        ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/dflash-e2e-source-sha256.txt",
+        "docs/DFLASH_ASCEND310P_VALIDATION.md",
+        "docs/DFLASH_ASCEND310P_CPP_RUNTIME.md",
+        "targets/ascend310p/runtime/cpp/CMakeLists.txt",
+        "targets/ascend310p/abi/closed-runtime-baseline-v1.json",
+        "targets/ascend310p/scripts/compare_cpp_closed_runtime.py",
+        ".work/qwen3.5-4b/20260829T062557Z-8879-f4312c/log/python-tests-cpp-final.log",
+        ".work/qwen3.5-4b/20260829T062557Z-8879-f4312c/log/cpp-cmake-final.log",
+        ".work/qwen3.5-4b/20260829T062557Z-8879-f4312c/log/cpp-build-final.log",
+        ".work/qwen3.5-4b/20260829T062557Z-8879-f4312c/log/cpp-tests-final.log",
+        ".work/qwen3.5-4b/20260829T062557Z-8879-f4312c/log/cpp-sanitize-build.log",
+        ".work/qwen3.5-4b/20260829T062557Z-8879-f4312c/log/cpp-sanitize-tests.log"
       ],
-      "blocker": "CPU candidate is admitted, but the exact internal runtime/device profile, ATC/CAModel, ordinary target graph and on-board outputs are unavailable",
-      "next_command": "Run the packaged S1/P1 case through the strict internal Ascend 310P backend and return manifest, raw outputs, logs and hashes"
+      "blocker": "hardware_reference_policy is use, but no matching measured Ascend 310P capability portrait is cataloged; the only declared profile is simulation-only and exposes no TorchAir, torch_npu, ATC, AscendCL/pyACL, npu-smi, Davinci device node, physical device or closed-runtime baseline",
+      "experience_audit": {
+        "captured": [
+          "The target workflow must resolve the concrete ATC SoC and executable, pass the workspace-declared strict ATC/device preflight and import TorchAir before constructing the two locked 4B checkpoints",
+          "A generic Ascend310P family string is not an admissible ATC SoC identity; the exact variant must come from the real target profile",
+          "One-command target evidence must use backend configs that differ only in ordinary_only, so runtime/device/graph identity cannot drift between the authority and candidate",
+          "The PASS summary is written only after AIR, OM, ordinary 3+10, DFlash 3+10, stability and zero-mismatch gates all pass",
+          "The current profile manifest hash still matches the environment lock, but both declared preflight and direct PCIe/module/device-node probes confirm simulation-only state",
+          "The scoped knowledge query returned no measured capability portrait matching Ascend 310P",
+          "Python remains the build/tokenizer control plane, while the preferred target hot path loads one OM once and runs paired ordinary/DFlash generation in native AscendCL C++",
+          "The C++ executor preallocates pinned host memory, device buffers, datasets and one stream; each graph call queues H2D, asynchronous model execution and D2H before one stream synchronization",
+          "Alternating ordinary and DFlash measurements in one loaded process reduces load and order bias while preserving the ordinary zero-mismatch authority",
+          "A closed-runtime latency comparison is admissible only with the same device/model/gear/prompt tokens/output tokens and explicit preapproved median/p90 ratio thresholds",
+          "C++ host scheduling cannot by itself remove the integrated graph's full-prefix recomputation; incremental KV/Gated-DeltaNet/draft state remains a separately gated optimization hypothesis"
+        ],
+        "destination": [
+          "model/qwen35_dflash/ascend310p/workflow.py",
+          "model/qwen35_dflash/ascend310p/compiler.py",
+          "model/qwen35_dflash/ascend310p/exporter.py",
+          "docs/DFLASH_ASCEND310P_FRAMEWORK.md",
+          "docs/DFLASH_ASCEND310P_VALIDATION.md",
+          "docs/DFLASH_ASCEND310P_CPP_RUNTIME.md",
+          "model/qwen35_dflash/ascend310p/cpp_runtime.py",
+          "targets/ascend310p/runtime/cpp",
+          "targets/ascend310p/abi/closed-runtime-baseline-v1.json",
+          "targets/ascend310p/scripts/compare_cpp_closed_runtime.py",
+          "specs/dflash-deployment-contract.json"
+        ],
+        "skills_changed": [],
+        "rejected_promotions": [
+          "The fail-fast run-e2e readiness result was not promoted to AIR, OM, device correctness or performance evidence",
+          "No hardware bound or headroom claim was made without a matching measured capability portrait",
+          "The passing fake-ACL executable was not promoted to a real libascendcl link, physical OM execution or closed-runtime latency claim",
+          "No claim that C++ alone closes the latency gap was made before measuring the recompute graph on the target"
+        ],
+        "remaining_hypotheses": [
+          "The integrated graph exports without TorchAir graph breaks on the exact target stack",
+          "ATC framework=1 compiles the hash-locked AIR and external weights for the concrete 310P SoC",
+          "The production C++ runner links against the declared AscendCL, loads the same OM and passes paired ordinary/DFlash 3+10 with zero token-ID/EOS mismatch on the physical device",
+          "The C++ model-loop median and p90 satisfy preapproved thresholds against the same-scope closed runtime",
+          "A measured capability portrait can be acquired for the exact device, firmware, profile and timing scope",
+          "If the recompute graph remains the dominant gap, an independently gated incremental target/draft state design can preserve ordinary tokens"
+        ]
+      },
+      "next_command": "Activate a manifest-locked real 310P CANN/TorchAir/AscendCL profile, build-cpp, execute run-e2e-cpp, then compare its same-device token-exact model-loop report with a closed-runtime baseline using explicit approved median/p90 ratios"
     },
     {"id": "adaptation", "owner": "model", "status": "pending", "evidence": [], "next_command": null},
     {"id": "integration", "owner": "model", "status": "pending", "evidence": [], "next_command": null},
@@ -124,6 +229,8 @@
   "device_probe": {
     "status": "pending-no-device-in-profile",
     "profile_mode": "simulation-only",
-    "evidence": ".work/qwen3.5-4b/20260818T105058Z-8154-e71669/log/ascend310p-preflight.log"
+    "evidence": ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/ascend310p-preflight-capabilities.log",
+    "strict_evidence": ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/ascend310p-preflight-strict.log",
+    "direct_probe": ".work/qwen3.5-4b/20260829T050816Z-22260-6771fe/log/ascend310p-direct-capability-probe.log"
   }
 }

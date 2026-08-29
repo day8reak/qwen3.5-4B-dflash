@@ -148,16 +148,30 @@ class DFlashAttention(nn.Module):
         context_length: int,
         *,
         device: torch.device,
+        position_ids: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> Tensor | None:
-        if not self.is_causal and self.sliding_window is None:
+        if (
+            not self.is_causal
+            and self.sliding_window is None
+            and context_attention_mask is None
+        ):
             return None
         key_length = context_length + query_length
-        query_positions = context_length + torch.arange(
-            query_length, device=device
-        ).view(query_length, 1)
-        key_positions = torch.arange(key_length, device=device).view(1, key_length)
+        if position_ids is None:
+            batch = 1 if context_attention_mask is None else context_attention_mask.shape[0]
+            query_positions = context_length + torch.arange(
+                query_length, device=device
+            ).view(1, query_length, 1)
+            key_positions = torch.arange(key_length, device=device).view(1, 1, key_length)
+        else:
+            if position_ids.ndim != 2 or position_ids.shape[1] != key_length:
+                raise ValueError("position_ids have an incompatible DFlash key length")
+            batch = position_ids.shape[0]
+            query_positions = position_ids[:, -query_length:].unsqueeze(-1)
+            key_positions = position_ids.unsqueeze(-2)
         visible = torch.ones(
-            (query_length, key_length), dtype=torch.bool, device=device
+            (batch, query_length, key_length), dtype=torch.bool, device=device
         )
         if self.is_causal:
             visible &= key_positions <= query_positions
@@ -165,7 +179,18 @@ class DFlashAttention(nn.Module):
             visible &= query_positions - key_positions < self.sliding_window
             if not self.is_causal:
                 visible &= key_positions - query_positions < self.sliding_window
-        return visible.view(1, 1, query_length, key_length)
+        if context_attention_mask is not None:
+            if tuple(context_attention_mask.shape) != (batch, context_length):
+                raise ValueError("context_attention_mask must have shape [B,C]")
+            draft_valid = torch.ones(
+                (batch, query_length), dtype=torch.bool, device=device
+            )
+            key_valid = torch.cat(
+                (context_attention_mask.to(device=device, dtype=torch.bool), draft_valid),
+                dim=-1,
+            )
+            visible &= key_valid.unsqueeze(1)
+        return visible.unsqueeze(1)
 
     def forward(
         self,
@@ -174,6 +199,8 @@ class DFlashAttention(nn.Module):
         cosine: Tensor,
         sine: Tensor,
         attention_mask: Tensor | None = None,
+        position_ids: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> Tensor:
         batch, query_length, _ = hidden_states.shape
         context_length = target_hidden.shape[1]
@@ -203,11 +230,17 @@ class DFlashAttention(nn.Module):
         value = value.transpose(1, 2)
         query, key = self.ops.rotary(query, key, cosine, sine)
 
+        if attention_mask is not None and context_attention_mask is not None:
+            raise ValueError(
+                "attention_mask and context_attention_mask cannot be supplied together"
+            )
         if attention_mask is None:
             attention_mask = self._attention_mask(
                 query_length,
                 context_length,
                 device=hidden_states.device,
+                position_ids=position_ids,
+                context_attention_mask=context_attention_mask,
             )
         elif tuple(attention_mask.shape[-2:]) != (
             query_length,
@@ -295,6 +328,8 @@ class DFlashDecoderLayer(nn.Module):
         cosine: Tensor,
         sine: Tensor,
         attention_mask: Tensor | None = None,
+        position_ids: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> Tensor:
         residual = hidden_states
         hidden_states = residual + self.self_attn(
@@ -303,6 +338,8 @@ class DFlashDecoderLayer(nn.Module):
             cosine,
             sine,
             attention_mask,
+            position_ids,
+            context_attention_mask,
         )
         residual = hidden_states
         return residual + self.mlp(self.post_attention_layernorm(hidden_states))
@@ -382,6 +419,7 @@ class DFlashDraftModel(nn.Module):
         noise_embedding: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> Tensor:
         if target_hidden.ndim != 3 or noise_embedding.ndim != 3:
             raise ValueError("target_hidden and noise_embedding must be rank-3")
@@ -411,6 +449,11 @@ class DFlashDraftModel(nn.Module):
             )
         if target_hidden.dtype != noise_embedding.dtype:
             raise ValueError("target_hidden and noise_embedding dtypes differ")
+        if context_attention_mask is not None and tuple(context_attention_mask.shape) != (
+            target_hidden.shape[0],
+            target_hidden.shape[1],
+        ):
+            raise ValueError("context_attention_mask must have shape [B,C]")
 
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         hidden_states = noise_embedding
@@ -422,6 +465,8 @@ class DFlashDraftModel(nn.Module):
                 cosine,
                 sine,
                 attention_mask,
+                position_ids,
+                context_attention_mask,
             )
         return self.norm(hidden_states)
 
@@ -431,6 +476,7 @@ class DFlashDraftModel(nn.Module):
         noise_embedding: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> Tensor:
         if noise_embedding.shape[1] < 2:
             raise ValueError("a DFlash draft needs one anchor and at least one mask token")
@@ -439,6 +485,7 @@ class DFlashDraftModel(nn.Module):
             noise_embedding,
             position_ids,
             attention_mask,
+            context_attention_mask,
         )[:, 1:, :]
 
     def compute_logits(self, hidden: Tensor, lm_head_weight: Tensor) -> Tensor:
@@ -456,12 +503,14 @@ class DFlashDraftModel(nn.Module):
         position_ids: Tensor,
         lm_head_weight: Tensor,
         attention_mask: Tensor | None = None,
+        context_attention_mask: Tensor | None = None,
     ) -> Tensor:
         hidden = self.draft_hidden(
             target_hidden,
             noise_embedding,
             position_ids,
             attention_mask,
+            context_attention_mask,
         )
         # Positive scaling and tanh softcapping are monotonic, so they cannot
         # change Top1. This boundary permits a fused LM-head + argmax operator.

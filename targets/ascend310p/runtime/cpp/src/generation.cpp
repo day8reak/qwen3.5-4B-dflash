@@ -1,0 +1,427 @@
+#include "qwen35_dflash/generation.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <numeric>
+#include <stdexcept>
+#include <unordered_set>
+#include <utility>
+
+namespace qwen35::dflash {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double Milliseconds(Clock::time_point start, Clock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+void RequireNonNegative(
+    const std::vector<std::int64_t>& values,
+    const char* description) {
+  if (std::any_of(values.begin(), values.end(), [](std::int64_t value) {
+        return value < 0;
+      })) {
+    throw std::runtime_error(std::string(description) +
+                             " contains a negative token ID");
+  }
+}
+
+void ValidateOutputs(
+    const GraphExecutor& executor,
+    const GraphOutputs& outputs) {
+  if (outputs.target_top1.size() != executor.sequence_length()) {
+    throw std::runtime_error("target_top1 size differs from the fixed OM gear");
+  }
+  if (outputs.draft_top1.size() != executor.draft_width()) {
+    throw std::runtime_error("draft_top1 size differs from the OM ABI");
+  }
+}
+
+bool IsEos(
+    std::int64_t token,
+    const std::unordered_set<std::int64_t>& eos) {
+  return eos.find(token) != eos.end();
+}
+
+void AppendCommitted(
+    const std::vector<std::int64_t>& values,
+    std::size_t remaining,
+    const std::unordered_set<std::int64_t>& eos,
+    std::vector<std::int64_t>* generated,
+    std::vector<std::int64_t>* prefix,
+    bool* finished) {
+  if (values.empty()) {
+    throw std::runtime_error("generation step committed no token");
+  }
+  if (values.size() > remaining) {
+    throw std::runtime_error("generation step exceeded the remaining token budget");
+  }
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    const std::int64_t token = values[index];
+    if (token < 0) {
+      throw std::runtime_error("generation step returned a negative token ID");
+    }
+    generated->push_back(token);
+    prefix->push_back(token);
+    if (IsEos(token, eos)) {
+      if (index + 1 != values.size()) {
+        throw std::runtime_error("generation step returned tokens after EOS");
+      }
+      *finished = true;
+    }
+  }
+}
+
+void ValidateInputs(
+    const GraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt,
+    const GenerationOptions& options) {
+  if (executor.sequence_length() <= 1) {
+    throw std::invalid_argument("OM sequence gear must exceed one token");
+  }
+  if (executor.draft_width() == 0) {
+    throw std::invalid_argument("OM draft width must be positive");
+  }
+  if (prompt.empty()) {
+    throw std::invalid_argument("prompt token IDs must not be empty");
+  }
+  RequireNonNegative(prompt, "prompt");
+  RequireNonNegative(options.eos_token_ids, "EOS set");
+  if (options.pad_token_id < 0) {
+    throw std::invalid_argument("pad token ID must be non-negative");
+  }
+  if (options.max_new_tokens == 0) {
+    throw std::invalid_argument("max_new_tokens must be positive");
+  }
+  if (options.max_draft_tokens == 0) {
+    throw std::invalid_argument("max_draft_tokens must be positive");
+  }
+  if (prompt.size() + options.max_new_tokens - 1 >
+      executor.sequence_length()) {
+    throw std::invalid_argument(
+        "prompt plus requested generation exceeds the fixed OM gear");
+  }
+}
+
+BenchmarkResult FinalizeBenchmark(
+    GenerationMode mode,
+    std::size_t warmup,
+    std::vector<GenerationMeasurement> measurements) {
+  if (measurements.empty()) {
+    throw std::invalid_argument("benchmark repetitions must be positive");
+  }
+  const auto& reference_tokens = measurements.front().generated_token_ids;
+  const auto& reference_stop = measurements.front().stop_reason;
+  for (const auto& measurement : measurements) {
+    if (measurement.generated_token_ids != reference_tokens) {
+      throw std::runtime_error(
+          "measured repetitions produced different token IDs");
+    }
+    if (measurement.stop_reason != reference_stop) {
+      throw std::runtime_error(
+          "measured repetitions produced different stop reasons");
+    }
+  }
+
+  std::vector<double> prefill;
+  std::vector<double> decode;
+  std::vector<double> model_total;
+  prefill.reserve(measurements.size());
+  decode.reserve(measurements.size());
+  model_total.reserve(measurements.size());
+  BenchmarkResult result;
+  result.mode = mode;
+  result.warmup = warmup;
+  result.repetitions = measurements.size();
+  result.stable_generated_token_ids = reference_tokens;
+  result.stable_stop_reason = reference_stop;
+  result.measurements = std::move(measurements);
+  for (const auto& measurement : result.measurements) {
+    prefill.push_back(measurement.prefill_ms);
+    decode.push_back(measurement.decode_ms);
+    model_total.push_back(measurement.model_total_ms);
+    result.total_graph_calls += measurement.counters.graph_calls;
+    result.total_drafted_tokens += measurement.counters.drafted_tokens;
+    result.total_accepted_draft_tokens +=
+        measurement.counters.accepted_draft_tokens;
+    result.total_rejected_draft_tokens +=
+        measurement.counters.rejected_draft_tokens;
+  }
+  result.prefill_ms = Summarize(prefill);
+  result.decode_ms = Summarize(decode);
+  result.model_total_ms = Summarize(model_total);
+  if (result.total_drafted_tokens != 0) {
+    result.acceptance_rate =
+        static_cast<double>(result.total_accepted_draft_tokens) /
+        static_cast<double>(result.total_drafted_tokens);
+  }
+  const double seconds = std::accumulate(
+      model_total.begin(), model_total.end(), 0.0) / 1000.0;
+  const std::size_t generated =
+      reference_tokens.size() * result.measurements.size();
+  if (seconds > 0.0) {
+    result.generated_tokens_per_second =
+        static_cast<double>(generated) / seconds;
+  }
+  return result;
+}
+
+}  // namespace
+
+const char* ModeName(GenerationMode mode) noexcept {
+  return mode == GenerationMode::kOrdinary ? "ordinary-greedy"
+                                            : "dflash-strict-greedy";
+}
+
+GenerationMeasurement GenerateOnce(
+    GraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    GenerationMode mode,
+    const GenerationOptions& options) {
+  ValidateInputs(executor, prompt_token_ids, options);
+  const std::unordered_set<std::int64_t> eos(
+      options.eos_token_ids.begin(), options.eos_token_ids.end());
+
+  std::vector<std::int64_t> prefix = prompt_token_ids;
+  prefix.reserve(executor.sequence_length());
+  std::vector<std::int64_t> generated;
+  generated.reserve(options.max_new_tokens);
+  std::vector<std::int64_t> committed;
+  committed.reserve(options.max_draft_tokens + 1);
+  GenerationMeasurement result;
+  result.counters.graph_calls = 1;
+
+  const auto prefill_start = Clock::now();
+  const GraphOutputs& prefill_outputs =
+      executor.Execute(prefix, options.pad_token_id);
+  ValidateOutputs(executor, prefill_outputs);
+  const std::int64_t first = prefill_outputs.target_top1[prefix.size() - 1];
+  bool finished = false;
+  AppendCommitted(
+      std::vector<std::int64_t>{first},
+      options.max_new_tokens,
+      eos,
+      &generated,
+      &prefix,
+      &finished);
+  const auto prefill_end = Clock::now();
+  result.prefill_ms = Milliseconds(prefill_start, prefill_end);
+
+  while (!finished && generated.size() < options.max_new_tokens) {
+    const std::size_t remaining = options.max_new_tokens - generated.size();
+    const auto decode_start = Clock::now();
+    const GraphOutputs& proposal_outputs =
+        executor.Execute(prefix, options.pad_token_id);
+    ++result.counters.graph_calls;
+    ValidateOutputs(executor, proposal_outputs);
+    const std::int64_t ordinary_next =
+        proposal_outputs.target_top1[prefix.size() - 1];
+    if (ordinary_next < 0) {
+      throw std::runtime_error("target OM returned a negative token ID");
+    }
+
+    committed.clear();
+    if (mode == GenerationMode::kOrdinary || remaining == 1) {
+      committed.push_back(ordinary_next);
+    } else {
+      const std::size_t proposal_count_limit = std::min(
+          {options.max_draft_tokens,
+           executor.draft_width(),
+           remaining - 1});
+      for (std::size_t index = 0; index < proposal_count_limit; ++index) {
+        const std::int64_t proposal = proposal_outputs.draft_top1[index];
+        if (proposal < 0) {
+          throw std::runtime_error("draft OM returned a negative token ID");
+        }
+        committed.push_back(proposal);
+        if (IsEos(proposal, eos)) {
+          break;
+        }
+      }
+      const std::size_t proposal_count = committed.size();
+      result.counters.drafted_tokens += proposal_count;
+      if (proposal_count == 0) {
+        committed.push_back(ordinary_next);
+      } else {
+        const std::size_t base = prefix.size();
+        prefix.insert(prefix.end(), committed.begin(), committed.end());
+        const GraphOutputs& verify_outputs =
+            executor.Execute(prefix, options.pad_token_id);
+        ++result.counters.graph_calls;
+        ValidateOutputs(executor, verify_outputs);
+        if (verify_outputs.target_top1[base - 1] != ordinary_next) {
+          throw std::runtime_error(
+              "target OM changed its next token between proposal and verify");
+        }
+        std::size_t accepted = 0;
+        for (; accepted < proposal_count; ++accepted) {
+          if (committed[accepted] !=
+              verify_outputs.target_top1[base - 1 + accepted]) {
+            break;
+          }
+        }
+        result.counters.accepted_draft_tokens += accepted;
+        result.counters.rejected_draft_tokens += proposal_count - accepted;
+        prefix.resize(base);
+        if (accepted < proposal_count) {
+          committed.resize(accepted);
+          committed.push_back(verify_outputs.target_top1[base - 1 + accepted]);
+        } else if (!IsEos(committed.back(), eos)) {
+          committed.push_back(
+              verify_outputs.target_top1[base + proposal_count - 1]);
+        }
+      }
+    }
+    RequireNonNegative(committed, "committed output");
+    AppendCommitted(
+        committed, remaining, eos, &generated, &prefix, &finished);
+    const auto decode_end = Clock::now();
+    const double iteration_ms = Milliseconds(decode_start, decode_end);
+    result.decode_iteration_ms.push_back(iteration_ms);
+    result.decode_ms += iteration_ms;
+    ++result.counters.decode_iterations;
+  }
+
+  result.generated_token_ids = std::move(generated);
+  result.stop_reason =
+      (!result.generated_token_ids.empty() &&
+       IsEos(result.generated_token_ids.back(), eos))
+          ? "eos"
+          : "length";
+  result.model_total_ms = result.prefill_ms + result.decode_ms;
+  return result;
+}
+
+BenchmarkResult Benchmark(
+    GraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    GenerationMode mode,
+    const GenerationOptions& options,
+    std::size_t warmup,
+    std::size_t repetitions) {
+  if (repetitions == 0) {
+    throw std::invalid_argument("benchmark repetitions must be positive");
+  }
+  for (std::size_t index = 0; index < warmup; ++index) {
+    static_cast<void>(GenerateOnce(executor, prompt_token_ids, mode, options));
+  }
+  std::vector<GenerationMeasurement> measurements;
+  measurements.reserve(repetitions);
+  for (std::size_t index = 0; index < repetitions; ++index) {
+    measurements.push_back(
+        GenerateOnce(executor, prompt_token_ids, mode, options));
+  }
+  return FinalizeBenchmark(mode, warmup, std::move(measurements));
+}
+
+PairedBenchmarkResult BenchmarkPair(
+    GraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    const GenerationOptions& options,
+    std::size_t warmup,
+    std::size_t repetitions) {
+  if (repetitions == 0) {
+    throw std::invalid_argument("benchmark repetitions must be positive");
+  }
+  for (std::size_t index = 0; index < warmup; ++index) {
+    if (index % 2 == 0) {
+      static_cast<void>(GenerateOnce(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options));
+      static_cast<void>(GenerateOnce(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options));
+    } else {
+      static_cast<void>(GenerateOnce(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options));
+      static_cast<void>(GenerateOnce(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options));
+    }
+  }
+
+  std::vector<GenerationMeasurement> ordinary;
+  std::vector<GenerationMeasurement> dflash;
+  ordinary.reserve(repetitions);
+  dflash.reserve(repetitions);
+  for (std::size_t index = 0; index < repetitions; ++index) {
+    if (index % 2 == 0) {
+      ordinary.push_back(GenerateOnce(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options));
+      dflash.push_back(GenerateOnce(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options));
+    } else {
+      dflash.push_back(GenerateOnce(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options));
+      ordinary.push_back(GenerateOnce(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options));
+    }
+  }
+
+  PairedBenchmarkResult result{
+      FinalizeBenchmark(
+          GenerationMode::kOrdinary, warmup, std::move(ordinary)),
+      FinalizeBenchmark(
+          GenerationMode::kDFlash, warmup, std::move(dflash)),
+      0,
+      0,
+  };
+  const auto& expected = result.ordinary.stable_generated_token_ids;
+  const auto& actual = result.dflash.stable_generated_token_ids;
+  const std::size_t width = std::max(expected.size(), actual.size());
+  for (std::size_t index = 0; index < width; ++index) {
+    if (index >= expected.size() || index >= actual.size() ||
+        expected[index] != actual[index]) {
+      ++result.token_id_mismatches;
+    }
+  }
+  result.eos_mismatches =
+      result.ordinary.stable_stop_reason == result.dflash.stable_stop_reason
+          ? 0
+          : 1;
+  if (result.token_id_mismatches != 0 || result.eos_mismatches != 0) {
+    throw std::runtime_error(
+        "DFlash output differs from the ordinary greedy authority");
+  }
+  return result;
+}
+
+Distribution Summarize(const std::vector<double>& values) {
+  if (values.empty()) {
+    throw std::invalid_argument("cannot summarize an empty latency set");
+  }
+  std::vector<double> ordered = values;
+  std::sort(ordered.begin(), ordered.end());
+  const double sum = std::accumulate(ordered.begin(), ordered.end(), 0.0);
+  const double mean = sum / static_cast<double>(ordered.size());
+  double variance = 0.0;
+  for (const double value : ordered) {
+    const double delta = value - mean;
+    variance += delta * delta;
+  }
+  variance /= static_cast<double>(ordered.size());
+  auto percentile = [&ordered](double fraction) {
+    if (ordered.size() == 1) {
+      return ordered.front();
+    }
+    const double position =
+        static_cast<double>(ordered.size() - 1) * fraction;
+    const auto low = static_cast<std::size_t>(std::floor(position));
+    const auto high = static_cast<std::size_t>(std::ceil(position));
+    if (low == high) {
+      return ordered[low];
+    }
+    const double weight = position - static_cast<double>(low);
+    return ordered[low] * (1.0 - weight) + ordered[high] * weight;
+  };
+  return Distribution{
+      ordered.size(),
+      ordered.front(),
+      ordered.back(),
+      mean,
+      percentile(0.5),
+      percentile(0.9),
+      std::sqrt(variance),
+  };
+}
+
+}  // namespace qwen35::dflash

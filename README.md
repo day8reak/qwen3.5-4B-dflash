@@ -1,10 +1,12 @@
 # Qwen3.5-4B MTP / DFlash / Ascend 310P 准确率优先 PoC
 
-这个仓库现在包含三条边界明确的路径：
+这个仓库现在包含四条边界明确的路径：
 
 1. 普通 Qwen3.5-4B greedy PyTorch 基线；
 2. 官方单层 MTP/NEXTN drafter + 主模型严格校验。
-3. 官方 Z-Lab Qwen3.5-4B-DFlash 的无 cache draft-core golden。
+3. 官方 Z-Lab Qwen3.5-4B-DFlash 的无 cache draft-core golden；
+4. 锁定 target+DFlash 一体重计算图的 TorchAir AIR → ATC OM → pyACL prompt 推理、
+   ordinary 零 mismatch 门禁与分阶段计时。
 
 本项目不依赖拿不到的内部框架源码。内部框架只需实现
 `MainBackend.evaluate` 和 `DraftBackend.propose`，或者替换 MTP 的 5 个细粒度
@@ -12,9 +14,9 @@
 
 DFlash 路径已复现官方 feature projection、六层 drafter、逐层 target-context
 K/V 注入、RoPE/GQA、前五层 sliding-causal attention 和末层 bidirectional
-attention，并把六类 primitive 暴露为可替换接口。它目前不是完整端到端 DFlash：
-尚未包含 target verifier、接受/拒绝、draft/target cache 与 Qwen3.5 Gated
-DeltaNet 状态提交/回滚、循环调度。
+attention，并把六类 primitive 暴露为可替换接口。部署层已实现 ordinary target verify、
+接受/拒绝、correction/bonus、EOS、循环调度和普通/DFlash 报告对照。首版仍按完整前缀
+重算，尚未包含 draft/target cache 与 Qwen3.5 Gated DeltaNet 状态提交/回滚。
 
 ## 已锁定的官方结构
 
@@ -52,7 +54,7 @@ python -m qwen35_dflash audit \
 python -m qwen35_dflash run-case \
   --draft-dir /path/to/z-lab-Qwen3.5-4B-DFlash \
   --case /path/to/dflash-case.npz \
-  --dtype float16 --output /tmp/dflash-hidden.npy
+  --dtype float16 --output "$AI_RUN_DIR/out/dflash-hidden.npy"
 ```
 
 DFlash 的输入、算子 ABI、官方 revision 和精确边界见
@@ -61,6 +63,21 @@ DFlash 的输入、算子 ABI、官方 revision 和精确边界见
 现有 torch_npu target 的第一阶段只接选择性 hidden feature 输出，不改 GDN、attention、
 cache 或 `hiai_nd`。目录映射和 `modeling_qwen3_5.py` 的三个稳定插入点见
 [DFlash target 接入说明](docs/DFLASH_TARGET_INTEGRATION.md)。
+
+如何直接从锁定 target+DFlash checkpoint 生成一体图、AIR/OM、用 pyACL 执行并从
+prompt 得到文本，以及 tokenize/prefill/decode/model-total/end-to-end/TTFT 的精确口径，
+见 [DFlash Ascend 310P 框架](docs/DFLASH_ASCEND310P_FRAMEWORK.md)。目标命令默认执行
+ordinary 和 DFlash 各 3 次 warmup + 10 次测量；CPU fallback、artifact hash、具体 310P
+identity 或任一 token/EOS mismatch 都会失败。
+
+从静态测试、真实权重 CPU smoke、AIR/OM 构建到物理 310P prompt→token 的逐级验收命令、
+PASS 门槛、独立 hash 检查和失败定位，见
+[DFlash Ascend 310P 验收手册](docs/DFLASH_ASCEND310P_VALIDATION.md)。
+
+低时延目标路径使用原生 AscendCL C++：一次加载 OM、复用 pinned host/device buffer 和
+dataset、单 stream 异步 H2D/execute/D2H，并在一个进程中交错执行 ordinary/DFlash 3+10。
+构建、运行及与闭源框架同口径 A/B 的方法见
+[DFlash AscendCL C++ 低时延推理](docs/DFLASH_ASCEND310P_CPP_RUNTIME.md)。
 
 运行普通基线：
 

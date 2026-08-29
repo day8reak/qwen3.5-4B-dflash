@@ -18,5 +18,32 @@
     "simulation": "allowed-and-reported",
     "target": "forbidden"
   },
+  "dflash_deployment_framework": {
+    "contract": "specs/dflash-deployment-contract.json",
+    "abi": "targets/ascend310p/abi/dflash-deployment-v1.json",
+    "status": "real-weight-pytorch-and-cpp-host-pass-awaiting-torchair-atc-ascendcl-and-device",
+    "capabilities": [
+      "TorchAir graph-factory export with external-weight hashes",
+      "ATC AIR framework-1 compilation with locked core arguments",
+      "static-shape pyACL OM execution",
+      "preferred native AscendCL C++ execution with persistent pinned/device buffers",
+      "single-process interleaved ordinary/DFlash 3+10 model-loop timing",
+      "locked target plus official DFlash integrated recompute graph",
+      "built-in ordinary and strict-DFlash host scheduler",
+      "zero token-ID/EOS ordinary-reference gate",
+      "strict prompt generation with synchronized prefill/decode timing"
+    ],
+    "pending": [
+      "real AIR and OM artifacts",
+      "Ascend 310P accuracy and 10-round timing evidence"
+    ],
+    "preferred_runtime": {
+      "source": "targets/ascend310p/runtime/cpp",
+      "build_command": "python -m qwen35_dflash.ascend310p build-cpp",
+      "target_command": "python -m qwen35_dflash.ascend310p run-e2e-cpp",
+      "closed_baseline_abi": "targets/ascend310p/abi/closed-runtime-baseline-v1.json",
+      "current_evidence": "host scheduler and fake-ACL integration only; no physical latency claim"
+    }
+  },
   "device_gate": "pending-until-internal-board-feedback"
 }

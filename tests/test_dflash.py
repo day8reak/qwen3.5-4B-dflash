@@ -139,6 +139,30 @@ class DFlashGoldenTest(unittest.TestCase):
         self.assertTrue(bool(mask[0, 0, -1, -1]))
         self.assertTrue(bool(mask[0, 0, -1, 0]))
 
+    def test_right_padded_context_mask_matches_unpadded_draft(self):
+        model = self._model()
+        target = torch.randn(1, 2, model.config.feature_size)
+        padded_target = torch.cat(
+            (target, torch.randn(1, 2, model.config.feature_size) * 100.0), dim=1
+        )
+        noise = torch.randn(1, 4, model.config.hidden_size)
+        unpadded_positions = torch.arange(6).unsqueeze(0)
+        padded_positions = torch.tensor([[0, 1, 0, 0, 2, 3, 4, 5]])
+        with torch.inference_mode():
+            expected = model(
+                target,
+                noise,
+                unpadded_positions,
+                context_attention_mask=torch.ones(1, 2, dtype=torch.bool),
+            )
+            actual = model(
+                padded_target,
+                noise,
+                padded_positions,
+                context_attention_mask=torch.tensor([[True, True, False, False]]),
+            )
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
     def test_module_ops_strict_and_fallback(self):
         with self.assertRaisesRegex(ValueError, "missing"):
             ModuleDFlashOps(types.ModuleType("empty"), strict=True)
