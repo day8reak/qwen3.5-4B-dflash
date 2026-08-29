@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "abi_id": "qwen35-4b-dflash-closed-runtime-baseline-v1",
+  "purpose": "same-device latency comparison between the C++ AscendCL path and an unavailable-source production runtime",
+  "required_report": {
+    "status": "PASS",
+    "runner": {"name": "concrete runtime name", "version": "exact version/build"},
+    "device": {
+      "target_id": "ascend310p",
+      "model": "concrete product and 310P variant",
+      "device_id": 0
+    },
+    "runtime_identity": {
+      "cann": "exact version",
+      "driver": "exact version",
+      "firmware": "exact version",
+      "runtime": "closed runtime identity"
+    },
+    "model_identity": {
+      "target_checkpoint_manifest_sha256": "64 lowercase hex",
+      "draft_checkpoint_manifest_sha256": "64 lowercase hex",
+      "dtype": "float16",
+      "target_quant_mode": "w8a8_dynamic",
+      "quant_input_manifest_sha256": "64 lowercase hex",
+      "sequence_length": "same static S as the C++ OM"
+    },
+    "prompt": "exact prompt string",
+    "chat": true,
+    "prompt_token_ids": ["exact token IDs supplied to the model loop"],
+    "output": {
+      "token_ids": ["generated token IDs"],
+      "stop_reason": "eos or length"
+    },
+    "measurement_protocol": {
+      "warmup": "at least 3",
+      "repetitions": "at least 10",
+      "concurrency": 1,
+      "model_load_excluded": true,
+      "device_synchronization": "explicitly documented"
+    },
+    "latency_ms": {
+      "model_total": {
+        "raw": ["one synchronized value per measured repetition"]
+      }
+    }
+  },
+  "comparison_rules": [
+    "same physical device, target/draft checkpoints, quant-input manifest, Target W8A8 policy, Draft FP16 policy, static sequence gear, tokenizer output and generated token IDs",
+    "same single-request concurrency and model-load-excluded synchronized model-loop scope",
+    "median and p90 ratio thresholds must be supplied before comparison; this contract defines no invented default",
+    "a faster result with any token/EOS mismatch is FAIL"
+  ]
+}

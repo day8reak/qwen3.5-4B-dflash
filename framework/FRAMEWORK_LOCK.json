@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v1",
+  "repository_base": {
+    "branch": "quant",
+    "revision": "5c61f110a007820ee6df564f87b9c8d1d2733ba5"
+  },
+  "precision": {
+    "target": "W8A8 dynamic QLinear with FP16 output",
+    "target_embedding": "INT8 weight times FP32 row scale to FP16",
+    "draft": "FP16",
+    "lm_head": "FP16"
+  },
+  "input_identity": {
+    "repository_source": "verify every SOURCE_LOCK.json file/hash pair before checkpoint load",
+    "external_artifacts": "hash-complete quant input manifest is required and reverified before checkpoint load",
+    "symlink_policy": "reject symlinked roots and payloads"
+  },
+  "graph": {
+    "factory": "qwen35_dflash.ascend310p.quant_factory:create_quant_recompute_graph",
+    "name": "quant_dflash_recompute",
+    "role": "generation-recompute",
+    "inputs": [
+      {"name": "input_ids", "dtype": "int64", "shape": [1, "S"]},
+      {"name": "attention_mask", "dtype": "int64", "shape": [1, "S"]}
+    ],
+    "outputs": [
+      {"name": "target_top1", "dtype": "int64", "shape": [1, "S"]},
+      {"name": "draft_top1", "dtype": "int64", "shape": [1, 15]}
+    ],
+    "shape_policy": "static S divisible by 64; right-padded valid prefix",
+    "state_policy": "recompute committed prefix"
+  },
+  "compiler": {
+    "exporter": "TorchAir dynamo_export",
+    "atc_mode": 0,
+    "atc_framework": 1,
+    "soc_policy": "exact 310P variant required; generic Ascend310P rejected"
+  },
+  "runtime": {
+    "language": "C++17",
+    "api": "AscendCL",
+    "model_load": "aclmdlLoadFromFile",
+    "execute": "aclmdlExecuteAsync",
+    "memory": "persistent pinned host and device buffers",
+    "synchronization": "one stream synchronization per OM invocation",
+    "generation": "ordinary greedy and strict-greedy DFlash"
+  },
+  "correctness_gate": {
+    "token_id_mismatches": 0,
+    "eos_mismatches": 0,
+    "warmup": 3,
+    "measured_repetitions": 10
+  },
+  "claim_boundary": "Host and fake-ACL tests do not prove AIR export, OM conversion, physical 310P correctness, or latency. Those gates require the real locked target environment."
+}

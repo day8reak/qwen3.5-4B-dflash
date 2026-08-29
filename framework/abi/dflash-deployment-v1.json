@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "abi_id": "qwen35-4b-dflash-ascend310p-deployment-v1",
+  "artifact_manifest": {
+    "air": "qwen35-dflash-torchair-bundle",
+    "om": "qwen35-dflash-ascend310p-om-bundle",
+    "graph_fields": ["name", "role", "input_names", "output_names", "air", "om"]
+  },
+  "integrated_graph": {
+    "name": "quant_dflash_recompute",
+    "role": "generation-recompute",
+    "static_batch": 1,
+    "inputs_in_order": [
+      {"name": "input_ids", "dtype": "int64", "shape": [1, "S"]},
+      {"name": "attention_mask", "dtype": "int64", "shape": [1, "S"]}
+    ],
+    "outputs_in_order": [
+      {"name": "target_top1", "dtype": "int64", "shape": [1, "S"]},
+      {"name": "draft_top1", "dtype": "int64", "shape": [1, 15]}
+    ],
+    "binding": "manifest names are authoritative aliases for OM bindings at the same index",
+    "padding": "right-padded contiguous prefix",
+    "anchor": "last valid input token; excluded from target feature context and placed at DFlash block row zero"
+  },
+  "generation_backend": {
+    "preferred_runner": "framework/runtime/cpp -> qwen35_dflash_acl_runner",
+    "preferred_runner_abi": "pretokenized prompt/EOS IDs in; paired ordinary/DFlash JSON out; one loaded model, persistent buffers and one ACL stream",
+    "reference_factory": "qwen35_dflash.ascend310p.recompute_backend:create_backend",
+    "reference_factory_signature": "create_backend(bundle_dir, manifest, device_id, options)",
+    "prefill": "prefill(prompt_token_ids, max_new_tokens, eos_token_ids) -> GenerationStep",
+    "decode": "decode(committed_token_ids, max_new_tokens, max_draft_tokens, eos_token_ids) -> GenerationStep",
+    "modes": {
+      "ordinary-greedy": "commit target_top1 at the last valid row",
+      "dflash-strict-greedy": "accept the longest proposal prefix equal to target predictions, then commit target correction/bonus"
+    },
+    "step": {
+      "token_ids": "one or more committed non-negative token IDs",
+      "drafted_tokens": "non-negative integer",
+      "accepted_draft_tokens": "non-negative integer not exceeding drafted_tokens",
+      "rejected_draft_tokens": "non-negative integer not exceeding drafted_tokens",
+      "finished": "true only at EOS or a declared terminal target state"
+    },
+    "metadata_required": {
+      "cpu_fallback": false,
+      "artifacts": "exact mapping of loaded graph names to OM SHA-256",
+      "generation_mode": "ordinary-greedy or dflash-strict-greedy",
+      "device.target_id": "ascend310p",
+      "device.model": "concrete product, not generic 310P",
+      "device.device_id": "non-negative integer",
+      "runtime_identities": ["cann", "driver", "firmware", "runtime"]
+    }
+  },
+  "ordinary_parity": {
+    "same": ["OM hashes", "quant input manifest", "Target W8A8 mode", "Draft FP16 mode", "device", "runtime identities", "tokenizer", "prompt", "chat mode", "max_new_tokens"],
+    "required_counts": "3 warmups plus 10 measured repetitions for both reports",
+    "allowed_token_id_mismatches": 0,
+    "allowed_eos_mismatches": 0
+  },
+  "cpp_runtime": {
+    "commands": ["build-cpp", "infer-cpp", "run-e2e-cpp"],
+    "model_load": "once per paired benchmark process and excluded from model-loop latency",
+    "memory": "aclrtMallocHost plus persistent aclrtMalloc buffers and datasets",
+    "execution": "one stream queues H2D, aclmdlExecuteAsync and D2H, followed by one aclrtSynchronizeStream per OM call",
+    "measurement_order": "ordinary and DFlash warmups/measurements alternate in one process",
+    "integrity": "C++ recomputes the expected OM SHA-256 before aclmdlLoadFromFile",
+    "fallback": "none"
+  },
+  "timing_outputs_ms": ["tokenize", "prefill", "decode", "model_total", "detokenize", "end_to_end", "time_to_first_token"],
+  "strict_rules": [
+    "all outputs are below AI_RUN_DIR",
+    "ATC core arguments cannot be overridden",
+    "AIR payload hashes are checked immediately before ATC",
+    "OM hashes are checked immediately before backend construction",
+    "CPU fallback is rejected for target reports",
+    "measured repetitions must return identical token IDs and stop reason",
+    "DFlash target report requires a passing ordinary-greedy report"
+  ]
+}

@@ -11,6 +11,12 @@
 Qwen3.5 DFlash port，不是 z-lab/dflash 全部 generation API 的逐行复制，也尚未取得 Ascend
 310P 端到端加速结论。
 
+`framework/quant-air-om` 分支在这份 `quant` 实现上增加了独立部署层：用现有 W8A8 Target
+和 FP16 Draft 导出 TorchAir AIR，通过 ATC 生成 OM，并由 C++ AscendCL runner 加载 OM、
+循环生成 token。入口和完整验证方法见
+[基于 quant 的 AIR/OM/C++ 框架](docs/QUANT_AIR_OM_FRAMEWORK.md)。第一版 OM 使用静态完整前缀
+重算来冻结功能 ABI；现有 persistent rollback 仍是后续增量 OM 状态 ABI 的语义基线。
+
 ## 当前实现
 
 | 环节 | 当前行为 |
@@ -105,6 +111,7 @@ embedding_scale_path: /data/qwen35-w8a8/embedding_scale.bin
 | [自定义算子](docs/DFLASH_OPERATORS.md) | 已有、生产必需、条件新增和性能优化算子的功能与 I/O |
 | [运行与验证](docs/DFLASH_RUN_AND_VALIDATE.md) | CPU/CUDA/NPU、W8A8、benchmark、msprof 和报告门禁 |
 | [源码索引](models/dflash_v1/README.md) | 入口、scheduler、Target、Draft 和量化文件映射 |
+| [AIR/OM/C++ 框架](docs/QUANT_AIR_OM_FRAMEWORK.md) | 从 quant 权重到 AIR、OM、C++ token 推理和闭源时延 A/B |
 
 ## 结果应怎样解释
 

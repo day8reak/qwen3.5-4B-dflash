@@ -8,9 +8,15 @@ __pycache__/
 *.pt
 *.pth
 *.log
+*.air
+*.om
+**/dynamo.pbtxt
+**/weight_*
 reports/
 runs/
 evidence/
+artifacts/
+build/
 
 # Release-audit files belong to the cold-storage delivery package.
 MANIFEST.sha256

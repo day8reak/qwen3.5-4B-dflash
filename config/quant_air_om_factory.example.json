@@ -1,0 +1,13 @@
+{
+  "target_dir": "/ABSOLUTE/PATH/Qwen3.5-4B",
+  "draft_dir": "/ABSOLUTE/PATH/Qwen3.5-4B-DFlash",
+  "quant_config": "/ABSOLUTE/PATH/qwen3.5.yaml",
+  "input_manifest": "/ABSOLUTE/RUN/PATH/quant-input-manifest.json",
+  "receiver_models_dir": "/ABSOLUTE/PATH/qwen35-runtime/models",
+  "max_sequence_length": 64,
+  "example_sequence_length": 2,
+  "pad_token_id": 0,
+  "dtype": "float16",
+  "device": "npu:0",
+  "name": "quant_dflash_recompute"
+}

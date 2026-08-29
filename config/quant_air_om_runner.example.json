@@ -1,0 +1,9 @@
+{
+  "device_model": "REPLACE_WITH_EXACT_310P_PRODUCT",
+  "cann": "REPLACE_WITH_CANN_VERSION",
+  "driver": "REPLACE_WITH_DRIVER_VERSION",
+  "firmware": "REPLACE_WITH_FIRMWARE_VERSION",
+  "runtime": "AscendCL C++",
+  "graph_name": "quant_dflash_recompute",
+  "pad_token_id": 0
+}
