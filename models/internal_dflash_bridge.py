@@ -350,6 +350,7 @@ class InternalDFlashTarget(nn.Module):
 
         return {
             "prefill_alignment": "right_pad_s_gt_1_to_multiple_of_64",
+            "gdr_effective_length_contract": "int16_batch_call_local_valid_rows",
             "call_local_state_release_barrier": True,
             "full_prefix_calls": self._full_prefix_calls,
             "full_prefix_completions": self._full_prefix_completions,
@@ -370,6 +371,9 @@ class InternalDFlashTarget(nn.Module):
             "historical_prefix_replay_during_verify": False,
             "conv_bank_backend": "torch_tensor_golden_on_input_device",
             "gdr_backend": "npu_gated_delta_rule_mtp",
+            "ordinary_gdr_effective_length_contract": (
+                "int16_batch_call_local_valid_rows"
+            ),
             "state_bank_update_policy": "replace_returned_banks_no_copy",
             "persistent_call_synchronization_policy": (
                 "same_device_stream_dependencies_no_per_call_host_barrier"
@@ -766,6 +770,12 @@ class InternalDFlashTarget(nn.Module):
             raise ValueError("persistent HIAI rows exceed kv_cache_max_len")
 
         inputs_embeds = self._target_inputs(input_ids)
+        gdr_effective_length = torch.full(
+            (int(input_ids.shape[0]),),
+            sequence_length,
+            dtype=torch.int16,
+            device=self.requested_device,
+        )
         positions = torch.arange(
             start_position,
             logical_end,
@@ -794,6 +804,7 @@ class InternalDFlashTarget(nn.Module):
                     dflash_skip_lm_head=not bool(require_logits),
                     dflash_last_token_only=last_token_logits_only,
                     accepted_tokens=accepted_tokens,
+                    gdr_effective_length=gdr_effective_length,
                 )
             logits, features = _unwrap_logits_and_features(
                 raw_output,
@@ -1082,6 +1093,12 @@ class InternalDFlashTarget(nn.Module):
         self._total_padding_tokens += execution_length - sequence_length
 
         inputs_embeds = self._target_inputs(execution_input_ids)
+        gdr_effective_length = torch.full(
+            (int(execution_input_ids.shape[0]),),
+            sequence_length,
+            dtype=torch.int16,
+            device=self.requested_device,
+        )
         attention_mask = self._fresh_attention_mask(execution_length)
         position_ids = torch.arange(
             execution_length,
@@ -1112,6 +1129,7 @@ class InternalDFlashTarget(nn.Module):
                     # rows are aligned to the physical 64-token GDN chunk.
                     allQLen=[sequence_length],
                     output_dflash_features=bool(output_dflash_features),
+                    gdr_effective_length=gdr_effective_length,
                 )
             logits, features = _unwrap_logits_and_features(
                 raw_output,

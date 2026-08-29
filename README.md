@@ -15,7 +15,7 @@ Qwen3.5 DFlash port，不是 z-lab/dflash 全部 generation API 的逐行复制�
 
 | 环节 | 当前行为 |
 | --- | --- |
-| Prompt | Target 按最多 64 个真实 token 分块 prefill；多 token 继续走原 GDR chunk 路线 |
+| Prompt | Target 按最多 64 个真实 token 分块 prefill；原 GDR 接收本次真实行数 `effective_length` |
 | Draft | 官方 6 层、69 tensor；维护逐层 committed KV cache，只计算新增 feature 与当前 block |
 | `block_size` | 包含 1 个 anchor；`B=16` 表示最多 15 个 proposal，Target verify 总行数最多 16 |
 | Target verify | 一次输入 `[anchor, d1, ..., dK]`，不附带历史前缀 |
@@ -71,8 +71,9 @@ python -B -m models.dflash_v1.run_npu \
   --report /path/to/run/dflash-fp16.json
 ```
 
-NPU 进程必须已经注册 `npu_gated_delta_rule_mtp`。`kv-cache-max-len` 需要覆盖 prompt 和输出，
-并能被 64 整除。
+NPU 进程必须同时提供带 `INT16[B] effective_length` 输入的新
+`npu_chunk_gated_delta_rule` ABI，以及现有 `npu_gated_delta_rule_mtp`。后者接口没有随本次适配
+改变。`kv-cache-max-len` 需要覆盖 prompt 和输出，并能被 64 整除。
 
 ### Target W8A8 dynamic
 

@@ -6,7 +6,8 @@
 
 ## 1. 当前结论
 
-- 已完成并接入：`GatedDeltaRuleMTP`。
+- 已完成并接入：`GatedDeltaRuleMTP`；原 `ChunkGatedDeltaRule` 已适配新增的
+  `effective_length` ABI。
 - 当前可运行：causal-conv 使用输入 NPU 上的 Tensor golden；KV 使用现有
   `npu_cache_update_` 逐 row 写；attention 使用现有 `adn_fused_infer_attention`；Draft 使用
   package-local Torch-NPU 分解 primitives。
@@ -25,6 +26,7 @@ golden”则明确需要 `CausalConv1dMTP`。
 
 | 算子 | 当前状态 | 功能 | 主要输入 | 主要输出 | 需要程度 |
 | --- | --- | --- | --- | --- | --- |
+| `ChunkGatedDeltaRule` | 复用 receiver 新 ABI、已接线 | 普通 prompt/decode GDR；固定物理行数时忽略无效尾部 | Q/K/V、g、beta、`effective_length`、初始 state | attention output、最终 FP32 state | P0，已有 |
 | `GatedDeltaRuleMTP` | 已完成、已接线 | 选择上一轮 committed recurrent slot，计算 T 行并保存逐行 provisional state | Q/K/V、g、beta、state bank、`accepted_tokens` | attention output、FP32 state bank | P0，已有 |
 | `CausalConv1dMTP` | Torch-NPU golden | 同一 accepted slot 上执行 depthwise causal conv，保存逐行 conv window | mixed QKV、conv bank、weight/bias、`accepted_tokens` | activated rows、FP16 conv bank | P1，去 golden 必需 |
 | `CacheUpdateMTP` | 现有 op 逐 row | 一次写入 T 行 paged K 或 V，支持跨 64-token block | cache、updates、positions、block table | 原位 cache | 条件 P1 |
@@ -58,7 +60,36 @@ golden”则明确需要 `CausalConv1dMTP`。
 
 ## 4. 状态算子
 
-### 4.1 `GatedDeltaRuleMTP`：已完成
+### 4.1 原 `ChunkGatedDeltaRule`：新增 `effective_length` ABI 已适配
+
+```text
+npu_chunk_gated_delta_rule(
+  query, key, value, g, beta, effective_length,
+  chunk_size=64,
+  initial_state=None,
+  output_final_state=False,
+  use_qk_l2norm_in_kernel=False
+) -> (core_attn_out, final_state)
+```
+
+| Tensor | Shape | Dtype | 含义 |
+| --- | --- | --- | --- |
+| query/key/value | `[B,S,32,128]` | FP16 | 本次普通 GDR 的物理输入行 |
+| g | `[B,S,32]` | FP32 | decay/gate |
+| beta | `[B,S,32]` | FP16 | update coefficient |
+| `effective_length` | `[B]` | INT16 | 每个 batch 在本次 S 行中的有效前缀长度 |
+| initial/final state | `[B,32,128,128]` | FP32 | 本次调用前/后的 recurrent state |
+| core output | `[B,S,32,128]` | FP16 | 本次物理 S 行输出 |
+
+`effective_length` 是 call-local valid rows，不是累计 KV 长度 `allQLen`，也不是
+`accepted_tokens`。例如 full-prefix oracle 把真实 37 行右补齐到物理 S=64 时传 `[37]`；
+persistent prompt chunk 为 64+1 时两次分别传 `[64]` 和 `[1]`；decode 传 `[1]`。同一个
+`INT16[B]` Tensor 在一次 Target forward 的 24 个 GDN 层间复用，避免每层重复构造。
+
+普通 modeling 和 rollback modeling 的 ordinary 分支都调用这个新 ABI。部署侧若仍注册旧签名，
+必须先更新原 GDR 算子包；Python 侧不能通过删掉该参数兼容，否则 padding 会污染 final state。
+
+### 4.2 `GatedDeltaRuleMTP`：已完成
 
 ```text
 npu_gated_delta_rule_mtp(
@@ -82,8 +113,11 @@ npu_gated_delta_rule_mtp(
 
 还需补齐真实设备证据：24 层、多轮、`a=0/1/K-1/K`、K 改变和 rejection 后至少一个 token。
 `accepted_tokens` 是上一轮接受数；当前轮接受数在算子执行后才由 Target Top-1 决定。
+当前 GDR-MTP 是精确 T=1..16 的 recurrent/state-bank 语义，没有 padding tail；其
+`chunk_size=64` 仅保留现有调用 ABI，不代表执行原 GDR 的 chunk 路线。本次改动不向 GDR-MTP
+增加 `effective_length`。
 
-### 4.2 `CausalConv1dMTP`：生产优先
+### 4.3 `CausalConv1dMTP`：生产优先
 
 ```text
 causal_conv1d_mtp(

@@ -1,11 +1,12 @@
 # coding=utf-8
 """Qwen3.5 HIAI target with an explicit DFlash rollback integration boundary.
 
-The ordinary HIAI path is intentionally unchanged: when ``accepted_tokens`` is
-``None`` it still calls ``npu_chunk_gated_delta_rule`` and uses the receiver's
-original in-place convolution/cache updates.  A vectorized DFlash verification
-call passes ``accepted_tokens: int8[B]`` and exactly ``K + 1`` input rows
-(``anchor + K proposals``).  In that mode:
+The ordinary HIAI path keeps its original math and state ownership: when
+``accepted_tokens`` is ``None`` it calls the current
+``npu_chunk_gated_delta_rule`` ABI with a call-local ``INT16[B]`` effective
+length and uses the receiver's original in-place convolution/cache updates.  A
+vectorized DFlash verification call passes ``accepted_tokens: int8[B]`` and
+exactly ``K + 1`` input rows (``anchor + K proposals``).  In that mode:
 
 * the completed ``npu_gated_delta_rule_mtp`` operator selects the previously
   accepted recurrent-state slot and returns one provisional state per row;
@@ -72,6 +73,46 @@ logger = logging.get_logger(__name__)
 DFLASH_BLOCK_SIZE = 16
 DFLASH_MAX_PROPOSALS = DFLASH_BLOCK_SIZE - 1
 DFLASH_MAX_VERIFY_TOKENS = DFLASH_BLOCK_SIZE
+
+
+def _normalize_gdr_effective_length(
+    effective_length: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    physical_sequence_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the current GDR valid-row count as one reusable INT16 tensor."""
+
+    if physical_sequence_length <= 0:
+        raise ValueError("GDR physical sequence length must be positive")
+    if effective_length is None:
+        return torch.full(
+            (batch_size,),
+            physical_sequence_length,
+            dtype=torch.int16,
+            device=device,
+        )
+    if not isinstance(effective_length, torch.Tensor):
+        raise TypeError("gdr_effective_length must be a Tensor")
+    if effective_length.dtype != torch.int16:
+        raise TypeError("gdr_effective_length must use torch.int16")
+    if tuple(effective_length.shape) != (batch_size,):
+        raise ValueError(
+            f"gdr_effective_length must have shape [{batch_size}], "
+            f"got {tuple(effective_length.shape)}"
+        )
+    if effective_length.device != device:
+        raise ValueError("gdr_effective_length and hidden states must share one device")
+    if effective_length.device.type == "cpu" and effective_length.numel():
+        minimum = int(effective_length.min().item())
+        maximum = int(effective_length.max().item())
+        if minimum < 1 or maximum > physical_sequence_length:
+            raise ValueError(
+                "gdr_effective_length values must be in "
+                f"[1,{physical_sequence_length}]"
+            )
+    return effective_length
 
 
 def _require_dflash_accepted_tokens(
@@ -1073,6 +1114,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         accepted_tokens: Optional[torch.Tensor] = None,
+        gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         if cache_params is None or len(cache_params) != 2:
@@ -1159,6 +1201,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(repeat, dim=2)
             key = key.repeat_interleave(repeat, dim=2)
         if accepted_tokens is None:
+            if gdr_effective_length is None:
+                raise ValueError("ordinary GDN requires gdr_effective_length")
             core_attn_out, last_recurrent_state = (
                 torch_npu.npu_chunk_gated_delta_rule(
                     query,
@@ -1166,6 +1210,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     value.contiguous(),
                     g=g,
                     beta=beta,
+                    effective_length=gdr_effective_length,
                     chunk_size=1 if seq_len == 1 else 64,
                     initial_state=recurrent_state.to(torch.float32),
                     output_final_state=True,
@@ -1236,6 +1281,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         token_count=0,
         export_flag=False,
         accepted_tokens: Optional[torch.Tensor] = None,
+        gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Tuple]:
         residual = hidden_states
@@ -1247,6 +1293,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 cache_position=new_kv_cache_pos,
                 attention_mask=attention_mask,
                 accepted_tokens=accepted_tokens,
+                gdr_effective_length=gdr_effective_length,
             )
         elif self.block_type == "full_attention":
             hidden_states, _, present_key_value = self.self_attn(
@@ -1348,12 +1395,19 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         export_flag=False,
         output_dflash_features: bool = False,
         accepted_tokens: Optional[torch.Tensor] = None,
+        gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds.to(torch.float16)
+        gdr_effective_length = _normalize_gdr_effective_length(
+            gdr_effective_length,
+            batch_size=int(hidden_states.shape[0]),
+            physical_sequence_length=int(hidden_states.shape[1]),
+            device=hidden_states.device,
+        )
         if accepted_tokens is not None:
             if past_key_values is None:
                 raise ValueError(
@@ -1392,6 +1446,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 token_count=token_count,
                 export_flag=export_flag,
                 accepted_tokens=accepted_tokens,
+                gdr_effective_length=gdr_effective_length,
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
@@ -1451,6 +1506,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         dflash_skip_lm_head: bool = False,
         dflash_last_token_only: bool = False,
         accepted_tokens: Optional[torch.Tensor] = None,
+        gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         text_output = self.language_model(
@@ -1466,6 +1522,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             export_flag=export_flag,
             output_dflash_features=output_dflash_features,
             accepted_tokens=accepted_tokens,
+            gdr_effective_length=gdr_effective_length,
             **kwargs,
         )
         if output_dflash_features:

@@ -17,7 +17,9 @@ SOURCE = (
     / "models"
     / "modeling_qwen3_5_hiai_nd_dflash_rollback.py"
 )
+BASE_SOURCE = REPOSITORY_ROOT / "models" / "modeling_qwen3_5_hiai_nd.py"
 HELPERS = {
+    "_normalize_gdr_effective_length",
     "_require_dflash_accepted_tokens",
     "_select_dflash_state_slot",
     "seed_dflash_gdn_state_banks",
@@ -83,7 +85,43 @@ def sequential_reference(
     return outputs, states
 
 
+def assert_gdr_effective_length_source_contract() -> None:
+    for source in (BASE_SOURCE, SOURCE):
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        ordinary_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "npu_chunk_gated_delta_rule"
+        ]
+        assert len(ordinary_calls) == 1
+        keyword_names = {item.arg for item in ordinary_calls[0].keywords}
+        assert "effective_length" in keyword_names
+
+    rollback_tree = ast.parse(
+        SOURCE.read_text(encoding="utf-8"),
+        filename=str(SOURCE),
+    )
+    mtp_bridge = next(
+        node
+        for node in rollback_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_npu_gated_delta_rule_mtp"
+    )
+    assert [argument.arg for argument in mtp_bridge.args.args] == [
+        "query",
+        "key",
+        "value",
+        "g",
+        "beta",
+        "initial_state",
+        "accepted_tokens",
+    ]
+
+
 def main() -> None:
+    assert_gdr_effective_length_source_contract()
     helper = load_helpers()
     assert helper["DFLASH_BLOCK_SIZE"] == 16
     assert helper["DFLASH_MAX_PROPOSALS"] == 15
@@ -91,6 +129,42 @@ def main() -> None:
     seed = helper["seed_dflash_gdn_state_banks"]
     rebase = helper["rebase_dflash_gdn_state_banks"]
     conv = helper["torch_dflash_causal_conv1d_mtp"]
+    normalize_effective_length = helper["_normalize_gdr_effective_length"]
+
+    default_effective_length = normalize_effective_length(
+        None,
+        batch_size=2,
+        physical_sequence_length=5,
+        device=torch.device("cpu"),
+    )
+    assert default_effective_length.dtype == torch.int16
+    assert default_effective_length.tolist() == [5, 5]
+    explicit_effective_length = torch.tensor([3, 4], dtype=torch.int16)
+    assert normalize_effective_length(
+        explicit_effective_length,
+        batch_size=2,
+        physical_sequence_length=5,
+        device=torch.device("cpu"),
+    ) is explicit_effective_length
+    for invalid, expected_error in (
+        (torch.tensor([3, 4], dtype=torch.int64), TypeError),
+        (torch.tensor([[3, 4]], dtype=torch.int16), ValueError),
+        (torch.tensor([0, 4], dtype=torch.int16), ValueError),
+        (torch.tensor([3, 6], dtype=torch.int16), ValueError),
+    ):
+        try:
+            normalize_effective_length(
+                invalid,
+                batch_size=2,
+                physical_sequence_length=5,
+                device=torch.device("cpu"),
+            )
+        except expected_error:
+            pass
+        else:
+            raise AssertionError(
+                "invalid GDR effective_length contract was not rejected"
+            )
 
     torch.manual_seed(20260826)
     committed_conv = torch.randn(2, 3, 4, dtype=torch.float16)

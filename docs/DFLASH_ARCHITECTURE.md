@@ -85,9 +85,16 @@ sequenceDiagram
 Target 只 prefill 一次。HIAI bridge 按 KV block 边界拆成最多 64 个真实 token 的 chunk：
 
 - 多 token chunk 继续调用原 `npu_chunk_gated_delta_rule`，使用原版 GDR prefill 路线；
+- bridge 为每次 Target forward 构造 `INT16[B] gdr_effective_length`，值是本次调用的真实
+  token 行数，而不是累计上下文长度 `allQLen`；
 - 不用逐 token prefill 代替原 GDR；
 - 不把 padding 写进 persistent GDN/conv/KV state；
 - 中间 chunk 跳过完整 LM head，最后一个真实 prompt row 产生 clean anchor。
+
+full-prefix correctness oracle 仍可把例如 37 个真实 token 对齐到 64 行物理输入，此时
+`allQLen=37`、`gdr_effective_length=[37]`、物理 GDR 序列长度为 64。persistent rollback prompt
+使用真实 token chunk，因此其 `gdr_effective_length` 等于每个 chunk 的实际 T；decode 为 1。
+verify 虽也向 modeling 传入当前 T，但只走精确 T 的 GDR-MTP 分支，GDR-MTP ABI 未增加该输入。
 
 Feature collector 读取 Target decoder 层 `1,5,9,13,17,21,25,29` 在 final norm 之前的 hidden，
 拼成 `[batch, tokens, 20480]`。
@@ -148,8 +155,9 @@ runner 的固定行为。
 | CPU/CUDA | `modeling_qwen3_5_dflash.py` | `TorchDFlashOps` | DynamicCache + GDN snapshot/restore + bounded replay |
 | HIAI/NPU | 独立 rollback modeling/wrapper | package-local NPU Tensor decomposition | GDR/conv bank + paged-KV logical cursor |
 
-原 `models/modeling_qwen3_5_hiai_nd.py` 和原部署 wrapper 不被覆盖；rollback 使用独立 modeling、
-wrapper adapter 和 bridge。
+ordinary `models/modeling_qwen3_5_hiai_nd.py` 保持权威，只增加原 GDR 新
+`effective_length` ABI 的参数传播；原部署 wrapper 不被 rollback 覆盖。rollback 仍使用独立
+modeling、wrapper adapter 和 bridge。
 
 ## 5. 状态事务
 
@@ -169,6 +177,9 @@ logical cursor 覆写。
 `accepted_tokens` 传给 GDR-MTP/conv bank 时表示“上一轮选择哪个 provisional slot”，不是当前轮
 尚未计算出的接受数。T 改变时先选择 committed slot，再 rebase 为新 T。任一层 verify 失败后，
 整个 session 失效，不能继续使用部分更新的状态。
+
+`gdr_effective_length` 与 `accepted_tokens` 不属于同一合同：前者只描述原 GDR 本次物理输入中
+有多少行有效，后者只让 rollback 算子选择上一轮已提交的 state-bank slot。
 
 ## 6. FP16 与 W8A8
 
