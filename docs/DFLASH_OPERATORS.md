@@ -1,272 +1,231 @@
-# DFlash rollback 算子清单
+# DFlash 自定义算子清单
 
-本文回答两个问题：当前 rollback 为什么已经能走 correctness 路线，以及除用户已完成的
-GDR MTP 外，哪些位置还需要或可能需要自定义算子。
+本文区分三件事：当前 strict-greedy rollback 能否运行、去掉生产 golden 还缺什么、性能优化可能
+需要什么。只有实测热点才进入优化算子开发；sampling、streaming、batch 和 transaction 所有权
+首先是软件能力，不应被包装成一个巨型算子。
 
-## 1. 结论
+## 1. 当前结论
 
-当前版本要先跑通 rollback，不再缺少硬性的数学功能：
+- 已完成并接入：`GatedDeltaRuleMTP`。
+- 当前可运行：causal-conv 使用输入 NPU 上的 Tensor golden；KV 使用现有
+  `npu_cache_update_` 逐 row 写；attention 使用现有 `adn_fused_infer_attention`；Draft 使用
+  package-local Torch-NPU 分解 primitives。
+- 去掉 production golden 的首要新增算子：`CausalConv1dMTP`。
+- `CacheUpdateMTP` 和 `FusedInferAttentionMTP` 不是默认必做；先证明现有算子的多行、跨块和数值
+  能力，再根据 profile 决定。
+- 当前高价值性能候选：Draft/Target full-vocab Top-1、Draft GQA、W8A8 dynamic-quant+matmul
+  dispatch 融合。
 
-- GDN recurrent state 已接入 npu_gated_delta_rule_mtp；
-- GDN causal-conv state 由输入 NPU device 上的 Torch Tensor golden 实现；
-- full-attention KV 逐 row 复用 npu_cache_update_；
-- attention 先复用 adn_fused_infer_attention；
-- Top-1 先用普通 LM head 和设备侧 argmax，只把 T 个 ID 搬回 host 做连续 accept scan。
-- Draft 6 层 committed K/V 已由 request-local Torch cache 实现，当前 block 成功后裁掉、异常时
-  abort；它不再是 correctness 缺口。
+因此，“完整官方 generation 功能”不能仅靠新增算子完成；“当前 NPU 路线不再依赖 conv
+golden”则明确需要 `CausalConv1dMTP`。
 
-因此当前 correctness bring-up 的最小外部依赖仍只有已经完成并注册的
-npu_gated_delta_rule_mtp。面向生产性能，最先建议开发 CausalConv1dMTP。CacheUpdateMTP 和
-FusedInferAttentionMTP 必须先做现有算子能力测试；TargetLmHeadTop1Accept 是高价值性能候选。
+## 2. 总表
 
-| 分类 | 算子 | 当前决定 |
-| --- | --- | --- |
-| 已完成 | GatedDeltaRuleMTP | 已接入，补 24 层、多轮真机证据 |
-| 已完成 golden | Draft KV cache/crop | 语义与官方 append-then-crop 对齐；真机 profile 后决定是否做 cache-aware GQA |
-| 生产优先 | CausalConv1dMTP | 建议新增，替换 Tensor 分解 golden |
-| 条件新增 | CacheUpdateMTP | 现有多行/跨块能力或性能不足时新增 |
-| 条件新增 | FusedInferAttentionMTP | 现有 T=2/4/6/8/16 能力失败时扩展或新增 |
-| 性能优先 | TargetLmHeadTop1Accept | correctness 不依赖，但可消除完整 logits 落地和 D2H |
-| Profiling 后 | Draft GQA、Draft Top-1、projection | Draft 热点确认后逐项融合；projection 已按 token 缓存 |
+表中 P0 表示已有 correctness 依赖，P1 表示生产或实测热点优先，P2/P3 表示 profile 后选择。
 
-## 2. Target 尺寸和状态
+| 算子 | 当前状态 | 功能 | 主要输入 | 主要输出 | 需要程度 |
+| --- | --- | --- | --- | --- | --- |
+| `GatedDeltaRuleMTP` | 已完成、已接线 | 选择上一轮 committed recurrent slot，计算 T 行并保存逐行 provisional state | Q/K/V、g、beta、state bank、`accepted_tokens` | attention output、FP32 state bank | P0，已有 |
+| `CausalConv1dMTP` | Torch-NPU golden | 同一 accepted slot 上执行 depthwise causal conv，保存逐行 conv window | mixed QKV、conv bank、weight/bias、`accepted_tokens` | activated rows、FP16 conv bank | P1，去 golden 必需 |
+| `CacheUpdateMTP` | 现有 op 逐 row | 一次写入 T 行 paged K 或 V，支持跨 64-token block | cache、updates、positions、block table | 原位 cache | 条件 P1 |
+| `FusedInferAttentionMTP` | 复用现有 attention | 历史 paged KV + 当前 T 行 block-causal attention | Q、K/V cache、mask、length/table | T 行 attention | 条件 P1 |
+| `DFlashBlockGQA` | Draft Tensor 分解 | 直接读取 committed/new KV，避免 repeat/concat 和小算子链 | Draft Q、committed/new K/V、mask | 6 层 attention rows | 性能 P1 |
+| `DFlashDraftLmHeadTop1` | 普通 LM head + argmax | 分块完整词表 matmul，只落地 K 个 Top-1 ID | Draft hidden、完整 FP16 LM head | `[B,K]` IDs | 性能 P1 |
+| `TargetLmHeadTop1Accept` | 普通 LM head + argmax + host scan | 完整词表 Top-1，并计算连续接受数和 correction/bonus | Target hidden、LM head、proposal | Top-1、accepted、next token | 性能 P1 |
+| `FusedDynamicQuantLinear` | 每次 QLinear 分别 dynamic-quant + quant-matmul | 在一个设备任务内完成激活量化和 W8A8 matmul | FP16 activation、INT8 weight、FP32 scale | FP16 output | W8A8 性能 P1，先 profile |
+| `DFlashFeatureProjectNorm` | Linear + RMSNorm | 只处理本轮新增 `1+a` feature | `[B,Δ,20480]`、projection/norm weight | `[B,Δ,2560]` | 性能 P2 |
+| `DraftKVAppendCrop` | request-local Tensor cache | attention 可见 old+new+block，只提交 old+new | 6 层 cache、新 context、transient block | committed cache | 性能/内存 P2 |
+| Draft small-op fusion | 标准 Tensor ops | 融合 RMSNorm/RoPE/SwiGLU 等短链 | hidden、norm/rope/MLP 参数 | 同数学输出 | 性能 P2 |
+| `StateBankSelectRebase` | Tensor gather/expand | T 改变时选择 committed slot 并建立新 bank | state bank、accepted、新 T | rebased bank | 性能 P3 |
 
-| 项目 | 值 |
+## 3. 形状符号
+
+| 符号 | 当前 Qwen3.5-4B 值 |
 | --- | ---: |
-| Decoder 层数 | 32 |
-| GDN / full-attention 层数 | 24 / 8 |
-| Hidden / MLP | 2560 / 9216 |
-| Target attention Q / KV heads | 16 / 4 |
-| Target attention head dim | 256 |
-| GDN K / V heads | 16 / 32 |
-| GDN K / V head dim | 128 / 128 |
-| GDN mixed QKV channels | 8192 |
-| GDN conv kernel/state length | 4 |
-| Vocab size | 248320 |
-| 官方 block_size / 最大 proposal K / verify T | 16 / 15 / 16 |
-| KV block size | 64 |
-| 单层 packed KV cache | [num_blocks,64,64,16] FP16 |
+| batch `B` | 1 |
+| verify rows `T` | 1..16；正常 speculative round 为 2..16 |
+| hidden `H` | 2560 |
+| vocab `V` | 248320 |
+| Target GDN/full-attention layers | 24 / 8 |
+| GDN mixed channels `Cg` | 8192 |
+| GDN value heads/dim | 32 / 128 |
+| GDN conv window `Kc` | 4 |
+| Draft Q/KV heads/dim | 32 / 8 / 128 |
+| paged-KV block | 64 tokens |
 
-当前 HIAI receiver 的 conv state 最后一维是 4。自定义算子必须复现这个实际 ABI，不能按其他
-framework 中常见的 kernel_size-1 擅自改成 3。
+物理 layout 必须以当前 receiver/exporter 为准；下面同时给出稳定的逻辑 ABI，不能只靠 shape
+相同就假设 layout 等价。
 
-## 3. 已完成：GatedDeltaRuleMTP
+## 4. 状态算子
 
-功能：从上一轮 state bank 选择 accepted_tokens 对应槽，以该状态执行当前 T 行 GDR，并为每个
-输入行保存 provisional recurrent state。
+### 4.1 `GatedDeltaRuleMTP`：已完成
 
-~~~text
+```text
 npu_gated_delta_rule_mtp(
-  query,
-  key,
-  value,
-  g,
-  beta,
-  initial_state,
-  accepted_tokens,
+  query, key, value, g, beta,
+  initial_state, accepted_tokens,
   chunk_size=64,
   output_final_state=True,
   use_qk_l2norm_in_kernel=True
 ) -> (core_attn_out, state_bank)
-~~~
-
-输入输出：
+```
 
 | Tensor | Shape | Dtype | 含义 |
 | --- | --- | --- | --- |
-| query / key / value | [B,T,32,128] | FP16 | 当前 verify block 的 GDR 输入 |
-| g | [B,T,32] | FP32 | decay/gate |
-| beta | [B,T,32] | FP16 | update 系数 |
-| initial_state | [B,T,32,128,128] | FP32 | 上一轮 provisional state bank |
-| accepted_tokens | [B] | INT8 | 选择上一轮已提交槽 |
-| core_attn_out | [B,T,32,128] | FP16 | 当前 T 行输出 |
-| state_bank | [B,T,32,128,128] | FP32 | 每行执行后的 provisional state |
+| query/key/value | `[B,T,32,128]` | FP16 | 当前 verify rows |
+| g | `[B,T,32]` | FP32 | decay/gate |
+| beta | `[B,T,32]` | FP16 | update coefficient |
+| initial state bank | `[B,T,32,128,128]` | FP32 | 上一轮 provisional slots |
+| `accepted_tokens` | `[B]` | INT8 | 选择上一轮 committed slot |
+| core output | `[B,T,32,128]` | FP16 | 当前 T 行输出 |
+| next state bank | `[B,T,32,128,128]` | FP32 | slot i 为处理 row 0..i 后状态 |
 
-accepted_tokens 是上一轮接受长度，不是当前 verify 尚未得出的接受长度。slot i 表示执行本轮输入
-row 0 到 row i 后的状态。当前还需要的工作是目标设备上覆盖 24 层、连续多轮、accepted
-为 0、1、K-1、K，以及 K 改变时的 select/rebase。
+还需补齐真实设备证据：24 层、多轮、`a=0/1/K-1/K`、K 改变和 rejection 后至少一个 token。
+`accepted_tokens` 是上一轮接受数；当前轮接受数在算子执行后才由 Target Top-1 决定。
 
-当前 modeling 直接接管算子返回的 `state_bank` 并更新 persistent state list，不再把完整 FP32
-bank `copy_` 回旧 tensor；B16 下可省去约 768 MiB/轮的额外目的端写入。
+### 4.2 `CausalConv1dMTP`：生产优先
 
-## 4. 生产优先：CausalConv1dMTP
-
-### 功能
-
-GDN 的 causal-conv window 也包含前缀历史。算子必须与 GDR 使用同一个 accepted_tokens 选择
-起始窗口，计算 T 行 depthwise causal convolution，并输出每一行之后的 conv state bank。
-
-### 建议 ABI
+```text
+causal_conv1d_mtp(
+  hidden_states, conv_state_bank, weight, bias,
+  accepted_tokens, activation="silu"
+) -> (output, next_conv_state_bank)
+```
 
 | Tensor | Shape | Dtype |
 | --- | --- | --- |
-| hidden_states | [B,8192,T] | FP16 |
-| conv_state_bank | [B,T,8192,4] | FP16 |
-| weight | [8192,4] | FP16 |
-| bias | [8192] 或无 | FP16 |
-| accepted_tokens | [B] | INT8 |
-| activation | scalar attribute | SiLU |
-| output | [B,8192,T] | FP16 |
-| next_state_bank | [B,T,8192,4] | FP16 |
+| hidden states | `[B,Cg,T]` | FP16 |
+| previous conv bank | `[B,T,Cg,Kc]` | FP16 |
+| weight | `[Cg,Kc]` | FP16 |
+| bias | `[Cg]` 或无 | FP16 |
+| `accepted_tokens` | `[B]` | INT8 |
+| output | `[B,Cg,T]` | FP16 |
+| next conv bank | `[B,T,Cg,Kc]` | FP16 |
 
-状态槽的含义与 GDR 完全相同：next_state_bank[:,i] 是输入 row 0 到 row i 执行后的窗口。
+当前 `torch_dflash_causal_conv1d_mtp` 已实现相同语义，输入在 NPU 时没有 CPU fallback，但会形成
+gather、concat/unfold、depthwise conv、activation 和中间 tensor。新算子必须逐 row、逐 state
+slot 对齐该 golden，并与 GDR、KV、feature 使用同一个 accepted count。
 
-### 当前替代实现
+验收档位：`K=1/3/5/7/15`，`a=0/1/K-1/K`，连续多轮及动态 T；拒绝后继续执行至少一个 token，
+确认 rejected window 未污染 committed state。
 
-models/modeling_qwen3_5_hiai_nd_dflash_rollback.py 中的
-torch_dflash_causal_conv1d_mtp 已实现同一数学语义。输入是 NPU tensor 时，分解运算仍在 NPU
-上执行，因此它不是 CPU fallback；rolling state 已改为一次 unfold/permute，但仍包含 concat、
-grouped conv 和中间 tensor，不适合作为最终性能实现。
+## 5. Target 条件算子
 
-### 验收
+### 5.1 `CacheUpdateMTP`
 
-- K 为 1、3、5、7、15；
-- accepted 为 0、1、K-1、K；
-- 每个输出 row 和 state slot 对齐逐 token ordinary reference；
-- 下一轮至少再执行一个 token，确认拒绝尾部没有污染；
-- 与 GDR、KV 和 feature 使用完全相同的 accepted count。
+当前 K/V 分别对 T 行调用现有 `npu_cache_update_`，正确但一轮最多形成 `2*T` 次 launch。只有
+现有 ABI 不能多行/跨块，或 msprof 证明它是热点时才新增：
 
-## 5. 条件新增：CacheUpdateMTP
+| 输入/输出 | Shape / dtype |
+| --- | --- |
+| packed cache | `[num_blocks,64,64,16]` FP16 |
+| logical updates | `[B,T,4,256]` FP16；或物理 `[T,64,16]` |
+| positions | `[B,T]` INT32/INT64 |
+| block table | `[B,max_blocks]` INT32 |
+| cache out | 原位更新，与输入 cache 同 layout |
 
-### 什么时候需要
+必须覆盖 round start `62/63/64/65`、T=`2/4/6/8/16`、prefix/suffix sentinel 不变，以及 rejected
+tail 下一轮不可见并被覆写。算子只做物理写入；是否提交 `1+a` 仍由 runtime cursor 决定。
 
-当前实现对 K 和 V 的 T 行分别逐 row 调用现有 npu_cache_update_，可以跨越 64-token block，
-但最多产生 2T 次 update launch。先验证现有算子是否已有多行或向量 position ABI；满足功能和
-性能时只改调用，不另造 kernel。
+### 5.2 `FusedInferAttentionMTP`
 
-以下任一情况成立时再新增或扩展：
+先验证现有 `adn_fused_infer_attention`：
 
-- 现有 ABI 不能一次写入 T 行；
-- 不能正确跨越位置 63 到 64；
-- 逐 row launch 在整网 profile 中成为明显热点。
+| 输入/输出 | 逻辑 shape / dtype |
+| --- | --- |
+| current Q | `[B,T,16,256]` FP16；当前 packed 形式为 `[B,256,T,16]` |
+| paged K/V | 8 层各自的 receiver layout |
+| mask | `[B,1,T,kv_max_len]` FP16 |
+| block table / lengths | INT32/INT64 runtime values |
+| output | `[B,T,16,256]` FP16，随后投影回 hidden |
 
-### 建议 ABI
+只有它不能同时处理历史 KV、当前块内 causal mask、动态真实长度和跨块位置，或性能明显不足时，
+才扩展/新增 MTP 版本。
 
-| Tensor | Shape / dtype | 含义 |
-| --- | --- | --- |
-| cache | [Nblock,64,64,16] FP16 | 单个 packed K 或 V cache |
-| update | [B,T,4,256] FP16 或 [T,64,16] FP16 | 当前 T 行 |
-| positions | [B,T] INT32/INT64 | 每一行逻辑位置 |
-| block_table | [B,max_blocks] INT32 | 逻辑块到物理块映射 |
-| cache_out | 与 cache 相同，或原位副作用 | 写入全部 provisional rows |
+## 6. 性能算子
 
-这个算子只负责物理写入。接受后推进 logical cursor 1+a 是 runtime 事务，不应让 CacheUpdate
-自己决定接受长度。
+### 6.1 Draft GQA 与 Top-1
 
-### 验收
+`DFlashBlockGQA` 建议直接消费：
 
-- T 为 2、4、6、8、16；
-- round start 位于 62、63、64、65；
-- 写入位置与逐 row oracle 完全相同；
-- prefix 和未触及 suffix sentinel 不变；
-- 拒绝尾部在下一轮不可见，并从新 cursor 被覆盖。
+```text
+Q                 [B,32,T,128]
+committed K/V     [B,8,C,128]
+new context K/V   [B,8,Δ,128]
+transient K/V     [B,8,T,128]
+mask              block/sliding visibility
+-> output          [B,32,T,128]
+```
 
-## 6. 条件新增：FusedInferAttentionMTP
+前五层是 sliding causal，最后一层允许当前 block 内 non-causal 可见，不能把六层统一成一种 mask。
+cache commit 只包含 old+Δ，不包含 transient T。
 
-现有 adn_fused_infer_attention 如果能够正确处理历史 paged KV、当前 T 行块内 causal mask 和
-真实长度，就继续复用。先测下面的逻辑 ABI：
+`DFlashDraftLmHeadTop1` 输入 hidden `[B,K,2560]` 和完整 FP16 weight `[248320,2560]`，输出
+`[B,K]` token ID。必须遍历完整词表，精确 tie 时选择最小 vocab ID；未经批准不能换成 shortlist。
+
+### 6.2 Target Top-1 与接受
+
+`TargetLmHeadTop1Accept`：
 
 | Tensor | Shape / dtype |
 | --- | --- |
-| packed query | [B,256,T,16] FP16 |
-| K/V cache | 8 层各自的 packed paged cache |
-| attention mask | [B,1,T,kv_max_len] FP16 |
-| block table | [B,max_blocks] INT32 |
-| actual query / KV length | runtime scalar 或 vector |
-| output | [B,256,T,16] FP16，恢复后为 [B,T,4096] |
+| Target hidden | `[B,T,2560]` FP16 |
+| LM head | `[248320,2560]` FP16 或已批准目标 layout |
+| proposals | `[B,T-1]` INT32/INT64 |
+| Top-1 IDs | `[B,T]` INT32/INT64 |
+| accepted | `[B]` INT8 |
+| correction/bonus | `[B]` INT32/INT64 |
 
-只有现有 op 在 T=2、4、6、8、16、不同历史长度或跨块场景中出现能力限制或数值不等价时，才扩展
-它或新增 FusedInferAttentionMTP。每个有效 row 的 Top-1 都要与独立前缀 oracle 对齐。
+当前已经只把 T 个 argmax ID 搬回 host，不再搬完整 logits；新算子的收益来自避免完整 logits
+落地、减少 kernel/host 边界。普通 LM head + argmax 必须保留为 golden。
 
-## 7. 高价值性能算子：TargetLmHeadTop1Accept
+### 6.3 W8A8 `FusedDynamicQuantLinear`
 
-当前 Target 仍生成 `[B,T,248320]` 完整 logits，但 argmax 已在设备上执行，只把 T 个 token ID
-搬到 host 做连续匹配。大 logits 的计算/落地和边界同步仍存在，但不再有完整 logits D2H。
+原 QLinear 每次调用分别执行 `npu_dynamic_quant(x)` 和 `npu_quant_matmul(...)`：
 
-建议功能：
+```text
+x            [B,T,K] FP16
+W_q          [K,N] INT8 blocked-ZN carrier
+weight scale [N] 或导出约定 shape FP32
+-> output    [B,T,N] FP16
+```
 
-1. 分块执行 Target LM head；
-2. 每行只保留 Top-1 token，严格相等时选择最小 vocab ID；
-3. 将前 T-1 行与 proposal 比较；
-4. 输出最长连续 accepted count、correction 或 bonus。
+如果 Runtime timeline 显示大量 DynamicQuant/QuantMatmul 下发间隙或隐式同步，可以融合激活量化、
+per-token scale 和 quant matmul。不能只凭 QuantMatmul kernel 时间判断；先锁定相同 token hash、
+T 分布和调用次数，再比较端到端 latency。融合后必须逐 T=`1..64`、每个 Linear path 与原
+QLinear 对齐。
 
-建议 ABI：
+### 6.4 其余候选
 
-| Tensor | Shape / dtype |
-| --- | --- |
-| hidden | [B,T,2560] FP16 |
-| lm_head_weight | [248320,2560] FP16 或已批准的目标格式 |
-| proposal | [B,T-1] INT32/INT64 |
-| optional EOS | 标量或小 vector |
-| top1_ids | [B,T] INT32/INT64 |
-| accepted_tokens | [B] INT8 |
-| next_token | [B] INT32/INT64 |
+- `DFlashFeatureProjectNorm`：只对本轮新增 Δ=`1+a` 行执行 `20480->2560 + RMSNorm`；当前已经
+  每个 committed token 只算一次，profile 热时才融合。
+- `DraftKVAppendCrop`：减少 cache concat/allocator 峰值；异常时旧 committed cache 必须原样可用。
+- RMSNorm/RoPE/SwiGLU fusion：只在小算子 launch 成为热点时做，保持 FP32 reduction 和 FP16
+  rounding boundary。
+- `StateBankSelectRebase`：固定 B/T 时通常无收益；动态 T gather/expand 明显时再开发。
 
-这个算子不是 bring-up 必需项。实现后仍应保留普通 LM head 加 argmax 作为 golden，并比较所有
-Top-1、tie、accepted 和 correction/bonus。
+## 7. 不应做成自定义算子的内容
 
-## 8. Runtime 逻辑不要做成算子
+以下内容默认留在 scheduler/runtime：
 
-DFlashStateTransaction 负责让 24 层 recurrent bank、24 层 conv bank、8 层 KV、position、
-feature 和 logical cursor 使用同一个 a，并在失败时整轮失效。它是 scheduler/bridge 的状态
-所有权协议，不建议包装成一个巨大的自定义算子。
+- longest-prefix accept 的请求级控制流；
+- EOS、max-new-tokens、zero-accept Target-only fallback；
+- 24 层 recurrent、24 层 conv、8 层 KV、feature、position 的原子 commit/abort；
+- sampling 的随机流、概率比 rejection 和 residual correction；
+- ordinary/DFlash correctness gate 和报告。
 
-StateBankRebase 当前也已有 Tensor helper。固定 K 时不需要 rebase；只有图内动态 K 或 profiling
-证明 gather/copy 明显受限时，才考虑独立 StateBankRebase 算子。
+可以在 profile 证明 host round trip 是瓶颈后，把“Top-1 + accepted reduction”做成小型设备算子，
+但不要让一个 kernel 隐式拥有整个 request transaction。
 
-DynamicQuant 和 quant matmul 先做 T 行能力检查。如果现有实现支持激活首维 B×T，就不新增
-算子；不能假定它们只支持 decode T=1 或 prefill T=64。
+## 8. 开发顺序
 
-当前 quant 分支复用原 HIAI modeling 中同一个 `QLinear`：`npu_dynamic_quant` 接收当前
-`[B,T,K]` 激活，`npu_quant_matmul` 输出 FP16 `[B,T,N]`。rollback modeling 不复制第二套
-QLinear，也不改变其公式。Linear artifact 由内置的原 `utils.quant_model` 兼容实现读取；量化
-embedding 是 YAML 指定 raw INT8 weight 与 FP32 scale 的索引/反量化边界，不是新的自定义算子。
-它必须分别覆盖真实 prompt chunk `T=1..64`、decode `T=1` 和 verify `T=1..16`。若其中任一 T
-不支持，应先修现有量化路径的 shape contract，不能回退到完整前缀或逐 token prefill 来掩盖。
+1. 用现有 GDR-MTP、conv golden、逐 row KV 和现有 attention 跑通 B=2，再扩到 B=16。
+2. 覆盖 accepted `0/1/K-1/K`、动态 T、cursor `62/63/64/65` 和 rejection 后下一 token。
+3. 开发 `CausalConv1dMTP`，逐 row/slot 对齐 golden，去掉 production conv golden。
+4. 在相同 token/hash/调用次数下采集无 profiler 3+10 latency，再用 msprof 定位热点。
+5. 按收益依次评估 Draft GQA/Top-1、Target Top-1、CacheUpdate、W8A8 fused linear。
+6. 每替换一个算子，重新跑完整 state 门禁和 ordinary/DFlash strict-greedy 零差异。
 
-## 9. Draft 侧候选
-
-这些算子不影响 Target rollback 是否正确，应在 NPU correctness 闭合后按 profile 选择。
-
-| 优先级 | 候选 | 输入 | 输出 | 目的 |
-| --- | --- | --- | --- | --- |
-| P2 | DFlashFeatureProjection | 新增 feature [B,1+a,20480]；weight [2560,20480] | [B,1+a,2560] | 当前每个 token 只算一次，输出被 KV cache 消费后释放；profile 显示仍热时再融合 |
-| P1 | DFlashBlockGQA | Q [B,32,T,128]；committed K/V [B,8,C,128]；new K/V [B,8,1+a+T,128]；mask | [B,32,T,128] | 避免显式 cache concat，并融合 5 层 causal sliding 与末层 block non-causal attention |
-| P1 | DFlashDraftLmHeadTop1 | hidden [B,K,2560]；weight [248320,2560] | IDs [B,K] | 避免 Draft 完整 vocab logits 落地 |
-| P2 | RMSNorm、RoPE、SwiGLU 融合 | 各层 hidden 与参数 | 同数学输出 | 减少小算子 launch |
-| P2 | DraftKVAppendCrop | 6 层 committed K/V、new context K/V、transient block K/V | 更新后 committed cache | 当前 Torch golden 已避免历史 K/V projection；仅在 concat/分配成为热点时开发 |
-
-Draft RMSNorm 使用 checkpoint 的直接 scale，不能套用 Target 的 1+weight 语义。最后一层
-attention 的 block non-causal mask 也不能被统一改成前五层的 causal mask。
-
-`DraftKVAppendCrop` 不接收 Target accepted count：进入下一轮 Draft 的 feature 本身已经只包含
-Target 提交的 `1+a` 行。算子应在一次 Draft forward 内让 attention 看见 old+new+block，并在
-返回前只提交 old+new。失败时旧 cache 必须保持可复用；无 cache `forward_projected` 是 golden。
-
-## 10. 内存取舍
-
-T=16、B=1 时，单层 recurrent bank 为 32 MiB，24 层为 768 MiB；单层 conv bank 为
-1 MiB，24 层为 24 MiB。两者合计约 792 MiB，还未包含 KV、权重和 workspace。
-
-Draft committed KV 的 FP16 逻辑大小为每 token 24 KiB（6 层、K/V、8 KV heads、head dim
-128），C=2048 时约 48 MiB；当前轮 transient block 最多再增加 16 行。它远小于 Target state
-bank，但 benchmark 仍应同时记录 allocator peak，防止 cache 拼接造成隐藏的双份峰值。
-
-需要在真机比较：
-
-1. 保留完整 T 槽 bank，一次计算所有 provisional state；
-2. 只保留 round-start state，得到 a 后短重放 anchor 加 accepted proposals。
-
-不能为了省内存直接把 FP32 recurrent bank 改为 FP16；这会改变已锁定的 GDR ABI，需要单独
-精度实验和批准。
-
-## 11. 建议开发顺序
-
-1. 用当前 conv golden、逐 row CacheUpdate 和现有 attention 跑通 K=1/T=2。
-2. 扩到 `block_size=16`（K=15/T=16），覆盖 accepted 0、1、K-1、K 和 cursor 62、63、64、65。
-3. 证明 ordinary 与 DFlash 多 prompt、多轮 strict-greedy 零 token mismatch，且无 fallback。
-4. 开发 CausalConv1dMTP，并逐 row、逐 state slot 对齐 golden。
-5. Profile CacheUpdate、attention、完整词表 LM head/Top-1 和 Draft 热点；当前完整 logits D2H
-   已消除，只剩 T 个 Top-1 ID 回传。
-6. 只对实测热点开发 CacheUpdateMTP、TargetLmHeadTop1Accept 或 Draft 融合算子。
-7. 每替换一个算子，重新跑拒绝后下一 token 状态门禁和端到端 token 门禁。
+T=16 时单层 recurrent bank 约 32 MiB，24 层约 768 MiB；conv bank 24 层约 24 MiB。若 profile
+显示 bank 峰值比短重放更差，应比较“完整 provisional bank”与“round-start state + accepted 短重放”，
+但不能未经精度批准把 FP32 recurrent state 改成 FP16。

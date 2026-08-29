@@ -136,7 +136,7 @@
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "b5fdd64b1eaea44b3f53452bc260cf62de53ca38b1fcd8699bf4f9e358d99c76",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "b57e825509e3ea3209843f7908db614fff41eb014adae405b67000a4818b65ac",
+    "documentation_sha256": "b709a85ed5f929adf2b73607f67da44ab5eb839ef3cdb8d27150b722e63403db",
     "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks on the unchanged original GDR; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback"
   }
 }

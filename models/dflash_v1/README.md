@@ -1,63 +1,74 @@
 # DFlash rollback 源码索引
 
-当前默认路线是 persistent incremental rollback；完整历史前缀重算只作为 oracle 保留。
+默认路线是 persistent incremental rollback；完整历史前缀重算只保留为诊断 oracle。
 
-## 调度与运行
-
-| 文件 | 职责 |
-| --- | --- |
-| run_rollback.py | CPU、CUDA、NPU 共用入口和报告生成 |
-| run_npu.py | HIAI 固定参数入口 |
-| benchmark_npu.py | rollback 正确性门禁后的 NPU 3 warmup + 10 次同步性能测试 |
-| preflight_target_quant.py | Target-only W8A8 装配、QLinear 数值和 rollback transaction 预检 |
-| dflash_rollback_decode.py | ordinary incremental、T=K+1 verify、accept 和 EOS 调度 |
-| dflash_rollback_adapter.py | framework Target transaction、新增 feature 生命周期和 Draft KV cache adapter |
-| dflash_reference_decode_v1.py | 旧 full-prefix sequential oracle，不是默认执行路径 |
-| diagnose_acceptance.py | 固定 workload 的 proposal、verifier 和接受率诊断 |
-
-## Target 与 Draft
+## 入口与调度
 
 | 文件 | 职责 |
 | --- | --- |
-| modeling_qwen3_5_dflash.py | CPU/CUDA feature-enabled Target |
-| ../modeling_qwen3_5_hiai_nd_dflash_rollback.py | 独立 HIAI rollback Target |
-| ../internal_dflash_bridge.py | HIAI state bank 与 logical KV cursor |
-| ../export_model_wrapper_qwen3_5_dflash_rollback.py | 部署 wrapper adapter |
-| modeling_dflash.py | 官方 6 层 Draft、无 cache golden 与 request-local committed KV cache |
-| dflash_config.py、dflash_weights.py | 结构、69 tensor 和 checkpoint identity 门禁 |
-| dflash_ops.py | CPU/CUDA Torch backend |
-| dflash_ascend310p_ops.py | NPU Tensor 分解 backend |
-| original_quant.py | 用户原 `utils.py` 的 key 映射、blocked-ZN 与 QLinear 替换实现 |
-| target_quant.py | 原 inference YAML、量化 embedding 与完整 QLinear 拓扑审计 |
-| w8a8_emulation.py、validate_w8a8_cpu.py | QLinear CPU/CUDA 公式仿真和确定性验证；不是 NPU 整网结论 |
+| `run_rollback.py` | CPU/CUDA/NPU 共用入口、validate/dflash 模式和报告 |
+| `run_npu.py` | HIAI 固定参数入口；默认 FP16，可选 Target W8A8 |
+| `benchmark_npu.py` | 正确性门禁后的 independent-process NPU benchmark |
+| `dflash_rollback_decode.py` | ordinary incremental、Draft/verify、longest-prefix accept、EOS |
+| `dflash_rollback_adapter.py` | framework transaction、feature 生命周期和 Draft KV adapter |
+| `diagnose_acceptance.py` | 固定 workload 的 proposal/Target/接受率诊断 |
+| `dflash_reference_decode_v1.py` | 旧 full-prefix oracle，不是默认 DFlash |
 
-量化路线只替换 Target Linear，并按原 YAML 索引 INT8 embedding weight 与 FP32 scale。
-rollback modeling 导入原 HIAI 文件的同一个 `QLinear` 类型，因此没有第二套量化算子；Draft
-共享的 embedding/LM head 仍由独立 FP16 module 提供。CLI 只需 `--config ... --quant_mode
-enable`，prefill、decode 和 verify 都走内置 embedding 路径；GDR/GDR-MTP、state bank 和
-logical KV 事务保持不变。
+## Draft
 
-本包统一使用官方 DFlash 口径：`block_size` 是包含 clean anchor 的 Draft query/Target verify
-总行数。官方配置 `block_size=16` 因此对应 1 个 anchor 加最多 15 个 proposal，即
-`K=block_size-1=15`。接受率诊断仍显式记录 proposal count K，避免把 K 与 block_size 混用。
+| 文件 | 职责 |
+| --- | --- |
+| `modeling_dflash.py` | 官方 6 层 Draft 和 request-local committed/transient KV cache |
+| `dflash_config.py` | `block_size`、6 层/69 tensor 和官方 shape 合同 |
+| `dflash_weights.py` | checkpoint revision/hash/tensor 审计与流式加载 |
+| `dflash_ops.py` | CPU/CUDA Torch primitive interface |
+| `dflash_ascend310p_ops.py` | NPU 上无 CPU fallback 的 Tensor 分解 backend |
+
+`block_size` 包含 anchor：B=16 对应 K=15 proposals、T=16 Target rows。Draft cache 每轮让
+attention 看见 old committed + new committed + transient block，返回前只保留 committed 部分。
+
+## Target rollback
+
+| 文件 | 职责 |
+| --- | --- |
+| `modeling_qwen3_5_dflash.py` | CPU/CUDA feature-enabled Target |
+| `../modeling_qwen3_5_hiai_nd_dflash_rollback.py` | 独立 HIAI rollback Target modeling |
+| `../internal_dflash_bridge.py` | HIAI state bank、prompt chunk 和 paged-KV logical cursor |
+| `../export_model_wrapper_qwen3_5_dflash_rollback.py` | 原部署 wrapper 的 rollback adapter |
+| `dflash_target_features.py` | 八层 Target feature 合同 |
+
+原 `../modeling_qwen3_5_hiai_nd.py` 保持不变。Prompt 多 token 走原 GDR chunk，verify 才走
+`npu_gated_delta_rule_mtp`。Causal-conv 当前是输入 NPU 上的 Tensor golden；完整算子计划见文档。
+
+## Target W8A8
+
+| 文件 | 职责 |
+| --- | --- |
+| `original_quant.py` | 原 `utils.py` 的 key 映射、blocked-ZN 与 QLinear 替换 |
+| `target_quant.py` | YAML、INT8 embedding/scale、完整 QLinear topology 审计 |
+| `preflight_target_quant.py` | 不加载 Draft 的装配、公式和 transaction 预检 |
+| `w8a8_emulation.py` / `validate_w8a8_cpu.py` | CPU/CUDA 公式诊断，不是 NPU 整网结论 |
+
+量化默认关闭。启用只需：
+
+```bash
+--config ./config/qwen3.5.yaml --quant_mode enable
+```
+
+量化只替换 Target Linear 和 Target 输入 embedding；Draft-facing embedding、LM head 和 6 层主体
+保持 FP16。关闭量化时省略参数，或传 `--quant_mode disable`。
 
 ## 文档与检查
 
-- [完整框架流程](../../docs/DFLASH_ARCHITECTURE.md)
-- [与官方完整 DFlash 的差异](../../docs/DFLASH_UPSTREAM_COMPARISON.md)
-- [自定义算子表](../../docs/DFLASH_OPERATORS.md)
-- [运行和验证](../../docs/DFLASH_RUN_AND_VALIDATE.md)
+- [当前架构与完整 DFlash 差异](../../docs/DFLASH_ARCHITECTURE.md)
+- [自定义算子及 I/O](../../docs/DFLASH_OPERATORS.md)
+- [运行、benchmark 与报告门禁](../../docs/DFLASH_RUN_AND_VALIDATE.md)
 
-~~~bash
+```bash
 python -m models.dflash_v1.run_rollback --help
 python -m models.dflash_v1.run_npu --help
 python -m models.dflash_v1.benchmark_npu --help
 python -m models.dflash_v1.preflight_target_quant --help
-python tests/test_dflash_rollback_scheduler.py
-python tests/test_dflash_framework_rollback.py
-python tests/test_internal_dflash_bridge_rollback.py
-python tests/test_dflash_rollback_helpers.py
-python -m pytest -q tests/test_run_npu_modes.py tests/test_dflash_runtime_optimizations.py
-python -m pytest -q tests/test_benchmark_npu.py tests/test_msprof_script.py \
-  tests/test_source_lock_benchmark.py tests/test_rollback_target_quant.py
-~~~
+python -m pytest -q tests/test_dflash_rollback_scheduler.py \
+  tests/test_dflash_runtime_optimizations.py tests/test_rollback_target_quant.py
+```
