@@ -1,19 +1,19 @@
 {
   "schema_version": 6,
-  "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback with optional Target-only W8A8 dynamic quantization configured by the original inference YAML",
-  "package_revision": "r6",
-  "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-chunk-prefill",
+  "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback with the original GDR effective-length ABI and optional Target-only W8A8 dynamic quantization configured by the original inference YAML",
+  "package_revision": "r7",
+  "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-chunk-prefill-gdr-effective-length",
   "package_layout": {
-    "version": 5,
+    "version": 6,
     "canonical_package": "models.dflash_v1",
     "canonical_source_directory": "models/dflash_v1",
     "hiai_source_file": "models/modeling_qwen3_5_hiai_nd.py",
-    "hiai_source_sha256": "e02e9818ce4a896e2bd1882f37ba20d7afb3712df69058a6a4f6c0973b6b6851",
+    "hiai_source_sha256": "0aa2e5bf80edffe2d9b2bd50227d3f45b6adaf1a061538b28985cfcf9014a12f",
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
-    "hiai_bridge_sha256": "73248130446b3d16798dbacd2383de99fce4d0fb5faef65bc8e9485fc42a03f6",
-    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with block-aligned real-token prompt chunks on the unchanged original GDR, last-real-row LM head, at most 16 GDR-MTP verify rows, GDN/conv state banks, provisional paged-KV writes, one logical commit cursor, returned-bank ownership, same-stream ordering without per-call host barriers, and optional Target-only W8A8 conversion plus per-current-block INT8 embedding/FP32 scale dequantization configured by the original inference YAML",
+    "hiai_bridge_sha256": "0a9c125b571fe0d2e673d769742e12bea89a6ee2a8d768d7b3e6435fc79ea5cf",
+    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with block-aligned real-token prompt chunks on the original GDR route using one INT16[B] call-local effective length, last-real-row LM head, at most 16 unchanged-ABI GDR-MTP verify rows, GDN/conv state banks, provisional paged-KV writes, one logical commit cursor, returned-bank ownership, same-stream ordering without per-call host barriers, and optional Target-only W8A8 conversion plus per-current-block INT8 embedding/FP32 scale dequantization configured by the original inference YAML",
     "npu_policy": "keep the HIAI target in models/ and install the complete DFlash package in models/dflash_v1/",
     "namespace_compatibility_file": "models/__init__.py",
     "namespace_compatibility_sha256": "9bf3e37aed93d372ca13b17b9c6dae32efa47f805f32b48628fb5316eae34b6d",
@@ -121,12 +121,12 @@
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
     "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
     "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
-    "hiai_modeling_sha256": "14daa181a471629aa37583d8b9c86e15795f76d1c307ed59cd7d5be8833fcc1b",
+    "hiai_modeling_sha256": "9faa917696a4f113cafbabdef8d80a4ef9073c8d3fb2171f7694914cfed46627",
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
     "wrapper_sha256": "a62e4a554cd566194455a993e37dd0bc045579424d99c85e789dd241b1408020",
     "shared_qlinear_source_file": "models/modeling_qwen3_5_hiai_nd.py",
-    "shared_qlinear_source_sha256": "e02e9818ce4a896e2bd1882f37ba20d7afb3712df69058a6a4f6c0973b6b6851",
-    "policy": "persistent ordinary and DFlash sessions; prefill restores the original multi-token GDR route with 64-row real-token chunks and no padding commit; only the final real prompt row executes the LM head; T=K+1 transactional verification uses the unchanged GDR-MTP; optional Target W8A8 reuses the original QLinear while the Draft stays FP16; incremental Draft KV cache; no historical-prefix replay during verify; strict-greedy zero token mismatch"
+    "shared_qlinear_source_sha256": "0aa2e5bf80edffe2d9b2bd50227d3f45b6adaf1a061538b28985cfcf9014a12f",
+    "policy": "persistent ordinary and DFlash sessions; prefill restores the original multi-token GDR route with 64-row real-token chunks, INT16[B] call-local effective length, and no padding commit; only the final real prompt row executes the LM head; T=K+1 transactional verification uses the unchanged GDR-MTP ABI; optional Target W8A8 reuses the original QLinear while the Draft stays FP16; incremental Draft KV cache; no historical-prefix replay during verify; strict-greedy zero token mismatch"
   },
   "npu_benchmark": {
     "runner_file": "models/dflash_v1/benchmark_npu.py",
@@ -136,7 +136,7 @@
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "b5fdd64b1eaea44b3f53452bc260cf62de53ca38b1fcd8699bf4f9e358d99c76",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "b709a85ed5f929adf2b73607f67da44ab5eb839ef3cdb8d27150b722e63403db",
-    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks on the unchanged original GDR; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback"
+    "documentation_sha256": "6e82bc539482e86e153cab0b8993056d87658d67cf25cb7b3e4f22f13be9a3eb",
+    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks on the original GDR route with call-local effective length; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback"
   }
 }

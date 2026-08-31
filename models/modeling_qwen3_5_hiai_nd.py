@@ -4,7 +4,8 @@
 The existing HIAI attention, GDN, cache layout, cache updates, and default
 Tensor return ABI are preserved.  ``output_dflash_features=True`` adds only a
 second return value containing the eight post-decoder hidden states consumed
-by the DFlash draft, concatenated as ``[B, S, 20480]``.
+by the DFlash draft, concatenated as ``[B, S, 20480]``.  The original GDR call
+uses its current ABI with one call-local ``INT16[B]`` effective-length tensor.
 """
 
 from typing import Callable, Optional, Tuple
@@ -52,6 +53,46 @@ else:
     FusedRMSNormGated = None
 
 logger = logging.get_logger(__name__)
+
+
+def _normalize_gdr_effective_length(
+    effective_length: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    physical_sequence_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the current GDR valid-row count as one reusable INT16 tensor."""
+
+    if physical_sequence_length <= 0:
+        raise ValueError("GDR physical sequence length must be positive")
+    if effective_length is None:
+        return torch.full(
+            (batch_size,),
+            physical_sequence_length,
+            dtype=torch.int16,
+            device=device,
+        )
+    if not isinstance(effective_length, torch.Tensor):
+        raise TypeError("gdr_effective_length must be a Tensor")
+    if effective_length.dtype != torch.int16:
+        raise TypeError("gdr_effective_length must use torch.int16")
+    if tuple(effective_length.shape) != (batch_size,):
+        raise ValueError(
+            f"gdr_effective_length must have shape [{batch_size}], "
+            f"got {tuple(effective_length.shape)}"
+        )
+    if effective_length.device != device:
+        raise ValueError("gdr_effective_length and hidden states must share one device")
+    if effective_length.device.type == "cpu" and effective_length.numel():
+        minimum = int(effective_length.min().item())
+        maximum = int(effective_length.max().item())
+        if minimum < 1 or maximum > physical_sequence_length:
+            raise ValueError(
+                "gdr_effective_length values must be in "
+                f"[1,{physical_sequence_length}]"
+            )
+    return effective_length
 
 
 class QLinear(nn.Module):
@@ -788,6 +829,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache_params: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         batch_size, seq_len, _ = hidden_states.shape
@@ -826,6 +868,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             repeat = self.num_v_heads // self.num_k_heads
             query = query.repeat_interleave(repeat, dim=2)
             key = key.repeat_interleave(repeat, dim=2)
+        if gdr_effective_length is None:
+            raise ValueError("GDN requires gdr_effective_length")
         core_attn_out, last_recurrent_state = (
             torch_npu.npu_chunk_gated_delta_rule(
                 query,
@@ -833,6 +877,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 value.contiguous(),
                 g=g,
                 beta=beta,
+                effective_length=gdr_effective_length,
                 chunk_size=1 if seq_len == 1 else 64,
                 initial_state=recurrent_state.to(torch.float32),
                 output_final_state=True,
@@ -883,6 +928,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         allQLen=0,
         token_count=0,
         export_flag=False,
+        gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Tuple]:
         residual = hidden_states
@@ -893,6 +939,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 cache_params=past_key_values,
                 cache_position=new_kv_cache_pos,
                 attention_mask=attention_mask,
+                gdr_effective_length=gdr_effective_length,
             )
         elif self.block_type == "full_attention":
             hidden_states, _, present_key_value = self.self_attn(
@@ -989,12 +1036,19 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         token_count=0,
         export_flag=False,
         output_dflash_features: bool = False,
+        gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds.to(torch.float16)
+        gdr_effective_length = _normalize_gdr_effective_length(
+            gdr_effective_length,
+            batch_size=int(hidden_states.shape[0]),
+            physical_sequence_length=int(hidden_states.shape[1]),
+            device=hidden_states.device,
+        )
         dflash_collector = None
         if output_dflash_features:
             dflash_collector = DFlashFeatureCollector(
@@ -1021,6 +1075,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 allQLen=allQLen,
                 token_count=token_count,
                 export_flag=export_flag,
+                gdr_effective_length=gdr_effective_length,
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
@@ -1072,6 +1127,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         token_count=0,
         export_flag=False,
         output_dflash_features: bool = False,
+        gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         text_output = self.language_model(
@@ -1086,6 +1142,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             token_count=token_count,
             export_flag=export_flag,
             output_dflash_features=output_dflash_features,
+            gdr_effective_length=gdr_effective_length,
             **kwargs,
         )
         if output_dflash_features:

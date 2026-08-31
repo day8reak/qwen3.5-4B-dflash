@@ -63,7 +63,7 @@ NPU ops backend。
 
 ```text
 models/
-├── modeling_qwen3_5_hiai_nd.py                         # 原文件，不覆盖
+├── modeling_qwen3_5_hiai_nd.py                         # ordinary；适配新 GDR effective_length ABI
 ├── export_model_wrapper_qwen3_5.py                     # 原文件，不覆盖
 ├── modeling_qwen3_5_hiai_nd_dflash_rollback.py
 ├── export_model_wrapper_qwen3_5_dflash_rollback.py
@@ -86,7 +86,19 @@ export PYTHONDONTWRITEBYTECODE=1
   "$DEPLOY_ROOT/models/dflash_v1/run_npu.py"
 ```
 
-检查 GDR-MTP 注册：
+先确认部署的原 GDR 算子包已经升级到带 `effective_length` 的新 ABI：
+
+```text
+npu_chunk_gated_delta_rule(
+  query, key, value, g, beta, effective_length,
+  chunk_size=64, initial_state=None,
+  output_final_state=False, use_qk_l2norm_in_kernel=False
+)
+```
+
+其中 `effective_length` 必须接受 `[B] INT16`。普通 modeling 和 rollback ordinary 路径都会传
+这个输入；旧注册包会在第一次 Target 调用时直接接口不匹配。GDR-MTP 的 ABI 不变，再检查其
+注册：
 
 ```bash
 "$MODEL_PYTHON" -B - <<'PY'
@@ -126,7 +138,8 @@ mkdir -p "$RUN_DIR"
 
 `run_npu` 固定 FP16、EOS 248044、prefill chunk 64、decode chunk 1 和 package-local NPU Draft
 backend。`kv-cache-max-len` 必须覆盖 prompt+output，并能被 64 整除。Prompt 多 token 使用原 GDR
-chunk 路线；只有 verify 使用 GDR-MTP。
+chunk 路线，并传本次 chunk 的 `INT16[B] effective_length`；只有 verify 使用 ABI 不变的
+GDR-MTP。
 
 如果 anchor 立即 EOS，报告会是 `INCONCLUSIVE_NO_DRAFT_ROUND`；换固定非立即结束 prompt。B=2
 通过后再跑 `--max-new-tokens 32 --block-size 16`。

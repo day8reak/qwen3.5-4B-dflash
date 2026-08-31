@@ -80,16 +80,25 @@ class FakeHIAIModel(nn.Module):
         new_kv_cache_pos: torch.Tensor,
         allQLen,
         output_dflash_features: bool,
-        accepted_tokens: torch.Tensor | None,
+        gdr_effective_length: torch.Tensor,
+        accepted_tokens: torch.Tensor | None = None,
         **kwargs,
     ):
         skip_lm_head = bool(kwargs.pop("dflash_skip_lm_head", False))
         last_token_only = bool(kwargs.pop("dflash_last_token_only", False))
         del kwargs
+        assert gdr_effective_length.dtype == torch.int16
+        assert tuple(gdr_effective_length.shape) == (input_ids.shape[0],)
+        assert gdr_effective_length.device == input_ids.device
+        assert bool((gdr_effective_length >= 1).all())
+        assert bool((gdr_effective_length <= input_ids.shape[1]).all())
         self.calls.append(
             {
                 "positions": tuple(int(value) for value in new_kv_cache_pos.tolist()),
                 "all_q_len": tuple(int(value) for value in allQLen),
+                "gdr_effective_length": tuple(
+                    int(value) for value in gdr_effective_length.tolist()
+                ),
                 "accepted": (
                     None
                     if accepted_tokens is None
@@ -169,6 +178,7 @@ def main() -> None:
     assert model.calls[0] == {
         "positions": (0, 1),
         "all_q_len": (2,),
+        "gdr_effective_length": (2,),
         "accepted": None,
         "skip_lm_head": False,
         "last_token_only": True,
@@ -179,6 +189,9 @@ def main() -> None:
     assert bridge.dflash_rollback_audit["prefill_execution_mode"] == (
         "block_aligned_real_token_chunks_original_gdr"
     )
+    assert bridge.dflash_rollback_audit[
+        "ordinary_gdr_effective_length_contract"
+    ] == "int16_batch_call_local_valid_rows"
 
     try:
         bridge._prepare_rollback_state(17)
@@ -202,6 +215,7 @@ def main() -> None:
     assert model.calls[-1] == {
         "positions": (4, 5),
         "all_q_len": (6,),
+        "gdr_effective_length": (2,),
         "accepted": (0,),
         "skip_lm_head": False,
         "last_token_only": False,
@@ -258,6 +272,9 @@ def main() -> None:
             expected_positions.append(tuple(range(cursor, cursor + chunk_length)))
             cursor += chunk_length
         assert [call["positions"] for call in chunk_model.calls] == expected_positions
+        assert [
+            call["gdr_effective_length"] for call in chunk_model.calls
+        ] == [(chunk_length,) for chunk_length in chunk_lengths]
         assert [call["skip_lm_head"] for call in chunk_model.calls] == [
             *([True] * (len(chunk_lengths) - 1)),
             False,
@@ -287,6 +304,7 @@ def main() -> None:
         {
             "positions": (0, 1, 2),
             "all_q_len": (3,),
+            "gdr_effective_length": (3,),
             "accepted": None,
             "skip_lm_head": False,
             "last_token_only": True,
@@ -296,6 +314,49 @@ def main() -> None:
     assert ordinary_audit["persistent_cursor"] == 3
     assert ordinary_audit["ordinary_prefill_token_calls"] == 1
     assert ordinary_audit["ordinary_prefill_lm_head_skips"] == 2
+
+    # The full-prefix oracle keeps a fixed 64-row physical GDR gear.  Its
+    # effective length must remain the real prefix length rather than allQLen
+    # or the padded execution length.
+    full_prefix_model = FakeHIAIModel().eval()
+    full_prefix_bridge = InternalDFlashTarget(
+        FakeWrapper(full_prefix_model).eval(),
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        kv_cache_max_len=64,
+        rollback_enabled=False,
+    ).eval()
+    real_prefix = torch.arange(1, 38, dtype=torch.long).view(1, -1)
+    full_prefix_bridge.prepare_dflash_full_prefix_call(
+        input_ids=real_prefix,
+        sequence_length=37,
+        output_dflash_features=True,
+        logits_to_keep=1,
+        call_index=0,
+    )
+    full_prefix_output = full_prefix_bridge(
+        real_prefix,
+        use_cache=False,
+        return_dict=True,
+        output_hidden_states=False,
+        output_dflash_features=True,
+        logits_to_keep=1,
+    )
+    assert tuple(full_prefix_output["logits"].shape) == (1, 1, VOCAB_SIZE)
+    assert tuple(full_prefix_output["dflash_features"].shape) == (
+        1,
+        37,
+        FEATURE_WIDTH,
+    )
+    assert full_prefix_model.calls[0]["positions"] == tuple(range(64))
+    assert full_prefix_model.calls[0]["all_q_len"] == (37,)
+    assert full_prefix_model.calls[0]["gdr_effective_length"] == (37,)
+    full_prefix_audit = full_prefix_bridge.dflash_full_prefix_bridge_audit
+    assert full_prefix_audit["last_requested_sequence_length"] == 37
+    assert full_prefix_audit["last_execution_sequence_length"] == 64
+    assert full_prefix_audit["gdr_effective_length_contract"] == (
+        "int16_batch_call_local_valid_rows"
+    )
     print("PASS: HIAI bridge state-bank selection, rebase, and logical KV cursor")
 
 
