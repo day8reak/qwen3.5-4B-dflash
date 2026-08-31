@@ -113,6 +113,10 @@ Fake/Meta 不执行任何算子数值，正式 eager、AIR 和 OM 也不会执�
 框架先运行 shape/dtype/alias 探针并复用；只有缺失时才调用 `torch.library.register_fake`。任何 schema
 参数、kw-only 标志、返回个数或可变 alias 漂移都会提前失败。
 
+`npu_quant_matmul` 的预检使用实际 W8A8 路径代表形状：`x1=[1,64,2560]`、
+`x2=[2560,8192]`、`scale=[8192]`、`pertoken_scale=[64]`。torch-npu 要求
+`pertoken_scale.shape[0] == x1.shape[-2]`（M 维）；不能把 batch 与 M 相乘后写成 `[B*M]`。
+
 七个预期 GE type 都在 `factory.json` 中显式锁定。builtin converter 和当前 fused-attention 精确
 映射必须使用表中的 type；RMS/GDR/cache 只有在目标环境把同一参数顺序的 IR 正式注册为其他
 type 时才可改名。该值不会自动回退：指定 IR 未注册、converter 没有命中，或 `dynamo.pbtxt` 中
@@ -605,6 +609,7 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | `unsupported operator: npu.<op>.default` | 七算子预检未运行、实际代码不是本分支，或 receiver 新增了第八个算子 | 核对远端提交、`PYTHONPATH`；已覆盖清单见 2.1，不能用 modeling Tensor fallback 掩盖 |
 | `schema drifted from the locked export contract` | torch-npu/receiver 算子签名与当前锁不一致 | 记录 dispatcher schema；按真实版本更新 schema、Fake、converter 和测试，不能跳过校验 |
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
+| `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |
 | TorchAir graph break | 某个 Python/自定义 op 未被捕获 | 定位首个 graph break，补正式 converter；不要伪造 AIR |

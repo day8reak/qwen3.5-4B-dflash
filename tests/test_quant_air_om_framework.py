@@ -38,6 +38,7 @@ from qwen35_dflash.ascend310p.custom_op_export import (
     NPU_QUANT_MATMUL_TORCH_OP,
     NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
     NPU_SCATTER_ND_UPDATE_TORCH_OP,
+    _validate_npu_quant_matmul_meta,
     audit_custom_op_export,
     prepare_custom_op_export,
 )
@@ -592,6 +593,61 @@ def test_w8a8_fakes_keep_dynamic_quant_and_quant_matmul_in_export() -> None:
     targets = [str(node.target) for node in exported.graph.nodes]
     assert "npu.npu_dynamic_quant.default" in targets
     assert "npu.npu_quant_matmul.default" in targets
+
+
+def test_quant_matmul_meta_probe_uses_the_m_dimension_for_pertoken_scale() -> None:
+    observed: dict[str, tuple[int, ...]] = {}
+
+    def strict_upstream_meta(
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        offset: torch.Tensor | None = None,
+        pertoken_scale: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
+        group_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        del scale, offset, bias, group_sizes
+        assert pertoken_scale is not None
+        observed["x1"] = tuple(x1.shape)
+        observed["pertoken_scale"] = tuple(pertoken_scale.shape)
+        if pertoken_scale.shape[0] != x1.shape[-2]:
+            raise RuntimeError(
+                "the pertoken_scale 1st dim value must be x1 m dim value"
+            )
+        return x1.new_empty(
+            (*x1.shape[:-1], x2.shape[-1]),
+            dtype=output_dtype,
+        )
+
+    _validate_npu_quant_matmul_meta(strict_upstream_meta)
+    assert observed == {
+        "x1": (1, 64, 2560),
+        "pertoken_scale": (64,),
+    }
+
+
+def test_quant_matmul_meta_rejects_flattened_batch_times_m_scale() -> None:
+    operation = _ensure_target_test_schema("npu_quant_matmul")
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            NPU_QUANT_MATMUL_TORCH_OP,
+            NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+        ),
+        _FakeTorchAir(),
+    )
+    with pytest.raises(RuntimeError, match="x1 m dim value"):
+        operation(
+            torch.empty((2, 3, 8), dtype=torch.int8, device="meta"),
+            torch.empty((8, 5), dtype=torch.int8, device="meta"),
+            torch.empty((5,), dtype=torch.float32, device="meta"),
+            pertoken_scale=torch.empty(
+                (6,), dtype=torch.float32, device="meta"
+            ),
+            output_dtype=torch.float16,
+        )
 
 
 def test_mutable_fakes_keep_cache_and_scatter_alias_ops_in_export() -> None:

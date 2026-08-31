@@ -261,9 +261,20 @@ def _fake_npu_quant_matmul(
 ) -> torch.Tensor:
     """Fallback metadata for the locked A8W8 matmul invocation."""
 
-    del scale, offset, pertoken_scale, bias, group_sizes
+    del scale, offset, bias, group_sizes
     if x1.dim() < 2 or x2.dim() < 2:
         raise RuntimeError("npu_quant_matmul inputs must be rank 2 or greater")
+    if pertoken_scale is not None:
+        if pertoken_scale.dim() != 1:
+            raise RuntimeError(
+                "the locked W8A8 route requires one-dimensional pertoken_scale"
+            )
+        torch._check(
+            pertoken_scale.shape[0] == x1.shape[-2],
+            lambda: (
+                "the pertoken_scale 1st dim value must be x1 m dim value"
+            ),
+        )
     batch_shape = torch.broadcast_shapes(x1.shape[:-2], x2.shape[:-2])
     output_shape = (*batch_shape, x1.shape[-2], x2.shape[-1])
     dtype = torch.int8 if output_dtype is None else output_dtype
@@ -401,17 +412,20 @@ def _validate_npu_dynamic_quant_meta(operation: Any) -> None:
 
 
 def _validate_npu_quant_matmul_meta(operation: Any) -> None:
-    x1 = torch.empty((2, 3, 8), dtype=torch.int8, device="meta")
-    x2 = torch.empty((8, 5), dtype=torch.int8, device="meta")
-    scale = torch.empty((5,), dtype=torch.float32, device="meta")
-    pertoken = torch.empty((6,), dtype=torch.float32, device="meta")
+    # Mirror the receiver's B=1, S=64 hidden->intermediate QLinear call.
+    # torch-npu's Meta contract requires pertoken_scale[0] == x1.shape[-2]
+    # (M), not the product of every leading x1 dimension.
+    x1 = torch.empty((1, 64, 2560), dtype=torch.int8, device="meta")
+    x2 = torch.empty((2560, 8192), dtype=torch.int8, device="meta")
+    scale = torch.empty((8192,), dtype=torch.float32, device="meta")
+    pertoken = x1.new_empty((x1.shape[-2],), dtype=torch.float32)
     result = operation(
         x1, x2, scale,
         pertoken_scale=pertoken,
         output_dtype=torch.float16,
     )
     _expect_tensor(
-        result, shape=(2, 3, 5), dtype=torch.float16,
+        result, shape=(1, 64, 8192), dtype=torch.float16,
         label="npu::npu_quant_matmul output",
     )
 
