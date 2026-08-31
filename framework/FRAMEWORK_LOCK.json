@@ -1,6 +1,6 @@
 {
-  "schema_version": 2,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v2",
+  "schema_version": 3,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v3",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -36,10 +36,22 @@
       "shape": ["B"],
       "semantics": "call-local logical valid rows; not physical S, cumulative KV length, or MTP accepted_tokens"
     },
+    "custom_operator_export": {
+      "frontend": "npu.adn_rms_norm.default",
+      "frontend_schema": "npu::adn_rms_norm(Tensor input, Tensor gamma, float epsilon=1e-6) -> (Tensor, Tensor)",
+      "fake_meta_outputs": [
+        "input shape/dtype/device",
+        "input.shape[:-1] + [1], float32, input device"
+      ],
+      "default_ge_op_type": "RmsNorm",
+      "lowering": "one registered GE operator; no Tensor decomposition",
+      "preservation_gate": "converter call count must be positive and dynamo.pbtxt GE-node count must cover every converter call"
+    },
     "state_policy": "recompute committed prefix"
   },
   "compiler": {
     "exporter": "TorchAir dynamo_export",
+    "custom_op_gate": "validate and propagate AIR custom_op_audit before ATC",
     "atc_mode": 0,
     "atc_framework": 1,
     "soc_policy": "exact 310P variant required; generic Ascend310P rejected"

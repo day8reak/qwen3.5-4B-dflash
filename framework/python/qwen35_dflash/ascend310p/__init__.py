@@ -2,7 +2,7 @@
 
 from .acl_runtime import AclOmRuntime
 from .compiler import compile_air_bundle, resolve_atc_executable, validate_soc_version
-from .contracts import AirGraphSpec, GenerationStep
+from .contracts import AirGraphSpec, CustomOpExportSpec, GenerationStep
 from .cpp_runtime import build_cpp_runner, run_cpp_pair
 from .exporter import export_air_bundle
 from .generation import benchmark_prompt, generate_prompt
@@ -15,6 +15,7 @@ from .workflow import run_cpp_target_pipeline, run_om_inference, run_target_pipe
 __all__ = [
     "AclOmRuntime",
     "AirGraphSpec",
+    "CustomOpExportSpec",
     "GenerationStep",
     "IntegratedDFlashRecomputeGraph",
     "RecomputeDFlashOmBackend",

@@ -10,6 +10,40 @@ import torch
 
 
 _GRAPH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_TORCH_OPERATOR_NAME = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$"
+)
+_TORCH_OVERLOAD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_GE_OPERATOR_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass(frozen=True)
+class CustomOpExportSpec:
+    """One front-end custom operator that must remain one GE graph node."""
+
+    torch_op: str
+    ge_op_type: str
+    overload: str = "default"
+    minimum_occurrences: int = 1
+
+    def __post_init__(self) -> None:
+        if not _TORCH_OPERATOR_NAME.fullmatch(self.torch_op):
+            raise ValueError(f"invalid torch custom-operator name: {self.torch_op!r}")
+        if not _TORCH_OVERLOAD_NAME.fullmatch(self.overload):
+            raise ValueError(f"invalid torch overload name: {self.overload!r}")
+        if not _GE_OPERATOR_TYPE.fullmatch(self.ge_op_type):
+            raise ValueError(f"invalid GE operator type: {self.ge_op_type!r}")
+        if (
+            isinstance(self.minimum_occurrences, bool)
+            or not isinstance(self.minimum_occurrences, int)
+            or self.minimum_occurrences < 1
+        ):
+            raise ValueError("minimum_occurrences must be a positive integer")
+
+    @property
+    def torch_target(self) -> str:
+        namespace, name = self.torch_op.split("::", 1)
+        return f"{namespace}.{name}.{self.overload}"
 
 
 @dataclass(frozen=True)
@@ -31,6 +65,7 @@ class AirGraphSpec:
     dynamic: bool = False
     compiler_config: Any | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    custom_ops: tuple[CustomOpExportSpec, ...] = ()
 
     def __post_init__(self) -> None:
         if not _GRAPH_NAME.fullmatch(self.name):
@@ -55,6 +90,13 @@ class AirGraphSpec:
             raise ValueError("AIR input names must be unique")
         if len(set(self.output_names)) != len(self.output_names):
             raise ValueError("AIR output names must be unique")
+        if not isinstance(self.custom_ops, tuple):
+            raise TypeError("AirGraphSpec.custom_ops must be a tuple")
+        if not all(isinstance(item, CustomOpExportSpec) for item in self.custom_ops):
+            raise TypeError("AirGraphSpec.custom_ops contains an invalid item")
+        targets = [item.torch_target for item in self.custom_ops]
+        if len(set(targets)) != len(targets):
+            raise ValueError("AIR custom-operator targets must be unique")
 
 
 @dataclass(frozen=True)

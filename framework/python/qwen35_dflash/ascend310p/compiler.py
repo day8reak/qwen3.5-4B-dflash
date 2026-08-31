@@ -95,6 +95,29 @@ def _atc_identity(atc_bin: Path) -> str:
     return text if text else f"exit={result.returncode} (no version text)"
 
 
+def _validated_custom_op_audit(graph: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw = graph.get("custom_op_audit", [])
+    if not isinstance(raw, list):
+        raise TypeError("AIR custom_op_audit must be a list")
+    metadata = graph.get("metadata", {})
+    requires_audit = isinstance(metadata, Mapping) and bool(
+        metadata.get("custom_op_export_contract")
+    )
+    if requires_audit and not raw:
+        raise ValueError("AIR graph requires a passing custom-operator audit")
+    result: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, Mapping) or item.get("status") != "PASS":
+            raise ValueError("AIR graph contains a non-passing custom-operator audit")
+        minimum = int(item.get("minimum_occurrences", 0))
+        converter_calls = int(item.get("converter_calls", 0))
+        ge_nodes = int(item.get("ge_node_occurrences", 0))
+        if minimum < 1 or converter_calls < minimum or ge_nodes < converter_calls:
+            raise ValueError("AIR custom-operator preservation counts are invalid")
+        result.append(dict(item))
+    return result
+
+
 def compile_air_bundle(
     air_manifest_path: str | Path,
     *,
@@ -131,6 +154,7 @@ def compile_air_bundle(
         if not isinstance(graph, Mapping):
             raise TypeError("AIR graph manifest entry must be an object")
         name = str(graph["name"])
+        custom_op_audit = _validated_custom_op_audit(graph)
         air_record = graph["air"]
         payload_records = graph.get("payload_files")
         if not isinstance(payload_records, list) or not payload_records:
@@ -178,6 +202,7 @@ def compile_air_bundle(
                 "role": graph["role"],
                 "input_names": list(graph.get("input_names", [])),
                 "output_names": list(graph.get("output_names", [])),
+                "custom_op_audit": custom_op_audit,
                 "air": dict(air_record),
                 "om": file_record(om_path, relative_to=root),
                 "atc_command": command,

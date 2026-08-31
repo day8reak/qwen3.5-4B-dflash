@@ -37,3 +37,8 @@ C++ 调用 OM 完成 token 推理，但尚未把 `quant` 分支已有的 persist
 当前 `quant` 基线要求原 GDR 算子接收 `INT16[B] effective_length`。框架不会为此增加第三个
 OM 输入，而是在 AIR 图内从 `attention_mask` 计算有效前缀长度；静态物理 gear 与逻辑有效
 行数因此可以分别为 64 和 37。
+
+Target modeling 中的 `torch_npu.adn_rms_norm` 调用保持不变。AIR 导出前，框架只为
+`npu::adn_rms_norm` 注册接收方实测合同对应的 Fake/Meta 输出，并把该 FX 节点一对一转换成
+注册的 GE `RmsNorm` 节点；它不会执行或导出 Tensor 公式替代。导出成功后还必须在
+`dynamo.pbtxt` 中找到该 GE 节点，结果和 converter 命中次数会写入 `air-manifest.json`。

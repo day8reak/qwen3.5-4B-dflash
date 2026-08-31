@@ -29,7 +29,11 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from .contracts import AirGraphSpec
+from .contracts import AirGraphSpec, CustomOpExportSpec
+from .custom_op_export import (
+    ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+    ADN_RMS_NORM_TORCH_OP,
+)
 from .integrated import (
     enable_padded_draft_context,
     integrated_recompute_graph_spec,
@@ -37,7 +41,7 @@ from .integrated import (
 
 
 QUANT_BASE_REVISION = "28f93e784a2beed87020a80bd93c8788754eab1c"
-QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v2"
+QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v3"
 _TARGET_GDN_CHUNK = 64
 _GDR_EFFECTIVE_LENGTH_MAX = torch.iinfo(torch.int16).max
 _DTYPES = {"float16": torch.float16}
@@ -380,6 +384,15 @@ def create_quant_recompute_graph(
     device = str(config.get("device", "npu:0"))
     if not device.startswith("npu"):
         raise ValueError("formal quant AIR export requires an explicit NPU device")
+    adn_rms_norm_export = CustomOpExportSpec(
+        torch_op=ADN_RMS_NORM_TORCH_OP,
+        ge_op_type=str(
+            config.get(
+                "adn_rms_norm_ge_op_type",
+                ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+            )
+        ),
+    )
     target_dir = _required_directory(config, "target_dir")
     draft_dir = _required_directory(config, "draft_dir")
     quant_config = _required_file(config, "quant_config")
@@ -499,6 +512,11 @@ def create_quant_recompute_graph(
         "gdr_effective_length_contract": (
             "INT16[B] call-local valid rows derived from attention_mask"
         ),
+        "custom_op_export_contract": {
+            "torch_target": adn_rms_norm_export.torch_target,
+            "ge_op_type": adn_rms_norm_export.ge_op_type,
+            "preservation": "one registered GE operator; no Tensor decomposition",
+        },
         "claim_boundary": (
             "fixed-gear recompute ABI; persistent rollback OM state is a "
             "separate later optimization"
@@ -514,6 +532,7 @@ def create_quant_recompute_graph(
             device=device,
             name=str(config.get("name", "quant_dflash_recompute")),
             metadata=metadata,
+            custom_ops=(adn_rms_norm_export,),
         ),
     )
 

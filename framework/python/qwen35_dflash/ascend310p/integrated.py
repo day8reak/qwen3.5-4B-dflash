@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from .contracts import AirGraphSpec
+from .contracts import AirGraphSpec, CustomOpExportSpec
 
 
 class PaddedContextDFlashAttention(nn.Module):
@@ -311,6 +311,7 @@ def integrated_recompute_graph_spec(
     device: str | torch.device = "npu:0",
     name: str = "dflash_recompute",
     metadata: dict[str, Any] | None = None,
+    custom_ops: tuple[CustomOpExportSpec, ...] = (),
 ) -> AirGraphSpec:
     """Create the standard fixed-gear AIR spec used by the built-in backend."""
 
@@ -355,6 +356,7 @@ def integrated_recompute_graph_spec(
             "padding": "right",
             "state_policy": "recompute committed prefixes",
         },
+        custom_ops=custom_ops,
     )
 
 

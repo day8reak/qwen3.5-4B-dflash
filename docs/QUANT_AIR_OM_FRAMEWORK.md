@@ -74,6 +74,31 @@ row，并只按接受数提交一个 GDN/conv state-bank 槽；后者固定提�
 GDR 的物理序列仍为 64 行，但 `effective_length=[37]`；MTP verify 算子 ABI 不受这次改动影响。
 由于该字段是 INT16，`S` 不能超过 32767。
 
+### 2.1 `adn_rms_norm` 自定义算子保留合同
+
+Target 的两个 modeling 文件继续直接调用 `torch_npu.adn_rms_norm`，没有加入 export-only Tensor
+公式分支。PyTorch FX 与 GE/AIR 使用不同的算子名称层级：
+
+```text
+torch_npu.adn_rms_norm
+        │ dispatcher schema: npu::adn_rms_norm(...)->(Tensor, Tensor)
+        │ Fake/Meta 只声明 shape/dtype，不计算 RMSNorm
+        ▼
+npu.adn_rms_norm.default（FX 节点）
+        │ TorchAir converter，一对一 lowering
+        ▼
+RmsNorm（GE/AIR 单节点，默认）
+```
+
+接收方实机已确认第一个输出与 input 同 shape/dtype，第二个输出为
+`[*input.shape[:-1],1] FP32`。框架按这个合同注册 Fake/Meta；Fake 代码只创建 meta tensor，正式
+NPU eager、AIR 和 OM 都不会执行它。converter 默认发出 CANN 已注册的 `RmsNorm` GE 节点，
+不会拆成 `square/mean/rsqrt/mul` 链。
+
+如果目标环境的私有算子包把同一 IR 注册成其他 GE type，例如 `AdnRmsNorm`，可以在
+`factory.json` 中显式设置 `adn_rms_norm_ge_op_type`。该值不会自动回退：指定的 GE IR 未注册、
+converter 没有命中或 `dynamo.pbtxt` 中没有该 type，导出都会失败，不会生成伪 PASS manifest。
+
 如果 `S=64`，则 `prompt_tokens + generated_tokens` 不能超过 64。需要更长上下文时重新编译
 `S=128/256/...`。当前重算路径的延迟随 `S` 增大，因此先使用能够覆盖验证 workload 的最小
 gear。
@@ -177,6 +202,7 @@ cp config/quant_air_om_factory.example.json "$AI_RUN_DIR/factory.json"
   "pad_token_id": 0,
   "dtype": "float16",
   "device": "npu:0",
+  "adn_rms_norm_ge_op_type": "RmsNorm",
   "name": "quant_dflash_recompute"
 }
 ```
@@ -248,6 +274,7 @@ $AI_RUN_DIR/artifacts/quant-dflash/
 └── air/
     └── quant_dflash_recompute/
         ├── quant_dflash_recompute.air
+        ├── dynamo.pbtxt
         └── TorchAir 生成的外置权重/辅助文件
 ```
 
@@ -263,6 +290,7 @@ from pathlib import Path
 root = Path(os.environ["AI_RUN_DIR"]) / "artifacts" / "quant-dflash"
 data = json.loads((root / "air-manifest.json").read_text())
 assert data["status"] == "PASS"
+assert data["schema_version"] == 2
 assert len(data["graphs"]) == 1
 graph = data["graphs"][0]
 assert graph["name"] == "quant_dflash_recompute"
@@ -273,12 +301,32 @@ assert graph["metadata"]["quant_branch_base_revision"] == \
 assert graph["metadata"]["gdr_effective_length_contract"] == \
     "INT16[B] call-local valid rows derived from attention_mask"
 assert graph["metadata"]["target_quant_mode"] == "w8a8_dynamic"
+audit = graph["custom_op_audit"]
+assert len(audit) == 1
+assert audit[0]["status"] == "PASS"
+assert audit[0]["torch_target"] == "npu.adn_rms_norm.default"
+assert audit[0]["ge_op_type"] == "RmsNorm"
+assert audit[0]["converter_calls"] > 0
+assert audit[0]["ge_node_occurrences"] > 0
 print("AIR manifest gate: PASS")
 PY
 ```
 
+还可以直接检查 TorchAir 的可读 GE 图：
+
+```bash
+rg -n 'type: "RmsNorm"' \
+  "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
+```
+
+至少应命中一次。这里检查的是 AIR 内部 GE type；`npu.adn_rms_norm.default` 是前端 FX 名称，
+不会原样作为 GE type 出现在 AIR。`air-manifest.json` 同时记录前端 converter 命中数和 GE 节点
+数，并要求 GE 节点数覆盖全部 converter 调用，共同证明这些调用没有被 export-only Tensor
+实现替换。
+
 如果 `dynamo_export` 报 graph break，应保留完整 TorchAir 日志并定位首个不支持节点；不能用空
-AIR、伪文件或 CPU export 替代。
+AIR、伪文件或 CPU export 替代。若错误已从 FakeTensor 阶段推进到另一个自定义算子，应为那个
+算子单独确认 schema、真实输出元数据和 GE IR，不能套用 RMSNorm 的 Fake 合同。
 
 ## 7. AIR 编译成 OM
 
@@ -310,7 +358,9 @@ $AI_RUN_DIR/artifacts/quant-dflash/
 ```
 
 编译器在调用 ATC 前重新核验 AIR 与所有外置 payload 的 hash；ATC 成功后记录 OM hash、ATC
-版本、完整命令和日志。退出码为 0 但 OM 缺失或为空也判定失败。
+版本、完整命令和日志。它还会重新校验并把 `custom_op_audit` 传入 deployment manifest；缺失
+审计或 GE 节点数少于 converter 命中数时不会调用 ATC。退出码为 0 但 OM 缺失或为空也判定
+失败。
 
 也可以一次执行 AIR + OM：
 
@@ -497,6 +547,9 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | 找不到 `export_model_wrapper_qwen3_5.py` | receiver 路径错误 | 修正 `receiver_models_dir` |
 | QLinear coverage mismatch | 量化权重与 Target topology 不同 | 核对 YAML、checkpoint revision 和 quant artifact |
 | `torch_npu`/TorchAir import 失败 | 环境不匹配 | 使用与 CANN/驱动匹配的声明环境 |
+| `unsupported operator: npu.adn_rms_norm.default` | 当前代码未加载 Fake/Meta 注册，或实际运行的不是本分支 | 核对远端提交、`PYTHONPATH` 和 `air-manifest` schema；不要改 modeling 为 Tensor fallback |
+| `GE IR ... is not registered` | `adn_rms_norm_ge_op_type` 与目标 CANN/自定义包不一致 | 默认使用 `RmsNorm`；私有 type 必须先由同一环境正式注册 |
+| custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |
 | TorchAir graph break | 某个 Python/自定义 op 未被捕获 | 定位首个 graph break，补正式 converter；不要伪造 AIR |
 | ATC unsupported op | TorchAir 图中存在 ATC 不支持节点 | 保留算子名和编译日志，决定分解或正式自定义算子 |
 | generic `Ascend310P` rejected | SoC 身份不精确 | 从设备/ATC 支持列表填写真实 variant |
@@ -523,6 +576,7 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 ## 14. 官方接口依据
 
 - [TorchAir `dynamo_export`](https://www.hiascend.com/document/detail/zh/Pytorch/600/modthirdparty/torchairuseguide/torchair_0052.html)：接口参数、静态/动态图、单图约束和 AIR 大小约束；
+- [TorchAir 自定义算子 converter](https://www.hiascend.com/document/detail/zh/Pytorch/710/modthirdparty/torchairuseguide/torchair_00045.html)：自定义 ATen IR 需要注册 converter 后转换为 GE IR；
 - [TorchAir AIR 产物与外置权重](https://www.hiascend.com/document/detail/zh/Pytorch/600/modthirdparty/torchairuseguide/torchair_0019.html)：`export.air`、`dynamo.pbtxt` 和 `weight_*` 的关系；
 - [ATC `--framework`](https://www.hiascend.com/document/detail/en/canncommercial/800/devaids/atc/atlasatcparam_16_0014.html)：TorchAir 标准 AIR 使用 `--framework=1`；
 - [AscendCL `aclmdlExecuteAsync`](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha002/apiref/appdevgapi/aclcppdevg_03_0299.html)：异步模型执行接口；

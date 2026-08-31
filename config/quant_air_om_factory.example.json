@@ -9,5 +9,6 @@
   "pad_token_id": 0,
   "dtype": "float16",
   "device": "npu:0",
+  "adn_rms_norm_ge_op_type": "RmsNorm",
   "name": "quant_dflash_recompute"
 }

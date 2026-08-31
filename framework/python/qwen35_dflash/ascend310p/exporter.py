@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import torch
 
 from .contracts import AirGraphSpec
+from .custom_op_export import audit_custom_op_export, prepare_custom_op_export
 from .utils import atomic_write_json, file_record, require_run_output, resolve_callable
 
 
@@ -97,6 +98,9 @@ def export_air_bundle(
     for spec in specs:
         graph_dir = air_root / spec.name
         graph_dir.mkdir()
+        custom_op_sessions = [
+            prepare_custom_op_export(item, torchair) for item in spec.custom_ops
+        ]
         call_kwargs = {
             "model": spec.model.eval(),
             "export_path": str(graph_dir),
@@ -108,6 +112,12 @@ def export_air_bundle(
         call_kwargs.update(dict(spec.example_kwargs))
         with torch.inference_mode(), _working_directory(graph_dir):
             torchair.dynamo_export(*spec.example_args, **call_kwargs)
+
+        custom_op_audit = audit_custom_op_export(
+            custom_op_sessions,
+            graph_dir,
+            relative_to=root,
+        )
 
         air_files = sorted(graph_dir.glob("*.air"))
         if len(air_files) != 1:
@@ -133,6 +143,7 @@ def export_air_bundle(
                     for name, item in spec.example_kwargs.items()
                 },
                 "metadata": dict(spec.metadata),
+                "custom_op_audit": custom_op_audit,
                 "air": air_record,
                 "payload_files": records,
             }
@@ -144,7 +155,7 @@ def export_air_bundle(
         else f"{factory_callable.__module__}:{factory_callable.__qualname__}"
     )
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_kind": "qwen35-dflash-torchair-bundle",
         "status": "PASS",
         "factory": factory_name,

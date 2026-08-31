@@ -19,6 +19,14 @@ if str(FRAMEWORK_PYTHON) not in sys.path:
     sys.path.insert(0, str(FRAMEWORK_PYTHON))
 
 from qwen35_dflash.ascend310p.compiler import compile_air_bundle
+from qwen35_dflash.ascend310p.contracts import AirGraphSpec, CustomOpExportSpec
+from qwen35_dflash.ascend310p.custom_op_export import (
+    ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+    ADN_RMS_NORM_TORCH_OP,
+    audit_custom_op_export,
+    prepare_custom_op_export,
+)
+from qwen35_dflash.ascend310p.exporter import export_air_bundle
 from qwen35_dflash.ascend310p.input_manifest import (
     build_quant_input_manifest,
     verify_quant_input_manifest,
@@ -32,6 +40,76 @@ from qwen35_dflash.ascend310p.quant_factory import (
 from qwen35_dflash.ascend310p.utils import sha256_file
 from qwen35_dflash.ascend310p.workflow import DEFAULT_GRAPH_FACTORY
 from models.dflash_v1 import dflash_ascend310p_ops as golden_ops
+
+
+_TEST_OPERATOR_LIBRARIES: list[torch.library.Library] = []
+
+
+def _ensure_adn_rms_norm_test_schema() -> object:
+    try:
+        return torch.ops.npu.adn_rms_norm.default
+    except AttributeError:
+        library = torch.library.Library("npu", "FRAGMENT")
+        library.define(
+            "adn_rms_norm(Tensor input, Tensor gamma, float epsilon=1e-6) "
+            "-> (Tensor, Tensor)"
+        )
+        _TEST_OPERATOR_LIBRARIES.append(library)
+        return torch.ops.npu.adn_rms_norm.default
+
+
+class _FakeTorchAirGeAttr:
+    @staticmethod
+    def Float(value: float) -> tuple[str, float]:
+        return ("float", value)
+
+
+class _FakeTorchAirGe:
+    attr = _FakeTorchAirGeAttr()
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def custom_op(self, op_type: str, *args: object, **kwargs: object):
+        del kwargs
+        self.calls.append((op_type, args))
+        return object(), object()
+
+
+class _FakeTorchAir:
+    __version__ = "test"
+
+    def __init__(self) -> None:
+        self.ge = _FakeTorchAirGe()
+        self.converter = None
+
+    def register_fx_node_ge_converter(self, operation: object):
+        assert operation is torch.ops.npu.adn_rms_norm.default
+
+        def register(converter):
+            self.converter = converter
+            return converter
+
+        return register
+
+    def dynamo_export(
+        self,
+        *args: object,
+        model: nn.Module,
+        export_path: str,
+        export_name: str,
+        dynamic: bool,
+        **kwargs: object,
+    ) -> None:
+        del args, model, dynamic, kwargs
+        assert self.converter is not None
+        self.converter(object(), object(), 1e-6, meta_outputs=(object(), object()))
+        root = Path(export_path)
+        (root / f"{export_name}.air").write_bytes(b"air")
+        (root / "dynamo.pbtxt").write_text(
+            'op {\n  name: "rms"\n  type: "RmsNorm"\n}\n',
+            encoding="utf-8",
+        )
 
 
 class _FakeExecutionModel(nn.Module):
@@ -132,6 +210,104 @@ class _FakeDraft(nn.Module):
             dtype=torch.long,
             device=noise_embedding.device,
         ).unsqueeze(0)
+
+
+def test_adn_rms_norm_fake_keeps_frontend_operator_in_export() -> None:
+    operation = _ensure_adn_rms_norm_test_schema()
+    torchair = _FakeTorchAir()
+    spec = CustomOpExportSpec(
+        torch_op=ADN_RMS_NORM_TORCH_OP,
+        ge_op_type=ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+    )
+    session = prepare_custom_op_export(spec, torchair)
+
+    class UsesAdnRmsNorm(nn.Module):
+        def forward(
+            self, input_tensor: torch.Tensor, gamma: torch.Tensor
+        ) -> torch.Tensor:
+            return operation(input_tensor, gamma, 1e-6)[0]
+
+    exported = torch.export.export(
+        UsesAdnRmsNorm(),
+        (torch.randn(2, 4, 8), torch.ones(8)),
+        strict=True,
+    )
+    targets = [str(node.target) for node in exported.graph.nodes]
+    assert "npu.adn_rms_norm.default" in targets
+    assert session.fake_kernel in {
+        "framework-registered-fake",
+        "preexisting-meta-kernel",
+    }
+
+
+def test_air_export_audits_retained_adn_rms_norm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ensure_adn_rms_norm_test_schema()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("AI_RUN_DIR", str(run_dir))
+    torchair = _FakeTorchAir()
+
+    def factory(config: object) -> tuple[AirGraphSpec, ...]:
+        del config
+        return (
+            AirGraphSpec(
+                name="retained_custom_op",
+                role="generation-recompute",
+                model=nn.Identity(),
+                example_args=(torch.ones(1),),
+                custom_ops=(
+                    CustomOpExportSpec(
+                        torch_op=ADN_RMS_NORM_TORCH_OP,
+                        ge_op_type=ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+                    ),
+                ),
+            ),
+        )
+
+    result = export_air_bundle(
+        factory,
+        {},
+        run_dir / "bundle",
+        torchair_module=torchair,
+    )
+    graph = result["graphs"][0]
+    audit = graph["custom_op_audit"][0]
+    assert result["schema_version"] == 2
+    assert audit["status"] == "PASS"
+    assert audit["torch_target"] == "npu.adn_rms_norm.default"
+    assert audit["ge_op_type"] == "RmsNorm"
+    assert audit["converter_calls"] == 1
+    assert audit["ge_node_occurrences"] == 1
+    assert torchair.ge.calls[0][0] == "RmsNorm"
+    assert any(
+        item["path"].endswith("dynamo.pbtxt")
+        for item in graph["payload_files"]
+    )
+
+
+def test_custom_op_audit_rejects_missing_ge_node(tmp_path: Path) -> None:
+    _ensure_adn_rms_norm_test_schema()
+    torchair = _FakeTorchAir()
+    session = prepare_custom_op_export(
+        CustomOpExportSpec(
+            torch_op=ADN_RMS_NORM_TORCH_OP,
+            ge_op_type=ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+        ),
+        torchair,
+    )
+    assert torchair.converter is not None
+    torchair.converter(object(), object(), 1e-6, meta_outputs=(object(), object()))
+    graph_dir = tmp_path / "air" / "missing"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "dynamo.pbtxt").write_text(
+        'op {\n  name: "wrong"\n  type: "Mul"\n}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="converter calls"):
+        audit_custom_op_export((session,), graph_dir, relative_to=tmp_path)
 
 
 def test_default_factory_is_quant_branch_factory() -> None:
@@ -291,8 +467,10 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
     graph_dir.mkdir(parents=True)
     air = graph_dir / "quant_dflash_recompute.air"
     air.write_bytes(b"quant-air")
+    pbtxt = graph_dir / "dynamo.pbtxt"
+    pbtxt.write_text('op { type: "RmsNorm" }\n', encoding="utf-8")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_kind": "qwen35-dflash-torchair-bundle",
         "status": "PASS",
         "graphs": [
@@ -301,6 +479,22 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
                 "role": "generation-recompute",
                 "input_names": ["input_ids", "attention_mask"],
                 "output_names": ["target_top1", "draft_top1"],
+                "metadata": {
+                    "custom_op_export_contract": {
+                        "torch_target": "npu.adn_rms_norm.default",
+                        "ge_op_type": "RmsNorm",
+                    }
+                },
+                "custom_op_audit": [
+                    {
+                        "status": "PASS",
+                        "torch_target": "npu.adn_rms_norm.default",
+                        "ge_op_type": "RmsNorm",
+                        "minimum_occurrences": 1,
+                        "converter_calls": 1,
+                        "ge_node_occurrences": 1,
+                    }
+                ],
                 "air": {
                     "path": "air/quant_dflash_recompute/quant_dflash_recompute.air",
                     "bytes": air.stat().st_size,
@@ -311,7 +505,12 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
                         "path": "air/quant_dflash_recompute/quant_dflash_recompute.air",
                         "bytes": air.stat().st_size,
                         "sha256": sha256_file(air),
-                    }
+                    },
+                    {
+                        "path": "air/quant_dflash_recompute/dynamo.pbtxt",
+                        "bytes": pbtxt.stat().st_size,
+                        "sha256": sha256_file(pbtxt),
+                    },
                 ],
             }
         ],
@@ -338,6 +537,7 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
         atc_identity="fake-atc",
     )
     assert result["status"] == "PASS"
+    assert result["graphs"][0]["custom_op_audit"][0]["status"] == "PASS"
     assert commands[0][1:3] == ["--mode=0", "--framework=1"]
     assert commands[0][-1] == "--soc_version=Ascend310P3"
 
@@ -472,6 +672,7 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
             input_names=("input_ids", "attention_mask"),
             output_names=("target_top1", "draft_top1"),
             metadata=dict(kwargs["metadata"]),
+            custom_ops=tuple(kwargs["custom_ops"]),
         )
 
     monkeypatch.setattr(
@@ -517,6 +718,9 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
     )
     assert spec.metadata["quant_source_lock"]["verified_file_count"] >= 10
     assert spec.metadata["target_checkpoint_manifest_sha256"]
+    assert len(spec.custom_ops) == 1
+    assert spec.custom_ops[0].torch_target == "npu.adn_rms_norm.default"
+    assert spec.custom_ops[0].ge_op_type == "RmsNorm"
     assert spec.input_names == ("input_ids", "attention_mask")
     assert spec.output_names == ("target_top1", "draft_top1")
 
