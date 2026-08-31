@@ -23,6 +23,7 @@ from .contracts import CustomOpExportSpec
 
 ADN_FUSED_INFER_ATTENTION_TORCH_OP = "npu::adn_fused_infer_attention"
 ADN_RMS_NORM_TORCH_OP = "npu::adn_rms_norm"
+FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP = "qwen35_dflash::npu_cache_update"
 NPU_CACHE_UPDATE_TORCH_OP = "npu::npu_cache_update_"
 NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP = "npu::npu_chunk_gated_delta_rule"
 NPU_DYNAMIC_QUANT_TORCH_OP = "npu::npu_dynamic_quant"
@@ -39,6 +40,8 @@ NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE = "ScatterNdUpdate"
 
 _GE_TYPE_FIELD = re.compile(r'\btype:\s*"([A-Za-z_][A-Za-z0-9_]*)"')
 _FAKE_REGISTRATION_LOCK = threading.Lock()
+_FUNCTIONAL_OP_REGISTRATION_LOCK = threading.Lock()
+_FUNCTIONAL_OP_LIBRARIES: list[torch.library.Library] = []
 _FRAMEWORK_CONVERTER = "framework-registered-ge-ir"
 _TORCHAIR_BUILTIN_CONVERTER = "torchair-builtin"
 
@@ -231,6 +234,18 @@ def _fake_npu_cache_update_(
     return input
 
 
+def _fake_functional_npu_cache_update(
+    input: torch.Tensor,
+    updates: torch.Tensor,
+    target_block: torch.Tensor,
+    offset_in_block: torch.Tensor,
+) -> torch.Tensor:
+    """Return a non-aliased cache value accepted by AOT functionalization."""
+
+    del updates, target_block, offset_in_block
+    return torch.empty_like(input)
+
+
 def _fake_npu_dynamic_quant(
     input: torch.Tensor,
     *,
@@ -396,6 +411,22 @@ def _validate_npu_cache_update_meta(operation: Any) -> None:
         raise RuntimeError("npu::npu_cache_update_ Meta kernel lost input alias")
 
 
+def _validate_functional_npu_cache_update_meta(operation: Any) -> None:
+    input_tensor = torch.empty((4, 64, 64, 16), dtype=torch.float16, device="meta")
+    updates = torch.empty((1, 64, 16), dtype=torch.float16, device="meta")
+    target_block = torch.empty((1,), dtype=torch.int32, device="meta")
+    offset = torch.empty((), dtype=torch.int32, device="meta")
+    result = operation(input_tensor, updates, target_block, offset)
+    _expect_tensor(
+        result, shape=(4, 64, 64, 16), dtype=torch.float16,
+        label="qwen35_dflash::npu_cache_update output",
+    )
+    if result is input_tensor:
+        raise RuntimeError(
+            "qwen35_dflash::npu_cache_update must not alias its input"
+        )
+
+
 def _validate_npu_dynamic_quant_meta(operation: Any) -> None:
     input_tensor = torch.empty((2, 3, 8), dtype=torch.float16, device="meta")
     result = operation(input_tensor, dst_type=torch.int8)
@@ -509,6 +540,18 @@ _ADAPTERS = {
         converter_policy=_FRAMEWORK_CONVERTER,
         inplace_alias=True,
     ),
+    FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP: _OperatorAdapter(
+        torch_op=FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
+        argument_names=(
+            ("input", "self"), "updates", "target_block", "offset_in_block"
+        ),
+        argument_types=("Tensor", "Tensor", "Tensor", "Tensor"),
+        kwarg_only=(False,) * 4,
+        return_types=("Tensor",),
+        fake_kernel=_fake_functional_npu_cache_update,
+        validate_meta=_validate_functional_npu_cache_update_meta,
+        converter_policy=_FRAMEWORK_CONVERTER,
+    ),
     NPU_DYNAMIC_QUANT_TORCH_OP: _OperatorAdapter(
         torch_op=NPU_DYNAMIC_QUANT_TORCH_OP,
         argument_names=(
@@ -618,6 +661,65 @@ def _validate_schema(operation: Any, adapter: _OperatorAdapter) -> str:
     if adapter.inplace_alias:
         _validate_inplace_alias(schema, adapter.torch_op)
     return str(schema)
+
+
+def _functional_npu_cache_update_impl(
+    input: torch.Tensor,
+    updates: torch.Tensor,
+    target_block: torch.Tensor,
+    offset_in_block: torch.Tensor,
+) -> torch.Tensor:
+    """Functional eager fallback over the receiver's mutable CacheUpdate."""
+
+    # The clone makes the wrapper's no-alias dispatcher schema truthful.  The
+    # formal AIR route never executes this copy: its converter emits one
+    # CacheUpdate GE node whose output is consumed by the following attention.
+    result = torch.ops.npu.npu_cache_update_.default(
+        input.clone(),
+        updates,
+        target_block,
+        offset_in_block,
+    )
+    return result
+
+
+def _ensure_functional_npu_cache_update_op() -> None:
+    """Install the AOT-safe frontend and validate its mutable source ABI."""
+
+    source_adapter = _ADAPTERS[NPU_CACHE_UPDATE_TORCH_OP]
+    source_spec = CustomOpExportSpec(
+        NPU_CACHE_UPDATE_TORCH_OP,
+        NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
+    )
+    source_operation = _resolve_operation(source_spec)
+    _validate_schema(source_operation, source_adapter)
+
+    with _FUNCTIONAL_OP_REGISTRATION_LOCK:
+        namespace = getattr(torch.ops, "qwen35_dflash", None)
+        packet = (
+            None if namespace is None else getattr(namespace, "npu_cache_update", None)
+        )
+        operation = None if packet is None else getattr(packet, "default", None)
+        if operation is None:
+            definition = torch.library.Library("qwen35_dflash", "FRAGMENT")
+            definition.define(
+                "npu_cache_update(Tensor input, Tensor updates, "
+                "Tensor target_block, Tensor offset_in_block) -> Tensor"
+            )
+            _FUNCTIONAL_OP_LIBRARIES.append(definition)
+
+        has_composite = torch._C._dispatch_has_kernel_for_dispatch_key(
+            FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
+            "CompositeExplicitAutograd",
+        )
+        if not has_composite:
+            implementation = torch.library.Library(
+                "qwen35_dflash", "IMPL", "CompositeExplicitAutograd"
+            )
+            implementation.impl(
+                "npu_cache_update", _functional_npu_cache_update_impl
+            )
+            _FUNCTIONAL_OP_LIBRARIES.append(implementation)
 
 
 def _has_meta_kernel(torch_op: str) -> bool:
@@ -762,7 +864,10 @@ def _register_framework_converter(
             )
 
         converter.__name__ = "convert_npu_chunk_gated_delta_rule_default"
-    elif adapter.torch_op == NPU_CACHE_UPDATE_TORCH_OP:
+    elif adapter.torch_op in {
+        NPU_CACHE_UPDATE_TORCH_OP,
+        FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
+    }:
 
         def converter(
             input: Any,
@@ -892,6 +997,8 @@ def prepare_custom_op_export(
         raise NotImplementedError(
             f"no exact export adapter is implemented for {spec.torch_target}"
         )
+    if spec.torch_op == FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP:
+        _ensure_functional_npu_cache_update_op()
     adapter = _ADAPTERS.get(spec.torch_op)
     if adapter is None:
         raise NotImplementedError(
@@ -995,6 +1102,7 @@ __all__ = [
     "ADN_FUSED_INFER_ATTENTION_TORCH_OP",
     "ADN_RMS_NORM_DEFAULT_GE_OP_TYPE",
     "ADN_RMS_NORM_TORCH_OP",
+    "FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP",
     "NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE",
     "NPU_CACHE_UPDATE_TORCH_OP",
     "NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE",

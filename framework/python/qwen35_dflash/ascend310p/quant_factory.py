@@ -35,8 +35,8 @@ from .custom_op_export import (
     ADN_FUSED_INFER_ATTENTION_TORCH_OP,
     ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
     ADN_RMS_NORM_TORCH_OP,
+    FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
     NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
-    NPU_CACHE_UPDATE_TORCH_OP,
     NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
     NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
     NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
@@ -362,6 +362,7 @@ class QuantFullPrefixExportTarget(nn.Module):
             allQLen=[sequence_length],
             output_dflash_features=True,
             gdr_effective_length=gdr_effective_length,
+            export_flag=True,
         )
         # The locked rollback/non-rollback receiver both expose the same
         # feature-enabled tensor tuple.  Avoid the eager bridge's generic
@@ -434,7 +435,7 @@ def create_quant_recompute_graph(
             ),
         ),
         CustomOpExportSpec(
-            torch_op=NPU_CACHE_UPDATE_TORCH_OP,
+            torch_op=FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
             ge_op_type=str(
                 config.get(
                     "npu_cache_update_ge_op_type",

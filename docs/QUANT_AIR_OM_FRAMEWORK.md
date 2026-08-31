@@ -99,7 +99,7 @@ schema/Meta 预检，但不能虚构一次图命中。
 | `npu.npu_quant_matmul.default` | broadcast batch + `[M,N]`，当前调用输出 FP16 | `QuantBatchMatmulV3` | TorchAir builtin | required |
 | `npu.adn_rms_norm.default` | 输出 0 与 input 同 shape/dtype；输出 1 为 `[*input.shape[:-1],1]` FP32 | `RmsNorm` | 框架注册 | required |
 | `npu.npu_chunk_gated_delta_rule.default` | output 为 value shape/query dtype；final state 为 initial-state shape/FP32 | `ChunkGatedDeltaRule` | 框架注册 | required |
-| `npu.npu_cache_update_.default` | 返回同一个 `Tensor(a!)`，不能丢失写 alias | `CacheUpdate` | 框架注册 | required |
+| `qwen35_dflash.npu_cache_update.default` | 返回同 shape/dtype/device 的非 alias 更新值 | `CacheUpdate` | 框架注册 | required |
 | `npu.adn_fused_infer_attention.default` | 按 layout 推导；当前 packed `BNSD` 路径保持 query shape/FP16 | `FusedInferAttentionScore` | 框架映射 | required |
 | `npu.npu_scatter_nd_update_.default` | 返回同一个 `Tensor(a!)`，不能丢失写 alias | `ScatterNdUpdate` | TorchAir builtin | optional（仅 `forward1`） |
 
@@ -116,6 +116,13 @@ Fake/Meta 不执行任何算子数值，正式 eager、AIR 和 OM 也不会执�
 `npu_quant_matmul` 的预检使用实际 W8A8 路径代表形状：`x1=[1,64,2560]`、
 `x2=[2560,8192]`、`scale=[8192]`、`pertoken_scale=[64]`。torch-npu 要求
 `pertoken_scale.shape[0] == x1.shape[-2]`（M 维）；不能把 batch 与 M 相乘后写成 `[B*M]`。
+
+receiver 的原始 `npu.npu_cache_update_` 使用 `Tensor(a!) -> Tensor(a!)` 原地 ABI。PyTorch
+AOTAutograd 不能 functionalize 带返回 alias 的非 ATen 算子，所以 AIR 专用 modeling 路径通过
+无 alias 前端 `qwen35_dflash.npu_cache_update.default` 表达“旧 cache 输入 -> 新 cache 输出”，
+再精确 lowering 为一个 `CacheUpdate` GE 节点。普通 eager 路径仍直接调用原始原地算子，不增加
+clone 或额外 NPU launch；rollback 多行写在 AIR 路径中显式串接每一行的更新输出。设置
+`keep_inference_input_mutations=True` 不能解除非 ATen 算子“返回值带 alias”的限制。
 
 七个预期 GE type 都在 `factory.json` 中显式锁定。builtin converter 和当前 fused-attention 精确
 映射必须使用表中的 type；RMS/GDR/cache 只有在目标环境把同一参数顺序的 IR 正式注册为其他
@@ -345,7 +352,7 @@ expected = {
     "npu.npu_chunk_gated_delta_rule.default": (
         "ChunkGatedDeltaRule", 1, "framework-registered-ge-ir"
     ),
-    "npu.npu_cache_update_.default": (
+    "qwen35_dflash.npu_cache_update.default": (
         "CacheUpdate", 1, "framework-registered-ge-ir"
     ),
     "npu.adn_fused_infer_attention.default": (
@@ -610,6 +617,7 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | `schema drifted from the locked export contract` | torch-npu/receiver 算子签名与当前锁不一致 | 记录 dispatcher schema；按真实版本更新 schema、Fake、converter 和测试，不能跳过校验 |
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
 | `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
+| `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 旧版 AIR 路径把 `Tensor(a!) -> Tensor(a!)` 直接交给 AOTAutograd；Fake 正确也无法 functionalize | 更新本分支；确认 FX target 为 `qwen35_dflash.npu_cache_update.default`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |
 | TorchAir graph break | 某个 Python/自定义 op 未被捕获 | 定位首个 graph break，补正式 converter；不要伪造 AIR |

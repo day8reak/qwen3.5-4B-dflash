@@ -28,6 +28,7 @@ from qwen35_dflash.ascend310p.custom_op_export import (
     ADN_FUSED_INFER_ATTENTION_TORCH_OP,
     ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
     ADN_RMS_NORM_TORCH_OP,
+    FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
     NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
     NPU_CACHE_UPDATE_TORCH_OP,
     NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
@@ -131,6 +132,27 @@ def _ensure_all_target_test_schemas() -> dict[str, object]:
     }
 
 
+def _ensure_cache_update_cpu_impl() -> None:
+    if torch._C._dispatch_has_kernel_for_dispatch_key(
+        NPU_CACHE_UPDATE_TORCH_OP, "CPU"
+    ):
+        return
+    library = torch.library.Library("npu", "IMPL", "CPU")
+
+    def cache_update(
+        input: torch.Tensor,
+        updates: torch.Tensor,
+        target_block: torch.Tensor,
+        offset_in_block: torch.Tensor,
+    ) -> torch.Tensor:
+        del target_block, offset_in_block
+        input.copy_(updates)
+        return input
+
+    library.impl("npu_cache_update_", cache_update)
+    _TEST_OPERATOR_LIBRARIES.append(library)
+
+
 class _FakeTorchAirGeAttr:
     @staticmethod
     def Float(value: float) -> tuple[str, float]:
@@ -223,6 +245,7 @@ class _FakeExecutionModel(nn.Module):
         object.__setattr__(self, "embedding", embedding)
         object.__setattr__(self, "lm_head", lm_head)
         self.last_gdr_effective_length: torch.Tensor | None = None
+        self.last_export_flag: bool | None = None
 
     def forward(
         self,
@@ -233,8 +256,9 @@ class _FakeExecutionModel(nn.Module):
         gdr_effective_length: torch.Tensor,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del input_ids, kwargs
+        del input_ids
         assert output_dflash_features is True
+        self.last_export_flag = bool(kwargs.pop("export_flag"))
         self.last_gdr_effective_length = gdr_effective_length.detach().clone()
         return self.lm_head(inputs_embeds), torch.cat(
             (inputs_embeds, inputs_embeds), dim=-1
@@ -356,7 +380,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
             ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
         ),
         CustomOpExportSpec(
-            NPU_CACHE_UPDATE_TORCH_OP,
+            FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
             NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
         ),
         CustomOpExportSpec(
@@ -392,16 +416,17 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
     assert policies == {
         ADN_FUSED_INFER_ATTENTION_TORCH_OP: "framework-registered-ge-ir",
         ADN_RMS_NORM_TORCH_OP: "framework-registered-ge-ir",
-        NPU_CACHE_UPDATE_TORCH_OP: "framework-registered-ge-ir",
+        FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP: "framework-registered-ge-ir",
         NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP: "framework-registered-ge-ir",
         NPU_DYNAMIC_QUANT_TORCH_OP: "torchair-builtin",
         NPU_QUANT_MATMUL_TORCH_OP: "torchair-builtin",
         NPU_SCATTER_ND_UPDATE_TORCH_OP: "torchair-builtin",
     }
+    functional_cache_update = torch.ops.qwen35_dflash.npu_cache_update.default
     assert set(torchair.converters) == {
         operations["adn_fused_infer_attention"],
         operations["adn_rms_norm"],
-        operations["npu_cache_update_"],
+        functional_cache_update,
         operations["npu_chunk_gated_delta_rule"],
     }
 
@@ -419,7 +444,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         False,
         meta_outputs=(placeholder, placeholder),
     )
-    torchair.converters[operations["npu_cache_update_"]](*([placeholder] * 4))
+    torchair.converters[functional_cache_update](*([placeholder] * 4))
     torchair.converters[operations["adn_fused_infer_attention"]](
         placeholder,
         [placeholder],
@@ -650,13 +675,14 @@ def test_quant_matmul_meta_rejects_flattened_batch_times_m_scale() -> None:
         )
 
 
-def test_mutable_fakes_keep_cache_and_scatter_alias_ops_in_export() -> None:
-    cache_update = _ensure_target_test_schema("npu_cache_update_")
+def test_functional_cache_update_survives_aot_and_keeps_ge_custom_op() -> None:
+    _ensure_target_test_schema("npu_cache_update_")
+    _ensure_cache_update_cpu_impl()
     scatter_update = _ensure_target_test_schema("npu_scatter_nd_update_")
     torchair = _FakeTorchAir()
     prepare_custom_op_export(
         CustomOpExportSpec(
-            NPU_CACHE_UPDATE_TORCH_OP,
+            FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
             NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
         ),
         torchair,
@@ -669,6 +695,7 @@ def test_mutable_fakes_keep_cache_and_scatter_alias_ops_in_export() -> None:
         ),
         torchair,
     )
+    cache_update = torch.ops.qwen35_dflash.npu_cache_update.default
 
     class UsesCacheUpdate(nn.Module):
         def forward(
@@ -678,8 +705,7 @@ def test_mutable_fakes_keep_cache_and_scatter_alias_ops_in_export() -> None:
             block: torch.Tensor,
             offset: torch.Tensor,
         ) -> torch.Tensor:
-            cache_update(cache, updates, block, offset)
-            return cache
+            return cache_update(cache, updates, block, offset)
 
     class UsesScatterUpdate(nn.Module):
         def forward(
@@ -701,6 +727,34 @@ def test_mutable_fakes_keep_cache_and_scatter_alias_ops_in_export() -> None:
         ),
         strict=True,
     )
+    eager_cache = torch.zeros(4, dtype=torch.float32)
+    aot_targets: set[str] = set()
+
+    def capture_aot_graph(
+        graph: torch.fx.GraphModule,
+        example_inputs: list[torch.Tensor],
+    ):
+        del example_inputs
+        aot_targets.update(str(node.target) for node in graph.graph.nodes)
+        return graph.forward
+
+    from torch._dynamo.backends.common import aot_autograd
+
+    compiled_cache_update = torch.compile(
+        UsesCacheUpdate(),
+        backend=aot_autograd(fw_compiler=capture_aot_graph),
+        fullgraph=True,
+    )
+    compiled_result = compiled_cache_update(
+        eager_cache,
+        torch.ones_like(eager_cache),
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros((), dtype=torch.int32),
+    )
+    torch.testing.assert_close(compiled_result, torch.ones_like(eager_cache))
+    torch.testing.assert_close(eager_cache, torch.zeros_like(eager_cache))
+    assert "qwen35_dflash.npu_cache_update.default" in aot_targets
+    assert "npu.npu_cache_update_.default" not in aot_targets
     scatter_export = torch.export.export(
         UsesScatterUpdate(),
         (
@@ -710,9 +764,11 @@ def test_mutable_fakes_keep_cache_and_scatter_alias_ops_in_export() -> None:
         ),
         strict=True,
     )
-    assert "npu.npu_cache_update_.default" in {
+    cache_targets = {
         str(node.target) for node in cache_export.graph.nodes
     }
+    assert "qwen35_dflash.npu_cache_update.default" in cache_targets
+    assert "npu.npu_cache_update_.default" not in cache_targets
     assert "npu.npu_scatter_nd_update_.default" in {
         str(node.target) for node in scatter_export.graph.nodes
     }
@@ -853,6 +909,24 @@ def test_quant_target_adapter_bypasses_eager_guards_and_sync() -> None:
     assert target.execution.last_gdr_effective_length is not None
     assert target.execution.last_gdr_effective_length.dtype == torch.int16
     assert target.execution.last_gdr_effective_length.tolist() == [2]
+    assert target.execution.last_export_flag is True
+
+
+def test_both_hiai_models_route_only_air_cache_updates_through_functional_op() -> None:
+    ordinary = (ROOT / "models" / "modeling_qwen3_5_hiai_nd.py").read_text(
+        encoding="utf-8"
+    )
+    rollback = (
+        ROOT / "models" / "modeling_qwen3_5_hiai_nd_dflash_rollback.py"
+    ).read_text(encoding="utf-8")
+
+    assert "def _cache_update_for_export(" in ordinary
+    assert "torch.ops.qwen35_dflash.npu_cache_update.default(" in ordinary
+    assert "torch_npu.npu_cache_update_(" in ordinary
+    assert ordinary.count("export_flag=export_flag") >= 3
+    assert "QLinear, _cache_update_for_export" in rollback
+    assert rollback.count("_cache_update_for_export(") >= 2
+    assert rollback.count("export_flag=export_flag") >= 6
 
 
 def test_air_ops_match_quant_branch_decomposed_golden() -> None:
@@ -1258,7 +1332,7 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
             "ChunkGatedDeltaRule",
             1,
         ),
-        "npu.npu_cache_update_.default": ("CacheUpdate", 1),
+        "qwen35_dflash.npu_cache_update.default": ("CacheUpdate", 1),
         "npu.adn_fused_infer_attention.default": (
             "FusedInferAttentionScore",
             1,

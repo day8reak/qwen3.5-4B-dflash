@@ -55,6 +55,32 @@ else:
 logger = logging.get_logger(__name__)
 
 
+def _cache_update_for_export(
+    input: torch.Tensor,
+    updates: torch.Tensor,
+    target_block: torch.Tensor,
+    offset_in_block: torch.Tensor,
+    *,
+    export_flag: bool,
+) -> torch.Tensor:
+    """Use an AOT-safe functional frontend only for the AIR graph route."""
+
+    if export_flag:
+        return torch.ops.qwen35_dflash.npu_cache_update.default(
+            input,
+            updates,
+            target_block,
+            offset_in_block,
+        )
+    torch_npu.npu_cache_update_(
+        input,
+        updates,
+        target_block,
+        offset_in_block,
+    )
+    return input
+
+
 def _normalize_gdr_effective_length(
     effective_length: Optional[torch.Tensor],
     *,
@@ -463,19 +489,21 @@ class Qwen3_5Attention(nn.Module):
         )
         return output_matrix.reshape(b, n, s, d)
 
-    def update(self, new_k, cache_position, past_key_value):
+    def update(
+        self, new_k, cache_position, past_key_value, *, export_flag=False
+    ):
         b, s, n, d = new_k.shape
         block_idx = cache_position[0] // self.block_size
         offset_in_block = (cache_position[0] % self.block_size).to(torch.int32)
         target_blocks = block_idx.reshape(1).to(torch.int32)
         k_flattened = new_k.reshape(b, s, -1, 16)
-        torch_npu.npu_cache_update_(
+        return _cache_update_for_export(
             past_key_value.to(new_k.device),
             k_flattened[0, :, :, :].to(torch.float16),
             target_blocks,
             offset_in_block,
+            export_flag=export_flag,
         )
-        return past_key_value
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -513,10 +541,16 @@ class Qwen3_5Attention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         key_states = self.update(
-            key_states, cache_position, past_key_values[0]
+            key_states,
+            cache_position,
+            past_key_values[0],
+            export_flag=export_flag,
         ).to(query_states.device)
         value_states = self.update(
-            value_states, cache_position, past_key_values[1]
+            value_states,
+            cache_position,
+            past_key_values[1],
+            export_flag=export_flag,
         ).to(query_states.device)
         past_key_values = (key_states, value_states)
         attention_mask = attention_mask.to(torch.float16)

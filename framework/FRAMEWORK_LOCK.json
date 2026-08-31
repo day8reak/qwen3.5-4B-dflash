@@ -1,6 +1,6 @@
 {
-  "schema_version": 4,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v4",
+  "schema_version": 5,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v5",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -82,11 +82,14 @@
         "minimum_occurrences": 1
       },
       {
-        "frontend": "npu.npu_cache_update_.default",
-        "frontend_schema": "npu::npu_cache_update_(Tensor(a!) input, Tensor updates, Tensor target_block, Tensor offset_in_block) -> Tensor(a!)",
+        "frontend": "qwen35_dflash.npu_cache_update.default",
+        "frontend_schema": "qwen35_dflash::npu_cache_update(Tensor input, Tensor updates, Tensor target_block, Tensor offset_in_block) -> Tensor",
+        "source_frontend": "npu.npu_cache_update_.default",
+        "source_frontend_schema": "npu::npu_cache_update_(Tensor(a!) input, Tensor updates, Tensor target_block, Tensor offset_in_block) -> Tensor(a!)",
         "fake_meta_outputs": [
-          "the same aliased input Tensor(a!)"
+          "input shape/dtype/device as a non-aliased Tensor"
         ],
+        "constraints": "AIR uses a functional no-alias frontend because AOTAutograd cannot functionalize a non-ATen output alias; eager modeling still invokes the original mutable source op",
         "default_ge_op_type": "CacheUpdate",
         "converter": "framework registered GE IR",
         "minimum_occurrences": 1

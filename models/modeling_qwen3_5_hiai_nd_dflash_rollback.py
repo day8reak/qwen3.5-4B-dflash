@@ -50,7 +50,7 @@ from .dflash_v1.dflash_target_features import (
     DFlashFeatureCollector,
     QWEN35_4B_DFLASH_TARGET_FEATURES,
 )
-from .modeling_qwen3_5_hiai_nd import QLinear
+from .modeling_qwen3_5_hiai_nd import QLinear, _cache_update_for_export
 
 if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -696,21 +696,25 @@ class Qwen3_5Attention(nn.Module):
         )
         return output_matrix.reshape(b, n, s, d)
 
-    def update(self, new_k, cache_position, past_key_value):
+    def update(
+        self, new_k, cache_position, past_key_value, *, export_flag=False
+    ):
         b, s, n, d = new_k.shape
         block_idx = cache_position[0] // self.block_size
         offset_in_block = (cache_position[0] % self.block_size).to(torch.int32)
         target_blocks = block_idx.reshape(1).to(torch.int32)
         k_flattened = new_k.reshape(b, s, -1, 16)
-        torch_npu.npu_cache_update_(
+        return _cache_update_for_export(
             past_key_value.to(new_k.device),
             k_flattened[0, :, :, :].to(torch.float16),
             target_blocks,
             offset_in_block,
+            export_flag=export_flag,
         )
-        return past_key_value
 
-    def update_dflash(self, new_k, cache_position, past_key_value):
+    def update_dflash(
+        self, new_k, cache_position, past_key_value, *, export_flag=False
+    ):
         """Correctness fallback for a K+1 write that may cross cache blocks.
 
         The receiver's current CacheUpdate call supplies one target block and
@@ -734,17 +738,19 @@ class Qwen3_5Attention(nn.Module):
             )
 
         flattened = new_k.reshape(batch_size, sequence_length, -1, 16)
+        updated_cache = past_key_value.to(new_k.device)
         for token_index in range(sequence_length):
             position = cache_position[token_index]
             target_block = (position // self.block_size).reshape(1).to(torch.int32)
             offset_in_block = (position % self.block_size).to(torch.int32)
-            torch_npu.npu_cache_update_(
-                past_key_value.to(new_k.device),
+            updated_cache = _cache_update_for_export(
+                updated_cache,
                 flattened[0, token_index : token_index + 1].to(torch.float16),
                 target_block,
                 offset_in_block,
+                export_flag=export_flag,
             )
-        return past_key_value
+        return updated_cache
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -784,10 +790,16 @@ class Qwen3_5Attention(nn.Module):
         key_states = key_states.transpose(1, 2)
         if accepted_tokens is None:
             key_states = self.update(
-                key_states, cache_position, past_key_values[0]
+                key_states,
+                cache_position,
+                past_key_values[0],
+                export_flag=export_flag,
             ).to(query_states.device)
             value_states = self.update(
-                value_states, cache_position, past_key_values[1]
+                value_states,
+                cache_position,
+                past_key_values[1],
+                export_flag=export_flag,
             ).to(query_states.device)
         else:
             _require_dflash_accepted_tokens(
@@ -797,10 +809,16 @@ class Qwen3_5Attention(nn.Module):
                 device=query_states.device,
             )
             key_states = self.update_dflash(
-                key_states, cache_position, past_key_values[0]
+                key_states,
+                cache_position,
+                past_key_values[0],
+                export_flag=export_flag,
             ).to(query_states.device)
             value_states = self.update_dflash(
-                value_states, cache_position, past_key_values[1]
+                value_states,
+                cache_position,
+                past_key_values[1],
+                export_flag=export_flag,
             ).to(query_states.device)
         past_key_values = (key_states, value_states)
         attention_mask = attention_mask.to(torch.float16)
