@@ -71,6 +71,8 @@ _TARGET_AUDIT_COUNTER_FIELDS = frozenset(
         "rollback_prefill_lm_head_skips",
         "rollback_verify_calls",
         "rollback_commit_calls",
+        "rollback_gdr_verify_layer_calls",
+        "rollback_gdr_commit_layer_calls",
         "rollback_aborts",
         # Framework transaction counters.
         "ordinary_prefill_calls",
@@ -82,7 +84,7 @@ _TARGET_AUDIT_COUNTER_FIELDS = frozenset(
 _TARGET_AUDIT_SESSION_FIELDS = (
     "persistent_mode",
     "persistent_cursor",
-    "previous_accepted",
+    "last_committed_rows",
     "pending_verify_rows",
     "session_invalid",
     "pending_transaction",

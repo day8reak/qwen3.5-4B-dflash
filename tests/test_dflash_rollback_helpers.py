@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -20,11 +20,9 @@ SOURCE = (
 BASE_SOURCE = REPOSITORY_ROOT / "models" / "modeling_qwen3_5_hiai_nd.py"
 HELPERS = {
     "_normalize_gdr_effective_length",
-    "_require_dflash_accepted_tokens",
-    "_select_dflash_state_slot",
-    "seed_dflash_gdn_state_banks",
-    "rebase_dflash_gdn_state_banks",
-    "torch_dflash_causal_conv1d_mtp",
+    "torch_dflash_causal_conv1d_chunk",
+    "select_dflash_chunk_commit_state",
+    "run_dflash_chunk_gdr_commit",
 }
 CONSTANTS = {
     "DFLASH_BLOCK_SIZE",
@@ -52,6 +50,7 @@ def load_helpers() -> dict[str, object]:
     namespace: dict[str, object] = {
         "torch": torch,
         "F": F,
+        "Callable": Callable,
         "Optional": Optional,
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
@@ -63,17 +62,19 @@ def load_helpers() -> dict[str, object]:
 
 def sequential_reference(
     hidden: torch.Tensor,
-    bank: torch.Tensor,
+    initial_state: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    accepted: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, channels, tokens = hidden.shape
-    state_len = bank.shape[-1]
+    state_len = initial_state.shape[-1]
     outputs = torch.empty_like(hidden)
-    states = torch.empty_like(bank)
+    states = torch.empty(
+        (batch, tokens, channels, state_len),
+        dtype=hidden.dtype,
+    )
     for batch_index in range(batch):
-        state = bank[batch_index, int(accepted[batch_index])].clone()
+        state = initial_state[batch_index].clone()
         for token_index in range(tokens):
             state = torch.cat(
                 (state, hidden[batch_index, :, token_index : token_index + 1]),
@@ -96,28 +97,29 @@ def assert_gdr_effective_length_source_contract() -> None:
             and node.func.attr == "npu_chunk_gated_delta_rule"
         ]
         assert len(ordinary_calls) == 1
-        keyword_names = {item.arg for item in ordinary_calls[0].keywords}
-        assert "effective_length" in keyword_names
+        for call in ordinary_calls:
+            keyword_names = {item.arg for item in call.keywords}
+            assert "effective_length" in keyword_names
+            assert "initial_state" in keyword_names
+            assert "output_final_state" in keyword_names
 
-    rollback_tree = ast.parse(
-        SOURCE.read_text(encoding="utf-8"),
-        filename=str(SOURCE),
+    rollback_tree = ast.parse(SOURCE.read_text("utf-8"), filename=str(SOURCE))
+    assert not any(
+        isinstance(node, ast.Attribute)
+        and node.attr == "npu_gated_delta_rule_mtp"
+        for node in ast.walk(rollback_tree)
     )
-    mtp_bridge = next(
+    commit_method = next(
         node
-        for node in rollback_tree.body
+        for node in ast.walk(rollback_tree)
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_npu_gated_delta_rule_mtp"
+        and node.name == "compute_dflash_chunk_commit"
     )
-    assert [argument.arg for argument in mtp_bridge.args.args] == [
-        "query",
-        "key",
-        "value",
-        "g",
-        "beta",
-        "initial_state",
-        "accepted_tokens",
-    ]
+    assert any(
+        isinstance(node, ast.Attribute)
+        and node.attr == "npu_chunk_gated_delta_rule"
+        for node in ast.walk(commit_method)
+    )
 
 
 def main() -> None:
@@ -126,9 +128,9 @@ def main() -> None:
     assert helper["DFLASH_BLOCK_SIZE"] == 16
     assert helper["DFLASH_MAX_PROPOSALS"] == 15
     assert helper["DFLASH_MAX_VERIFY_TOKENS"] == 16
-    seed = helper["seed_dflash_gdn_state_banks"]
-    rebase = helper["rebase_dflash_gdn_state_banks"]
-    conv = helper["torch_dflash_causal_conv1d_mtp"]
+    conv = helper["torch_dflash_causal_conv1d_chunk"]
+    select_commit = helper["select_dflash_chunk_commit_state"]
+    run_commit = helper["run_dflash_chunk_gdr_commit"]
     normalize_effective_length = helper["_normalize_gdr_effective_length"]
 
     default_effective_length = normalize_effective_length(
@@ -167,78 +169,77 @@ def main() -> None:
             )
 
     torch.manual_seed(20260826)
-    committed_conv = torch.randn(2, 3, 4, dtype=torch.float16)
-    committed_recurrent = torch.randn(2, 2, 3, 4, dtype=torch.float16)
-    conv_bank, recurrent_bank = seed(committed_conv, committed_recurrent, 5)
-    assert conv_bank.shape == (2, 5, 3, 4)
-    assert recurrent_bank.shape == (2, 5, 2, 3, 4)
-    assert recurrent_bank.dtype is torch.float32
-    for slot in range(5):
-        torch.testing.assert_close(conv_bank[:, slot], committed_conv)
-        torch.testing.assert_close(
-            recurrent_bank[:, slot], committed_recurrent.float()
-        )
-
-    # Give every previous slot a distinct identity so selection mistakes are
-    # visible, then compare the vectorized convolution with a token loop for
-    # the MTP sizes used by the device operator.
-    for tokens in (2, 5, 16):
-        conv_bank = torch.randn(2, tokens, 3, 4, dtype=torch.float32)
-        recurrent_bank = torch.randn(2, tokens, 2, 3, 4, dtype=torch.float32)
+    # Compare vectorized chunk convolution and every possible committed prefix
+    # against a sequential scalar-state reference.
+    for tokens in (1, 2, 5, 16):
+        initial_state = torch.randn(2, 3, 4, dtype=torch.float32)
         hidden = torch.randn(2, 3, tokens, dtype=torch.float32)
         weight = torch.randn(3, 4, dtype=torch.float32)
         bias = torch.randn(3, dtype=torch.float32)
-        accepted = torch.tensor([0, tokens - 1], dtype=torch.int8)
         output, next_bank = conv(
             hidden,
-            conv_bank,
+            initial_state,
             weight,
             bias,
-            accepted,
             "silu",
         )
         expected_output, expected_bank = sequential_reference(
             hidden,
-            conv_bank,
+            initial_state,
             weight,
             bias,
-            accepted,
         )
         torch.testing.assert_close(output, expected_output, rtol=1e-6, atol=1e-6)
         torch.testing.assert_close(next_bank, expected_bank, rtol=0, atol=0)
-
-    rebased_conv, rebased_recurrent = rebase(
-        next_bank,
-        recurrent_bank,
-        accepted,
-        2,
-    )
-    assert rebased_conv.shape == (2, 2, 3, 4)
-    assert rebased_recurrent.shape == (2, 2, 2, 3, 4)
-    selected_slots = accepted.to(torch.long)
-    for slot in range(2):
-        torch.testing.assert_close(
-            rebased_conv[:, slot], expected_bank[[0, 1], selected_slots]
-        )
-        torch.testing.assert_close(
-            rebased_recurrent[:, slot], recurrent_bank[[0, 1], selected_slots]
-        )
+        for committed_rows in {1, tokens}:
+            torch.testing.assert_close(
+                select_commit(next_bank, committed_rows),
+                expected_bank[:, committed_rows - 1],
+                rtol=0,
+                atol=0,
+            )
 
     try:
-        conv(
-            hidden,
-            conv_bank,
-            weight,
-            bias,
-            torch.tensor([0, 16], dtype=torch.int8),
-            "silu",
-        )
+        select_commit(next_bank, tokens + 1)
     except ValueError as error:
-        assert "values must be" in str(error)
+        assert "committed_rows must be" in str(error)
     else:
-        raise AssertionError("out-of-range accepted_tokens was not rejected")
+        raise AssertionError("out-of-range committed_rows was not rejected")
 
-    print("PASS: state-bank seed/select/rebase and causal-conv rollback helpers")
+    calls: list[dict[str, object]] = []
+
+    def fake_chunk_gdr(query, key, value, **kwargs):
+        del key, value
+        calls.append(kwargs)
+        initial = kwargs["initial_state"]
+        effective = kwargs["effective_length"].to(torch.float32)
+        return query, initial + effective.view(-1, 1, 1, 1)
+
+    query = torch.randn(2, 5, 3, 4, dtype=torch.float16)
+    key = torch.randn_like(query)
+    value = torch.randn(2, 5, 3, 6, dtype=torch.float16)
+    g = torch.randn(2, 5, 3, dtype=torch.float32)
+    beta = torch.randn(2, 5, 3, dtype=torch.float16)
+    initial = torch.zeros(2, 3, 4, 6, dtype=torch.float32)
+    committed = run_commit(
+        fake_chunk_gdr,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial,
+        3,
+    )
+    assert calls[0]["effective_length"].dtype == torch.int16
+    assert calls[0]["effective_length"].tolist() == [3, 3]
+    assert calls[0]["chunk_size"] == 64
+    assert calls[0]["initial_state"] is initial
+    assert calls[0]["output_final_state"] is True
+    assert calls[0]["use_qk_l2norm_in_kernel"] is True
+    torch.testing.assert_close(committed, torch.full_like(initial, 3.0))
+
+    print("PASS: two-pass chunk GDR source and causal-conv commit helpers")
 
 
 if __name__ == "__main__":

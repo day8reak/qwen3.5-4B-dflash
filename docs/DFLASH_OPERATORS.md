@@ -6,19 +6,20 @@
 
 ## 1. 当前结论
 
-- 已完成并接入：`GatedDeltaRuleMTP`；原 `ChunkGatedDeltaRule` 已适配新增的
-  `effective_length` ABI。
+- 已完成并接入：原 `ChunkGatedDeltaRule` 的 `effective_length` ABI；prompt、decode、verify 和
+  accepted-prefix commit 都复用它，不调用 `GatedDeltaRuleMTP`。
 - 当前可运行：causal-conv 使用输入 NPU 上的 Tensor golden；KV 使用现有
   `npu_cache_update_` 逐 row 写；attention 使用现有 `adn_fused_infer_attention`；Draft 使用
   package-local Torch-NPU 分解 primitives。
-- 去掉 production golden 的首要新增算子：`CausalConv1dMTP`。
+- 去掉 production golden 的首要新增算子：`CausalConv1dChunkCommit`。
+- `GDRChunkStateCommit` 是跳过第二次 output 计算的性能候选，不是当前 correctness 必需算子。
 - `CacheUpdateMTP` 和 `FusedInferAttentionMTP` 不是默认必做；先证明现有算子的多行、跨块和数值
   能力，再根据 profile 决定。
 - 当前高价值性能候选：Draft/Target full-vocab Top-1、Draft GQA、W8A8 dynamic-quant+matmul
   dispatch 融合。
 
 因此，“完整官方 generation 功能”不能仅靠新增算子完成；“当前 NPU 路线不再依赖 conv
-golden”则明确需要 `CausalConv1dMTP`。
+golden”则明确需要 `CausalConv1dChunkCommit`。
 
 ## 2. 总表
 
@@ -26,9 +27,9 @@ golden”则明确需要 `CausalConv1dMTP`。
 
 | 算子 | 当前状态 | 功能 | 主要输入 | 主要输出 | 需要程度 |
 | --- | --- | --- | --- | --- | --- |
-| `ChunkGatedDeltaRule` | 复用 receiver 新 ABI、已接线 | 普通 prompt/decode GDR；固定物理行数时忽略无效尾部 | Q/K/V、g、beta、`effective_length`、初始 state | attention output、最终 FP32 state | P0，已有 |
-| `GatedDeltaRuleMTP` | 已完成、已接线 | 选择上一轮 committed recurrent slot，计算 T 行并保存逐行 provisional state | Q/K/V、g、beta、state bank、`accepted_tokens` | attention output、FP32 state bank | P0，已有 |
-| `CausalConv1dMTP` | Torch-NPU golden | 同一 accepted slot 上执行 depthwise causal conv，保存逐行 conv window | mixed QKV、conv bank、weight/bias、`accepted_tokens` | activated rows、FP16 conv bank | P1，去 golden 必需 |
+| `ChunkGatedDeltaRule` | 复用 receiver 新 ABI、已接线 | prompt/decode；verify `T` 行；从同一 S0 按 `a+1` 二次计算 committed state | Q/K/V、g、beta、`effective_length`、标量初始 state | attention output、最终 FP32 state | P0，已有 |
+| `GDRChunkStateCommit` | 未实现 | 消费第一次的 capsule，只计算接受前缀最终 state，跳过 query/output 路径 | K/V/g/beta 或紧凑中间量、S0、`commit_length` | 单个 FP32 state | 性能 P1，profile 后 |
+| `CausalConv1dChunkCommit` | Torch-NPU golden | 从标量 window 计算 T 行输出和 prefix windows，按 `a+1` 提交一个 window | mixed QKV、标量 conv state、weight/bias、`commit_length` | activated rows、单个 committed window | P1，去 golden 必需 |
 | `CacheUpdateMTP` | 现有 op 逐 row | 一次写入 T 行 paged K 或 V，支持跨 64-token block | cache、updates、positions、block table | 原位 cache | 条件 P1 |
 | `FusedInferAttentionMTP` | 复用现有 attention | 历史 paged KV + 当前 T 行 block-causal attention | Q、K/V cache、mask、length/table | T 行 attention | 条件 P1 |
 | `DFlashBlockGQA` | Draft Tensor 分解 | 直接读取 committed/new KV，避免 repeat/concat 和小算子链 | Draft Q、committed/new K/V、mask | 6 层 attention rows | 性能 P1 |
@@ -38,7 +39,6 @@ golden”则明确需要 `CausalConv1dMTP`。
 | `DFlashFeatureProjectNorm` | Linear + RMSNorm | 只处理本轮新增 `1+a` feature | `[B,Δ,20480]`、projection/norm weight | `[B,Δ,2560]` | 性能 P2 |
 | `DraftKVAppendCrop` | request-local Tensor cache | attention 可见 old+new+block，只提交 old+new | 6 层 cache、新 context、transient block | committed cache | 性能/内存 P2 |
 | Draft small-op fusion | 标准 Tensor ops | 融合 RMSNorm/RoPE/SwiGLU 等短链 | hidden、norm/rope/MLP 参数 | 同数学输出 | 性能 P2 |
-| `StateBankSelectRebase` | Tensor gather/expand | T 改变时选择 committed slot 并建立新 bank | state bank、accepted、新 T | rebased bank | 性能 P3 |
 
 ## 3. 形状符号
 
@@ -81,64 +81,61 @@ npu_chunk_gated_delta_rule(
 | initial/final state | `[B,32,128,128]` | FP32 | 本次调用前/后的 recurrent state |
 | core output | `[B,S,32,128]` | FP16 | 本次物理 S 行输出 |
 
-`effective_length` 是 call-local valid rows，不是累计 KV 长度 `allQLen`，也不是
-`accepted_tokens`。例如 full-prefix oracle 把真实 37 行右补齐到物理 S=64 时传 `[37]`；
+`effective_length` 是 call-local valid rows，不是累计 KV 长度 `allQLen`。例如 full-prefix
+oracle 把真实 37 行右补齐到物理 S=64 时传 `[37]`；
 persistent prompt chunk 为 64+1 时两次分别传 `[64]` 和 `[1]`；decode 传 `[1]`。同一个
 `INT16[B]` Tensor 在一次 Target forward 的 24 个 GDN 层间复用，避免每层重复构造。
 
 普通 modeling 和 rollback modeling 的 ordinary 分支都调用这个新 ABI。部署侧若仍注册旧签名，
 必须先更新原 GDR 算子包；Python 侧不能通过删掉该参数兼容，否则 padding 会污染 final state。
 
-### 4.2 `GatedDeltaRuleMTP`：已完成
+### 4.2 Verify/commit：复用原 GDR
 
 ```text
-npu_gated_delta_rule_mtp(
-  query, key, value, g, beta,
-  initial_state, accepted_tokens,
-  chunk_size=64,
-  output_final_state=True,
-  use_qk_l2norm_in_kernel=True
-) -> (core_attn_out, state_bank)
+S0 = scalar committed recurrent state
+
+verify_out, _ = ChunkGatedDeltaRule(
+  q, k, v, g, beta, effective_length=T, initial_state=S0
+)
+a = longest_prefix_accept(verify_out, proposals)
+_, S1 = ChunkGatedDeltaRule(
+  cached_q, cached_k, cached_v, cached_g, cached_beta,
+  effective_length=a+1, initial_state=S0
+)
 ```
 
-| Tensor | Shape | Dtype | 含义 |
-| --- | --- | --- | --- |
-| query/key/value | `[B,T,32,128]` | FP16 | 当前 verify rows |
-| g | `[B,T,32]` | FP32 | decay/gate |
-| beta | `[B,T,32]` | FP16 | update coefficient |
-| initial state bank | `[B,T,32,128,128]` | FP32 | 上一轮 provisional slots |
-| `accepted_tokens` | `[B]` | INT8 | 选择上一轮 committed slot |
-| core output | `[B,T,32,128]` | FP16 | 当前 T 行输出 |
-| next state bank | `[B,T,32,128,128]` | FP32 | slot i 为处理 row 0..i 后状态 |
+framework 为 24 个 GDN 层各保存一个 request-local capsule：Q/K/V/g/beta、S0 和 conv prefix
+windows。第二次调用的 `commit_length` 必须是 `a+1`，因为 anchor 也作为本轮 Target 输入提交。
+所有层成功后才发布 S1；失败则整轮/session fail-closed。正确性版不需要修改自定义算子。
 
-还需补齐真实设备证据：24 层、多轮、`a=0/1/K-1/K`、K 改变和 rejection 后至少一个 token。
-`accepted_tokens` 是上一轮接受数；当前轮接受数在算子执行后才由 Target Top-1 决定。
-当前 GDR-MTP 是精确 T=1..16 的 recurrent/state-bank 语义，没有 padding tail；其
-`chunk_size=64` 仅保留现有调用 ABI，不代表执行原 GDR 的 chunk 路线。本次改动不向 GDR-MTP
-增加 `effective_length`。
+若 msprof 证明第二次调用的 output/query 路径是热点，可新增 `GDRChunkStateCommit`：输入 cached
+K/V/g/beta（或原 GDR 已生成的紧凑中间量）、S0 和 `INT16[B] commit_length`，只输出
+`[B,32,128,128]` FP32 state。该优化必须与上述第二次原 GDR 的 state 数值对齐，并重新执行整网
+零 token-ID mismatch 门禁。
 
-### 4.3 `CausalConv1dMTP`：生产优先
+### 4.3 `CausalConv1dChunkCommit`：生产优先
 
 ```text
-causal_conv1d_mtp(
-  hidden_states, conv_state_bank, weight, bias,
-  accepted_tokens, activation="silu"
-) -> (output, next_conv_state_bank)
+causal_conv1d_chunk_commit(
+  hidden_states, initial_conv_state, weight, bias,
+  commit_length, activation="silu"
+) -> (output, committed_conv_state)
 ```
 
 | Tensor | Shape | Dtype |
 | --- | --- | --- |
 | hidden states | `[B,Cg,T]` | FP16 |
-| previous conv bank | `[B,T,Cg,Kc]` | FP16 |
+| initial conv state | `[B,Cg,Kc]` | FP16 |
 | weight | `[Cg,Kc]` | FP16 |
 | bias | `[Cg]` 或无 | FP16 |
-| `accepted_tokens` | `[B]` | INT8 |
+| `commit_length` | `[B]` INT16 或 host scalar | 本轮 `a+1` |
 | output | `[B,Cg,T]` | FP16 |
-| next conv bank | `[B,T,Cg,Kc]` | FP16 |
+| committed conv state | `[B,Cg,Kc]` | FP16 |
 
-当前 `torch_dflash_causal_conv1d_mtp` 已实现相同语义，输入在 NPU 时没有 CPU fallback，但会形成
-gather、concat/unfold、depthwise conv、activation 和中间 tensor。新算子必须逐 row、逐 state
-slot 对齐该 golden，并与 GDR、KV、feature 使用同一个 accepted count。
+当前 `torch_dflash_causal_conv1d_chunk` 暂存 `[B,T,Cg,Kc]` prefix windows，再选第
+`commit_length-1` 个窗口；输入在 NPU 时没有 CPU fallback，但会形成 concat/unfold、depthwise
+conv、activation 和中间 tensor。新算子必须对齐每个 commit length，并与 GDR、KV、feature
+使用同一个 `a+1`。
 
 验收档位：`K=1/3/5/7/15`，`a=0/1/K-1/K`，连续多轮及动态 T；拒绝后继续执行至少一个 token，
 确认 rejected window 未污染 committed state。
@@ -236,7 +233,7 @@ QLinear 对齐。
 - `DraftKVAppendCrop`：减少 cache concat/allocator 峰值；异常时旧 committed cache 必须原样可用。
 - RMSNorm/RoPE/SwiGLU fusion：只在小算子 launch 成为热点时做，保持 FP32 reduction 和 FP16
   rounding boundary。
-- `StateBankSelectRebase`：固定 B/T 时通常无收益；动态 T gather/expand 明显时再开发。
+- `GDRChunkStateCommit`：只有第二次原 GDR 的 query/output 计算成为实测热点时才开发。
 
 ## 7. 不应做成自定义算子的内容
 
@@ -253,13 +250,15 @@ QLinear 对齐。
 
 ## 8. 开发顺序
 
-1. 用现有 GDR-MTP、conv golden、逐 row KV 和现有 attention 跑通 B=2，再扩到 B=16。
+1. 用原 GDR 两次 chunk、conv golden、逐 row KV 和现有 attention 跑通 B=2，再扩到 B=16。
 2. 覆盖 accepted `0/1/K-1/K`、动态 T、cursor `62/63/64/65` 和 rejection 后下一 token。
-3. 开发 `CausalConv1dMTP`，逐 row/slot 对齐 golden，去掉 production conv golden。
+3. 开发 `CausalConv1dChunkCommit`，逐 commit length 对齐 golden，去掉 production conv golden。
 4. 在相同 token/hash/调用次数下采集无 profiler 3+10 latency，再用 msprof 定位热点。
 5. 按收益依次评估 Draft GQA/Top-1、Target Top-1、CacheUpdate、W8A8 fused linear。
 6. 每替换一个算子，重新跑完整 state 门禁和 ordinary/DFlash strict-greedy 零差异。
 
-T=16 时单层 recurrent bank 约 32 MiB，24 层约 768 MiB；conv bank 24 层约 24 MiB。若 profile
-显示 bank 峰值比短重放更差，应比较“完整 provisional bank”与“round-start state + accepted 短重放”，
-但不能未经精度批准把 FP32 recurrent state 改成 FP16。
+当前不再持久化 `[B,T,32,128,128]` recurrent bank。原 GDR final state 是 FP32；bridge 在发布
+时复用 ordinary receiver 已有的 persistent cache dtype 边界（当前为 FP16），确保本分支测到的
+chunk/recurrent 差异不混入新的状态存储口径。T=16 的 conv prefix windows 约 24 MiB/24 层，
+Q/K/V/g/beta capsule 约 9 MiB/24 层，另有 FP32 round-start state 快照。实际峰值必须用设备
+profile 统计；若要实验 FP32 persistent state，应作为单独精度分支并重跑 ordinary 对照。

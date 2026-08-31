@@ -35,8 +35,8 @@ quant_dflash_recompute.om + deployment-manifest.json
 ```
 
 第一版冻结的是静态完整前缀重算 ABI。它能够由 OM 完成完整的 logits/Top1 推理，并由 C++
-循环连续生成 token；但它尚未把 `quant` 分支的 persistent rollback cache、GDR state bank 和
-Draft KV cache 变成显式 OM 输入/输出。因此：
+循环连续生成 token；但它尚未把 chunk-GDR 分支的 persistent rollback cache、标量 GDN state、
+verify/commit capsule 和 Draft KV cache 变成显式 OM 输入/输出。因此：
 
 - “是否真的调用 OM 生成完整 token 序列”可以验证；
 - “是否达到闭源增量推理框架时延”必须在真实设备测量，当前不能预先声称；
@@ -48,11 +48,12 @@ Draft KV cache 变成显式 OM 输入/输出。因此：
 | 阶段 | 逻辑图 | 物理 OM 数 | 当前状态 |
 | --- | --- | ---: | --- |
 | 当前可验证基线 | Target 全前缀 + Draft proposal 整图 | 每个静态 `S` gear 1 个 | 已接入 AIR/ATC/C++ |
-| 低时延目标 | `target_prefill_64`、`target_decode_1`、`target_verify_16`、`draft_16` | 至少 4 个；多 cache/shape gear 时更多 | 需要显式状态 ABI 与真机门禁 |
+| 低时延目标 | `target_prefill_64`、`target_decode_1`、`target_verify_16`、`target_state_commit_16`、`draft_16` | 至少 5 个；多 cache/shape gear 时更多 | 需要显式状态 ABI 与真机门禁 |
 
 `verify` 不能与 ordinary `decode` 共用一个含糊的状态合同：前者一次计算最多 16 个 provisional
-row，并只按接受数提交一个 GDN/conv state-bank 槽；后者固定提交单个 row。用户口头所说的
-“prefill、decode、draft 三类”在物理部署中因此通常落为上述四个 OM 角色。
+row，接受数产生后还要从同一个 round-start state 以 `a+1` 执行 state commit；后者固定提交
+单个 row。用户口头所说的“prefill、decode、draft 三类”在物理部署中因此通常落为上述五个
+OM 角色，除非 verify/accept/state-only commit 被证明可以安全融合。
 
 ## 2. 冻结 ABI
 
@@ -561,15 +562,16 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 ## 13. 下一性能阶段
 
 当前 C++ 已消除 Python token 热循环、重复 OM load、重复 host/device buffer 分配和多余 stream
-同步。若真实 profile 显示 OM 计算主导，下一步应基于 `quant` 已有 rollback 语义拆分：
+同步。若真实 profile 显示 OM 计算主导，下一步应基于 chunk-GDR rollback 语义拆分：
 
 1. `target_prefill_64.om`：分块 prompt prefill；
 2. `target_decode_1.om`：ordinary 单 token decode；
 3. `target_verify_16.om`：anchor + 最多 15 proposals；
-4. `draft_16.om`：增量 Draft KV；
-5. 显式输入/输出 32 层 paged KV、24 层 GDR/conv state bank、8 层 feature 和 Draft KV；
-6. C++ 负责同一 accepted count 下的原子 commit/abort；
-7. 对每一个 state 分支做 ordinary token/EOS 零差异门禁。
+4. `target_state_commit_16.om`：消费 verify capsule、round-start state 和 `a+1`；
+5. `draft_16.om`：增量 Draft KV；
+6. 显式输入/输出 8 层 paged KV、24 层标量 GDR/conv state、8 层 feature、verify capsule 和 Draft KV；
+7. C++ 负责同一 `a+1` 下的原子 commit/abort；
+8. 对每一个 state 分支做 ordinary token/EOS 零差异门禁。
 
 这一步是新的状态 ABI，不能在没有真实 baseline 和 state-branch 测试时悄悄替换当前功能基线。
 

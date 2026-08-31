@@ -4,7 +4,8 @@
 only the production generation path.  Both keep persistent Target state and no
 verification call receives the historical prefix.  CPU/CUDA use a
 ``DynamicCache`` transaction with GDN-state restore plus bounded commit replay;
-the HIAI route delegates state-bank and logical-KV commit to the receiver bridge.
+the HIAI route delegates two-pass chunk-GDR and logical-KV commit to the
+receiver bridge.
 """
 
 from __future__ import annotations
@@ -428,12 +429,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         target_quantization = dict(raw_target_quantization)
         state_policy = (
-            "persistent HIAI state; npu_gated_delta_rule_mtp recurrent banks; "
-            "Torch tensor causal-conv banks on the input NPU device; physical "
-            "provisional paged-KV writes with logical-cursor commit"
+            "persistent scalar HIAI state; original chunk GDR verify plus "
+            "accepted-prefix second chunk commit; Torch tensor causal-conv "
+            "prefix states on the input NPU device; physical provisional "
+            "paged-KV writes with logical-cursor commit"
         )
         target_operator_policy = {
-            "gdr": "npu_gated_delta_rule_mtp",
+            "gdr": "npu_chunk_gated_delta_rule_two_pass",
             "conv_bank": "torch_tensor_golden_on_input_device",
             "kv_update": "existing_npu_cache_update_per_row_correctness_fallback",
             "attention": "existing_adn_fused_infer_attention",

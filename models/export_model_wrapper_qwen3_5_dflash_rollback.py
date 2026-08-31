@@ -87,6 +87,16 @@ class Qwen3_5ForCausalLMWrapper(nn.Module):
         if getattr(self.delegate, "model", None) is not model:
             raise RuntimeError("deployed wrapper rejected the quantized Target")
 
+    def commit_dflash_chunk_state(self, committed_rows: int) -> Any:
+        """Publish scalar GDN state from the accepted-prefix chunk call."""
+
+        return self.model.commit_dflash_chunk_state(committed_rows)
+
+    def discard_dflash_chunk_state(self) -> None:
+        """Release every per-layer verify capsule without publishing state."""
+
+        self.model.discard_dflash_chunk_state()
+
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.delegate(*args, **kwargs)
 

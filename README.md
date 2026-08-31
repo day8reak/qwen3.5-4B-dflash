@@ -1,6 +1,7 @@
 # Qwen3.5-4B DFlash rollback
 
-`quant` 分支实现了 Qwen3.5-4B 的 persistent DFlash rollback，并支持同一套代码在两种 Target
+`feature/gdr-chunk-verify` 从 quant/AIR 框架分支演进，使用原 chunk GDR 实现
+Qwen3.5-4B persistent DFlash rollback，并支持同一套代码在两种 Target
 精度下运行：
 
 - 默认 FP16：不传量化参数；
@@ -27,7 +28,7 @@ Qwen3.5 DFlash port，不是 z-lab/dflash 全部 generation API 的逐行复制�
 | Target verify | 一次输入 `[anchor, d1, ..., dK]`，不附带历史前缀 |
 | 接受 | 只提交最长连续匹配前缀；提交行数为 `1 + accepted` |
 | CPU/CUDA rollback | 恢复 round-start cache/state，再逐 token 重放 anchor 与已接受 proposal |
-| NPU rollback | GDR-MTP state bank + NPU Tensor conv golden + paged-KV logical cursor |
+| NPU rollback | 原 GDR chunk verify + `accepted+1` 二次 chunk state commit + conv golden + paged-KV logical cursor |
 | 量化 | 只量化 Target Linear 和 Target 输入 embedding；Draft embedding、LM head 和主体保持 FP16 |
 | 正确性 | `validate` 用独立 ordinary incremental session 做 token/EOS/stop-reason 零差异门禁 |
 
@@ -77,9 +78,11 @@ python -B -m models.dflash_v1.run_npu \
   --report /path/to/run/dflash-fp16.json
 ```
 
-NPU 进程必须同时提供带 `INT16[B] effective_length` 输入的新
-`npu_chunk_gated_delta_rule` ABI，以及现有 `npu_gated_delta_rule_mtp`。后者接口没有随本次适配
-改变。`kv-cache-max-len` 需要覆盖 prompt 和输出，并能被 64 整除。
+NPU 进程只需要提供带 `INT16[B] effective_length` 输入的
+`npu_chunk_gated_delta_rule` ABI；本分支不调用 `npu_gated_delta_rule_mtp`。每轮第一次 chunk
+计算全部 verify rows，Target 得到接受数 `a` 后，第二次用同一个 round-start state 和
+`effective_length=a+1` 生成标量 committed state。`kv-cache-max-len` 需要覆盖 prompt 和输出，
+并能被 64 整除。
 
 ### Target W8A8 dynamic
 

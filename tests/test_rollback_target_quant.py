@@ -69,6 +69,13 @@ class FakeRollbackModel(nn.Module):
     def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
 
+    def discard_dflash_chunk_state(self) -> None:
+        return None
+
+    def commit_dflash_chunk_state(self, committed_rows: int):
+        del committed_rows
+        return {}
+
 
 class FakeRollbackWrapper(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
@@ -82,6 +89,12 @@ class FakeRollbackWrapper(nn.Module):
             raise TypeError("wrong execution model type")
         self.model = model
         self.replace_calls += 1
+
+    def commit_dflash_chunk_state(self, committed_rows: int):
+        return self.model.commit_dflash_chunk_state(committed_rows)
+
+    def discard_dflash_chunk_state(self) -> None:
+        self.model.discard_dflash_chunk_state()
 
 
 def fake_quant_model(model: nn.Module, quant_weight_path: str) -> nn.Module:

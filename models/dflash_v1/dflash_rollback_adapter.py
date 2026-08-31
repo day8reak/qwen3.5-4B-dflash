@@ -7,8 +7,9 @@ snapshot, and only ``anchor + accepted proposals`` is replayed one token at a
 time.  The replay is bounded by ``K + 1`` and never includes the historical
 prefix.
 
-The HIAI bridge implements the same public methods with native GDR state banks
-and a logical paged-KV cursor, so the scheduler below it is backend-neutral.
+The HIAI bridge implements the same public methods with scalar committed GDN
+state, two-pass chunk GDR, and a logical paged-KV cursor, so the scheduler below
+it is backend-neutral.
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 # 当前 DFlash rollback 架构
 
-本文是 `quant` 分支唯一的架构说明，覆盖 FP16 与 Target W8A8 两种模式。算子 ABI 见
+本文是 `feature/gdr-chunk-verify` 分支的架构说明，覆盖 FP16 与 Target W8A8 两种模式。算子 ABI 见
 [自定义算子清单](DFLASH_OPERATORS.md)，命令和报告门禁见
 [运行与验证](DFLASH_RUN_AND_VALIDATE.md)。
 
@@ -94,7 +94,9 @@ Target 只 prefill 一次。HIAI bridge 按 KV block 边界拆成最多 64 个�
 full-prefix correctness oracle 仍可把例如 37 个真实 token 对齐到 64 行物理输入，此时
 `allQLen=37`、`gdr_effective_length=[37]`、物理 GDR 序列长度为 64。persistent rollback prompt
 使用真实 token chunk，因此其 `gdr_effective_length` 等于每个 chunk 的实际 T；decode 为 1。
-verify 虽也向 modeling 传入当前 T，但只走精确 T 的 GDR-MTP 分支，GDR-MTP ABI 未增加该输入。
+verify 也传入当前 `T`，并走原 `npu_chunk_gated_delta_rule`。第一次以 `effective_length=T`
+计算全部验证输出；接受数确定后，第二次从同一个 round-start recurrent state 出发，以
+`effective_length=a+1` 只生成 committed state。两次都复用原 GDR ABI。
 
 Feature collector 读取 Target decoder 层 `1,5,9,13,17,21,25,29` 在 final norm 之前的 hidden，
 拼成 `[batch, tokens, 20480]`。
@@ -153,7 +155,7 @@ runner 的固定行为。
 | 路线 | Target | Draft primitives | 状态实现 |
 | --- | --- | --- | --- |
 | CPU/CUDA | `modeling_qwen3_5_dflash.py` | `TorchDFlashOps` | DynamicCache + GDN snapshot/restore + bounded replay |
-| HIAI/NPU | 独立 rollback modeling/wrapper | package-local NPU Tensor decomposition | GDR/conv bank + paged-KV logical cursor |
+| HIAI/NPU | 独立 rollback modeling/wrapper | package-local NPU Tensor decomposition | 标量 GDR state + 临时 commit capsule + paged-KV logical cursor |
 
 ordinary `models/modeling_qwen3_5_hiai_nd.py` 保持权威，只增加原 GDR 新
 `effective_length` ABI 的参数传播；原部署 wrapper 不被 rollback 覆盖。rollback 仍使用独立
@@ -166,20 +168,18 @@ modeling、wrapper adapter 和 bridge。
 | 状态 | CPU/CUDA | HIAI/NPU |
 | --- | --- | --- |
 | 8 层 full-attention KV | verify 前 snapshot 长度；恢复后重放 `1+a` 行 | provisional 物理写入；logical cursor 仅推进 `1+a` |
-| 24 层 GDN recurrent | 恢复 round-start state 后逐 token 重放 | `npu_gated_delta_rule_mtp` 返回每行 FP32 state bank |
-| 24 层 GDN causal-conv | 恢复 round-start window 后逐 token 重放 | NPU Tensor golden 返回每行 FP16 conv bank |
+| 24 层 GDN recurrent | 恢复 round-start state 后逐 token 重放 | 原 GDR 第一次 verify；第二次按 `a+1` 返回 FP32 final state，再按 ordinary receiver 边界存入标量 cache |
+| 24 层 GDN causal-conv | 恢复 round-start window 后逐 token 重放 | NPU Tensor golden 暂存当前 T 个 prefix window，提交第 `a` 个 slot |
 | Target feature | 使用 replay 的 `1+a` 行 | 截取 verify feature 前 `1+a` 行 |
 
 CPU/CUDA 不重放 prompt 或更早历史，只重放当前 anchor 与 accepted proposal，最多 16 个 S=1
 调用。NPU 可以保留 rejected KV 的物理内容，但 mask/length 不得读取它，下一轮从 committed
 logical cursor 覆写。
 
-`accepted_tokens` 传给 GDR-MTP/conv bank 时表示“上一轮选择哪个 provisional slot”，不是当前轮
-尚未计算出的接受数。T 改变时先选择 committed slot，再 rebase 为新 T。任一层 verify 失败后，
-整个 session 失效，不能继续使用部分更新的状态。
-
-`gdr_effective_length` 与 `accepted_tokens` 不属于同一合同：前者只描述原 GDR 本次物理输入中
-有多少行有效，后者只让 rollback 算子选择上一轮已提交的 state-bank slot。
+轮次边界不再保存 recurrent state bank，只保存一个标量 committed state。verify capsule 暂存
+每层 Q/K/V/g/beta、round-start FP32 state 和 conv prefix windows；`commit_rollback(a)` 必须使用
+`committed_rows=a+1`。24 层第二次 GDR 全部成功并完成 shape/dtype 检查后，bridge 才一次性发布
+新的 GDN state。任一层 verify/commit 失败后，整个 session 失效，不能继续使用部分结果。
 
 ## 6. FP16 与 W8A8
 
@@ -208,13 +208,13 @@ converter、不加载 INT8 artifact，并拒绝意外出现的 QLinear。
 
 这里的“完整 DFlash”指上面锁定的 z-lab 算法与 Qwen3.5 checkpoint 行为，不包含 DFlash2。
 
-| 维度 | 锁定完整 DFlash | 当前 `quant` 分支 | 状态 |
+| 维度 | 锁定完整 DFlash | 当前 chunk-GDR 分支 | 状态 |
 | --- | --- | --- | --- |
 | Draft checkpoint/结构 | checkpoint 驱动 | 同一 revision、6 层、69 tensor、hash fail-closed | 对齐 |
 | Feature、block、verify | 8 层 feature；B 含 anchor；一次 Target verify | 相同 | 对齐 |
 | Greedy accept | 最长连续 Top-1，随后 correction/bonus | 相同 | 对齐 |
 | Draft KV | 跨轮 cache，当前 block 后 crop/trim | request-local committed/transient cache | 语义对齐，代码重写 |
-| Target rollback | Transformers cache crop；Qwen3.5 MLX 捕获并短重算 GDN | CPU/CUDA restore+S1 replay；NPU state bank+logical cursor | 目标相同，实现不同 |
+| Target rollback | Transformers cache crop；Qwen3.5 MLX 捕获并短重算 GDN | CPU/CUDA restore+S1 replay；NPU 两次 chunk GDR+logical cursor | 目标相同，实现不同 |
 | Sampling | temperature/top-p/top-k、概率比 rejection 和 residual correction | 仅 strict greedy | 缺失的软件能力 |
 | Batch/API | generate/stream；不同 backend 能力不同 | batch 1 CLI/JSON report | 缺失的软件能力 |
 | 量化范围 | backend 可支持量化 Target/Draft | 仅 Target W8A8，Draft FP16 | 部分覆盖 |
@@ -232,8 +232,9 @@ Qwen3.5 CUDA 实现”。
 
 | 目标 | 还需工作 | 是否一定需要新自定义算子 |
 | --- | --- | --- |
-| 当前 strict-greedy correctness | 完成 24 层 GDR/conv、8 层 KV、多轮 rejection 和 block-boundary 真机证据 | GDR-MTP 已有；当前可用 golden 跑通 |
-| 去掉生产 golden | 用 `CausalConv1dMTP` 替换 conv Tensor 分解 | 是，生产优先 |
+| 当前 strict-greedy correctness | 完成 24 层两次 chunk GDR、8 层 KV、多轮 rejection 和 block-boundary 真机证据 | 不需要修改 GDR；当前框架已接线，真机证据待补 |
+| 去掉生产 golden | 用 `CausalConv1dChunkCommit` 替换 conv Tensor 分解 | 是，生产优先 |
+| 去掉第二次 GDR 的输出冗余 | 增加 `GDRChunkStateCommit` state-only 模式/算子 | 仅性能优化需要，正确性版不需要 |
 | 完整官方 generation 功能 | sampling 概率、rejection/residual correction、固定 RNG 门禁、stream/batch API | 否，首先是 scheduler/API 工作 |
 | NPU 端到端提速 | profile Draft GQA/LM head、Target LM head、KV update、W8A8 dispatch 和同步 | 只对实测热点新增 |
 | 静态图/OMC 交付 | 固定输入输出 ABI、cache writeback、逐算子 golden、转换和设备门禁 | 取决于现有编译器覆盖 |

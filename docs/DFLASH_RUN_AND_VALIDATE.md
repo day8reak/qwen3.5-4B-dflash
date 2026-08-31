@@ -96,20 +96,20 @@ npu_chunk_gated_delta_rule(
 )
 ```
 
-其中 `effective_length` 必须接受 `[B] INT16`。普通 modeling 和 rollback ordinary 路径都会传
-这个输入；旧注册包会在第一次 Target 调用时直接接口不匹配。GDR-MTP 的 ABI 不变，再检查其
-注册：
+其中 `effective_length` 必须接受 `[B] INT16`。普通 modeling、rollback ordinary、verify 和
+accepted-prefix commit 都会传这个输入；旧注册包会在第一次 Target 调用时直接接口不匹配。
+只检查原 GDR 注册：
 
 ```bash
 "$MODEL_PYTHON" -B - <<'PY'
 import torch
 import torch_npu
 
-op = getattr(torch_npu, "npu_gated_delta_rule_mtp", None)
+op = getattr(torch_npu, "npu_chunk_gated_delta_rule", None)
 if not callable(op):
-    op = getattr(getattr(torch.ops, "npu", None), "npu_gated_delta_rule_mtp", None)
-assert callable(op), "npu_gated_delta_rule_mtp is not registered"
-print("GDR_MTP_REGISTERED")
+    op = getattr(getattr(torch.ops, "npu", None), "npu_chunk_gated_delta_rule", None)
+assert callable(op), "npu_chunk_gated_delta_rule is not registered"
+print("CHUNK_GDR_REGISTERED")
 PY
 ```
 
@@ -137,9 +137,9 @@ mkdir -p "$RUN_DIR"
 ```
 
 `run_npu` 固定 FP16、EOS 248044、prefill chunk 64、decode chunk 1 和 package-local NPU Draft
-backend。`kv-cache-max-len` 必须覆盖 prompt+output，并能被 64 整除。Prompt 多 token 使用原 GDR
-chunk 路线，并传本次 chunk 的 `INT16[B] effective_length`；只有 verify 使用 ABI 不变的
-GDR-MTP。
+backend。`kv-cache-max-len` 必须覆盖 prompt+output，并能被 64 整除。Prompt、verify 和 commit
+都使用原 GDR chunk 路线：verify 传当前 `T`，commit 从同一个 round-start state 出发传
+`a+1`。本分支不要求注册 GDR-MTP。
 
 如果 anchor 立即 EOS，报告会是 `INCONCLUSIVE_NO_DRAFT_ROUND`；换固定非立即结束 prompt。B=2
 通过后再跑 `--max-new-tokens 32 --block-size 16`。
@@ -355,7 +355,8 @@ NPU rollback：
 
 ```python
 audit = report["target_rollback_audit"]
-assert audit["gdr_backend"] == "npu_gated_delta_rule_mtp"
+assert audit["gdr_backend"] == "npu_chunk_gated_delta_rule_two_pass"
+assert audit["custom_gdr_mtp_required"] is False
 assert audit["conv_bank_backend"] == "torch_tensor_golden_on_input_device"
 assert audit["kv_policy"] == "physical_provisional_writes_logical_cursor_commit"
 assert audit["prefill_execution_mode"] == "block_aligned_real_token_chunks_original_gdr"

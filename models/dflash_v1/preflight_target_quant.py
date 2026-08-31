@@ -4,8 +4,9 @@ This command loads the quantized rollback HIAI target and exercises both its
 fresh full-prefix diagnostic route and its persistent ordinary/rollback
 transaction, but deliberately does not hash or load the Draft checkpoint.  It
 is the inexpensive first device gate for the original quant converter,
-quantized embedding route, feature route, state bank, and logical-KV
-integration.
+quantized embedding route, feature route, scalar GDN state, and logical-KV
+integration.  The rollback state gate uses the original chunk GDR twice and
+does not require GDR-MTP.
 """
 
 from __future__ import annotations
@@ -341,7 +342,7 @@ def _run_rollback_target_probe(
     target: nn.Module,
     prefix: Tensor,
 ) -> dict[str, object]:
-    """Compare one quantized ordinary step with the rollback state-bank step."""
+    """Compare one quantized ordinary step with two-pass chunk rollback."""
 
     controller = getattr(target, "target", None)
     if not isinstance(controller, nn.Module):

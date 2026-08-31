@@ -1,25 +1,21 @@
 # coding=utf-8
-"""Qwen3.5 HIAI target with an explicit DFlash rollback integration boundary.
+"""Qwen3.5 HIAI target with two-pass chunk-GDR DFlash rollback.
 
-The ordinary HIAI path keeps its original math and state ownership: when
-``accepted_tokens`` is ``None`` it calls the current
-``npu_chunk_gated_delta_rule`` ABI with a call-local ``INT16[B]`` effective
-length and uses the receiver's original in-place convolution/cache updates.  A
-vectorized DFlash verification call passes ``accepted_tokens: int8[B]`` and
-exactly ``K + 1`` input rows (``anchor + K proposals``).  In that mode:
+The ordinary path and DFlash verification path both call the receiver's
+``npu_chunk_gated_delta_rule`` ABI.  A DFlash round keeps one scalar committed
+GDN state per layer, runs ``K + 1`` rows (anchor plus proposals) provisionally,
+then calls the same chunk GDR a second time with ``effective_length=a+1`` after
+the Target has accepted ``a`` proposals.  Only the second call's FP32 final
+state is eligible for commit; the bridge applies the ordinary receiver's
+persistent-state dtype boundary before publication.  No recurrent state bank
+and no ``npu_gated_delta_rule_mtp`` operator are required by this route.
 
-* the completed ``npu_gated_delta_rule_mtp`` operator selects the previously
-  accepted recurrent-state slot and returns one provisional state per row;
-* a correctness-first tensor decomposition does the same for causal-conv
-  state, providing a precise replacement boundary for a future fused operator;
-* full-attention K/V writes are issued one row at a time so a verification
-  block crossing a 64-token cache boundary is correct with the existing
-  ``npu_cache_update_`` ABI.
-
-This file is model-side integration code, not a complete scheduler.  The owner
-of the 32-layer cache must keep one shared accepted count and logical KV cursor,
-and must discard the whole provisional call on failure.  The correction/bonus
-token is not part of the committed cache until it is used as the next anchor.
+The first pass retains a bounded per-layer commit capsule containing the GDR
+inputs, round-start recurrent state, and causal-conv prefix states.  The bridge
+must either commit or discard every capsule before starting another Target
+call.  Full-attention K/V writes remain provisional physical writes and are
+issued one row at a time so a block crossing a 64-token cache boundary is
+correct; the bridge's logical cursor exposes only the committed prefix.
 """
 
 from typing import Callable, Optional, Tuple
@@ -115,140 +111,20 @@ def _normalize_gdr_effective_length(
     return effective_length
 
 
-def _require_dflash_accepted_tokens(
-    accepted_tokens: torch.Tensor,
-    *,
-    batch_size: int,
-    state_slots: int,
-    device: torch.device,
-) -> None:
-    """Validate the device ABI without introducing an NPU-to-host sync."""
-
-    if not isinstance(accepted_tokens, torch.Tensor):
-        raise TypeError("accepted_tokens must be a Tensor")
-    if accepted_tokens.dtype != torch.int8:
-        raise TypeError("accepted_tokens must use torch.int8")
-    if accepted_tokens.ndim != 1 or tuple(accepted_tokens.shape) != (batch_size,):
-        raise ValueError(
-            f"accepted_tokens must have shape [{batch_size}], "
-            f"got {tuple(accepted_tokens.shape)}"
-        )
-    if accepted_tokens.device != device:
-        raise ValueError("accepted_tokens and state banks must share one device")
-    if not 1 <= state_slots <= DFLASH_MAX_VERIFY_TOKENS:
-        raise ValueError(
-            f"DFlash state_slots must be in [1,{DFLASH_MAX_VERIFY_TOKENS}]"
-        )
-    # A device-side range check belongs in the custom operator/graph.  Checking
-    # NPU values here with .item() would force a synchronization on every round.
-    if accepted_tokens.device.type == "cpu" and accepted_tokens.numel():
-        minimum = int(accepted_tokens.min().item())
-        maximum = int(accepted_tokens.max().item())
-        if minimum < 0 or maximum >= state_slots:
-            raise ValueError(
-                f"accepted_tokens values must be in [0,{state_slots - 1}]"
-            )
-
-
-def _select_dflash_state_slot(
-    state_bank: torch.Tensor,
-    accepted_tokens: torch.Tensor,
-) -> torch.Tensor:
-    """Select ``state_bank[b, accepted_tokens[b]]`` for every batch row."""
-
-    if state_bank.ndim < 3:
-        raise ValueError("a DFlash state bank must have rank at least 3")
-    batch_size, state_slots = state_bank.shape[:2]
-    _require_dflash_accepted_tokens(
-        accepted_tokens,
-        batch_size=batch_size,
-        state_slots=state_slots,
-        device=state_bank.device,
-    )
-    index_shape = (batch_size, 1, *((1,) * (state_bank.ndim - 2)))
-    gather_index = accepted_tokens.to(torch.long).view(index_shape)
-    gather_index = gather_index.expand(batch_size, 1, *state_bank.shape[2:])
-    return torch.gather(state_bank, 1, gather_index).squeeze(1)
-
-
-def seed_dflash_gdn_state_banks(
-    conv_state: torch.Tensor,
-    recurrent_state: torch.Tensor,
-    verify_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Expand committed scalar GDN states into first-round DFlash banks.
-
-    ``verify_tokens`` is ``K + 1``.  All slots initially contain the same
-    committed state and the first verification call therefore uses an all-zero
-    ``accepted_tokens`` selector.  Recurrent state is deliberately promoted to
-    FP32 because that is the completed GDR MTP operator's locked input ABI.
-    """
-
-    if isinstance(verify_tokens, bool) or not isinstance(verify_tokens, int):
-        raise TypeError("verify_tokens must be an integer")
-    if not 1 <= verify_tokens <= DFLASH_MAX_VERIFY_TOKENS:
-        raise ValueError(
-            f"verify_tokens must be in [1,{DFLASH_MAX_VERIFY_TOKENS}]"
-        )
-    if conv_state.ndim != 3:
-        raise ValueError("conv_state must have shape [B,C,Kc]")
-    if recurrent_state.ndim != 4:
-        raise ValueError("recurrent_state must have shape [B,H,Dk,Dv]")
-    if conv_state.shape[0] != recurrent_state.shape[0]:
-        raise ValueError("conv_state and recurrent_state batches differ")
-    if conv_state.device != recurrent_state.device:
-        raise ValueError("conv_state and recurrent_state devices differ")
-    conv_bank = conv_state.unsqueeze(1).expand(
-        conv_state.shape[0], verify_tokens, *conv_state.shape[1:]
-    ).clone()
-    recurrent_state = recurrent_state.to(torch.float32)
-    recurrent_bank = recurrent_state.unsqueeze(1).expand(
-        recurrent_state.shape[0], verify_tokens, *recurrent_state.shape[1:]
-    ).clone()
-    return conv_bank, recurrent_bank
-
-
-def rebase_dflash_gdn_state_banks(
-    conv_state_bank: torch.Tensor,
-    recurrent_state_bank: torch.Tensor,
-    accepted_tokens: torch.Tensor,
-    next_verify_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select the committed slot and resize banks when the next K changes."""
-
-    if conv_state_bank.ndim != 4:
-        raise ValueError("conv_state_bank must have shape [B,T,C,Kc]")
-    if recurrent_state_bank.ndim != 5:
-        raise ValueError("recurrent_state_bank must have shape [B,T,H,Dk,Dv]")
-    if conv_state_bank.shape[:2] != recurrent_state_bank.shape[:2]:
-        raise ValueError("conv and recurrent state-bank batch/slot shapes differ")
-    committed_conv = _select_dflash_state_slot(conv_state_bank, accepted_tokens)
-    committed_recurrent = _select_dflash_state_slot(
-        recurrent_state_bank, accepted_tokens
-    )
-    return seed_dflash_gdn_state_banks(
-        committed_conv,
-        committed_recurrent,
-        next_verify_tokens,
-    )
-
-
-def torch_dflash_causal_conv1d_mtp(
+def torch_dflash_causal_conv1d_chunk(
     hidden_states: torch.Tensor,
-    conv_state_bank: torch.Tensor,
+    conv_state: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
-    accepted_tokens: torch.Tensor,
     activation: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Correctness-first causal-conv state bank on the input tensor's device.
+    """Run a verify chunk and retain each causal-conv prefix state.
 
     Args:
         hidden_states: ``[B,C,T]`` projected Q/K/V rows.
-        conv_state_bank: ``[B,T,C,Kc]`` previous provisional windows.
+        conv_state: ``[B,C,Kc]`` committed round-start window.
         weight: ``[C,Kc]`` depthwise convolution weight.
         bias: optional ``[C]`` bias.
-        accepted_tokens: ``int8[B]`` slot selected from the previous bank.
 
     Returns:
         Activated convolution rows ``[B,C,T]`` and provisional state windows
@@ -258,20 +134,17 @@ def torch_dflash_causal_conv1d_mtp(
 
     if hidden_states.ndim != 3:
         raise ValueError("hidden_states must have shape [B,C,T]")
-    if conv_state_bank.ndim != 4:
-        raise ValueError("conv_state_bank must have shape [B,T,C,Kc]")
+    if conv_state.ndim != 3:
+        raise ValueError("conv_state must have shape [B,C,Kc]")
     batch_size, channels, sequence_length = hidden_states.shape
     if sequence_length < 1 or sequence_length > DFLASH_MAX_VERIFY_TOKENS:
         raise ValueError(
             f"DFlash verify sequence length must be in "
             f"[1,{DFLASH_MAX_VERIFY_TOKENS}]"
         )
-    expected_bank_prefix = (batch_size, sequence_length, channels)
-    if tuple(conv_state_bank.shape[:3]) != expected_bank_prefix:
-        raise ValueError(
-            "conv_state_bank must use the same [B,T,C] dimensions as input"
-        )
-    state_length = conv_state_bank.shape[-1]
+    if tuple(conv_state.shape[:2]) != (batch_size, channels):
+        raise ValueError("conv_state must use the same [B,C] dimensions as input")
+    state_length = conv_state.shape[-1]
     if tuple(weight.shape) != (channels, state_length):
         raise ValueError(
             f"conv weight must have shape {(channels, state_length)}, "
@@ -279,15 +152,14 @@ def torch_dflash_causal_conv1d_mtp(
         )
     if bias is not None and tuple(bias.shape) != (channels,):
         raise ValueError("conv bias must have shape [C]")
-    if hidden_states.device != conv_state_bank.device:
-        raise ValueError("hidden_states and conv_state_bank devices differ")
-    if hidden_states.dtype != conv_state_bank.dtype:
-        raise ValueError("hidden_states and conv_state_bank dtypes differ")
+    if hidden_states.device != conv_state.device:
+        raise ValueError("hidden_states and conv_state devices differ")
+    if hidden_states.dtype != conv_state.dtype:
+        raise ValueError("hidden_states and conv_state dtypes differ")
     if activation not in {"silu", "swish"}:
         raise ValueError("the locked Qwen3.5 GDN path requires SiLU")
 
-    base_state = _select_dflash_state_slot(conv_state_bank, accepted_tokens)
-    history = torch.cat((base_state, hidden_states), dim=-1).to(weight.dtype)
+    history = torch.cat((conv_state, hidden_states), dim=-1).to(weight.dtype)
     convolution = F.conv1d(
         history,
         weight.unsqueeze(1),
@@ -307,45 +179,76 @@ def torch_dflash_causal_conv1d_mtp(
     return output.to(hidden_states.dtype), next_state_bank.to(hidden_states.dtype)
 
 
-def _npu_gated_delta_rule_mtp(
+def select_dflash_chunk_commit_state(
+    state_bank: torch.Tensor,
+    committed_rows: int,
+) -> torch.Tensor:
+    """Select the state after exactly ``committed_rows`` verify inputs."""
+
+    if state_bank.ndim < 3:
+        raise ValueError("chunk prefix state bank must have rank at least 3")
+    if isinstance(committed_rows, bool) or not isinstance(committed_rows, int):
+        raise TypeError("committed_rows must be an integer")
+    if not 1 <= committed_rows <= state_bank.shape[1]:
+        raise ValueError(
+            f"committed_rows must be in [1,{state_bank.shape[1]}]"
+        )
+    return state_bank[:, committed_rows - 1].contiguous()
+
+
+def run_dflash_chunk_gdr_commit(
+    operation: Callable[..., object],
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
     initial_state: torch.Tensor,
-    accepted_tokens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resolve and call the completed GDR MTP bridge; never fall back silently."""
+    committed_rows: int,
+) -> torch.Tensor:
+    """Call the original GDR with the accepted input-prefix length."""
 
-    operation = getattr(torch_npu, "npu_gated_delta_rule_mtp", None)
     if not callable(operation):
-        npu_namespace = getattr(torch.ops, "npu", None)
-        operation = (
-            getattr(npu_namespace, "npu_gated_delta_rule_mtp", None)
-            if npu_namespace is not None
-            else None
+        raise TypeError("chunk GDR operation must be callable")
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("chunk GDR query/key/value must have rank 4")
+    if query.shape[:2] != key.shape[:2] or query.shape[:2] != value.shape[:2]:
+        raise ValueError("chunk GDR query/key/value batch/token shapes differ")
+    verify_tokens = int(query.shape[1])
+    if isinstance(committed_rows, bool) or not isinstance(committed_rows, int):
+        raise TypeError("committed_rows must be an integer")
+    if not 1 <= committed_rows <= verify_tokens:
+        raise ValueError(
+            f"committed_rows must be in [1,{verify_tokens}]"
         )
-    if not callable(operation):
-        raise RuntimeError(
-            "DFlash rollback requires the registered "
-            "npu_gated_delta_rule_mtp custom operator"
-        )
+    effective_length = torch.full(
+        (int(query.shape[0]),),
+        committed_rows,
+        dtype=torch.int16,
+        device=query.device,
+    )
     result = operation(
         query,
         key,
         value,
-        g,
-        beta,
-        initial_state,
-        accepted_tokens,
-        64,
-        True,
-        True,
+        g=g,
+        beta=beta,
+        effective_length=effective_length,
+        chunk_size=1 if verify_tokens == 1 else 64,
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
     )
     if not isinstance(result, (tuple, list)) or len(result) != 2:
-        raise TypeError("npu_gated_delta_rule_mtp must return (out, state_bank)")
-    return result[0], result[1]
+        raise TypeError("chunk GDR must return (output, final_state)")
+    committed_state = result[1]
+    if not isinstance(committed_state, torch.Tensor):
+        raise TypeError("chunk GDR final state must be a Tensor")
+    if tuple(committed_state.shape) != tuple(initial_state.shape):
+        raise ValueError("chunk GDR commit returned an invalid state shape")
+    if committed_state.dtype != torch.float32:
+        raise TypeError("chunk GDR commit state must use FP32")
+    return committed_state
 
 
 class Qwen3_5RMSNorm(nn.Module):
@@ -755,7 +658,7 @@ class Qwen3_5Attention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        accepted_tokens: Optional[torch.Tensor] = None,
+        dflash_chunk_verify: bool = False,
         allQLen=0,
         export_flag=False,
         **kwargs: Unpack[FlashAttentionKwargs],
@@ -782,7 +685,9 @@ class Qwen3_5Attention(nn.Module):
         )
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
-        if accepted_tokens is None:
+        if not isinstance(dflash_chunk_verify, bool):
+            raise TypeError("dflash_chunk_verify must be a bool")
+        if not dflash_chunk_verify:
             key_states = self.update(
                 key_states, cache_position, past_key_values[0]
             ).to(query_states.device)
@@ -790,12 +695,11 @@ class Qwen3_5Attention(nn.Module):
                 value_states, cache_position, past_key_values[1]
             ).to(query_states.device)
         else:
-            _require_dflash_accepted_tokens(
-                accepted_tokens,
-                batch_size=input_shape[0],
-                state_slots=input_shape[1],
-                device=query_states.device,
-            )
+            if not 1 <= input_shape[1] <= DFLASH_MAX_VERIFY_TOKENS:
+                raise ValueError(
+                    "DFlash chunk verify must contain 1.."
+                    f"{DFLASH_MAX_VERIFY_TOKENS} rows"
+                )
             key_states = self.update_dflash(
                 key_states, cache_position, past_key_values[0]
             ).to(query_states.device)
@@ -1106,6 +1010,50 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.hidden_size, self.num_v_heads, bias=False
         )
         self.layer_type = config.layer_types[layer_idx]
+        self._dflash_chunk_commit_capsule: Optional[tuple[torch.Tensor, ...]] = None
+
+    @property
+    def dflash_pending_chunk_rows(self) -> Optional[int]:
+        capsule = self._dflash_chunk_commit_capsule
+        return None if capsule is None else int(capsule[0].shape[1])
+
+    def discard_dflash_chunk_commit(self) -> None:
+        self._dflash_chunk_commit_capsule = None
+
+    def compute_dflash_chunk_commit(
+        self,
+        committed_rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Re-run original chunk GDR for the accepted input prefix only."""
+
+        capsule = self._dflash_chunk_commit_capsule
+        if capsule is None:
+            raise RuntimeError(
+                f"GDN layer {self.layer_idx} has no pending chunk verification"
+            )
+        query, key, value, g, beta, initial_state, conv_state_bank = capsule
+        verify_tokens = int(query.shape[1])
+        if isinstance(committed_rows, bool) or not isinstance(committed_rows, int):
+            raise TypeError("committed_rows must be an integer")
+        if not 1 <= committed_rows <= verify_tokens:
+            raise ValueError(
+                f"committed_rows must be in [1,{verify_tokens}]"
+            )
+        committed_recurrent_state = run_dflash_chunk_gdr_commit(
+            torch_npu.npu_chunk_gated_delta_rule,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state,
+            committed_rows,
+        )
+        committed_conv_state = select_dflash_chunk_commit_state(
+            conv_state_bank,
+            committed_rows,
+        )
+        return committed_conv_state, committed_recurrent_state
 
     def forward(
         self,
@@ -1113,7 +1061,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache_params: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        accepted_tokens: Optional[torch.Tensor] = None,
+        dflash_chunk_verify: bool = False,
         gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
@@ -1122,13 +1070,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
         conv_state = cache_params[0]
         recurrent_state = cache_params[1]
+        if not isinstance(dflash_chunk_verify, bool):
+            raise TypeError("dflash_chunk_verify must be a bool")
+        if self._dflash_chunk_commit_capsule is not None:
+            raise RuntimeError(
+                f"GDN layer {self.layer_idx} still has an unresolved chunk commit"
+            )
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
         z = self.in_proj_z(hidden_states).reshape(
             batch_size, seq_len, -1, self.head_v_dim
         )
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
-        if accepted_tokens is None:
+        next_conv_state_bank: Optional[torch.Tensor] = None
+        initial_recurrent_state: Optional[torch.Tensor] = None
+        if not dflash_chunk_verify:
             mixed_qkv = self.causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1137,48 +1093,42 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.activation,
             ).transpose(1, 2)
         else:
-            if conv_state.ndim != 4:
+            if not 1 <= seq_len <= DFLASH_MAX_VERIFY_TOKENS:
                 raise ValueError(
-                    "DFlash conv_state must have shape [B,K+1,C,Kc]"
-                )
-            if recurrent_state.ndim != 5:
-                raise ValueError(
-                    "DFlash recurrent_state must have shape [B,K+1,H,Dk,Dv]"
+                    "DFlash chunk verify must contain 1.."
+                    f"{DFLASH_MAX_VERIFY_TOKENS} rows"
                 )
             expected_conv = (
                 batch_size,
-                seq_len,
                 self.conv_dim,
                 self.conv_kernel_size,
             )
             expected_recurrent = (
                 batch_size,
-                seq_len,
                 self.num_v_heads,
                 self.head_k_dim,
                 self.head_v_dim,
             )
             if tuple(conv_state.shape) != expected_conv:
                 raise ValueError(
-                    f"DFlash conv_state must have shape {expected_conv}, "
+                    f"DFlash scalar conv_state must have shape {expected_conv}, "
                     f"got {tuple(conv_state.shape)}"
                 )
             if tuple(recurrent_state.shape) != expected_recurrent:
                 raise ValueError(
-                    f"DFlash recurrent_state must have shape {expected_recurrent}, "
+                    "DFlash scalar recurrent_state must have shape "
+                    f"{expected_recurrent}, "
                     f"got {tuple(recurrent_state.shape)}"
                 )
-            if recurrent_state.dtype != torch.float32:
-                raise TypeError("DFlash recurrent_state bank must use FP32")
-            mixed_qkv, next_conv_state = torch_dflash_causal_conv1d_mtp(
+            initial_recurrent_state = recurrent_state.to(torch.float32).clone()
+            mixed_qkv, next_conv_state_bank = torch_dflash_causal_conv1d_chunk(
                 mixed_qkv,
                 conv_state,
                 self.conv1d.weight.squeeze(1),
                 self.conv1d.bias,
-                accepted_tokens,
                 self.activation,
             )
-            conv_state = next_conv_state
+            conv_state = next_conv_state_bank[:, -1].contiguous()
             mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
             mixed_qkv,
@@ -1200,43 +1150,47 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             repeat = self.num_v_heads // self.num_k_heads
             query = query.repeat_interleave(repeat, dim=2)
             key = key.repeat_interleave(repeat, dim=2)
-        if accepted_tokens is None:
-            if gdr_effective_length is None:
-                raise ValueError("ordinary GDN requires gdr_effective_length")
-            core_attn_out, last_recurrent_state = (
-                torch_npu.npu_chunk_gated_delta_rule(
-                    query,
-                    key,
-                    value.contiguous(),
-                    g=g,
-                    beta=beta,
-                    effective_length=gdr_effective_length,
-                    chunk_size=1 if seq_len == 1 else 64,
-                    initial_state=recurrent_state.to(torch.float32),
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                )
-            )
-            recurrent_state = last_recurrent_state.to(torch.float16)
-        else:
-            core_attn_out, next_recurrent_state = _npu_gated_delta_rule_mtp(
+        if gdr_effective_length is None:
+            raise ValueError("GDN requires gdr_effective_length")
+        value = value.contiguous()
+        gdr_initial_state = (
+            initial_recurrent_state
+            if initial_recurrent_state is not None
+            else recurrent_state.to(torch.float32)
+        )
+        core_attn_out, last_recurrent_state = (
+            torch_npu.npu_chunk_gated_delta_rule(
                 query,
                 key,
-                value.contiguous(),
-                g,
-                beta,
-                recurrent_state.contiguous(),
-                accepted_tokens,
+                value,
+                g=g,
+                beta=beta,
+                effective_length=gdr_effective_length,
+                chunk_size=1 if seq_len == 1 else 64,
+                initial_state=gdr_initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
             )
-            if tuple(next_recurrent_state.shape) != tuple(recurrent_state.shape):
-                raise ValueError(
-                    "npu_gated_delta_rule_mtp returned an invalid state-bank shape"
-                )
-            if next_recurrent_state.dtype != torch.float32:
-                raise TypeError(
-                    "npu_gated_delta_rule_mtp state output must use FP32"
-                )
-            recurrent_state = next_recurrent_state
+        )
+        if tuple(last_recurrent_state.shape) != tuple(gdr_initial_state.shape):
+            raise ValueError("chunk GDR returned an invalid recurrent-state shape")
+        if dflash_chunk_verify:
+            if last_recurrent_state.dtype != torch.float32:
+                raise TypeError("DFlash chunk GDR state must use FP32")
+            assert initial_recurrent_state is not None
+            assert next_conv_state_bank is not None
+            self._dflash_chunk_commit_capsule = (
+                query.detach(),
+                key.detach(),
+                value.detach(),
+                g.detach(),
+                beta.detach(),
+                initial_recurrent_state.detach(),
+                next_conv_state_bank.detach(),
+            )
+            recurrent_state = last_recurrent_state
+        else:
+            recurrent_state = last_recurrent_state.to(torch.float16)
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
@@ -1280,7 +1234,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         allQLen=0,
         token_count=0,
         export_flag=False,
-        accepted_tokens: Optional[torch.Tensor] = None,
+        dflash_chunk_verify: bool = False,
         gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Tuple]:
@@ -1292,7 +1246,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 cache_params=past_key_values,
                 cache_position=new_kv_cache_pos,
                 attention_mask=attention_mask,
-                accepted_tokens=accepted_tokens,
+                dflash_chunk_verify=dflash_chunk_verify,
                 gdr_effective_length=gdr_effective_length,
             )
         elif self.block_type == "full_attention":
@@ -1302,7 +1256,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_position=new_kv_cache_pos,
-                accepted_tokens=accepted_tokens,
+                dflash_chunk_verify=dflash_chunk_verify,
                 allQLen=allQLen,
                 export_flag=export_flag,
                 **kwargs,
@@ -1354,7 +1308,7 @@ class Qwen3_5PreTrainedModel(PreTrainedModel):
 
 
 class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
-    """HIAI text body with feature capture and opt-in DFlash state banks."""
+    """HIAI text body with feature capture and chunk-GDR transactions."""
 
     config: Qwen3_5TextConfig
     dflash_feature_contract_id = "qwen3.5-4b-dflash-hiai-feature-source-v1"
@@ -1362,7 +1316,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         "package_local:modeling_qwen3_5_hiai_nd_dflash_rollback.py"
     )
     dflash_feature_capture_point = "decoder_post_layer_pre_final_norm"
-    dflash_state_contract_id = "qwen3.5-4b-dflash-target-state-bank-v1"
+    dflash_state_contract_id = "qwen3.5-4b-dflash-target-chunk-commit-v1"
 
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__(config)
@@ -1381,6 +1335,48 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         self.gradient_checkpointing = False
         self.post_init()
 
+    def _dflash_gdn_layers(self) -> list[Qwen3_5GatedDeltaNet]:
+        return [
+            layer.linear_attn
+            for layer in self.layers
+            if layer.block_type == "linear_attention"
+        ]
+
+    def discard_dflash_chunk_state(self) -> None:
+        for layer in self._dflash_gdn_layers():
+            layer.discard_dflash_chunk_commit()
+
+    def commit_dflash_chunk_state(
+        self,
+        committed_rows: int,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Compute every GDN committed state before publishing any of them."""
+
+        gdn_layers = self._dflash_gdn_layers()
+        if not gdn_layers:
+            raise RuntimeError("DFlash Target has no GDN layers")
+        pending_rows = {layer.dflash_pending_chunk_rows for layer in gdn_layers}
+        if None in pending_rows or len(pending_rows) != 1:
+            raise RuntimeError(
+                "every GDN layer must own one matching pending chunk capsule"
+            )
+        verify_tokens = next(iter(pending_rows))
+        assert verify_tokens is not None
+        if isinstance(committed_rows, bool) or not isinstance(committed_rows, int):
+            raise TypeError("committed_rows must be an integer")
+        if not 1 <= committed_rows <= verify_tokens:
+            raise ValueError(
+                f"committed_rows must be in [1,{verify_tokens}]"
+            )
+
+        committed = {
+            layer.layer_idx: layer.compute_dflash_chunk_commit(committed_rows)
+            for layer in gdn_layers
+        }
+        for layer in gdn_layers:
+            layer.discard_dflash_chunk_commit()
+        return committed
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1394,7 +1390,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         token_count=0,
         export_flag=False,
         output_dflash_features: bool = False,
-        accepted_tokens: Optional[torch.Tensor] = None,
+        dflash_chunk_verify: bool = False,
         gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1408,17 +1404,25 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             physical_sequence_length=int(hidden_states.shape[1]),
             device=hidden_states.device,
         )
-        if accepted_tokens is not None:
+        if not isinstance(dflash_chunk_verify, bool):
+            raise TypeError("dflash_chunk_verify must be a bool")
+        if any(
+            layer.dflash_pending_chunk_rows is not None
+            for layer in self._dflash_gdn_layers()
+        ):
+            raise RuntimeError(
+                "a pending DFlash chunk must be committed or discarded first"
+            )
+        if dflash_chunk_verify:
             if past_key_values is None:
                 raise ValueError(
                     "DFlash rollback mode requires persistent 32-layer state"
                 )
-            _require_dflash_accepted_tokens(
-                accepted_tokens,
-                batch_size=hidden_states.shape[0],
-                state_slots=hidden_states.shape[1],
-                device=hidden_states.device,
-            )
+            if not 1 <= hidden_states.shape[1] <= DFLASH_MAX_VERIFY_TOKENS:
+                raise ValueError(
+                    "DFlash chunk verify must contain 1.."
+                    f"{DFLASH_MAX_VERIFY_TOKENS} rows"
+                )
         dflash_collector = None
         if output_dflash_features:
             dflash_collector = DFlashFeatureCollector(
@@ -1445,7 +1449,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 allQLen=allQLen,
                 token_count=token_count,
                 export_flag=export_flag,
-                accepted_tokens=accepted_tokens,
+                dflash_chunk_verify=dflash_chunk_verify,
                 gdr_effective_length=gdr_effective_length,
                 **kwargs,
             )
@@ -1469,7 +1473,7 @@ class KwargsForCausalLM(FlashAttentionKwargs, TransformersKwargs):
 
 
 class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
-    """Tensor-returning HIAI LM with opt-in feature/state-bank execution."""
+    """Tensor-returning HIAI LM with opt-in chunk-GDR transactions."""
 
     _tied_weights_keys = {"lm_head.weight": "language_model.embed_tokens.weight"}
     config: Qwen3_5TextConfig
@@ -1479,7 +1483,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         "package_local:modeling_qwen3_5_hiai_nd_dflash_rollback.py"
     )
     dflash_feature_capture_point = "decoder_post_layer_pre_final_norm"
-    dflash_state_contract_id = "qwen3.5-4b-dflash-target-state-bank-v1"
+    dflash_state_contract_id = "qwen3.5-4b-dflash-target-chunk-commit-v1"
 
     def __init__(self, config):
         super().__init__(config)
@@ -1489,6 +1493,15 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             config.hidden_size, config.vocab_size, bias=False
         )
         self.post_init()
+
+    def discard_dflash_chunk_state(self) -> None:
+        self.language_model.discard_dflash_chunk_state()
+
+    def commit_dflash_chunk_state(
+        self,
+        committed_rows: int,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        return self.language_model.commit_dflash_chunk_state(committed_rows)
 
     def forward(
         self,
@@ -1505,7 +1518,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         output_dflash_features: bool = False,
         dflash_skip_lm_head: bool = False,
         dflash_last_token_only: bool = False,
-        accepted_tokens: Optional[torch.Tensor] = None,
+        dflash_chunk_verify: bool = False,
         gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1521,7 +1534,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             token_count=token_count,
             export_flag=export_flag,
             output_dflash_features=output_dflash_features,
-            accepted_tokens=accepted_tokens,
+            dflash_chunk_verify=dflash_chunk_verify,
             gdr_effective_length=gdr_effective_length,
             **kwargs,
         )

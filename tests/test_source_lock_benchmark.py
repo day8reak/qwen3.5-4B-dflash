@@ -96,9 +96,11 @@ class BenchmarkSourceLockTests(unittest.TestCase):
 
     def test_lock_declares_rollback_target_only_quant_scope(self) -> None:
         lock = json.loads((REPOSITORY / "SOURCE_LOCK.json").read_text("utf-8"))
-        self.assertEqual(lock["schema_version"], 6)
+        self.assertEqual(lock["schema_version"], 7)
         self.assertIn("Target-only W8A8", lock["purpose"])
+        self.assertIn("two-pass chunk-GDR", lock["purpose"])
         self.assertIn("original multi-token GDR", lock["rollback_runtime"]["policy"])
+        self.assertIn("do not require GDR-MTP", lock["rollback_runtime"]["policy"])
         self.assertIn("Draft stays FP16", lock["rollback_runtime"]["policy"])
 
 

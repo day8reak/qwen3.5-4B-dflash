@@ -33,12 +33,13 @@ attention 看见 old committed + new committed + transient block，返回前只�
 | --- | --- |
 | `modeling_qwen3_5_dflash.py` | CPU/CUDA feature-enabled Target |
 | `../modeling_qwen3_5_hiai_nd_dflash_rollback.py` | 独立 HIAI rollback Target modeling |
-| `../internal_dflash_bridge.py` | HIAI state bank、prompt chunk 和 paged-KV logical cursor |
-| `../export_model_wrapper_qwen3_5_dflash_rollback.py` | 原部署 wrapper 的 rollback adapter |
+| `../internal_dflash_bridge.py` | HIAI 标量 GDN state、两阶段 chunk commit 和 paged-KV logical cursor |
+| `../export_model_wrapper_qwen3_5_dflash_rollback.py` | 原部署 wrapper 的 chunk transaction adapter |
 | `dflash_target_features.py` | 八层 Target feature 合同 |
 
-原 `../modeling_qwen3_5_hiai_nd.py` 保持不变。Prompt 多 token 走原 GDR chunk，verify 才走
-`npu_gated_delta_rule_mtp`。Causal-conv 当前是输入 NPU 上的 Tensor golden；完整算子计划见文档。
+原 `../modeling_qwen3_5_hiai_nd.py` 保持普通路径权威。Prompt、verify 和 accepted-prefix commit
+都复用原 `npu_chunk_gated_delta_rule`；本分支不调用 `npu_gated_delta_rule_mtp`。Causal-conv
+当前是输入 NPU 上的 Tensor golden；完整算子计划见文档。
 
 ## Target W8A8
 

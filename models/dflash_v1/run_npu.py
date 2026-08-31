@@ -46,7 +46,7 @@ ORIGINAL_QUANT_DISABLE = "disable"
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run Qwen3.5-4B DFlash with persistent HIAI state-bank rollback"
+            "Run Qwen3.5-4B DFlash with two-pass chunk-GDR rollback"
         )
     )
     parser.add_argument("--target-dir", required=True)

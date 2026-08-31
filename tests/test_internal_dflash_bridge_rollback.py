@@ -65,12 +65,40 @@ class FakeHIAIModel(nn.Module):
         self.lm_head = nn.Linear(2, VOCAB_SIZE, bias=False, dtype=torch.float16)
         self.paged_attention = FakePagedAttention(self.config)
         self.calls: list[dict[str, object]] = []
+        self.commit_rows: list[int] = []
+        self._pending_chunk: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ] | None = None
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embedding
 
     def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
+
+    def discard_dflash_chunk_state(self) -> None:
+        self._pending_chunk = None
+
+    def commit_dflash_chunk_state(
+        self,
+        committed_rows: int,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        if self._pending_chunk is None:
+            raise RuntimeError("no fake chunk is pending")
+        conv_base, recurrent_base, token_values = self._pending_chunk
+        if not 1 <= committed_rows <= token_values.shape[1]:
+            raise ValueError("invalid fake commit length")
+        delta = token_values[:, :committed_rows].sum()
+        self.commit_rows.append(committed_rows)
+        self._pending_chunk = None
+        return {
+            0: (
+                conv_base + delta,
+                recurrent_base.float() + delta.float() * 10,
+            )
+        }
 
     def forward(
         self,
@@ -81,7 +109,7 @@ class FakeHIAIModel(nn.Module):
         allQLen,
         output_dflash_features: bool,
         gdr_effective_length: torch.Tensor,
-        accepted_tokens: torch.Tensor | None = None,
+        dflash_chunk_verify: bool = False,
         **kwargs,
     ):
         skip_lm_head = bool(kwargs.pop("dflash_skip_lm_head", False))
@@ -99,32 +127,29 @@ class FakeHIAIModel(nn.Module):
                 "gdr_effective_length": tuple(
                     int(value) for value in gdr_effective_length.tolist()
                 ),
-                "accepted": (
-                    None
-                    if accepted_tokens is None
-                    else tuple(int(value) for value in accepted_tokens.tolist())
-                ),
+                "chunk_verify": dflash_chunk_verify,
                 "skip_lm_head": skip_lm_head,
                 "last_token_only": last_token_only,
             }
         )
         conv_state, recurrent_state = past_key_values[0]
         token_values = input_ids.to(torch.float16)
-        if accepted_tokens is None:
+        if not dflash_chunk_verify:
             conv_state.add_(token_values.sum())
             recurrent_state.add_(token_values.sum() * 10)
         else:
-            selected = int(accepted_tokens[0])
-            conv_base = conv_state[:, selected].clone()
-            recurrent_base = recurrent_state[:, selected].clone()
-            running_conv = conv_base
-            running_recurrent = recurrent_base
-            for row in range(input_ids.shape[1]):
-                value = token_values[:, row].view(1, 1, 1)
-                running_conv = running_conv + value
-                running_recurrent = running_recurrent + value.view(1, 1, 1, 1) * 10
-                conv_state[:, row].copy_(running_conv)
-                recurrent_state[:, row].copy_(running_recurrent)
+            if self._pending_chunk is not None:
+                raise RuntimeError("fake chunk already pending")
+            self._pending_chunk = (
+                conv_state.clone(),
+                recurrent_state.clone(),
+                token_values.clone(),
+            )
+            conv_state.add_(token_values.sum())
+            past_key_values[0] = (
+                conv_state,
+                recurrent_state.float() + token_values.sum().float() * 10,
+            )
 
         rows = input_ids.shape[1]
         logit_rows = 0 if skip_lm_head else (1 if last_token_only else rows)
@@ -147,6 +172,12 @@ class FakeWrapper(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
+
+    def commit_dflash_chunk_state(self, committed_rows: int):
+        return self.model.commit_dflash_chunk_state(committed_rows)
+
+    def discard_dflash_chunk_state(self) -> None:
+        self.model.discard_dflash_chunk_state()
 
 
 class QuantInputFakeHIAIModel(FakeHIAIModel):
@@ -179,7 +210,7 @@ def main() -> None:
         "positions": (0, 1),
         "all_q_len": (2,),
         "gdr_effective_length": (2,),
-        "accepted": None,
+        "chunk_verify": False,
         "skip_lm_head": False,
         "last_token_only": True,
     }
@@ -200,35 +231,55 @@ def main() -> None:
     else:
         raise AssertionError("17-row rollback verify block was not rejected")
 
+    persistent_before = bridge._persistent_state
+    assert persistent_before is not None
+    provisional = bridge._prepare_rollback_state(3)
+    assert provisional[0][0] is not persistent_before[0][0]
+    assert provisional[0][1] is not persistent_before[0][1]
+    assert provisional[1][0] is persistent_before[1][0]
+    assert provisional[1][1] is persistent_before[1][1]
+
     bridge.verify_rollback(torch.tensor([[3, 4, 99]], dtype=torch.long))
     state = bridge._persistent_state
     assert state is not None
-    assert tuple(state[0][0].shape) == (1, 3, 3, 2)
-    assert float(state[0][0][0, 1, 0, 0]) == 10.0
+    assert tuple(state[0][0].shape) == (1, 3, 2)
+    assert float(state[0][0][0, 0, 0]) == 3.0
     bridge.commit_rollback(1)
     assert bridge.dflash_rollback_audit["persistent_cursor"] == 4
-    assert bridge.dflash_rollback_audit["previous_accepted"] == 1
+    assert bridge.dflash_rollback_audit["last_committed_rows"] == 2
+    assert model.commit_rows == [2]
+    state = bridge._persistent_state
+    assert state is not None
+    assert float(state[0][0][0, 0, 0]) == 10.0
+    assert float(state[0][1][0, 0, 0, 0]) == 100.0
+    assert state[0][1].dtype == torch.float16
 
-    # K changes from 2 proposals to 1. The bridge must select old slot 1,
-    # rebase to two slots, and overwrite the rejected physical tail at pos 4.
+    # K changes from 2 proposals to 1. The next verify starts from the scalar
+    # state committed by the second original-GDR chunk call.
     bridge.verify_rollback(torch.tensor([[5, 6]], dtype=torch.long))
     assert model.calls[-1] == {
         "positions": (4, 5),
         "all_q_len": (6,),
         "gdr_effective_length": (2,),
-        "accepted": (0,),
+        "chunk_verify": True,
         "skip_lm_head": False,
         "last_token_only": False,
     }
     state = bridge._persistent_state
     assert state is not None
-    assert tuple(state[0][0].shape) == (1, 2, 3, 2)
-    assert float(state[0][0][0, 0, 0, 0]) == 15.0
+    assert tuple(state[0][0].shape) == (1, 3, 2)
+    assert float(state[0][0][0, 0, 0]) == 10.0
     bridge.commit_rollback(0)
     audit = bridge.dflash_rollback_audit
     assert audit["persistent_cursor"] == 5
     assert audit["rollback_verify_calls"] == 2
     assert audit["rollback_commit_calls"] == 2
+    assert audit["rollback_gdr_verify_layer_calls"] == 2
+    assert audit["rollback_gdr_commit_layer_calls"] == 2
+    assert audit["last_committed_rows"] == 1
+    assert audit["gdr_backend"] == "npu_chunk_gated_delta_rule_two_pass"
+    assert audit["custom_gdr_mtp_required"] is False
+    assert model.commit_rows == [2, 1]
     assert audit["historical_prefix_replay_during_verify"] is False
     assert audit["persistent_call_synchronization_policy"] == (
         "same_device_stream_dependencies_no_per_call_host_barrier"
@@ -305,7 +356,7 @@ def main() -> None:
             "positions": (0, 1, 2),
             "all_q_len": (3,),
             "gdr_effective_length": (3,),
-            "accepted": None,
+            "chunk_verify": False,
             "skip_lm_head": False,
             "last_token_only": True,
         }
@@ -357,7 +408,7 @@ def main() -> None:
     assert full_prefix_audit["gdr_effective_length_contract"] == (
         "int16_batch_call_local_valid_rows"
     )
-    print("PASS: HIAI bridge state-bank selection, rebase, and logical KV cursor")
+    print("PASS: HIAI bridge two-pass chunk GDR and logical KV cursor")
 
 
 def test_bridge_rollback_contract() -> None:

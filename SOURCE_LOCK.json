@@ -1,10 +1,10 @@
 {
-  "schema_version": 6,
-  "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback with the original GDR effective-length ABI and optional Target-only W8A8 dynamic quantization configured by the original inference YAML",
-  "package_revision": "r7",
-  "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-chunk-prefill-gdr-effective-length",
+  "schema_version": 7,
+  "purpose": "runtime identity contract for Qwen3.5-4B DFlash two-pass chunk-GDR rollback with the original GDR effective-length ABI and optional Target-only W8A8 dynamic quantization configured by the original inference YAML",
+  "package_revision": "r8",
+  "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-two-pass-chunk-gdr",
   "package_layout": {
-    "version": 6,
+    "version": 7,
     "canonical_package": "models.dflash_v1",
     "canonical_source_directory": "models/dflash_v1",
     "hiai_source_file": "models/modeling_qwen3_5_hiai_nd.py",
@@ -12,8 +12,8 @@
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
-    "hiai_bridge_sha256": "0a9c125b571fe0d2e673d769742e12bea89a6ee2a8d768d7b3e6435fc79ea5cf",
-    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with block-aligned real-token prompt chunks on the original GDR route using one INT16[B] call-local effective length, last-real-row LM head, at most 16 unchanged-ABI GDR-MTP verify rows, GDN/conv state banks, provisional paged-KV writes, one logical commit cursor, returned-bank ownership, same-stream ordering without per-call host barriers, and optional Target-only W8A8 conversion plus per-current-block INT8 embedding/FP32 scale dequantization configured by the original inference YAML",
+    "hiai_bridge_sha256": "abdfea225dc0cc4e39efa90f11ac34b31d1f26006bed48fee8a381745fdce404",
+    "hiai_bridge_policy": "retains the full-prefix oracle and provides persistent rollback with block-aligned real-token prompt chunks, scalar committed GDN state, at most 16 original-GDR chunk verify rows, accepted+1 second chunk state commit from the same round-start state, Torch conv prefix golden, provisional paged-KV writes, one logical commit cursor, atomic state publication, same-stream ordering without per-call host barriers, and optional Target-only W8A8 conversion plus per-current-block INT8 embedding/FP32 scale dequantization configured by the original inference YAML",
     "npu_policy": "keep the HIAI target in models/ and install the complete DFlash package in models/dflash_v1/",
     "namespace_compatibility_file": "models/__init__.py",
     "namespace_compatibility_sha256": "9bf3e37aed93d372ca13b17b9c6dae32efa47f805f32b48628fb5316eae34b6d",
@@ -89,7 +89,7 @@
   },
   "npu_embedded_runtime": {
     "runner_file": "models/dflash_v1/run_npu.py",
-    "runner_sha256": "698bd803b68841245c424e153cf0391ec302f3c362ee40011c409e56b0aa3380",
+    "runner_sha256": "3ef4df377c22d8a3cd97c252c212ff9bcdbb88b760d2cedcbac1a8037ae785e5",
     "loader_file": "models/dflash_v1/internal_target_loader.py",
     "loader_sha256": "b6b586e24e0d48d30cc8011390f8eb73dde955f37f54df69a109494aa4698d83",
     "loader_contract_file": "models/dflash_v1/internal_target_loader_template.py",
@@ -106,7 +106,7 @@
     "original_quant_file": "models/dflash_v1/original_quant.py",
     "original_quant_sha256": "67dc155f33ab25cd75862a55bd249b6d9ef1c1f5418da8bb74a0520131511273",
     "target_quant_preflight_file": "models/dflash_v1/preflight_target_quant.py",
-    "target_quant_preflight_sha256": "b42c79a17cc900403eda96caaff9d21bfefb4e601a3f248d155b69ff8337b61c",
+    "target_quant_preflight_sha256": "78739c2ef538cb918dc63bc0ca093b85ed8eb051fd632c1294a8d05098a0c599",
     "w8a8_emulation_file": "models/dflash_v1/w8a8_emulation.py",
     "w8a8_emulation_sha256": "fa604b2778f9e6a5e3c623f76ce714eb028713d5afdecbc52dae46514e070c37",
     "w8a8_cpu_validator_file": "models/dflash_v1/validate_w8a8_cpu.py",
@@ -115,28 +115,28 @@
   },
   "rollback_runtime": {
     "runner_file": "models/dflash_v1/run_rollback.py",
-    "runner_sha256": "d9730325de93f8373af3d084c569e156843415a78c6c274bef40014b872096c4",
+    "runner_sha256": "76df2ea77c41c9cc83e5c156bbfc835dbfa0bd43be28e12a6b3076733a3fb2f4",
     "adapter_file": "models/dflash_v1/dflash_rollback_adapter.py",
-    "adapter_sha256": "c00e5e060d15575c27c5fdf7bf48d61e88d0fdbfdf4d9af085de42f8131b0af0",
+    "adapter_sha256": "4cdb4489e9ed7345914ffc025804abfafe431326a1701e32540354de33069643",
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
     "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
     "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
-    "hiai_modeling_sha256": "9faa917696a4f113cafbabdef8d80a4ef9073c8d3fb2171f7694914cfed46627",
+    "hiai_modeling_sha256": "19cfde2e03297b6e882efc3b4acda94abe0b2f34dc3a6c03fd65387993bcaa31",
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
-    "wrapper_sha256": "a62e4a554cd566194455a993e37dd0bc045579424d99c85e789dd241b1408020",
+    "wrapper_sha256": "fb634dbf46880820df462dfa728d18aab0cc56be690ba6de0ad186083a57c53c",
     "shared_qlinear_source_file": "models/modeling_qwen3_5_hiai_nd.py",
     "shared_qlinear_source_sha256": "0aa2e5bf80edffe2d9b2bd50227d3f45b6adaf1a061538b28985cfcf9014a12f",
-    "policy": "persistent ordinary and DFlash sessions; prefill restores the original multi-token GDR route with 64-row real-token chunks, INT16[B] call-local effective length, and no padding commit; only the final real prompt row executes the LM head; T=K+1 transactional verification uses the unchanged GDR-MTP ABI; optional Target W8A8 reuses the original QLinear while the Draft stays FP16; incremental Draft KV cache; no historical-prefix replay during verify; strict-greedy zero token mismatch"
+    "policy": "persistent ordinary and DFlash sessions; prefill uses the original multi-token GDR route with 64-row real-token chunks, INT16[B] call-local effective length, and no padding commit; only the final real prompt row executes the LM head; T=K+1 verification and accepted+1 scalar state commit both reuse the original chunk GDR from the same round-start state and do not require GDR-MTP; optional Target W8A8 reuses the original QLinear while the Draft stays FP16; incremental Draft KV cache; no historical-prefix replay during verify; strict-greedy zero token mismatch"
   },
   "npu_benchmark": {
     "runner_file": "models/dflash_v1/benchmark_npu.py",
-    "runner_sha256": "a244545da5e748d596f3319c40c33441e635cb50c3e19f9272a78575731ce3c6",
+    "runner_sha256": "f1832a595d5aaf4771b84d7f3e051ff6047a60ac3919735fc045312aba3c2077",
     "msprof_wrapper_file": "tools/run_msprof.sh",
     "msprof_wrapper_sha256": "a6e8e9f82ecab0c7c9cadf7d0d5713e25d449feb6a6c49a60a71300881392a69",
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "b5fdd64b1eaea44b3f53452bc260cf62de53ca38b1fcd8699bf4f9e358d99c76",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "6e82bc539482e86e153cab0b8993056d87658d67cf25cb7b3e4f22f13be9a3eb",
-    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks on the original GDR route with call-local effective length; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback"
+    "documentation_sha256": "164828a55c204691a534184ec58d144b709df2bb2769ed42bb3979db85e6b197",
+    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks and rollback verify/accepted+1 commit uses two original-GDR chunk calls; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback"
   }
 }
