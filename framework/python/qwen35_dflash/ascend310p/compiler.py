@@ -100,21 +100,88 @@ def _validated_custom_op_audit(graph: Mapping[str, Any]) -> list[dict[str, Any]]
     if not isinstance(raw, list):
         raise TypeError("AIR custom_op_audit must be a list")
     metadata = graph.get("metadata", {})
-    requires_audit = isinstance(metadata, Mapping) and bool(
-        metadata.get("custom_op_export_contract")
-    )
-    if requires_audit and not raw:
+    contract_items: list[Mapping[str, Any]] = []
+    if isinstance(metadata, Mapping):
+        plural = metadata.get("custom_op_export_contracts")
+        singular = metadata.get("custom_op_export_contract")
+        if plural is not None:
+            if not isinstance(plural, list) or not all(
+                isinstance(item, Mapping) for item in plural
+            ):
+                raise TypeError(
+                    "AIR custom_op_export_contracts must be a list of objects"
+                )
+            contract_items = list(plural)
+        elif singular is not None:
+            if not isinstance(singular, Mapping):
+                raise TypeError("AIR custom_op_export_contract must be an object")
+            contract_items = [singular]
+    if contract_items and not raw:
         raise ValueError("AIR graph requires a passing custom-operator audit")
+    contract_by_target: dict[str, Mapping[str, Any]] = {}
+    for item in contract_items:
+        target = str(item.get("torch_target", ""))
+        if not target or target in contract_by_target:
+            raise ValueError(
+                "AIR custom-operator contracts contain a missing or duplicate target"
+            )
+        contract_by_target[target] = item
+
     result: list[dict[str, Any]] = []
+    audit_targets: set[str] = set()
     for item in raw:
         if not isinstance(item, Mapping) or item.get("status") != "PASS":
             raise ValueError("AIR graph contains a non-passing custom-operator audit")
+        target = str(item.get("torch_target", ""))
+        if not target or target in audit_targets:
+            raise ValueError(
+                "AIR custom-operator audits contain a missing or duplicate target"
+            )
+        audit_targets.add(target)
         minimum = int(item.get("minimum_occurrences", 0))
-        converter_calls = int(item.get("converter_calls", 0))
         ge_nodes = int(item.get("ge_node_occurrences", 0))
-        if minimum < 1 or converter_calls < minimum or ge_nodes < converter_calls:
+        converter_policy = str(
+            item.get("converter_policy", "framework-registered-ge-ir")
+        )
+        if converter_policy not in {
+            "framework-registered-ge-ir",
+            "torchair-builtin",
+        }:
+            raise ValueError("AIR custom-operator converter policy is invalid")
+        if minimum < 0 or ge_nodes < minimum:
             raise ValueError("AIR custom-operator preservation counts are invalid")
+        raw_converter_calls = item.get("converter_calls")
+        if converter_policy == "torchair-builtin":
+            if raw_converter_calls is not None:
+                raise ValueError(
+                    "TorchAir builtin converter audit must use a null call count"
+                )
+        else:
+            converter_calls = int(
+                0 if raw_converter_calls is None else raw_converter_calls
+            )
+            if converter_calls < minimum or ge_nodes < converter_calls:
+                raise ValueError(
+                    "AIR custom-operator preservation counts are invalid"
+                )
         result.append(dict(item))
+    if contract_by_target and audit_targets != set(contract_by_target):
+        raise ValueError(
+            "AIR custom-operator audits do not cover every declared contract"
+        )
+    for item in result:
+        contract = contract_by_target.get(str(item["torch_target"]))
+        if contract is None:
+            continue
+        if (
+            str(item.get("ge_op_type", ""))
+            != str(contract.get("ge_op_type", ""))
+            or int(item.get("minimum_occurrences", 0))
+            != int(contract.get("minimum_occurrences", 1))
+        ):
+            raise ValueError(
+                "AIR custom-operator audit differs from its declared contract"
+            )
     return result
 
 

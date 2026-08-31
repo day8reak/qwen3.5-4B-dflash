@@ -74,30 +74,49 @@ row，并只按接受数提交一个 GDN/conv state-bank 槽；后者固定提�
 GDR 的物理序列仍为 64 行，但 `effective_length=[37]`；MTP verify 算子 ABI 不受这次改动影响。
 由于该字段是 INT16，`S` 不能超过 32767。
 
-### 2.1 `adn_rms_norm` 自定义算子保留合同
+### 2.1 全部自定义算子的 Fake/Meta 与 AIR 保留合同
 
-Target 的两个 modeling 文件继续直接调用 `torch_npu.adn_rms_norm`，没有加入 export-only Tensor
-公式分支。PyTorch FX 与 GE/AIR 使用不同的算子名称层级：
+两个 Target modeling 文件里的 `torch_npu.*` 调用保持原样，没有加入 export-only Tensor 公式
+分支。导出适配发生在模型加载之后、`dynamo_export` 之前：
 
 ```text
-torch_npu.adn_rms_norm
-        │ dispatcher schema: npu::adn_rms_norm(...)->(Tensor, Tensor)
-        │ Fake/Meta 只声明 shape/dtype，不计算 RMSNorm
+modeling 中的 torch_npu.<op>
+        │ 校验 npu::<op> dispatcher schema/alias
+        │ 校验已有 Meta，缺失时注册精确 Fake（只声明 shape/dtype/alias）
         ▼
-npu.adn_rms_norm.default（FX 节点）
-        │ TorchAir converter，一对一 lowering
+npu.<op>.default（FX 节点仍保留）
+        │ receiver-private converter 或已校验的 TorchAir builtin converter
         ▼
-RmsNorm（GE/AIR 单节点，默认）
+对应 GE/AIR 节点（dynamo.pbtxt 必须可审计）
 ```
 
-接收方实机已确认第一个输出与 input 同 shape/dtype，第二个输出为
-`[*input.shape[:-1],1] FP32`。框架按这个合同注册 Fake/Meta；Fake 代码只创建 meta tensor，正式
-NPU eager、AIR 和 OM 都不会执行它。converter 默认发出 CANN 已注册的 `RmsNorm` GE 节点，
-不会拆成 `square/mean/rsqrt/mul` 链。
+当前锁定的七个算子如下。`required` 表示当前完整前缀重算图必须实际出现，`optional` 表示仍做
+schema/Meta 预检，但不能虚构一次图命中。
 
-如果目标环境的私有算子包把同一 IR 注册成其他 GE type，例如 `AdnRmsNorm`，可以在
-`factory.json` 中显式设置 `adn_rms_norm_ge_op_type`。该值不会自动回退：指定的 GE IR 未注册、
-converter 没有命中或 `dynamo.pbtxt` 中没有该 type，导出都会失败，不会生成伪 PASS manifest。
+| 前端 FX target | Fake/Meta 输出合同 | 默认 GE type | converter | 当前图 |
+| --- | --- | --- | --- | --- |
+| `npu.npu_dynamic_quant.default` | INT8 输出与 input 同 shape；FP32 scale 为 `input.shape[:-1]` | `DynamicQuant` | TorchAir builtin | required |
+| `npu.npu_quant_matmul.default` | broadcast batch + `[M,N]`，当前调用输出 FP16 | `QuantBatchMatmulV3` | TorchAir builtin | required |
+| `npu.adn_rms_norm.default` | 输出 0 与 input 同 shape/dtype；输出 1 为 `[*input.shape[:-1],1]` FP32 | `RmsNorm` | 框架注册 | required |
+| `npu.npu_chunk_gated_delta_rule.default` | output 为 value shape/query dtype；final state 为 initial-state shape/FP32 | `ChunkGatedDeltaRule` | 框架注册 | required |
+| `npu.npu_cache_update_.default` | 返回同一个 `Tensor(a!)`，不能丢失写 alias | `CacheUpdate` | 框架注册 | required |
+| `npu.adn_fused_infer_attention.default` | 按 layout 推导；当前 packed `BNSD` 路径保持 query shape/FP16 | `FusedInferAttentionScore` | 框架映射 | required |
+| `npu.npu_scatter_nd_update_.default` | 返回同一个 `Tensor(a!)`，不能丢失写 alias | `ScatterNdUpdate` | TorchAir builtin | optional（仅 `forward1`） |
+
+GDR 的模型合同是 Q/K/V `[B,S,32,128]` FP16、g `[B,S,32]` FP32、beta
+`[B,S,32]` FP16、`effective_length [B]` INT16、initial/final state
+`[B,32,128,128]` FP32、输出 `[B,S,32,128]` FP16；当前导出必须设置
+`output_final_state=True`。`adn_fused_infer_attention` 的当前重算 lowering 还要求
+`all_seq_lengths_q == actual_seq_lengths_q`，不满足时在生成错误 AIR 前直接失败。
+
+Fake/Meta 不执行任何算子数值，正式 eager、AIR 和 OM 也不会执行 Fake。若 torch-npu 已有 Meta，
+框架先运行 shape/dtype/alias 探针并复用；只有缺失时才调用 `torch.library.register_fake`。任何 schema
+参数、kw-only 标志、返回个数或可变 alias 漂移都会提前失败。
+
+七个预期 GE type 都在 `factory.json` 中显式锁定。builtin converter 和当前 fused-attention 精确
+映射必须使用表中的 type；RMS/GDR/cache 只有在目标环境把同一参数顺序的 IR 正式注册为其他
+type 时才可改名。该值不会自动回退：指定 IR 未注册、converter 没有命中，或 `dynamo.pbtxt` 中
+required type 数为 0，导出都会失败，不会生成伪 PASS manifest。
 
 如果 `S=64`，则 `prompt_tokens + generated_tokens` 不能超过 64。需要更长上下文时重新编译
 `S=128/256/...`。当前重算路径的延迟随 `S` 增大，因此先使用能够覆盖验证 workload 的最小
@@ -202,7 +221,13 @@ cp config/quant_air_om_factory.example.json "$AI_RUN_DIR/factory.json"
   "pad_token_id": 0,
   "dtype": "float16",
   "device": "npu:0",
+  "npu_dynamic_quant_ge_op_type": "DynamicQuant",
+  "npu_quant_matmul_ge_op_type": "QuantBatchMatmulV3",
   "adn_rms_norm_ge_op_type": "RmsNorm",
+  "npu_chunk_gated_delta_rule_ge_op_type": "ChunkGatedDeltaRule",
+  "npu_cache_update_ge_op_type": "CacheUpdate",
+  "adn_fused_infer_attention_ge_op_type": "FusedInferAttentionScore",
+  "npu_scatter_nd_update_ge_op_type": "ScatterNdUpdate",
   "name": "quant_dflash_recompute"
 }
 ```
@@ -221,6 +246,10 @@ HIAI modeling、QLinear、DFlash 和 bridge；receiver wrapper 只复用原工�
 PYTHONDONTWRITEBYTECODE=1 \
   "$MODEL_PYTHON" -m pytest -q
 
+# 只重跑 AIR/Fake/Meta/manifest/ATC/C++ 合同测试
+PYTHONDONTWRITEBYTECODE=1 \
+  "$MODEL_PYTHON" -m pytest -q tests/test_quant_air_om_framework.py
+
 cmake -S framework/runtime/cpp \
   -B "$AI_RUN_DIR/build/cpp-host" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -230,8 +259,10 @@ cmake --build "$AI_RUN_DIR/build/cpp-host" --parallel
 ctest --test-dir "$AI_RUN_DIR/build/cpp-host" --output-on-failure
 ```
 
-通过标准：所有 Python 测试和两个 CTest 都通过。fake ACL 测试会编译生产
-`acl_executor.cpp`，但只证明 host 侧 buffer、调用顺序、scheduler 和 JSON 门禁。
+通过标准：所有 Python 测试和两个 CTest 都通过。框架专项测试会以 strict `torch.export`
+确认七个前端 target 可保留，其中 cache/scatter 还会检查 writable alias；这仍然只验证
+FakeTensor/图捕获元数据，不执行算子数值。fake ACL 测试会编译生产 `acl_executor.cpp`，但只证明
+host 侧 buffer、调用顺序、scheduler 和 JSON 门禁。
 
 ### 5.2 量化 PyTorch 图探针
 
@@ -290,7 +321,7 @@ from pathlib import Path
 root = Path(os.environ["AI_RUN_DIR"]) / "artifacts" / "quant-dflash"
 data = json.loads((root / "air-manifest.json").read_text())
 assert data["status"] == "PASS"
-assert data["schema_version"] == 2
+assert data["schema_version"] == 3
 assert len(data["graphs"]) == 1
 graph = data["graphs"][0]
 assert graph["name"] == "quant_dflash_recompute"
@@ -302,12 +333,35 @@ assert graph["metadata"]["gdr_effective_length_contract"] == \
     "INT16[B] call-local valid rows derived from attention_mask"
 assert graph["metadata"]["target_quant_mode"] == "w8a8_dynamic"
 audit = graph["custom_op_audit"]
-assert len(audit) == 1
-assert audit[0]["status"] == "PASS"
-assert audit[0]["torch_target"] == "npu.adn_rms_norm.default"
-assert audit[0]["ge_op_type"] == "RmsNorm"
-assert audit[0]["converter_calls"] > 0
-assert audit[0]["ge_node_occurrences"] > 0
+assert len(audit) == 7
+expected = {
+    "npu.npu_dynamic_quant.default": ("DynamicQuant", 1, "torchair-builtin"),
+    "npu.npu_quant_matmul.default": ("QuantBatchMatmulV3", 1, "torchair-builtin"),
+    "npu.adn_rms_norm.default": ("RmsNorm", 1, "framework-registered-ge-ir"),
+    "npu.npu_chunk_gated_delta_rule.default": (
+        "ChunkGatedDeltaRule", 1, "framework-registered-ge-ir"
+    ),
+    "npu.npu_cache_update_.default": (
+        "CacheUpdate", 1, "framework-registered-ge-ir"
+    ),
+    "npu.adn_fused_infer_attention.default": (
+        "FusedInferAttentionScore", 1, "framework-registered-ge-ir"
+    ),
+    "npu.npu_scatter_nd_update_.default": (
+        "ScatterNdUpdate", 0, "torchair-builtin"
+    ),
+}
+for item in audit:
+    ge_type, minimum, policy = expected[item["torch_target"]]
+    assert item["status"] == "PASS"
+    assert item["ge_op_type"] == ge_type
+    assert item["minimum_occurrences"] == minimum
+    assert item["converter_policy"] == policy
+    assert item["ge_node_occurrences"] >= minimum
+    if policy == "torchair-builtin":
+        assert item["converter_calls"] is None
+    else:
+        assert item["converter_calls"] >= minimum
 print("AIR manifest gate: PASS")
 PY
 ```
@@ -315,18 +369,19 @@ PY
 还可以直接检查 TorchAir 的可读 GE 图：
 
 ```bash
-rg -n 'type: "RmsNorm"' \
+rg -n 'type: "(DynamicQuant|QuantBatchMatmulV3|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|FusedInferAttentionScore|ScatterNdUpdate)"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
 ```
 
-至少应命中一次。这里检查的是 AIR 内部 GE type；`npu.adn_rms_norm.default` 是前端 FX 名称，
-不会原样作为 GE type 出现在 AIR。`air-manifest.json` 同时记录前端 converter 命中数和 GE 节点
-数，并要求 GE 节点数覆盖全部 converter 调用，共同证明这些调用没有被 export-only Tensor
-实现替换。
+前六个 required type 至少应各命中一次；固定重算图不经过 `forward1` 时，`ScatterNdUpdate` 可以
+不出现。这里检查的是 AIR 内部 GE type，`npu.*.default` 前端 FX 名称不会原样作为 GE type
+出现。`air-manifest.json` 对框架 converter 同时记录调用数和 GE 节点数；TorchAir builtin 没有被
+框架包装，所以其 `converter_calls` 为 `null`，只以 schema/Meta 探针和最终 GE 节点作为门禁。
 
 如果 `dynamo_export` 报 graph break，应保留完整 TorchAir 日志并定位首个不支持节点；不能用空
-AIR、伪文件或 CPU export 替代。若错误已从 FakeTensor 阶段推进到另一个自定义算子，应为那个
-算子单独确认 schema、真实输出元数据和 GE IR，不能套用 RMSNorm 的 Fake 合同。
+AIR、伪文件或 CPU export 替代。若仍出现 `does not support running with fake tensors`，先看错误中
+的完整 `npu.<op>.default`：本分支会预检上述七个 target，出现第八个算子表示 receiver 源码/算子
+包已经漂移，需要先锁定它的真实 schema、输出元数据和 GE IR，不能套用已有 Fake 合同。
 
 ## 7. AIR 编译成 OM
 
@@ -547,8 +602,10 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | 找不到 `export_model_wrapper_qwen3_5.py` | receiver 路径错误 | 修正 `receiver_models_dir` |
 | QLinear coverage mismatch | 量化权重与 Target topology 不同 | 核对 YAML、checkpoint revision 和 quant artifact |
 | `torch_npu`/TorchAir import 失败 | 环境不匹配 | 使用与 CANN/驱动匹配的声明环境 |
-| `unsupported operator: npu.adn_rms_norm.default` | 当前代码未加载 Fake/Meta 注册，或实际运行的不是本分支 | 核对远端提交、`PYTHONPATH` 和 `air-manifest` schema；不要改 modeling 为 Tensor fallback |
-| `GE IR ... is not registered` | `adn_rms_norm_ge_op_type` 与目标 CANN/自定义包不一致 | 默认使用 `RmsNorm`；私有 type 必须先由同一环境正式注册 |
+| `unsupported operator: npu.<op>.default` | 七算子预检未运行、实际代码不是本分支，或 receiver 新增了第八个算子 | 核对远端提交、`PYTHONPATH`；已覆盖清单见 2.1，不能用 modeling Tensor fallback 掩盖 |
+| `schema drifted from the locked export contract` | torch-npu/receiver 算子签名与当前锁不一致 | 记录 dispatcher schema；按真实版本更新 schema、Fake、converter 和测试，不能跳过校验 |
+| `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
+| `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |
 | TorchAir graph break | 某个 Python/自定义 op 未被捕获 | 定位首个 graph break，补正式 converter；不要伪造 AIR |
 | ATC unsupported op | TorchAir 图中存在 ATC 不支持节点 | 保留算子名和编译日志，决定分解或正式自定义算子 |

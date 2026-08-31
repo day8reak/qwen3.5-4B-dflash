@@ -155,7 +155,7 @@ def export_air_bundle(
         else f"{factory_callable.__module__}:{factory_callable.__qualname__}"
     )
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "artifact_kind": "qwen35-dflash-torchair-bundle",
         "status": "PASS",
         "factory": factory_name,

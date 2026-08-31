@@ -1,6 +1,6 @@
 {
-  "schema_version": 3,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v3",
+  "schema_version": 4,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v4",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -36,17 +36,85 @@
       "shape": ["B"],
       "semantics": "call-local logical valid rows; not physical S, cumulative KV length, or MTP accepted_tokens"
     },
-    "custom_operator_export": {
-      "frontend": "npu.adn_rms_norm.default",
-      "frontend_schema": "npu::adn_rms_norm(Tensor input, Tensor gamma, float epsilon=1e-6) -> (Tensor, Tensor)",
-      "fake_meta_outputs": [
-        "input shape/dtype/device",
-        "input.shape[:-1] + [1], float32, input device"
-      ],
-      "default_ge_op_type": "RmsNorm",
-      "lowering": "one registered GE operator; no Tensor decomposition",
-      "preservation_gate": "converter call count must be positive and dynamo.pbtxt GE-node count must cover every converter call"
-    },
+    "custom_operator_exports": [
+      {
+        "frontend": "npu.npu_dynamic_quant.default",
+        "frontend_schema": "npu::npu_dynamic_quant(Tensor input, *, Tensor? smooth_scales=None, Tensor? group_index=None, ScalarType? dst_type=None) -> (Tensor, Tensor)",
+        "fake_meta_outputs": [
+          "input shape, int8, input device",
+          "input.shape[:-1], float32, input device"
+        ],
+        "default_ge_op_type": "DynamicQuant",
+        "converter": "validated TorchAir builtin",
+        "minimum_occurrences": 1
+      },
+      {
+        "frontend": "npu.npu_quant_matmul.default",
+        "frontend_schema": "npu::npu_quant_matmul(Tensor x1, Tensor x2, Tensor scale, *, Tensor? offset=None, Tensor? pertoken_scale=None, Tensor? bias=None, ScalarType? output_dtype=None, SymInt[]? group_sizes=None) -> Tensor",
+        "fake_meta_outputs": [
+          "broadcast batch + [x1[-2], x2[-1]], requested output dtype, input device"
+        ],
+        "default_ge_op_type": "QuantBatchMatmulV3",
+        "converter": "validated TorchAir builtin",
+        "minimum_occurrences": 1
+      },
+      {
+        "frontend": "npu.adn_rms_norm.default",
+        "frontend_schema": "npu::adn_rms_norm(Tensor input, Tensor gamma, float epsilon=1e-6) -> (Tensor, Tensor)",
+        "fake_meta_outputs": [
+          "input shape/dtype/device",
+          "input.shape[:-1] + [1], float32, input device"
+        ],
+        "default_ge_op_type": "RmsNorm",
+        "converter": "framework registered GE IR",
+        "minimum_occurrences": 1
+      },
+      {
+        "frontend": "npu.npu_chunk_gated_delta_rule.default",
+        "frontend_schema": "npu::npu_chunk_gated_delta_rule(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, Tensor effective_length, int chunk_size=64, Tensor? initial_state=None, bool output_final_state=False, bool use_qk_l2norm_in_kernel=False) -> (Tensor, Tensor)",
+        "fake_meta_outputs": [
+          "value shape, query dtype/device",
+          "initial_state shape, float32, input device"
+        ],
+        "constraints": "locked route requires output_final_state=true; effective_length is int16[B]",
+        "default_ge_op_type": "ChunkGatedDeltaRule",
+        "converter": "framework registered GE IR",
+        "minimum_occurrences": 1
+      },
+      {
+        "frontend": "npu.npu_cache_update_.default",
+        "frontend_schema": "npu::npu_cache_update_(Tensor(a!) input, Tensor updates, Tensor target_block, Tensor offset_in_block) -> Tensor(a!)",
+        "fake_meta_outputs": [
+          "the same aliased input Tensor(a!)"
+        ],
+        "default_ge_op_type": "CacheUpdate",
+        "converter": "framework registered GE IR",
+        "minimum_occurrences": 1
+      },
+      {
+        "frontend": "npu.adn_fused_infer_attention.default",
+        "frontend_schema": "npu::adn_fused_infer_attention(Tensor query, Tensor[] key, Tensor[] value, *, Tensor? pse_shift=None, Tensor? atten_mask=None, SymInt[]? all_seq_lengths_q=None, SymInt[]? actual_seq_lengths_q=None, SymInt[]? actual_seq_lengths_kv=None, Tensor? dequant_scale1=None, Tensor? quant_scale1=None, Tensor? dequant_scale2=None, Tensor? quant_scale2=None, Tensor? quant_offset2=None, Tensor? antiquant_scale=None, Tensor? antiquant_offset=None, Tensor? block_table=None, Tensor? kv_padding_size=None, int num_heads=1, float scale_value=1., str input_layout=\"BSH\", int num_key_value_heads=0, int block_size=0, int inner_precise=1) -> Tensor",
+        "fake_meta_outputs": [
+          "layout-derived attention output shape and receiver dtype rule"
+        ],
+        "constraints": "current recompute lowering requires all_seq_lengths_q to equal actual_seq_lengths_q",
+        "default_ge_op_type": "FusedInferAttentionScore",
+        "converter": "framework mapping to registered GE IR",
+        "minimum_occurrences": 1
+      },
+      {
+        "frontend": "npu.npu_scatter_nd_update_.default",
+        "frontend_schema": "npu::npu_scatter_nd_update_(Tensor(a!) input, Tensor indices, Tensor updates) -> Tensor(a!)",
+        "fake_meta_outputs": [
+          "the same aliased input Tensor(a!)"
+        ],
+        "default_ge_op_type": "ScatterNdUpdate",
+        "converter": "validated TorchAir builtin",
+        "minimum_occurrences": 0,
+        "optional_reason": "forward1 is not selected by the fixed recompute graph"
+      }
+    ],
+    "custom_operator_preservation_gate": "all seven schemas and Meta contracts must validate; required paths need their declared dynamo.pbtxt GE-node counts, and framework converters also need matching call counts",
     "state_policy": "recompute committed prefix"
   },
   "compiler": {

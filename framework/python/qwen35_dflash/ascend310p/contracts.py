@@ -36,9 +36,9 @@ class CustomOpExportSpec:
         if (
             isinstance(self.minimum_occurrences, bool)
             or not isinstance(self.minimum_occurrences, int)
-            or self.minimum_occurrences < 1
+            or self.minimum_occurrences < 0
         ):
-            raise ValueError("minimum_occurrences must be a positive integer")
+            raise ValueError("minimum_occurrences must be a non-negative integer")
 
     @property
     def torch_target(self) -> str:

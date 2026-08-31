@@ -18,11 +18,26 @@ FRAMEWORK_PYTHON = ROOT / "framework" / "python"
 if str(FRAMEWORK_PYTHON) not in sys.path:
     sys.path.insert(0, str(FRAMEWORK_PYTHON))
 
-from qwen35_dflash.ascend310p.compiler import compile_air_bundle
+from qwen35_dflash.ascend310p.compiler import (
+    _validated_custom_op_audit,
+    compile_air_bundle,
+)
 from qwen35_dflash.ascend310p.contracts import AirGraphSpec, CustomOpExportSpec
 from qwen35_dflash.ascend310p.custom_op_export import (
+    ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+    ADN_FUSED_INFER_ATTENTION_TORCH_OP,
     ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
     ADN_RMS_NORM_TORCH_OP,
+    NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
+    NPU_CACHE_UPDATE_TORCH_OP,
+    NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+    NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+    NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
+    NPU_DYNAMIC_QUANT_TORCH_OP,
+    NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+    NPU_QUANT_MATMUL_TORCH_OP,
+    NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
+    NPU_SCATTER_ND_UPDATE_TORCH_OP,
     audit_custom_op_export,
     prepare_custom_op_export,
 )
@@ -45,17 +60,74 @@ from models.dflash_v1 import dflash_ascend310p_ops as golden_ops
 _TEST_OPERATOR_LIBRARIES: list[torch.library.Library] = []
 
 
-def _ensure_adn_rms_norm_test_schema() -> object:
+_TARGET_TEST_SCHEMAS = {
+    "adn_fused_infer_attention": (
+        "adn_fused_infer_attention("
+        "Tensor query, Tensor[] key, Tensor[] value, *, "
+        "Tensor? pse_shift=None, Tensor? atten_mask=None, "
+        "SymInt[]? all_seq_lengths_q=None, "
+        "SymInt[]? actual_seq_lengths_q=None, "
+        "SymInt[]? actual_seq_lengths_kv=None, "
+        "Tensor? dequant_scale1=None, Tensor? quant_scale1=None, "
+        "Tensor? dequant_scale2=None, Tensor? quant_scale2=None, "
+        "Tensor? quant_offset2=None, Tensor? antiquant_scale=None, "
+        "Tensor? antiquant_offset=None, Tensor? block_table=None, "
+        "Tensor? kv_padding_size=None, int num_heads=1, "
+        'float scale_value=1., str input_layout="BSH", '
+        "int num_key_value_heads=0, int block_size=0, int inner_precise=1"
+        ") -> Tensor"
+    ),
+    "adn_rms_norm": (
+        "adn_rms_norm(Tensor input, Tensor gamma, float epsilon=1e-6) "
+        "-> (Tensor, Tensor)"
+    ),
+    "npu_cache_update_": (
+        "npu_cache_update_(Tensor(a!) input, Tensor updates, "
+        "Tensor target_block, Tensor offset_in_block) -> Tensor(a!)"
+    ),
+    "npu_chunk_gated_delta_rule": (
+        "npu_chunk_gated_delta_rule("
+        "Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
+        "Tensor effective_length, int chunk_size=64, "
+        "Tensor? initial_state=None, bool output_final_state=False, "
+        "bool use_qk_l2norm_in_kernel=False) -> (Tensor, Tensor)"
+    ),
+    "npu_dynamic_quant": (
+        "npu_dynamic_quant(Tensor input, *, Tensor? smooth_scales=None, "
+        "Tensor? group_index=None, ScalarType? dst_type=None) "
+        "-> (Tensor, Tensor)"
+    ),
+    "npu_quant_matmul": (
+        "npu_quant_matmul(Tensor x1, Tensor x2, Tensor scale, *, "
+        "Tensor? offset=None, Tensor? pertoken_scale=None, Tensor? bias=None, "
+        "ScalarType? output_dtype=None, SymInt[]? group_sizes=None) -> Tensor"
+    ),
+    "npu_scatter_nd_update_": (
+        "npu_scatter_nd_update_(Tensor(a!) input, Tensor indices, "
+        "Tensor updates) -> Tensor(a!)"
+    ),
+}
+
+
+def _ensure_target_test_schema(name: str) -> object:
     try:
-        return torch.ops.npu.adn_rms_norm.default
+        return getattr(getattr(torch.ops.npu, name), "default")
     except AttributeError:
         library = torch.library.Library("npu", "FRAGMENT")
-        library.define(
-            "adn_rms_norm(Tensor input, Tensor gamma, float epsilon=1e-6) "
-            "-> (Tensor, Tensor)"
-        )
+        library.define(_TARGET_TEST_SCHEMAS[name])
         _TEST_OPERATOR_LIBRARIES.append(library)
-        return torch.ops.npu.adn_rms_norm.default
+        return getattr(getattr(torch.ops.npu, name), "default")
+
+
+def _ensure_adn_rms_norm_test_schema() -> object:
+    return _ensure_target_test_schema("adn_rms_norm")
+
+
+def _ensure_all_target_test_schemas() -> dict[str, object]:
+    return {
+        name: _ensure_target_test_schema(name)
+        for name in _TARGET_TEST_SCHEMAS
+    }
 
 
 class _FakeTorchAirGeAttr:
@@ -63,17 +135,44 @@ class _FakeTorchAirGeAttr:
     def Float(value: float) -> tuple[str, float]:
         return ("float", value)
 
+    @staticmethod
+    def Int(value: int) -> tuple[str, int]:
+        return ("int", value)
+
+    @staticmethod
+    def Str(value: str) -> tuple[str, str]:
+        return ("str", value)
+
+
+class _FakeTorchAirGeDataType:
+    DT_INT64 = "DT_INT64"
+
 
 class _FakeTorchAirGe:
     attr = _FakeTorchAirGeAttr()
+    DataType = _FakeTorchAirGeDataType()
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.calls: list[
+            tuple[str, tuple[object, ...], dict[str, object]]
+        ] = []
+
+    @staticmethod
+    def Const(value: object, *, dtype: object) -> tuple[str, object, object]:
+        return ("const", value, dtype)
 
     def custom_op(self, op_type: str, *args: object, **kwargs: object):
-        del kwargs
-        self.calls.append((op_type, args))
-        return object(), object()
+        self.calls.append((op_type, args, dict(kwargs)))
+        output_count = len(kwargs.get("outputs", ()))
+        if output_count:
+            values = tuple(object() for _ in range(output_count))
+            return values[0] if output_count == 1 else values
+        if op_type in {
+            ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+            NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+        }:
+            return object(), object()
+        return object()
 
 
 class _FakeTorchAir:
@@ -81,13 +180,15 @@ class _FakeTorchAir:
 
     def __init__(self) -> None:
         self.ge = _FakeTorchAirGe()
-        self.converter = None
+        self.converters: dict[object, object] = {}
+
+    @property
+    def converter(self):
+        return self.converters.get(torch.ops.npu.adn_rms_norm.default)
 
     def register_fx_node_ge_converter(self, operation: object):
-        assert operation is torch.ops.npu.adn_rms_norm.default
-
         def register(converter):
-            self.converter = converter
+            self.converters[operation] = converter
             return converter
 
         return register
@@ -102,8 +203,9 @@ class _FakeTorchAir:
         **kwargs: object,
     ) -> None:
         del args, model, dynamic, kwargs
-        assert self.converter is not None
-        self.converter(object(), object(), 1e-6, meta_outputs=(object(), object()))
+        converter = self.converter
+        assert converter is not None
+        converter(object(), object(), 1e-6, meta_outputs=(object(), object()))
         root = Path(export_path)
         (root / f"{export_name}.air").write_bytes(b"air")
         (root / "dynamo.pbtxt").write_text(
@@ -240,6 +342,326 @@ def test_adn_rms_norm_fake_keeps_frontend_operator_in_export() -> None:
     }
 
 
+def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
+    operations = _ensure_all_target_test_schemas()
+    torchair = _FakeTorchAir()
+    specs = (
+        CustomOpExportSpec(
+            ADN_FUSED_INFER_ATTENTION_TORCH_OP,
+            ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+        ),
+        CustomOpExportSpec(
+            ADN_RMS_NORM_TORCH_OP,
+            ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+        ),
+        CustomOpExportSpec(
+            NPU_CACHE_UPDATE_TORCH_OP,
+            NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
+        ),
+        CustomOpExportSpec(
+            NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+            NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+        ),
+        CustomOpExportSpec(
+            NPU_DYNAMIC_QUANT_TORCH_OP,
+            NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
+        ),
+        CustomOpExportSpec(
+            NPU_QUANT_MATMUL_TORCH_OP,
+            NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+        ),
+        CustomOpExportSpec(
+            NPU_SCATTER_ND_UPDATE_TORCH_OP,
+            NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
+            minimum_occurrences=0,
+        ),
+    )
+    sessions = tuple(
+        prepare_custom_op_export(spec, torchair) for spec in specs
+    )
+    assert all(
+        session.fake_kernel
+        in {"framework-registered-fake", "preexisting-meta-kernel"}
+        for session in sessions
+    )
+    policies = {
+        session.spec.torch_op: session.converter_policy
+        for session in sessions
+    }
+    assert policies == {
+        ADN_FUSED_INFER_ATTENTION_TORCH_OP: "framework-registered-ge-ir",
+        ADN_RMS_NORM_TORCH_OP: "framework-registered-ge-ir",
+        NPU_CACHE_UPDATE_TORCH_OP: "framework-registered-ge-ir",
+        NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP: "framework-registered-ge-ir",
+        NPU_DYNAMIC_QUANT_TORCH_OP: "torchair-builtin",
+        NPU_QUANT_MATMUL_TORCH_OP: "torchair-builtin",
+        NPU_SCATTER_ND_UPDATE_TORCH_OP: "torchair-builtin",
+    }
+    assert set(torchair.converters) == {
+        operations["adn_fused_infer_attention"],
+        operations["adn_rms_norm"],
+        operations["npu_cache_update_"],
+        operations["npu_chunk_gated_delta_rule"],
+    }
+
+    placeholder = object()
+    torchair.converters[operations["npu_chunk_gated_delta_rule"]](
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        64,
+        placeholder,
+        True,
+        False,
+        meta_outputs=(placeholder, placeholder),
+    )
+    torchair.converters[operations["npu_cache_update_"]](*([placeholder] * 4))
+    torchair.converters[operations["adn_fused_infer_attention"]](
+        placeholder,
+        [placeholder],
+        [placeholder],
+        all_seq_lengths_q=[3],
+        actual_seq_lengths_q=[3],
+        actual_seq_lengths_kv=[64],
+        num_heads=16,
+        scale_value=0.125,
+        input_layout="BNSD",
+        num_key_value_heads=4,
+        block_size=64,
+        inner_precise=2,
+    )
+    assert {
+        call[0] for call in torchair.ge.calls
+    } >= {
+        ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+        NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
+        NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+    }
+
+
+def test_gdr_fake_keeps_frontend_operator_in_strict_export() -> None:
+    operation = _ensure_target_test_schema("npu_chunk_gated_delta_rule")
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+            NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+        ),
+        _FakeTorchAir(),
+    )
+
+    class UsesGdr(nn.Module):
+        def forward(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            gate: torch.Tensor,
+            beta: torch.Tensor,
+            effective_length: torch.Tensor,
+            state: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return operation(
+                query,
+                key,
+                value,
+                gate,
+                beta,
+                effective_length,
+                64,
+                state,
+                True,
+                False,
+            )
+
+    query = torch.randn(1, 64, 2, 8, dtype=torch.float16)
+    exported = torch.export.export(
+        UsesGdr(),
+        (
+            query,
+            query.clone(),
+            torch.randn(1, 64, 2, 16, dtype=torch.float16),
+            torch.randn(1, 64, 2, dtype=torch.float32),
+            torch.randn(1, 64, 2, dtype=torch.float16),
+            torch.tensor([64], dtype=torch.int16),
+            torch.randn(1, 2, 8, 16, dtype=torch.float32),
+        ),
+        strict=True,
+    )
+    targets = [str(node.target) for node in exported.graph.nodes]
+    assert "npu.npu_chunk_gated_delta_rule.default" in targets
+
+
+def test_fused_attention_fake_keeps_frontend_operator_in_strict_export() -> None:
+    operation = _ensure_target_test_schema("adn_fused_infer_attention")
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            ADN_FUSED_INFER_ATTENTION_TORCH_OP,
+            ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+        ),
+        _FakeTorchAir(),
+    )
+
+    class UsesFusedAttention(nn.Module):
+        def forward(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            mask: torch.Tensor,
+            block_table: torch.Tensor,
+        ) -> torch.Tensor:
+            return operation(
+                query,
+                [key],
+                [value],
+                atten_mask=mask,
+                all_seq_lengths_q=[3],
+                actual_seq_lengths_q=[3],
+                actual_seq_lengths_kv=[64],
+                block_table=block_table,
+                num_heads=16,
+                scale_value=0.125,
+                input_layout="BNSD",
+                num_key_value_heads=4,
+                block_size=64,
+                inner_precise=2,
+            )
+
+    exported = torch.export.export(
+        UsesFusedAttention(),
+        (
+            torch.randn(1, 256, 3, 16, dtype=torch.float16),
+            torch.randn(1, 64, 64, 16, dtype=torch.float16),
+            torch.randn(1, 64, 64, 16, dtype=torch.float16),
+            torch.zeros(1, 1, 3, 64, dtype=torch.float16),
+            torch.zeros(1, 1, dtype=torch.int32),
+        ),
+        strict=True,
+    )
+    targets = [str(node.target) for node in exported.graph.nodes]
+    assert "npu.adn_fused_infer_attention.default" in targets
+
+
+def test_w8a8_fakes_keep_dynamic_quant_and_quant_matmul_in_export() -> None:
+    dynamic_quant = _ensure_target_test_schema("npu_dynamic_quant")
+    quant_matmul = _ensure_target_test_schema("npu_quant_matmul")
+    torchair = _FakeTorchAir()
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            NPU_DYNAMIC_QUANT_TORCH_OP,
+            NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
+        ),
+        torchair,
+    )
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            NPU_QUANT_MATMUL_TORCH_OP,
+            NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+        ),
+        torchair,
+    )
+
+    class UsesW8A8Ops(nn.Module):
+        def forward(
+            self,
+            value: torch.Tensor,
+            weight: torch.Tensor,
+            scale: torch.Tensor,
+        ) -> torch.Tensor:
+            quantized, pertoken = dynamic_quant(value)
+            return quant_matmul(
+                quantized,
+                weight,
+                scale,
+                pertoken_scale=pertoken.reshape(-1),
+                output_dtype=torch.float16,
+            )
+
+    exported = torch.export.export(
+        UsesW8A8Ops(),
+        (
+            torch.randn(1, 3, 8, dtype=torch.float16),
+            torch.randint(-8, 8, (8, 5), dtype=torch.int8),
+            torch.randn(5, dtype=torch.float32),
+        ),
+        strict=True,
+    )
+    targets = [str(node.target) for node in exported.graph.nodes]
+    assert "npu.npu_dynamic_quant.default" in targets
+    assert "npu.npu_quant_matmul.default" in targets
+
+
+def test_mutable_fakes_keep_cache_and_scatter_alias_ops_in_export() -> None:
+    cache_update = _ensure_target_test_schema("npu_cache_update_")
+    scatter_update = _ensure_target_test_schema("npu_scatter_nd_update_")
+    torchair = _FakeTorchAir()
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            NPU_CACHE_UPDATE_TORCH_OP,
+            NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
+        ),
+        torchair,
+    )
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            NPU_SCATTER_ND_UPDATE_TORCH_OP,
+            NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
+            minimum_occurrences=0,
+        ),
+        torchair,
+    )
+
+    class UsesCacheUpdate(nn.Module):
+        def forward(
+            self,
+            cache: torch.Tensor,
+            updates: torch.Tensor,
+            block: torch.Tensor,
+            offset: torch.Tensor,
+        ) -> torch.Tensor:
+            cache_update(cache, updates, block, offset)
+            return cache
+
+    class UsesScatterUpdate(nn.Module):
+        def forward(
+            self,
+            cache: torch.Tensor,
+            indices: torch.Tensor,
+            updates: torch.Tensor,
+        ) -> torch.Tensor:
+            scatter_update(cache, indices, updates)
+            return cache
+
+    cache_export = torch.export.export(
+        UsesCacheUpdate(),
+        (
+            torch.zeros(4, 64, 64, 16, dtype=torch.float16),
+            torch.zeros(1, 64, 16, dtype=torch.float16),
+            torch.zeros(1, dtype=torch.int32),
+            torch.zeros((), dtype=torch.int32),
+        ),
+        strict=True,
+    )
+    scatter_export = torch.export.export(
+        UsesScatterUpdate(),
+        (
+            torch.zeros(8, 2, 4, dtype=torch.float16),
+            torch.zeros(2, dtype=torch.int64),
+            torch.zeros(2, 2, 4, dtype=torch.float16),
+        ),
+        strict=True,
+    )
+    assert "npu.npu_cache_update_.default" in {
+        str(node.target) for node in cache_export.graph.nodes
+    }
+    assert "npu.npu_scatter_nd_update_.default" in {
+        str(node.target) for node in scatter_export.graph.nodes
+    }
+
+
 def test_air_export_audits_retained_adn_rms_norm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -275,7 +697,7 @@ def test_air_export_audits_retained_adn_rms_norm(
     )
     graph = result["graphs"][0]
     audit = graph["custom_op_audit"][0]
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
     assert audit["status"] == "PASS"
     assert audit["torch_target"] == "npu.adn_rms_norm.default"
     assert audit["ge_op_type"] == "RmsNorm"
@@ -306,8 +728,40 @@ def test_custom_op_audit_rejects_missing_ge_node(tmp_path: Path) -> None:
         'op {\n  name: "wrong"\n  type: "Mul"\n}\n',
         encoding="utf-8",
     )
-    with pytest.raises(RuntimeError, match="converter calls"):
+    with pytest.raises(RuntimeError, match="TorchAir IR contains"):
         audit_custom_op_export((session,), graph_dir, relative_to=tmp_path)
+
+
+def test_compiler_rejects_incomplete_declared_custom_op_audit() -> None:
+    graph = {
+        "metadata": {
+            "custom_op_export_contracts": [
+                {
+                    "torch_target": "npu.adn_rms_norm.default",
+                    "ge_op_type": "RmsNorm",
+                    "minimum_occurrences": 1,
+                },
+                {
+                    "torch_target": "npu.npu_chunk_gated_delta_rule.default",
+                    "ge_op_type": "ChunkGatedDeltaRule",
+                    "minimum_occurrences": 1,
+                },
+            ]
+        },
+        "custom_op_audit": [
+            {
+                "status": "PASS",
+                "torch_target": "npu.adn_rms_norm.default",
+                "ge_op_type": "RmsNorm",
+                "minimum_occurrences": 1,
+                "converter_policy": "framework-registered-ge-ir",
+                "converter_calls": 1,
+                "ge_node_occurrences": 1,
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="every declared contract"):
+        _validated_custom_op_audit(graph)
 
 
 def test_default_factory_is_quant_branch_factory() -> None:
@@ -470,7 +924,7 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
     pbtxt = graph_dir / "dynamo.pbtxt"
     pbtxt.write_text('op { type: "RmsNorm" }\n', encoding="utf-8")
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "artifact_kind": "qwen35-dflash-torchair-bundle",
         "status": "PASS",
         "graphs": [
@@ -480,10 +934,17 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
                 "input_names": ["input_ids", "attention_mask"],
                 "output_names": ["target_top1", "draft_top1"],
                 "metadata": {
-                    "custom_op_export_contract": {
-                        "torch_target": "npu.adn_rms_norm.default",
-                        "ge_op_type": "RmsNorm",
-                    }
+                    "custom_op_export_contracts": [
+                        {
+                            "torch_target": "npu.adn_rms_norm.default",
+                            "ge_op_type": "RmsNorm",
+                        },
+                        {
+                            "torch_target": "npu.npu_scatter_nd_update_.default",
+                            "ge_op_type": "ScatterNdUpdate",
+                            "minimum_occurrences": 0,
+                        },
+                    ]
                 },
                 "custom_op_audit": [
                     {
@@ -491,9 +952,19 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
                         "torch_target": "npu.adn_rms_norm.default",
                         "ge_op_type": "RmsNorm",
                         "minimum_occurrences": 1,
+                        "converter_policy": "framework-registered-ge-ir",
                         "converter_calls": 1,
                         "ge_node_occurrences": 1,
-                    }
+                    },
+                    {
+                        "status": "PASS",
+                        "torch_target": "npu.npu_scatter_nd_update_.default",
+                        "ge_op_type": "ScatterNdUpdate",
+                        "minimum_occurrences": 0,
+                        "converter_policy": "torchair-builtin",
+                        "converter_calls": None,
+                        "ge_node_occurrences": 0,
+                    },
                 ],
                 "air": {
                     "path": "air/quant_dflash_recompute/quant_dflash_recompute.air",
@@ -537,6 +1008,7 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
         atc_identity="fake-atc",
     )
     assert result["status"] == "PASS"
+    assert len(result["graphs"][0]["custom_op_audit"]) == 2
     assert result["graphs"][0]["custom_op_audit"][0]["status"] == "PASS"
     assert commands[0][1:3] == ["--mode=0", "--framework=1"]
     assert commands[0][-1] == "--soc_version=Ascend310P3"
@@ -718,9 +1190,26 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
     )
     assert spec.metadata["quant_source_lock"]["verified_file_count"] >= 10
     assert spec.metadata["target_checkpoint_manifest_sha256"]
-    assert len(spec.custom_ops) == 1
-    assert spec.custom_ops[0].torch_target == "npu.adn_rms_norm.default"
-    assert spec.custom_ops[0].ge_op_type == "RmsNorm"
+    assert len(spec.custom_ops) == 7
+    assert {
+        item.torch_target: (item.ge_op_type, item.minimum_occurrences)
+        for item in spec.custom_ops
+    } == {
+        "npu.npu_dynamic_quant.default": ("DynamicQuant", 1),
+        "npu.npu_quant_matmul.default": ("QuantBatchMatmulV3", 1),
+        "npu.adn_rms_norm.default": ("RmsNorm", 1),
+        "npu.npu_chunk_gated_delta_rule.default": (
+            "ChunkGatedDeltaRule",
+            1,
+        ),
+        "npu.npu_cache_update_.default": ("CacheUpdate", 1),
+        "npu.adn_fused_infer_attention.default": (
+            "FusedInferAttentionScore",
+            1,
+        ),
+        "npu.npu_scatter_nd_update_.default": ("ScatterNdUpdate", 0),
+    }
+    assert len(spec.metadata["custom_op_export_contracts"]) == 7
     assert spec.input_names == ("input_ids", "attention_mask")
     assert spec.output_names == ("target_top1", "draft_top1")
 

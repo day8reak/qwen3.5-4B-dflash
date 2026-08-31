@@ -31,8 +31,20 @@ import torch.nn.functional as F
 
 from .contracts import AirGraphSpec, CustomOpExportSpec
 from .custom_op_export import (
+    ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+    ADN_FUSED_INFER_ATTENTION_TORCH_OP,
     ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
     ADN_RMS_NORM_TORCH_OP,
+    NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
+    NPU_CACHE_UPDATE_TORCH_OP,
+    NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+    NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+    NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
+    NPU_DYNAMIC_QUANT_TORCH_OP,
+    NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+    NPU_QUANT_MATMUL_TORCH_OP,
+    NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
+    NPU_SCATTER_ND_UPDATE_TORCH_OP,
 )
 from .integrated import (
     enable_padded_draft_context,
@@ -41,7 +53,7 @@ from .integrated import (
 
 
 QUANT_BASE_REVISION = "28f93e784a2beed87020a80bd93c8788754eab1c"
-QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v3"
+QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v4"
 _TARGET_GDN_CHUNK = 64
 _GDR_EFFECTIVE_LENGTH_MAX = torch.iinfo(torch.int16).max
 _DTYPES = {"float16": torch.float16}
@@ -384,13 +396,73 @@ def create_quant_recompute_graph(
     device = str(config.get("device", "npu:0"))
     if not device.startswith("npu"):
         raise ValueError("formal quant AIR export requires an explicit NPU device")
-    adn_rms_norm_export = CustomOpExportSpec(
-        torch_op=ADN_RMS_NORM_TORCH_OP,
-        ge_op_type=str(
-            config.get(
-                "adn_rms_norm_ge_op_type",
-                ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
-            )
+    custom_op_exports = (
+        CustomOpExportSpec(
+            torch_op=NPU_DYNAMIC_QUANT_TORCH_OP,
+            ge_op_type=str(
+                config.get(
+                    "npu_dynamic_quant_ge_op_type",
+                    NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
+                )
+            ),
+        ),
+        CustomOpExportSpec(
+            torch_op=NPU_QUANT_MATMUL_TORCH_OP,
+            ge_op_type=str(
+                config.get(
+                    "npu_quant_matmul_ge_op_type",
+                    NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+                )
+            ),
+        ),
+        CustomOpExportSpec(
+            torch_op=ADN_RMS_NORM_TORCH_OP,
+            ge_op_type=str(
+                config.get(
+                    "adn_rms_norm_ge_op_type",
+                    ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+                )
+            ),
+        ),
+        CustomOpExportSpec(
+            torch_op=NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+            ge_op_type=str(
+                config.get(
+                    "npu_chunk_gated_delta_rule_ge_op_type",
+                    NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+                )
+            ),
+        ),
+        CustomOpExportSpec(
+            torch_op=NPU_CACHE_UPDATE_TORCH_OP,
+            ge_op_type=str(
+                config.get(
+                    "npu_cache_update_ge_op_type",
+                    NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
+                )
+            ),
+        ),
+        CustomOpExportSpec(
+            torch_op=ADN_FUSED_INFER_ATTENTION_TORCH_OP,
+            ge_op_type=str(
+                config.get(
+                    "adn_fused_infer_attention_ge_op_type",
+                    ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+                )
+            ),
+        ),
+        # forward1 is not selected by the fixed recompute graph, but its
+        # schema/Meta contract must still be valid if that receiver path is
+        # enabled later. Zero means preflight it without inventing a graph hit.
+        CustomOpExportSpec(
+            torch_op=NPU_SCATTER_ND_UPDATE_TORCH_OP,
+            ge_op_type=str(
+                config.get(
+                    "npu_scatter_nd_update_ge_op_type",
+                    NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
+                )
+            ),
+            minimum_occurrences=0,
         ),
     )
     target_dir = _required_directory(config, "target_dir")
@@ -512,11 +584,19 @@ def create_quant_recompute_graph(
         "gdr_effective_length_contract": (
             "INT16[B] call-local valid rows derived from attention_mask"
         ),
-        "custom_op_export_contract": {
-            "torch_target": adn_rms_norm_export.torch_target,
-            "ge_op_type": adn_rms_norm_export.ge_op_type,
-            "preservation": "one registered GE operator; no Tensor decomposition",
-        },
+        "custom_op_export_contracts": [
+            {
+                "torch_target": item.torch_target,
+                "ge_op_type": item.ge_op_type,
+                "minimum_occurrences": item.minimum_occurrences,
+                "preservation": (
+                    "one registered GE operator; no Tensor decomposition"
+                    if item.minimum_occurrences
+                    else "optional path: validate metadata without requiring a graph node"
+                ),
+            }
+            for item in custom_op_exports
+        ],
         "claim_boundary": (
             "fixed-gear recompute ABI; persistent rollback OM state is a "
             "separate later optimization"
@@ -532,7 +612,7 @@ def create_quant_recompute_graph(
             device=device,
             name=str(config.get("name", "quant_dflash_recompute")),
             metadata=metadata,
-            custom_ops=(adn_rms_norm_export,),
+            custom_ops=custom_op_exports,
         ),
     )
 

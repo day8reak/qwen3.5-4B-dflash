@@ -15,7 +15,8 @@ Qwen3.5 DFlash port，不是 z-lab/dflash 全部 generation API 的逐行复制�
 和 FP16 Draft 导出 TorchAir AIR，通过 ATC 生成 OM，并由 C++ AscendCL runner 加载 OM、
 循环生成 token。入口和完整验证方法见
 [基于 quant 的 AIR/OM/C++ 框架](docs/QUANT_AIR_OM_FRAMEWORK.md)。第一版 OM 使用静态完整前缀
-重算来冻结功能 ABI；现有 persistent rollback 仍是后续增量 OM 状态 ABI 的语义基线。
+重算来冻结功能 ABI；AIR 入口会预检并保留 Target modeling 的七个 torch-npu 自定义算子，
+现有 persistent rollback 仍是后续增量 OM 状态 ABI 的语义基线。
 
 ## 当前实现
 
