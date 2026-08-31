@@ -36,9 +36,10 @@ from .integrated import (
 )
 
 
-QUANT_BASE_REVISION = "5c61f110a007820ee6df564f87b9c8d1d2733ba5"
-QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v1"
+QUANT_BASE_REVISION = "28f93e784a2beed87020a80bd93c8788754eab1c"
+QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v2"
 _TARGET_GDN_CHUNK = 64
+_GDR_EFFECTIVE_LENGTH_MAX = torch.iinfo(torch.int16).max
 _DTYPES = {"float16": torch.float16}
 
 
@@ -312,10 +313,17 @@ class QuantFullPrefixExportTarget(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         # The physical gear is always fully executed. Right-padding comes
         # after every valid token, so causal Target rows inside the valid
-        # prefix cannot depend on padding. The mask is consumed by the Draft
-        # side of IntegratedDFlashRecomputeGraph.
-        del attention_mask, kwargs
+        # prefix cannot depend on padding. The receiver's original GDR ABI
+        # nevertheless needs the call-local logical row count as INT16[B].
+        # Derive it inside the graph to keep the external two-input OM ABI.
+        del kwargs
         sequence_length = int(input_ids.shape[1])
+        gdr_effective_length = (
+            attention_mask.to(dtype=torch.bool)
+            .to(dtype=torch.long)
+            .sum(dim=1)
+            .to(dtype=torch.int16)
+        )
         inputs_embeds = self.target._target_quantized_embedding(input_ids)
         positions = torch.arange(
             sequence_length,
@@ -337,6 +345,7 @@ class QuantFullPrefixExportTarget(nn.Module):
             output_pos=None,
             allQLen=[sequence_length],
             output_dflash_features=True,
+            gdr_effective_length=gdr_effective_length,
         )
         # The locked rollback/non-rollback receiver both expose the same
         # feature-enabled tensor tuple.  Avoid the eager bridge's generic
@@ -355,6 +364,11 @@ def create_quant_recompute_graph(
         raise ValueError(
             "max_sequence_length must be positive and divisible by the "
             "quant Target's 64-token GDN chunk"
+        )
+    if max_sequence_length > _GDR_EFFECTIVE_LENGTH_MAX:
+        raise ValueError(
+            "max_sequence_length exceeds the original GDR INT16 "
+            "effective_length ABI"
         )
     example_sequence_length = int(config.get("example_sequence_length", 2))
     if not 1 <= example_sequence_length <= max_sequence_length:
@@ -482,6 +496,9 @@ def create_quant_recompute_graph(
         ),
         "physical_target_gear": max_sequence_length,
         "valid_prefix_policy": "right-padded causal rows only",
+        "gdr_effective_length_contract": (
+            "INT16[B] call-local valid rows derived from attention_mask"
+        ),
         "claim_boundary": (
             "fixed-gear recompute ABI; persistent rollback OM state is a "
             "separate later optimization"

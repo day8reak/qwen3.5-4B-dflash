@@ -41,6 +41,7 @@ class _FakeExecutionModel(nn.Module):
         # already registers both weights.
         object.__setattr__(self, "embedding", embedding)
         object.__setattr__(self, "lm_head", lm_head)
+        self.last_gdr_effective_length: torch.Tensor | None = None
 
     def forward(
         self,
@@ -48,10 +49,12 @@ class _FakeExecutionModel(nn.Module):
         *,
         inputs_embeds: torch.Tensor,
         output_dflash_features: bool,
+        gdr_effective_length: torch.Tensor,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del input_ids, kwargs
         assert output_dflash_features is True
+        self.last_gdr_effective_length = gdr_effective_length.detach().clone()
         return self.lm_head(inputs_embeds), torch.cat(
             (inputs_embeds, inputs_embeds), dim=-1
         )
@@ -133,12 +136,17 @@ class _FakeDraft(nn.Module):
 
 def test_default_factory_is_quant_branch_factory() -> None:
     assert DEFAULT_GRAPH_FACTORY.endswith("quant_factory:create_quant_recompute_graph")
-    assert QUANT_BASE_REVISION == "5c61f110a007820ee6df564f87b9c8d1d2733ba5"
+    assert QUANT_BASE_REVISION == "28f93e784a2beed87020a80bd93c8788754eab1c"
 
 
 def test_quant_graph_rejects_non_chunk_aligned_gear_before_weight_load() -> None:
     with pytest.raises(ValueError, match="divisible"):
         create_quant_recompute_graph({"max_sequence_length": 65})
+
+
+def test_quant_graph_rejects_gear_outside_gdr_int16_abi() -> None:
+    with pytest.raises(ValueError, match="INT16"):
+        create_quant_recompute_graph({"max_sequence_length": 32768})
 
 
 def test_quant_target_adapter_bypasses_eager_guards_and_sync() -> None:
@@ -156,6 +164,9 @@ def test_quant_target_adapter_bypasses_eager_guards_and_sync() -> None:
     assert logits.shape == (1, 4, 32)
     assert features.shape == (1, 4, 8)
     assert target.public_forward_calls == 0
+    assert target.execution.last_gdr_effective_length is not None
+    assert target.execution.last_gdr_effective_length.dtype == torch.int16
+    assert target.execution.last_gdr_effective_length.tolist() == [2]
 
 
 def test_air_ops_match_quant_branch_decomposed_golden() -> None:
@@ -501,6 +512,9 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
     spec = specs[0]
     assert spec.name == "quant_dflash_recompute"
     assert spec.metadata["target_quant_mode"] == "w8a8_dynamic"
+    assert spec.metadata["gdr_effective_length_contract"] == (
+        "INT16[B] call-local valid rows derived from attention_mask"
+    )
     assert spec.metadata["quant_source_lock"]["verified_file_count"] >= 10
     assert spec.metadata["target_checkpoint_manifest_sha256"]
     assert spec.input_names == ("input_ids", "attention_mask")

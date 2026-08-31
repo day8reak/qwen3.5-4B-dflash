@@ -3,7 +3,7 @@
 ## 1. 目标和边界
 
 本框架直接建立在远端 `quant` 分支提交
-`5c61f110a007820ee6df564f87b9c8d1d2733ba5` 上。它不会把另一套模型冒充成量化模型：
+`28f93e784a2beed87020a80bd93c8788754eab1c` 上。它不会把另一套模型冒充成量化模型：
 
 - Target 由 `models.internal_dflash_bridge.load_qwen35_target` 加载；
 - Target Linear 使用 `models.dflash_v1.original_quant.quant_model` 转成原有 W8A8
@@ -69,6 +69,11 @@ row，并只按接受数提交一个 GDN/conv state-bank 槽；后者固定提�
 `target_top1[prefix_length-1]`，Draft 只读取 attention mask 声明的有效前缀。pad 位位于未来，
 因果 Target 的有效 row 不依赖这些 pad row。
 
+原 GDR 的新 ABI 还要求一个 `[B] INT16 effective_length`。它不是新增的 OM 外部输入：AIR 图
+在内部统计 `attention_mask` 的非零行数并传给普通 GDR。比如 `S=64`、有效前缀为 37 时，
+GDR 的物理序列仍为 64 行，但 `effective_length=[37]`；MTP verify 算子 ABI 不受这次改动影响。
+由于该字段是 INT16，`S` 不能超过 32767。
+
 如果 `S=64`，则 `prompt_tokens + generated_tokens` 不能超过 64。需要更长上下文时重新编译
 `S=128/256/...`。当前重算路径的延迟随 `S` 增大，因此先使用能够覆盖验证 workload 的最小
 gear。
@@ -98,7 +103,7 @@ gear。
 ```bash
 git switch framework/quant-air-om
 git merge-base --is-ancestor \
-  5c61f110a007820ee6df564f87b9c8d1d2733ba5 HEAD
+  28f93e784a2beed87020a80bd93c8788754eab1c HEAD
 ```
 
 第二条命令退出码必须为 0。
@@ -264,7 +269,9 @@ assert graph["name"] == "quant_dflash_recompute"
 assert graph["input_names"] == ["input_ids", "attention_mask"]
 assert graph["output_names"] == ["target_top1", "draft_top1"]
 assert graph["metadata"]["quant_branch_base_revision"] == \
-    "5c61f110a007820ee6df564f87b9c8d1d2733ba5"
+    "28f93e784a2beed87020a80bd93c8788754eab1c"
+assert graph["metadata"]["gdr_effective_length_contract"] == \
+    "INT16[B] call-local valid rows derived from attention_mask"
 assert graph["metadata"]["target_quant_mode"] == "w8a8_dynamic"
 print("AIR manifest gate: PASS")
 PY

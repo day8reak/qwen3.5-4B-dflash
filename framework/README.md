@@ -1,7 +1,7 @@
 # Quant AIR/OM 推理框架
 
 这个目录是直接加在仓库 `quant` 分支之上的部署层，不替换现有量化、rollback 或 DFlash
-实现。基线提交固定为 `5c61f110a007820ee6df564f87b9c8d1d2733ba5`。
+实现。基线提交固定为 `28f93e784a2beed87020a80bd93c8788754eab1c`。
 
 完整数据流是：
 
@@ -33,3 +33,7 @@ ordinary greedy 与 strict-greedy DFlash 逐 token 生成
 当前第一版 OM 使用固定 gear 的完整前缀重算，以先冻结可验证的两输入/两输出 ABI。它确实由
 C++ 调用 OM 完成 token 推理，但尚未把 `quant` 分支已有的 persistent rollback cache/state
 转成显式 OM I/O。因此它是功能基线，不应在真实测量前声称已达到闭源框架时延。
+
+当前 `quant` 基线要求原 GDR 算子接收 `INT16[B] effective_length`。框架不会为此增加第三个
+OM 输入，而是在 AIR 图内从 `attention_mask` 计算有效前缀长度；静态物理 gear 与逻辑有效
+行数因此可以分别为 64 和 37。

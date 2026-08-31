@@ -1,9 +1,9 @@
 {
-  "schema_version": 1,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v1",
+  "schema_version": 2,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v2",
   "repository_base": {
     "branch": "quant",
-    "revision": "5c61f110a007820ee6df564f87b9c8d1d2733ba5"
+    "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
   },
   "precision": {
     "target": "W8A8 dynamic QLinear with FP16 output",
@@ -28,7 +28,14 @@
       {"name": "target_top1", "dtype": "int64", "shape": [1, "S"]},
       {"name": "draft_top1", "dtype": "int64", "shape": [1, 15]}
     ],
-    "shape_policy": "static S divisible by 64; right-padded valid prefix",
+    "shape_policy": "static S divisible by 64 and at most 32767; right-padded valid prefix",
+    "gdr_effective_length": {
+      "external_om_input": false,
+      "source": "count nonzero attention_mask rows along S inside the graph",
+      "dtype": "int16",
+      "shape": ["B"],
+      "semantics": "call-local logical valid rows; not physical S, cumulative KV length, or MTP accepted_tokens"
+    },
     "state_policy": "recompute committed prefix"
   },
   "compiler": {
