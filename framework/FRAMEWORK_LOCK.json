@@ -54,8 +54,8 @@
         "fake_meta_outputs": [
           "broadcast batch + [x1[-2], x2[-1]], requested output dtype, input device"
         ],
-        "default_ge_op_type": "QuantBatchMatmulV3",
-        "converter": "validated TorchAir builtin",
+        "default_ge_op_type": "QuantBatchMatmulV4444",
+        "converter": "framework registered GE IR; named receiver ABI; FP16 dtype=DT_FLOAT16; group_size=0",
         "minimum_occurrences": 1
       },
       {

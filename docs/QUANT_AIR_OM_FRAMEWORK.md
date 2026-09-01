@@ -96,7 +96,7 @@ schema/Meta 预检，但不能虚构一次图命中。
 | 前端 FX target | Fake/Meta 输出合同 | 默认 GE type | converter | 当前图 |
 | --- | --- | --- | --- | --- |
 | `npu.npu_dynamic_quant.default` | INT8 输出与 input 同 shape；FP32 scale 为 `input.shape[:-1]` | `DynamicQuant` | TorchAir builtin | required |
-| `npu.npu_quant_matmul.default` | broadcast batch + `[M,N]`，当前调用输出 FP16 | `QuantBatchMatmulV3` | TorchAir builtin | required |
+| `npu.npu_quant_matmul.default` | broadcast batch + `[M,N]`，当前调用输出 FP16 | `QuantBatchMatmulV4444` | 框架注册 | required |
 | `npu.adn_rms_norm.default` | 输出 0 与 input 同 shape/dtype；输出 1 为 `[*input.shape[:-1],1]` FP32 | `RmsNorm` | 框架注册 | required |
 | `npu.npu_chunk_gated_delta_rule.default` | output 为 value shape/query dtype；final state 为 initial-state shape/FP32 | `ChunkGatedDeltaRule` | 框架注册 | required |
 | `qwen35_dflash.npu_cache_update.default` | 返回同 shape/dtype/device 的非 alias 更新值 | `CacheUpdate` | 框架注册 | required |
@@ -127,6 +127,21 @@ attrs: chunk_size, output_final_state, use_qk_l2norm_in_kernel
 Fake/Meta 不执行任何算子数值，正式 eager、AIR 和 OM 也不会执行 Fake。若 torch-npu 已有 Meta，
 框架先运行 shape/dtype/alias 探针并复用；只有缺失时才调用 `torch.library.register_fake`。任何 schema
 参数、kw-only 标志、返回个数或可变 alias 漂移都会提前失败。
+
+W8A8 matmul 不再使用 TorchAir 内置的 `QuantBatchMatmulV3` lowering。310P3
+receiver 安装的是 `QuantBatchMatmulV4444`，其 GE 输入顺序
+`x1,x2,scale,offset,bias,pertoken_scale` 与 PyTorch 前端的
+`x1,x2,scale,offset,pertoken_scale,bias` 不同，因此框架按名称绑定六个输入，并显式写入：
+
+```text
+outputs: y
+attrs: dtype=DT_FLOAT16(1), transpose_x1=false, transpose_x2=false, group_size=0
+```
+
+当前模型调用合同锁定 `output_dtype=torch.float16`、`group_sizes=None`；其他组合会在 AIR
+导出时直接失败，不能静默生成一个可能选错 kernel 的 OM。已有运行目录中的
+`factory.json` 也必须把 `npu_quant_matmul_ge_op_type` 从
+`QuantBatchMatmulV3` 改为 `QuantBatchMatmulV4444`。
 
 `npu_quant_matmul` 的预检使用实际 W8A8 路径代表形状：`x1=[1,64,2560]`、
 `x2=[2560,8192]`、`scale=[8192]`、`pertoken_scale=[64]`。torch-npu 要求
@@ -301,7 +316,7 @@ cp config/quant_air_om_factory.example.json "$AI_RUN_DIR/factory.json"
   "dtype": "float16",
   "device": "npu:0",
   "npu_dynamic_quant_ge_op_type": "DynamicQuant",
-  "npu_quant_matmul_ge_op_type": "QuantBatchMatmulV3",
+  "npu_quant_matmul_ge_op_type": "QuantBatchMatmulV4444",
   "adn_rms_norm_ge_op_type": "RmsNorm",
   "npu_chunk_gated_delta_rule_ge_op_type": "ChunkGatedDeltaRule",
   "npu_cache_update_ge_op_type": "CacheUpdate",
@@ -434,7 +449,9 @@ audit = graph["custom_op_audit"]
 assert len(audit) == 7
 expected = {
     "npu.npu_dynamic_quant.default": ("DynamicQuant", 1, "torchair-builtin"),
-    "npu.npu_quant_matmul.default": ("QuantBatchMatmulV3", 1, "torchair-builtin"),
+    "npu.npu_quant_matmul.default": (
+        "QuantBatchMatmulV4444", 1, "framework-registered-ge-ir"
+    ),
     "npu.adn_rms_norm.default": ("RmsNorm", 1, "framework-registered-ge-ir"),
     "npu.npu_chunk_gated_delta_rule.default": (
         "ChunkGatedDeltaRule", 1, "framework-registered-ge-ir"
@@ -467,8 +484,18 @@ PY
 还可以直接检查 TorchAir 的可读 GE 图：
 
 ```bash
-rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV3|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|FusedInferAttentionScore|ScatterNdUpdate)"' \
+rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV4444|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|FusedInferAttentionScore|ScatterNdUpdate)"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
+```
+
+并确认旧类型没有残留：
+
+```bash
+if rg -n '(type|op): "QuantBatchMatmulV3"' \
+  "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"; then
+  echo "FAIL: stale QuantBatchMatmulV3 lowering" >&2
+  exit 1
+fi
 ```
 
 前六个 required type 至少应各命中一次；固定重算图不经过 `forward1` 时，`ScatterNdUpdate` 可以
@@ -709,6 +736,8 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 旧版 AIR 路径把 `Tensor(a!) -> Tensor(a!)` 直接交给 AOTAutograd；Fake 正确也无法 functionalize | 更新本分支；确认 FX target 为 `qwen35_dflash.npu_cache_update.default`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
 | `ERR03005 GRAPH internal error`，`Original traceback` 指向 `qwen35_dflash.npu_cache_update.default`，Meta 单测通过 | 旧 converter 把前端 snake_case 参数按 positional 传入，但 GE `CacheUpdate` 原型要求 `x/updates/targetBlock/offsetInBlock -> x` | 更新本分支；确认 AIR manifest 中该算子的 `converter_mode` 为 `named-cache-update-x-v1` |
 | `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |
+| ATC 报 `QuantBatchMatmulV3` unsupported 或 FP32 scale 不匹配 | 旧 factory/builtin converter 生成了 CANN V3，而 receiver 实际安装 V4444 | 把现有 `factory.json` 改为 `QuantBatchMatmulV4444`，重新生成 AIR；确认图中有 V4444 且没有 V3 |
+| `No supported Ops kernel and engine ... FusedInferAttentionScore`（Ascend310P3） | AIR 使用的 A2 attention GE type 在 310P3 没有可用 kernel；与 QuantMatmul 是两个独立阻塞项 | 采集 ADN attention 自定义包的 `REG_OP` 原型、host 注册和 kernel 注册名，再按真实 ABI 改 lowering；不能只换字符串或假定 `PromptFlashAttention` 的 310P GQA 能力 |
 | `pse_shift` 期望 `Optional[Tensor]` 但收到 `[64]` / `immutable_list` | 旧版 modeling 在 export 路径把 `allQLen` 长度列表误接到了 PSE 输入，尚未进入 Fake/converter | 更新本分支；确认两个 modeling 文件均传 `all_seq_lengths_q=allQLen` 且不构造伪 PSE Tensor |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |

@@ -179,6 +179,7 @@ class _FakeTorchAirGeAttr:
 
 
 class _FakeTorchAirGeDataType:
+    DT_FLOAT16 = 1
     DT_INT64 = "DT_INT64"
 
 
@@ -603,7 +604,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP: "framework-registered-ge-ir",
         NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP: "framework-registered-ge-ir",
         NPU_DYNAMIC_QUANT_TORCH_OP: "torchair-builtin",
-        NPU_QUANT_MATMUL_TORCH_OP: "torchair-builtin",
+        NPU_QUANT_MATMUL_TORCH_OP: "framework-registered-ge-ir",
         NPU_SCATTER_ND_UPDATE_TORCH_OP: "torchair-builtin",
     }
     functional_cache_update = torch.ops.qwen35_dflash.npu_cache_update.default
@@ -612,6 +613,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         operations["adn_rms_norm"],
         functional_cache_update,
         operations["npu_chunk_gated_delta_rule"],
+        operations["npu_quant_matmul"],
     }
 
     placeholder = object()
@@ -628,6 +630,11 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         for session in sessions
         if session.spec.torch_op == FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP
     )
+    quant_matmul_session = next(
+        session
+        for session in sessions
+        if session.spec.torch_op == NPU_QUANT_MATMUL_TORCH_OP
+    )
     torchair.converters[operations["npu_chunk_gated_delta_rule"]](
         query,
         key,
@@ -642,6 +649,16 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         meta_outputs=(placeholder, placeholder),
     )
     torchair.converters[functional_cache_update](*([placeholder] * 4))
+    quant_x1, quant_x2, scale, pertoken_scale = (
+        object() for _ in range(4)
+    )
+    torchair.converters[operations["npu_quant_matmul"]](
+        quant_x1,
+        quant_x2,
+        scale,
+        pertoken_scale=pertoken_scale,
+        output_dtype=torch.float16,
+    )
     torchair.converters[operations["adn_fused_infer_attention"]](
         placeholder,
         [placeholder],
@@ -662,6 +679,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
         NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
         NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+        NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
     }
     gdr_call = next(
         call
@@ -703,6 +721,32 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         "outputs": ["x"],
     }
     assert cache_session.converter_mode == "named-cache-update-x-v1"
+    quant_matmul_call = next(
+        call
+        for call in torchair.ge.calls
+        if call[0] == NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE
+    )
+    assert quant_matmul_call[1] == ()
+    assert quant_matmul_call[2] == {
+        "inputs": {
+            "x1": quant_x1,
+            "x2": quant_x2,
+            "scale": scale,
+            "offset": None,
+            "bias": None,
+            "pertoken_scale": pertoken_scale,
+        },
+        "outputs": ["y"],
+        "attrs": {
+            "dtype": ("int", 1),
+            "transpose_x1": ("bool", False),
+            "transpose_x2": ("bool", False),
+            "group_size": ("int", 0),
+        },
+    }
+    assert quant_matmul_session.converter_mode == (
+        "named-quant-batch-matmul-v4444-fp16"
+    )
 
 
 def test_gdr_fake_keeps_frontend_operator_in_strict_export() -> None:
@@ -855,6 +899,45 @@ def test_w8a8_fakes_keep_dynamic_quant_and_quant_matmul_in_export() -> None:
     targets = [str(node.target) for node in exported.graph.nodes]
     assert "npu.npu_dynamic_quant.default" in targets
     assert "npu.npu_quant_matmul.default" in targets
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    (
+        ({"output_dtype": torch.int32}, "output_dtype=torch.float16"),
+        (
+            {"output_dtype": torch.float16, "group_sizes": [128]},
+            "group_sizes=None",
+        ),
+    ),
+)
+def test_quant_matmul_v4444_converter_rejects_unlocked_routes(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    operation = _ensure_target_test_schema("npu_quant_matmul")
+    torchair = _FakeTorchAir()
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            NPU_QUANT_MATMUL_TORCH_OP,
+            NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+        ),
+        torchair,
+    )
+    with pytest.raises(RuntimeError, match=message):
+        torchair.converters[operation](object(), object(), object(), **kwargs)
+
+
+def test_quant_matmul_rejects_legacy_v3_ge_type() -> None:
+    _ensure_target_test_schema("npu_quant_matmul")
+    with pytest.raises(RuntimeError, match="Update npu_quant_matmul_ge_op_type"):
+        prepare_custom_op_export(
+            CustomOpExportSpec(
+                NPU_QUANT_MATMUL_TORCH_OP,
+                "QuantBatchMatmulV3",
+            ),
+            _FakeTorchAir(),
+        )
 
 
 def test_quant_matmul_meta_probe_uses_the_m_dimension_for_pertoken_scale() -> None:
@@ -1610,7 +1693,7 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
         for item in spec.custom_ops
     } == {
         "npu.npu_dynamic_quant.default": ("DynamicQuant", 1),
-        "npu.npu_quant_matmul.default": ("QuantBatchMatmulV3", 1),
+        "npu.npu_quant_matmul.default": ("QuantBatchMatmulV4444", 1),
         "npu.adn_rms_norm.default": ("RmsNorm", 1),
         "npu.npu_chunk_gated_delta_rule.default": (
             "ChunkGatedDeltaRule",

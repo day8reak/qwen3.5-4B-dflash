@@ -38,7 +38,7 @@ ADN_RMS_NORM_DEFAULT_GE_OP_TYPE = "RmsNorm"
 NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE = "CacheUpdate"
 NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE = "ChunkGatedDeltaRule"
 NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE = "DynamicQuant"
-NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE = "QuantBatchMatmulV3"
+NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE = "QuantBatchMatmulV4444"
 NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE = "ScatterNdUpdate"
 
 _GDR_GE_PROTO_BLOCK = re.compile(
@@ -711,7 +711,7 @@ _ADAPTERS = {
         return_types=("Tensor",),
         fake_kernel=_fake_npu_quant_matmul,
         validate_meta=_validate_npu_quant_matmul_meta,
-        converter_policy=_TORCHAIR_BUILTIN_CONVERTER,
+        converter_policy=_FRAMEWORK_CONVERTER,
     ),
     NPU_SCATTER_ND_UPDATE_TORCH_OP: _OperatorAdapter(
         torch_op=NPU_SCATTER_ND_UPDATE_TORCH_OP,
@@ -1035,6 +1035,78 @@ def _register_framework_converter(
 
         converter.__name__ = "convert_npu_chunk_gated_delta_rule_default"
         session.converter_mode = "named-gdr-effective-length-v2"
+    elif adapter.torch_op == NPU_QUANT_MATMUL_TORCH_OP:
+        if spec.ge_op_type != NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE:
+            raise RuntimeError(
+                "npu_quant_matmul has an exact Ascend310P lowering only to "
+                f"{NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE}; got "
+                f"{spec.ge_op_type}. Update npu_quant_matmul_ge_op_type in "
+                "factory.json"
+            )
+        _require_ge_attrs(ge_api, ("Int", "Bool"))
+        ge_data_type = getattr(ge_api, "DataType", None)
+        fp16_dtype = getattr(ge_data_type, "DT_FLOAT16", None)
+        if isinstance(fp16_dtype, bool) or not isinstance(fp16_dtype, int):
+            raise RuntimeError(
+                "TorchAir ge.DataType.DT_FLOAT16 is required for "
+                "QuantBatchMatmulV4444"
+            )
+
+        def converter(
+            x1: Any,
+            x2: Any,
+            scale: Any,
+            *,
+            offset: Any = None,
+            pertoken_scale: Any = None,
+            bias: Any = None,
+            output_dtype: Any = None,
+            group_sizes: Any = None,
+            meta_outputs: Any = None,
+        ) -> Any:
+            del meta_outputs
+            if output_dtype != torch.float16:
+                raise RuntimeError(
+                    "the locked QuantBatchMatmulV4444 route requires explicit "
+                    f"output_dtype=torch.float16; got {output_dtype!r}"
+                )
+            if group_sizes is not None:
+                raise RuntimeError(
+                    "the locked QuantBatchMatmulV4444 route requires "
+                    f"group_sizes=None; got {group_sizes!r}"
+                )
+            session.converter_calls += 1
+            result = custom_op(
+                spec.ge_op_type,
+                inputs={
+                    "x1": x1,
+                    "x2": x2,
+                    "scale": scale,
+                    "offset": offset,
+                    # The receiver GE ABI orders bias before pertoken_scale,
+                    # unlike the npu::npu_quant_matmul frontend schema.
+                    "bias": bias,
+                    "pertoken_scale": pertoken_scale,
+                },
+                outputs=["y"],
+                attrs={
+                    "dtype": ge_api.attr.Int(fp16_dtype),
+                    "transpose_x1": ge_api.attr.Bool(False),
+                    "transpose_x2": ge_api.attr.Bool(False),
+                    "group_size": ge_api.attr.Int(0),
+                },
+            )
+            if isinstance(result, (tuple, list)):
+                if len(result) != 1:
+                    raise RuntimeError(
+                        "QuantBatchMatmulV4444 GE IR must return exactly one y "
+                        f"output; got {len(result)}"
+                    )
+                return result[0]
+            return result
+
+        converter.__name__ = "convert_npu_quant_matmul_v4444_fp16"
+        session.converter_mode = "named-quant-batch-matmul-v4444-fp16"
     elif adapter.torch_op in {
         NPU_CACHE_UPDATE_TORCH_OP,
         FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,

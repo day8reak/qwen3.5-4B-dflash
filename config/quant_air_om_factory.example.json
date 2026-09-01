@@ -10,7 +10,7 @@
   "dtype": "float16",
   "device": "npu:0",
   "npu_dynamic_quant_ge_op_type": "DynamicQuant",
-  "npu_quant_matmul_ge_op_type": "QuantBatchMatmulV3",
+  "npu_quant_matmul_ge_op_type": "QuantBatchMatmulV4444",
   "adn_rms_norm_ge_op_type": "RmsNorm",
   "npu_chunk_gated_delta_rule_ge_op_type": "ChunkGatedDeltaRule",
   "npu_cache_update_ge_op_type": "CacheUpdate",
