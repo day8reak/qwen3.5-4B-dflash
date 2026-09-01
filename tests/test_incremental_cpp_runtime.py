@@ -116,13 +116,15 @@ def _report(
     models = [
         {
             "role": role,
+            "model_id": model_id,
             "sha256": hashes[role],
             "work_bytes": 64,
             "weight_bytes": 64 if role == "target-prefill-head" else 256,
         }
-        for role in _INCREMENTAL_GRAPH_ABI
+        for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
+        "schema_version": 4,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -136,6 +138,7 @@ def _report(
             "repetitions": 10,
             "kind": "evidence",
             "formal_latency_evidence": True,
+            "profile_model_execution_trace_enabled": False,
             "prefill_completion_policy": (
                 "intermediate prompt chunks stay queued; final chunk performs "
                 "the only compact D2H and stream synchronization"
@@ -337,6 +340,7 @@ def _report(
         },
         "ordinary": _mode("ordinary-greedy"),
         "dflash": _mode("dflash-strict-greedy"),
+        "profile_model_execution_trace": [],
         "ordinary_parity": {
             "status": "PASS",
             "token_id_mismatches": 0,

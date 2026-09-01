@@ -246,6 +246,9 @@ def test_document_contains_memory_inspector_and_claim_boundary() -> None:
     assert "--state-bytes" in document
     assert "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE" in document
     assert "--decode-carrier-policy" in document
+    assert "analyze-msprof" in document
+    assert "profile_model_execution_trace" in document
+    assert "expected/observed" in document
     assert "one-token-h2d" in document
     assert "last-token-d2d" in document
     assert "不能宣称" in document
@@ -272,6 +275,10 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert "actual/full-equivalent H2D and D2H bytes" in (
         runtime["execution_io_evidence"]
     )
+    assert "model ID" in runtime["incremental_profile_attribution"]
+    assert "formal unprofiled 3+10" in runtime[
+        "incremental_profile_attribution"
+    ]
 
     cpp_runtime = deployment["cpp_runtime"]
     assert "changed contiguous range" in cpp_runtime["memory"]

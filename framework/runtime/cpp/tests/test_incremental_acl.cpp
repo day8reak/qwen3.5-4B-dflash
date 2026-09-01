@@ -335,10 +335,22 @@ void TestUnifiedTargetStep(
         if (std::string(stage) == "load-done") {
           loaded_roles.emplace_back(role);
         }
-      });
+      },
+      qwen35::dflash::IncrementalStateResetPolicy::kAsyncMemset,
+      qwen35::dflash::IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact,
+      true);
   Require(executor.unified_target_step(), "unified Target-step was not selected");
   Require(loaded_roles.size() == 4, "unified route did not load four OMs");
   Require(executor.model_memory().size() == 4, "unified memory set differs");
+  const auto& memory = executor.model_memory();
+  Require(
+      memory[0].model_id != memory[1].model_id &&
+          memory[0].model_id != memory[2].model_id &&
+          memory[0].model_id != memory[3].model_id &&
+          memory[1].model_id != memory[2].model_id &&
+          memory[1].model_id != memory[3].model_id &&
+          memory[2].model_id != memory[3].model_id,
+      "unified runtime model IDs are not unique");
 
   qwen35::dflash::GenerationOptions options;
   options.max_new_tokens = 6;
@@ -376,6 +388,26 @@ void TestUnifiedTargetStep(
                 stats.target_verify_commit_executions) &&
           stats.target_step_padded_rows_elided > 0,
       "unified Target-step physical/scratch rows do not close");
+  const auto& trace = executor.model_execution_trace();
+  const std::size_t model_executions =
+      stats.target_prefill_executions +
+      stats.target_prefill_head_executions +
+      stats.target_decode1_executions + stats.draft_propose_executions +
+      stats.target_verify_commit_executions;
+  Require(
+      trace.size() == model_executions,
+      "unified profile execution trace does not close");
+  std::size_t target_step_t1 = 0;
+  for (std::size_t index = 0; index < trace.size(); ++index) {
+    Require(trace[index].ordinal == index, "profile trace ordinal differs");
+    if (trace[index].model_id == memory[3].model_id &&
+        trace[index].physical_rows == 1) {
+      ++target_step_t1;
+    }
+  }
+  Require(
+      target_step_t1 == stats.target_decode1_executions,
+      "unified profile trace T1 count differs");
 }
 
 }  // namespace

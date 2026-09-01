@@ -509,13 +509,23 @@ void WriteReport(
       execution.target_decode1_executions +
       execution.draft_propose_executions +
       execution.target_verify_commit_executions;
+  const auto& model_execution_trace = executor.model_execution_trace();
+  if (formal_latency_evidence && !model_execution_trace.empty()) {
+    throw std::runtime_error(
+        "formal evidence unexpectedly enabled model execution tracing");
+  }
+  if (!formal_latency_evidence &&
+      model_execution_trace.size() != model_executions) {
+    throw std::runtime_error(
+        "profile model execution trace does not close");
+  }
   const double speedup = result.dflash.model_total_ms.median > 0.0
       ? result.ordinary.model_total_ms.median /
             result.dflash.model_total_ms.median
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":3,\"status\":\"PASS\","
+         << "{\"schema_version\":4,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
          << (executor.unified_target_step() ? "four" : "five")
          << "-resident-OM paired model loop\","
@@ -533,7 +543,8 @@ void WriteReport(
     output << "{\"role\":\"" << model.role << "\",\"path\":\""
            << JsonEscape(std::filesystem::absolute(model.path).string())
            << "\",\"sha256\":\"" << model.sha256
-           << "\",\"work_bytes\":" << memory[index].work_bytes
+           << "\",\"model_id\":" << memory[index].model_id
+           << ",\"work_bytes\":" << memory[index].work_bytes
            << ",\"weight_bytes\":" << memory[index].weight_bytes << '}';
   }
   output << "],\"abi\":{"
@@ -599,6 +610,8 @@ void WriteReport(
          << (formal_latency_evidence ? "evidence" : "profile")
          << "\",\"formal_latency_evidence\":"
          << (formal_latency_evidence ? "true" : "false")
+         << ",\"profile_model_execution_trace_enabled\":"
+         << (formal_latency_evidence ? "false" : "true")
          << ",\"order\":\"alternating ordinary/DFlash in one "
          << (executor.unified_target_step() ? "four" : "five")
          << "-model process\","
@@ -795,7 +808,15 @@ void WriteReport(
          << execution.target_step_zero_count_device_bytes
          << ",\"target_step_zero_count_bindings\":"
          << execution.target_step_zero_count_bindings
-         << "},\"prompt_token_ids\":";
+         << "},\"profile_model_execution_trace\":[";
+  for (std::size_t index = 0; index < model_execution_trace.size(); ++index) {
+    if (index != 0) output << ',';
+    const auto& event = model_execution_trace[index];
+    output << "{\"ordinal\":" << event.ordinal
+           << ",\"model_id\":" << event.model_id
+           << ",\"physical_rows\":" << event.physical_rows << '}';
+  }
+  output << "],\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
   output << ",\"eos_token_ids\":";
   WriteTokenIds(output, arguments.eos_token_ids);
@@ -901,7 +922,8 @@ int main(int argc, char** argv) {
           PrintProgress(arguments.progress, message.str());
         },
         arguments.state_reset_policy,
-        arguments.decode_carrier_policy);
+        arguments.decode_carrier_policy,
+        arguments.measurement_protocol == MeasurementProtocol::kProfile);
     const auto load_end = std::chrono::steady_clock::now();
     const double load_ms = std::chrono::duration<double, std::milli>(
         load_end - load_start).count();

@@ -65,6 +65,7 @@ class MsprofScriptTests(unittest.TestCase):
         self.assertIn("PipeUtilization Memory MemoryUB", section)
         self.assertIn("msprof --query=on", section)
         self.assertIn("msprof --export=on", section)
+        self.assertIn("analyze-msprof", section)
         for report in (
             "op_summary_*.csv",
             "op_statistic_*.csv",

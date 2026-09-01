@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(qwen35_dflash_acl_runner VERSION 1.11.0 LANGUAGES CXX)
+project(qwen35_dflash_acl_runner VERSION 1.12.0 LANGUAGES CXX)
 
 option(QWEN35_DFLASH_BUILD_ACL_RUNNER "Build the AscendCL executable" ON)
 option(QWEN35_DFLASH_BUILD_TESTS "Build host-only scheduler tests" ON)
@@ -279,6 +279,23 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DVERIFY_SHA=${_dynamic_verify_om_sha256}
       -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-unified-target-step-report.json
       -DUNIFIED_TARGET_STEP=ON
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_unified_target_step_runner_profile
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DDRAFT_SHA=${_draft_om_sha256}
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om
+      -DVERIFY_SHA=${_dynamic_verify_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-unified-target-step-profile-report.json
+      -DUNIFIED_TARGET_STEP=ON
+      -DMEASUREMENT_PROTOCOL=profile
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
   )
   add_test(

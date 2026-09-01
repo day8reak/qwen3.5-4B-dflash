@@ -1038,11 +1038,59 @@ rg --files "$PROF_DIR" | \
   rg '/(model|op_summary|op_statistic|api_statistic|task_time)_[^/]*\.csv$'
 ```
 
-五图用 model/task 表建立 `model_id -> target-prefill/target-prefill-head/target-decode1/
+不同 CANN 版本的默认导出范围并不一致；有的版本只导出迭代最多或最小 model ID 的一轮数据。
+因此不能看到一个 `op_summary` 就开始比较。官方的
+[`msprof --model-id/--iteration-id` 导出说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/devaids/Profiling/atlasprofiling_16_0021.html)
+也要求在需要其他模型/迭代时显式选择它们。本 runner 的 profile report 会记录每个已加载 OM 的
+真实 `aclmdl` model ID，以及每次执行的 `model_id/physical_rows/ordinal`；正式 evidence 3+10
+明确关闭这个 trace，避免诊断记录进入时延基线。
+
+导出后用强校验分析器建立 role/gear 映射：
+
+```bash
+MSPROF_ANALYSIS="$AI_RUN_DIR/reports/${LABEL}-msprof-analysis.json"
+
+PYTHONPATH="$DFLASH_SOURCE/framework/python:$DFLASH_SOURCE" \
+  "$MODEL_PYTHON" -m qwen35_dflash.ascend310p analyze-msprof \
+    --profile-dir "$PROF_DIR" \
+    --runner-report "$CASE_ROOT/runner-report.json" \
+    --output "$MSPROF_ANALYSIS"
+
+jq -e '
+  (.status == "PASS") and
+  (.formal_latency_evidence == false) and
+  (.coverage.expected_model_executions ==
+   .coverage.observed_model_executions) and
+  ([.api_count_gates[].status] | all(. == "PASS"))
+' "$MSPROF_ANALYSIS"
+
+jq '{
+  topology,
+  device_task_summary,
+  by_role,
+  by_role_and_physical_rows,
+  top_operators: .top_operators[:20],
+  api_statistics: .api_statistics[:20],
+  expected_memcpy_signature
+}' "$MSPROF_ANALYSIS"
+```
+
+若默认 export 漏掉任何 model ID 或 iteration，分析器会直接失败并报告该 role 的
+`expected/observed`，不会用部分数据生成排名。先根据
+`runner-report.json.models[].model_id` 和 `profile_model_execution_trace` 的每个 model 计数重新
+执行 `msprof --export ... --model-id=N --iteration-id=M`，把每轮 `op_summary` 保留在同一个独立的
+analysis-input 目录后再运行上述命令。旧版
+`op_summary_<device>_<model>_<iteration>.csv` 和新版带 `Model ID/Infer ID` 列的汇总 CSV 都支持；
+同一 `(model_id,infer_id)` 出现在两个文件时会被视为重复导出并拒绝，避免耗时翻倍。
+
+分析器用 runner 自报信息建立 `model_id -> target-prefill/target-prefill-head/target-decode1/
 draft-propose/target-verify-commit` 映射；统一候选只有四个 model ID，ordinary 的
 `target_decode1_executions` 是逻辑计数，物理执行归入动态 `target-verify-commit`。再按 model ID 汇总
-duration，并用 gear/T 行数拆分 T=1 与 T>1。`runner-report.json` 的各 role execution
-次数是交叉校验依据。msprof 仅用于定位 kernel、Memcpy、launch、同步和空洞；最终 median/p90
+`Task Duration(us)`，并用 trace 的物理 T 拆分 T=1 与 T>1。它还要求 `aclmdlExecuteAsync`、
+`aclrtMemcpyAsync`、`aclrtMemsetAsync`、`aclrtSynchronizeStream` 的 API count 与 runner 计数严格
+闭合；官方说明 `api_statistic` 的 `Time/Count/Avg/Min/Max` 是 API 汇总，而
+`op_summary` 的 `Task Duration` 是算子 task 耗时，因此两种 scope 不会相加成所谓 OM wall time。
+msprof 仅用于定位 kernel、Memcpy、launch、同步和空洞；最终 median/p90
 必须重新关闭 profiling，以 `--measurement-protocol evidence --warmup 3 --repetitions 10` 跑上面
 的正式命令。profile report 会明确写入 `formal_latency_evidence=false`，不能混入候选提升依据。
 

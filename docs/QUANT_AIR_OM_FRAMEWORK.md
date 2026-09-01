@@ -846,6 +846,13 @@ token 末行做一次 8-byte D2D 到对齐 scalar。report 必须满足
 `decode_id_device_compaction_operations == decode_id_multi_token_carrier_hits`；真机必须用相同
 runner/OM/input 做未 profile 的 3+10 A/B，msprof API timeline 仅用于解释新增 D2D 与被替换 H2D。
 
+多 OM profile 必须使用报告 schema 4 中的运行时 model ID 和逐次执行 trace 做严格归因，
+不能靠文件顺序猜测 OM 角色。采集完成后运行
+`python -m qwen35_dflash.ascend310p analyze-msprof`；完整命令、输入约束和判定规则见
+`docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节。分析器会拒绝只导出单个 model/iteration 的
+不完整结果、重复执行记录以及 ACL API 次数不闭合的报告。单张
+`quant_dflash_recompute.om` 仍按本小节后续手工流程分析，不能伪装成四图或五图角色级结果。
+
 正式时延基线仍然使用 11.3 中未开 profiling 的 3 次 warmup + 10 次
 measurement 报告。下面的 msprof 命令只做瓶颈定位，采集器引入的开销不能算入
 闭源框架对比值。

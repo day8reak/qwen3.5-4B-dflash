@@ -23,8 +23,15 @@ struct IncrementalOmPaths {
 
 struct IncrementalModelMemory {
   std::string role;
+  std::uint32_t model_id = 0;
   std::size_t work_bytes = 0;
   std::size_t weight_bytes = 0;
+};
+
+struct IncrementalModelExecutionTrace {
+  std::size_t ordinal = 0;
+  std::uint32_t model_id = 0;
+  std::size_t physical_rows = 0;
 };
 
 enum class IncrementalStateResetPolicy {
@@ -151,7 +158,8 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
       IncrementalStateResetPolicy state_reset_policy =
           IncrementalStateResetPolicy::kAsyncMemset,
       IncrementalDecodeCarrierPolicy decode_carrier_policy =
-          IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact);
+          IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact,
+      bool profile_model_executions = false);
   ~AclIncrementalExecutor() override;
 
   AclIncrementalExecutor(const AclIncrementalExecutor&) = delete;
@@ -180,6 +188,8 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
       std::size_t logical_proposal_count) override;
 
   const std::vector<IncrementalModelMemory>& model_memory() const noexcept;
+  const std::vector<IncrementalModelExecutionTrace>&
+  model_execution_trace() const noexcept;
   const IncrementalAclExecutionStats& execution_stats() const noexcept;
   IncrementalStateResetPolicy state_reset_policy() const noexcept;
   IncrementalDecodeCarrierPolicy decode_carrier_policy() const noexcept;

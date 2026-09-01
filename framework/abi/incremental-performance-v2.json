@@ -296,7 +296,8 @@
     "weight_budget": "sum queried weightSize; cross-artifact weight sharing must not be assumed",
     "state_budget": "persistent state plus peak transient state/workspace plus I/O and a declared safety margin",
     "load_test": "load the complete candidate set together on the exact 310P product before timing",
-    "profile": "unprofiled 3 warmups plus 10 measurements for promotion; msprof 1..3 iterations only for diagnosis",
+    "profile": "unprofiled 3 warmups plus 10 measurements for promotion with execution tracing disabled; msprof profile 1+1 is diagnostic only and must pass complete model-ID/infer-ID/physical-row attribution plus exact runtime API count closure",
+    "profile_analyzer": "qwen35_dflash.ascend310p analyze-msprof rejects default partial exports, duplicate model/infer groups, missing Task Duration, role/gear count drift and aclmdlExecuteAsync/aclrtMemcpyAsync/aclrtMemsetAsync/aclrtSynchronizeStream count drift",
     "winner": "lowest median end-to-end model-loop latency among zero-mismatch candidates, not the candidate with the most or fewest OM files"
   },
   "hot_loop": {
@@ -317,6 +318,7 @@
     "prefill": "never execute Draft proposal or full LM head for non-final prompt chunks",
     "prefill_control_prefix_policy": "one aligned carrier uses exactly one H2D per chunk: base ends after IDs/effective length, count extends through the final-Draft cumulative prompt count, proposal extends through a changed proposal count, and full extends through the process-resident EOS table/count only on first use or EOS identity change",
     "unified_target_step_zero_count_policy": "T=1 datasets bind one process-resident 64-byte-aligned INT32 zero initialized by the first full prefill-control H2D; T=2..16 datasets bind the mutable positive-K proposal carrier, so ordinary decode performs no K=0 H2D and cannot force a later positive-K restore",
+    "profile_execution_trace_policy": "profile 1+1 preallocates and records ordinal, runtime aclmdl model ID and physical T for every model execution; formal evidence 3+10 must report profile_model_execution_trace_enabled=false and an empty trace",
     "verify": "never recompute the committed historical prefix",
     "runtime_counter_invariants": [
       "prefill_control_full_upload_operations + prefill_control_base_upload_operations + prefill_control_count_upload_operations + prefill_control_proposal_upload_operations == prefill_control_upload_operations",

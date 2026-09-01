@@ -685,6 +685,8 @@ def validate_incremental_cpp_runner_report(
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
+    if report.get("schema_version") != 4:
+        raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
         or report.get("runner_id") != INCREMENTAL_CPP_RUNNER_ID
@@ -722,8 +724,19 @@ def validate_incremental_cpp_runner_report(
                 isinstance(value, bool)
                 or not isinstance(value, int)
                 or (value < 0 if field == "work_bytes" else value <= 0)
-            ):
-                raise RuntimeError(f"incremental {role} {field} is invalid")
+                ):
+                    raise RuntimeError(f"incremental {role} {field} is invalid")
+    model_ids = [item.get("model_id") for item in models]
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in model_ids
+        )
+        or len(set(model_ids)) != len(model_ids)
+    ):
+        raise RuntimeError("incremental model IDs are invalid or duplicated")
     model_by_role = {str(item["role"]): item for item in models}
     if int(model_by_role["target-prefill-head"]["weight_bytes"]) >= int(
         model_by_role["target-prefill"]["weight_bytes"]
@@ -747,6 +760,10 @@ def validate_incremental_cpp_runner_report(
         or protocol.get("formal_latency_evidence") is not True
     ):
         raise RuntimeError("incremental runner returned diagnostic-only timing")
+    if protocol.get("profile_model_execution_trace_enabled") is not False:
+        raise RuntimeError("formal incremental timing enabled profile tracing")
+    if report.get("profile_model_execution_trace") != []:
+        raise RuntimeError("formal incremental timing contains a profile trace")
     if state_reset_policy not in _INCREMENTAL_STATE_RESET_POLICIES:
         raise ValueError("expected incremental state reset policy is invalid")
     if protocol.get("state_reset_policy") != state_reset_policy:

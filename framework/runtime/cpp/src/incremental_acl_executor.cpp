@@ -496,11 +496,13 @@ class AclIncrementalExecutor::Impl {
       int device_id,
       const IncrementalModelProgress& progress,
       IncrementalStateResetPolicy state_reset_policy,
-      IncrementalDecodeCarrierPolicy decode_carrier_policy)
+      IncrementalDecodeCarrierPolicy decode_carrier_policy,
+      bool profile_model_executions)
       : device_id_(device_id),
         unified_target_step_(paths.target_decode1.empty()),
         state_reset_policy_(state_reset_policy),
-        decode_carrier_policy_(decode_carrier_policy) {
+        decode_carrier_policy_(decode_carrier_policy),
+        profile_model_executions_(profile_model_executions) {
     if (device_id < 0) {
       throw std::invalid_argument("device ID must be non-negative");
     }
@@ -513,6 +515,9 @@ class AclIncrementalExecutor::Impl {
         decode_carrier_policy_ !=
             IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact) {
       throw std::invalid_argument("unknown incremental decode carrier policy");
+    }
+    if (profile_model_executions_) {
+      model_execution_trace_.reserve(4096);
     }
     try {
       Check(aclInit(nullptr), "aclInit");
@@ -537,20 +542,6 @@ class AclIncrementalExecutor::Impl {
             "target-prefill-head weightSize must be smaller than the "
             "head-free target-prefill body; refusing a duplicated Target");
       }
-      memory_.push_back(
-          {prefill_.role, prefill_.work_bytes, prefill_.weight_bytes});
-      memory_.push_back(
-          {prefill_head_.role,
-           prefill_head_.work_bytes,
-           prefill_head_.weight_bytes});
-      if (!unified_target_step_) {
-        memory_.push_back(
-            {decode_.role, decode_.work_bytes, decode_.weight_bytes});
-      }
-      memory_.push_back(
-          {draft_.role, draft_.work_bytes, draft_.weight_bytes});
-      memory_.push_back(
-          {verify_.role, verify_.work_bytes, verify_.weight_bytes});
       const std::size_t shared_work_bytes = std::max(
           {prefill_.work_bytes,
            prefill_head_.work_bytes,
@@ -591,6 +582,30 @@ class AclIncrementalExecutor::Impl {
       }
       load(draft_, model_weights_[3], true);
       load(verify_, model_weights_[4], unified_target_step_);
+      memory_.push_back(
+          {prefill_.role,
+           prefill_.id,
+           prefill_.work_bytes,
+           prefill_.weight_bytes});
+      memory_.push_back(
+          {prefill_head_.role,
+           prefill_head_.id,
+           prefill_head_.work_bytes,
+           prefill_head_.weight_bytes});
+      if (!unified_target_step_) {
+        memory_.push_back(
+            {decode_.role,
+             decode_.id,
+             decode_.work_bytes,
+             decode_.weight_bytes});
+      }
+      memory_.push_back(
+          {draft_.role, draft_.id, draft_.work_bytes, draft_.weight_bytes});
+      memory_.push_back(
+          {verify_.role,
+           verify_.id,
+           verify_.work_bytes,
+           verify_.weight_bytes});
       ValidateAbi();
       AllocateBuffers();
       InitializeImmutableZeroState();
@@ -609,6 +624,10 @@ class AclIncrementalExecutor::Impl {
   std::size_t eos_table_width() const noexcept { return eos_table_width_; }
   const std::vector<IncrementalModelMemory>& model_memory() const noexcept {
     return memory_;
+  }
+  const std::vector<IncrementalModelExecutionTrace>&
+  model_execution_trace() const noexcept {
+    return model_execution_trace_;
   }
   const IncrementalAclExecutionStats& execution_stats() const noexcept {
     return stats_;
@@ -714,17 +733,21 @@ class AclIncrementalExecutor::Impl {
     UploadPrefillControl(staging_index, control_upload_bytes);
 
     if (use_immutable_zero) {
-      Execute(prefill_, initial_prefill_plan_);
+      Execute(prefill_, initial_prefill_plan_, prefill_width_);
       target_state_index_ = 0;
     } else {
-      Execute(prefill_, prefill_plans_[staging_index][target_state_index_]);
+      Execute(
+          prefill_,
+          prefill_plans_[staging_index][target_state_index_],
+          prefill_width_);
       target_state_index_ = 1 - target_state_index_;
     }
     ++stats_.target_prefill_executions;
     feature_source_ = FeatureSource::kPrefill;
     std::size_t executions = 1;
     if (complete) {
-      Execute(prefill_head_, prefill_head_plans_[target_state_index_]);
+      Execute(
+          prefill_head_, prefill_head_plans_[target_state_index_], 1);
       ++stats_.target_prefill_head_executions;
       ++executions;
     } else {
@@ -793,7 +816,7 @@ class AclIncrementalExecutor::Impl {
       stats_.decode_id_upload_bytes += decode_id_.bytes;
       plan = &decode_upload_plans_[target_state_index_];
     }
-    Execute(unified_target_step_ ? verify_ : decode_, *plan);
+    Execute(unified_target_step_ ? verify_ : decode_, *plan, 1);
     ++stats_.target_decode1_executions;
     if (unified_target_step_) {
       ++stats_.target_step_zero_count_bindings;
@@ -834,7 +857,10 @@ class AclIncrementalExecutor::Impl {
     DatasetPlan& target_plan = unified_target_step_
         ? target_step_plans_.at(physical_rows - 1)[target_state_index_]
         : verify_plans_[target_state_index_];
-    Execute(verify_, target_plan);
+    Execute(
+        verify_,
+        target_plan,
+        unified_target_step_ ? physical_rows : verify_width_);
     ++stats_.target_verify_commit_executions;
     stats_.target_step_input_rows +=
         unified_target_step_ ? physical_rows : verify_width_;
@@ -2031,7 +2057,7 @@ class AclIncrementalExecutor::Impl {
     } else {
       plan = &verify_draft_plans_[target_state_index_][draft_state_index_];
     }
-    Execute(draft_, *plan);
+    Execute(draft_, *plan, feature_rows);
     ++stats_.draft_propose_executions;
     if (prefill_source) {
       ++stats_.prefill_draft_propose_executions;
@@ -2041,7 +2067,17 @@ class AclIncrementalExecutor::Impl {
     draft_reset_pending_ = false;
   }
 
-  void Execute(const ModelSession& session, DatasetPlan& plan) {
+  void Execute(
+      const ModelSession& session,
+      DatasetPlan& plan,
+      std::size_t physical_rows) {
+    if (physical_rows == 0) {
+      throw std::invalid_argument("model execution rows must be positive");
+    }
+    if (profile_model_executions_) {
+      model_execution_trace_.push_back(
+          {model_execution_trace_.size(), session.id, physical_rows});
+    }
     Check(
         aclmdlExecuteAsync(session.id, plan.input, plan.output, stream_),
         session.role + ": aclmdlExecuteAsync");
@@ -2306,6 +2342,7 @@ class AclIncrementalExecutor::Impl {
       IncrementalStateResetPolicy::kAsyncMemset;
   IncrementalDecodeCarrierPolicy decode_carrier_policy_ =
       IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact;
+  bool profile_model_executions_ = false;
   bool initialized_ = false;
   bool device_set_ = false;
   bool reset_ = false;
@@ -2318,6 +2355,7 @@ class AclIncrementalExecutor::Impl {
   ModelSession draft_;
   ModelSession verify_;
   std::vector<IncrementalModelMemory> memory_;
+  std::vector<IncrementalModelExecutionTrace> model_execution_trace_;
   DeviceAllocation shared_model_work_;
   std::array<DeviceAllocation, 5> model_weights_;
 
@@ -2411,13 +2449,15 @@ AclIncrementalExecutor::AclIncrementalExecutor(
     int device_id,
     IncrementalModelProgress progress,
     IncrementalStateResetPolicy state_reset_policy,
-    IncrementalDecodeCarrierPolicy decode_carrier_policy)
+    IncrementalDecodeCarrierPolicy decode_carrier_policy,
+    bool profile_model_executions)
     : impl_(std::make_unique<Impl>(
           model_paths,
           device_id,
           progress,
           state_reset_policy,
-          decode_carrier_policy)) {}
+          decode_carrier_policy,
+          profile_model_executions)) {}
 
 AclIncrementalExecutor::~AclIncrementalExecutor() = default;
 AclIncrementalExecutor::AclIncrementalExecutor(
@@ -2476,6 +2516,11 @@ StatefulStep AclIncrementalExecutor::SpeculativeStep(
 const std::vector<IncrementalModelMemory>&
 AclIncrementalExecutor::model_memory() const noexcept {
   return impl_->model_memory();
+}
+
+const std::vector<IncrementalModelExecutionTrace>&
+AclIncrementalExecutor::model_execution_trace() const noexcept {
+  return impl_->model_execution_trace();
 }
 
 const IncrementalAclExecutionStats&

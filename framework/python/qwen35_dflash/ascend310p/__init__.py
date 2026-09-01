@@ -9,6 +9,7 @@ from .generation import benchmark_prompt, generate_prompt
 from .integrated import IntegratedDFlashRecomputeGraph, integrated_recompute_graph_spec
 from .input_manifest import build_quant_input_manifest, verify_quant_input_manifest
 from .incremental import ExactAcceptCommitStateGraph
+from .msprof_analysis import analyze_incremental_msprof
 from .incremental_graphs import (
     DraftProposeStateGraph,
     TargetDecodeOneStateGraph,
@@ -40,6 +41,7 @@ __all__ = [
     "TargetStepStateGraph",
     "TargetVerifyCommitStateGraph",
     "benchmark_prompt",
+    "analyze_incremental_msprof",
     "build_cpp_runner",
     "build_quant_input_manifest",
     "compile_air_bundle",

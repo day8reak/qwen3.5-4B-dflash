@@ -37,6 +37,7 @@ from .workflow import (
     run_target_pipeline,
 )
 from .generation import tokenize_prompt
+from .msprof_analysis import analyze_incremental_msprof
 
 
 def _config(path: Path | None) -> dict[str, Any]:
@@ -100,6 +101,19 @@ def command_build_cpp(args: argparse.Namespace) -> int:
         cmake=args.cmake,
         ascendcl_root=args.ascendcl_root,
     )
+    _print(payload)
+    return 0
+
+
+def command_analyze_msprof(args: argparse.Namespace) -> int:
+    output = require_run_output(args.output)
+    if output.exists():
+        raise FileExistsError(f"msprof analysis output already exists: {output}")
+    payload = analyze_incremental_msprof(
+        profile_dir=args.profile_dir,
+        runner_report=args.runner_report,
+    )
+    atomic_write_json(output, payload)
     _print(payload)
     return 0
 
@@ -387,6 +401,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="active CANN toolkit root; otherwise use declared environment variables",
     )
     build_cpp.set_defaults(handler=command_build_cpp)
+
+    analyze_msprof = subparsers.add_parser(
+        "analyze-msprof",
+        help="attribute incremental-runner msprof tasks to exact OM roles/gears",
+    )
+    analyze_msprof.add_argument("--profile-dir", type=Path, required=True)
+    analyze_msprof.add_argument("--runner-report", type=Path, required=True)
+    analyze_msprof.add_argument("--output", type=Path, required=True)
+    analyze_msprof.set_defaults(handler=command_analyze_msprof)
 
     probe = subparsers.add_parser(
         "probe-pytorch", help="run one integrated real-weight PyTorch graph probe"
