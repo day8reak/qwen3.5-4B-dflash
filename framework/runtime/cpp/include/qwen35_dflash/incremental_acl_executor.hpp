@@ -58,6 +58,17 @@ enum class IncrementalDecodeCarrierPolicy {
 const char* IncrementalDecodeCarrierPolicyName(
     IncrementalDecodeCarrierPolicy policy) noexcept;
 
+enum class IncrementalDraftFeaturePolicy {
+  // Preserve the original physical Draft context input N=16 after verify.
+  kFixedVerifyWidth,
+  // Bind only the leading committed Target feature rows when host-visible;
+  // an unsynchronized second transaction uses the exact causal upper bound.
+  kCommittedPrefix,
+};
+
+const char* IncrementalDraftFeaturePolicyName(
+    IncrementalDraftFeaturePolicy policy) noexcept;
+
 struct IncrementalAclExecutionStats {
   std::size_t target_prefill_executions = 0;
   std::size_t target_prefill_head_executions = 0;
@@ -77,6 +88,12 @@ struct IncrementalAclExecutionStats {
   std::size_t prefill_draft_propose_executions = 0;
   std::size_t prefill_draft_propose_executions_elided = 0;
   std::size_t prefill_feature_rows_batched = 0;
+  std::size_t draft_verify_feature_input_rows = 0;
+  std::size_t draft_verify_full_width_equivalent_rows = 0;
+  std::size_t draft_verify_feature_rows_elided = 0;
+  std::size_t draft_verify_fixed_width_executions = 0;
+  std::size_t draft_verify_committed_prefix_executions = 0;
+  std::size_t draft_verify_pending_upper_bound_executions = 0;
   std::size_t prefill_control_upload_operations = 0;
   std::size_t prefill_control_upload_bytes = 0;
   std::size_t prefill_control_full_upload_operations = 0;
@@ -124,6 +141,8 @@ struct IncrementalAclExecutionStats {
   std::size_t prefill_feature_slab_bytes = 0;
   std::size_t prefill_feature_arena_bytes = 0;
   std::size_t draft_dynamic_gear_count = 0;
+  std::size_t draft_verify_dynamic_gear_count = 0;
+  std::size_t draft_prefill_dynamic_gear_count = 0;
   std::size_t target_step_dynamic_gear_count = 0;
   std::size_t target_step_input_rows = 0;
   std::size_t target_step_padded_rows_elided = 0;
@@ -167,7 +186,9 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
           IncrementalStateResetPolicy::kAsyncMemset,
       IncrementalDecodeCarrierPolicy decode_carrier_policy =
           IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact,
-      bool profile_model_executions = false);
+      bool profile_model_executions = false,
+      IncrementalDraftFeaturePolicy draft_feature_policy =
+          IncrementalDraftFeaturePolicy::kFixedVerifyWidth);
   ~AclIncrementalExecutor() override;
 
   AclIncrementalExecutor(const AclIncrementalExecutor&) = delete;
@@ -204,6 +225,7 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
   const IncrementalAclExecutionStats& execution_stats() const noexcept;
   IncrementalStateResetPolicy state_reset_policy() const noexcept;
   IncrementalDecodeCarrierPolicy decode_carrier_policy() const noexcept;
+  IncrementalDraftFeaturePolicy draft_feature_policy() const noexcept;
   bool unified_target_step() const noexcept;
 
  private:

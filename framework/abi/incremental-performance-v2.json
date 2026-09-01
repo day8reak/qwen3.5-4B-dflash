@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
   "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
   "approval": {
@@ -67,7 +67,7 @@
     },
     {
       "role": "draft-propose",
-      "rows": "one dynamic new-context tail plus anchor and 15 masks",
+      "rows": "dynamic Target-feature N=1..16 after verify, or N=64..kv_cache_max_len in 64-row prompt gears, plus a fixed anchor-and-15-mask proposal block",
       "purpose": "reuse committed Draft KV, append only newly committed Target features, and produce one fixed [anchor,p0..p14] verify carrier",
       "required_outputs": [
         "fixed 16-row verify input IDs in a device-resident buffer",
@@ -155,9 +155,10 @@
       },
       {
         "name": "target_feature_tail",
-        "shape": [1, 16, 20480],
+        "shape": [1, "N", 20480],
         "dtype": "float16",
-        "semantics": "static carrier; only committed_input_count leading rows are valid"
+        "dynamic_gears": "N=1..16 plus N=64,128,...,kv_cache_max_len",
+        "semantics": "only committed_input_count leading rows are authoritative; fixed-16 is the rollback route and committed-prefix binds accepted_count+1 leading rows after a synchronized verify"
       },
       {
         "name": "committed_input_count",
@@ -199,7 +200,7 @@
     ],
     "target_full_attention": "provisional physical KV writes are allowed; only the logical cursor advances by anchor plus accepted proposals and rejected slots are overwritten later",
     "target_gdr_and_conv": "verify may materialize per-row banks as graph workspace, but its graph tail gathers slot a and persists only the selected scalar state",
-    "draft": "committed KV persists; the transient mask block is never committed",
+    "draft": "only KV positions below logical_draft_cursor are authoritative; fixed-16 may write masked future feature slots as scratch, committed-prefix omits those writes, and either route overwrites a slot before it can become visible; the transient mask block is never committed",
     "ordinary_decode_token": "two compact result arenas ping-pong with the Target state index; the previous transaction's last committed token remains device-resident, row zero binds directly, and a later row is copied D2D into the existing aligned decode scalar",
     "ordinary_decode_override": "only a caller-supplied token that differs from the tracked last committed token uses the original pinned-host 8-byte H2D path"
   },
@@ -241,6 +242,18 @@
     "cache_update_model_nodes_per_verify_unchanged": 256,
     "seed_policy": "per-linear-layer-jit-v1",
     "notes": "the JIT seed values describe source-graph input-seed tensors, not a measured OM peak; provisional output banks still exist; excludes model weights, model workspaces, I/O buffers, allocator/runtime overhead and optional feature/logit intermediates"
+  },
+  "draft_committed_prefix_work_model": {
+    "classification": "exact source-shape work lower bound; not measured Ascend310P latency",
+    "target_feature_projection_mac_per_row": 52428800,
+    "six_layer_context_kv_projection_mac_per_row": 31457280,
+    "modeled_mac_per_elided_feature_row": 83886080,
+    "common_k3_all_accepted_committed_rows": 4,
+    "fixed_width_rows": 16,
+    "elided_rows_at_k3_all_accepted": 12,
+    "modeled_mac_eliminated_at_k3_all_accepted": 1006632960,
+    "excluded_work": "normalization, rotary, scatter/cache update, elementwise and compiler/runtime overhead, so this is not an end-to-end speedup estimate",
+    "measurement_gate": "same Draft OM hash and runner binary; compare fixed-16 against committed-prefix with zero token/EOS mismatch, report physical Draft rows, then use unprofiled 3+10 latency for selection and msprof 1+1 only for diagnostic attribution"
   },
   "physical_topology_candidates": [
     {
@@ -305,6 +318,13 @@
     "resident_datasets_and_device_buffers": true,
     "stream": "one request stream unless profile proves overlap safe and beneficial",
     "draft_to_verify": "the [anchor,p0..p14] carrier stays on device and binds directly to Target verify",
+    "draft_feature_dynamic_gears": "one Draft OM contains verify-source N=1..16 plus prompt-source N=64,128,...,kv_cache_max_len; tensor order and weights are unchanged",
+    "draft_feature_policies": {
+      "fixed-16": "default rollback and matched baseline; every verify-source Draft execution binds N=16",
+      "committed-prefix": "inactive exact candidate; after a synchronized verify bind N=accepted_count+1, while an unsynchronized second transaction binds the causal upper bound N=previous logical K+1"
+    },
+    "draft_feature_liveness_proof": "only Draft KV positions below logical_draft_cursor are authoritative; fixed-16 suffix writes are masked scratch, and every omitted position is overwritten before the logical cursor can expose it",
+    "draft_feature_selection_gate": "hold runner binary, all OM hashes, prompt/token limits, reset/decode/sync-window policies and device identity fixed; require zero token/EOS mismatch and closed row/route counters; select committed-prefix only when real 310P unprofiled 3+10 median and p90 improve outside measurement noise, otherwise retain fixed-16",
     "last_committed_token_to_decode": "the preceding compact Target result stays on device; row zero binds directly and later rows use one 8-byte D2D copy into the aligned decode scalar; no decode-ID H2D is issued by the standard scheduler",
     "decode_fallback": "an explicit caller override retains the exact 8-byte pinned-host H2D route",
     "decode_carrier_policies": {
@@ -342,6 +362,10 @@
       "device_to_host_operations + speculative_d2h_operations_elided == prefill_completion_synchronizations + target_decode1_executions + target_verify_commit_executions",
       "speculative_d2h_operations_elided == speculative_synchronizations_elided",
       "speculative_d2h_padding_bytes == speculative_d2h_operations_elided * (compact_slot_bytes - compact_verify_result_bytes)",
+      "draft_verify_fixed_width_executions + draft_verify_committed_prefix_executions + draft_verify_pending_upper_bound_executions == draft_propose_executions - prefill_draft_propose_executions",
+      "draft_verify_feature_input_rows + draft_verify_feature_rows_elided == draft_verify_full_width_equivalent_rows",
+      "draft_verify_full_width_equivalent_rows == 16 * (draft_propose_executions - prefill_draft_propose_executions)",
+      "draft_dynamic_gear_count == draft_verify_dynamic_gear_count + draft_prefill_dynamic_gear_count, with verify gears 16 and prefill gears kv_cache_max_len/64",
       "unified target_step_zero_count_device_bytes == 4 and target_step_zero_count_bindings == target_decode1_executions",
       "five-artifact target_step_zero_count_device_bytes == 0 and target_step_zero_count_bindings == 0",
       "compact_ping_pong_device_bytes is positive and included in carrier_device_bytes"
@@ -437,6 +461,27 @@
       "stream_synchronizations_elided": 13,
       "claim_boundary": "the exact state machine and host barrier reduction close under Fake ACL; no physical-device speedup is claimed and window 1 remains the default"
     },
+    "fake_acl_committed_prefix_70_token_10_output_paired_3_plus_10": {
+      "classification": "matched host structural and logical-state-liveness evidence only; Fake ACL timing is not Ascend310P latency",
+      "stable_generated_token_ids_fixed_and_prefix": [11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+      "token_id_mismatches": 0,
+      "eos_mismatches": 0,
+      "verify_source_draft_executions_each": 13,
+      "fixed_16_feature_input_rows": 208,
+      "committed_prefix_feature_input_rows": 52,
+      "committed_prefix_full_width_equivalent_rows": 208,
+      "committed_prefix_feature_rows_elided": 156,
+      "window_1_committed_prefix_executions": 13,
+      "window_1_pending_upper_bound_executions": 0,
+      "window_2_committed_prefix_executions": 0,
+      "window_2_pending_upper_bound_executions": 13,
+      "matched_fixed_and_prefix_sync_window": 2,
+      "combined_four_om_window_2_committed_prefix_status": "PASS",
+      "draft_dynamic_gear_count": 18,
+      "draft_verify_dynamic_gear_count": 16,
+      "draft_prefill_dynamic_gear_count": 2,
+      "claim_boundary": "the exact Fake ACL scheduler proves token parity, route selection and row-count closure; AIR/ATC, real-model parity, memory and physical-device latency remain pending and fixed-16 remains default"
+    },
     "fake_acl_adaptive_k_sync_window_70_token_32_output_paired_3_plus_10": {
       "classification": "matched host structural evidence for the common K=15 boundary; Fake ACL timing is not Ascend310P latency",
       "max_new_tokens": 32,
@@ -479,12 +524,13 @@
     "approval_scope": "replace the active full-prefix integrated OM ABI with explicit device-state graph boundaries and a device-side exact accept/commit tail",
     "required_before_default": [
       "AIR custom-node preservation for every role",
-      "ATC success for every selected gear",
+      "Draft AIR/ATC success for every N=1..16 verify gear and every 64-row prompt gear",
       "ordinary and DFlash zero token/EOS mismatch",
+      "fixed-16 versus committed-prefix zero token/EOS mismatch with visible Draft KV equality below logical_draft_cursor",
       "fixed-T16 causal scratch-suffix tests for logical K=1/3/5/7/15",
       "state rejection tests across positions 62/63/64/65",
       "full candidate-set memory/load report",
-      "same-device unprofiled performance comparison"
+      "same-device unprofiled 3+10 fixed-16 versus committed-prefix performance comparison plus msprof physical-row attribution"
     ]
   },
   "claim_boundary": "Approval authorizes implementation of this exact ABI. APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE is not evidence that any topology exports, loads, fits, is correct, or is faster on a physical Ascend310P device."

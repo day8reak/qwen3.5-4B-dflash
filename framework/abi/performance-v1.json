@@ -25,6 +25,7 @@
     "paired_single_loaded_process": true,
     "measurement_order": "alternating ordinary and DFlash",
     "required_decode_carrier_policy": "one-token-h2d or last-token-d2d; same-binary comparisons must hold every other case-identity field fixed",
+    "required_draft_feature_policy": "fixed-16 is the rollback baseline; committed-prefix is an inactive exact candidate; same-binary and same-OM-hash comparisons must hold every other case-identity field fixed",
     "required_backend_hook": "synchronize()",
     "optional_state_reset_hooks_in_priority_order": [
       "reset_benchmark_state()",
@@ -33,7 +34,7 @@
     ],
     "stable_token_ids_across_repetitions": true,
     "current_integrated_om_io": "persistent input device mirror with changed-range H2D; Target D2H tail is bounded by K+1; full Draft ID D2H; one stream synchronization per model execution",
-    "incremental_five_om_io": "one aligned prefill control carrier uploads only the live base/count/proposal/full prefix while its EOS tail stays process-resident; compact Target results ping-pong with Target state; one-token-h2d retains direct row-zero binding and falls back to pinned-host H2D after multi-token commits, while last-token-d2d retains every last committed token and copies later rows D2D into the aligned scalar; an explicit caller override uses the exact 8-byte H2D fallback in either policy; exact DFlash synchronization window 2 may queue two complete transactions and their two compact D2H copies before one barrier without changing OM tensor ABI",
+    "incremental_five_om_io": "one aligned prefill control carrier uploads only the live base/count/proposal/full prefix while its EOS tail stays process-resident; compact Target results ping-pong with Target state; one-token-h2d retains direct row-zero binding and falls back to pinned-host H2D after multi-token commits, while last-token-d2d retains every last committed token and copies later rows D2D into the aligned scalar; an explicit caller override uses the exact 8-byte H2D fallback in either policy; exact DFlash synchronization window 2 may queue two complete transactions and their two compact D2H copies before one barrier; the same Draft OM exposes N=1..16 verify gears so committed-prefix can omit masked scratch feature rows without changing tensor order or weights",
     "required_io_counters": [
       "model_executions",
       "stream_synchronizations",
@@ -49,7 +50,13 @@
       "decode_id_multi_token_carrier_hits",
       "decode_id_h2d_operations_elided",
       "decode_id_device_compaction_operations and bytes",
-      "compact_ping_pong_device_bytes"
+      "compact_ping_pong_device_bytes",
+      "draft_verify_feature_input_rows",
+      "draft_verify_full_width_equivalent_rows",
+      "draft_verify_feature_rows_elided",
+      "draft_verify_fixed_width_executions",
+      "draft_verify_committed_prefix_executions",
+      "draft_verify_pending_upper_bound_executions"
     ]
   },
   "unprofiled_baseline": {

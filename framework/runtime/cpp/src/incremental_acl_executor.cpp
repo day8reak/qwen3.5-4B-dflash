@@ -490,6 +490,17 @@ const char* IncrementalDecodeCarrierPolicyName(
   return "unknown";
 }
 
+const char* IncrementalDraftFeaturePolicyName(
+    IncrementalDraftFeaturePolicy policy) noexcept {
+  switch (policy) {
+    case IncrementalDraftFeaturePolicy::kFixedVerifyWidth:
+      return "fixed-16";
+    case IncrementalDraftFeaturePolicy::kCommittedPrefix:
+      return "committed-prefix";
+  }
+  return "unknown";
+}
+
 class AclIncrementalExecutor::Impl {
  public:
   Impl(
@@ -498,11 +509,13 @@ class AclIncrementalExecutor::Impl {
       const IncrementalModelProgress& progress,
       IncrementalStateResetPolicy state_reset_policy,
       IncrementalDecodeCarrierPolicy decode_carrier_policy,
-      bool profile_model_executions)
+      bool profile_model_executions,
+      IncrementalDraftFeaturePolicy draft_feature_policy)
       : device_id_(device_id),
         unified_target_step_(paths.target_decode1.empty()),
         state_reset_policy_(state_reset_policy),
         decode_carrier_policy_(decode_carrier_policy),
+        draft_feature_policy_(draft_feature_policy),
         profile_model_executions_(profile_model_executions) {
     if (device_id < 0) {
       throw std::invalid_argument("device ID must be non-negative");
@@ -516,6 +529,12 @@ class AclIncrementalExecutor::Impl {
         decode_carrier_policy_ !=
             IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact) {
       throw std::invalid_argument("unknown incremental decode carrier policy");
+    }
+    if (draft_feature_policy_ !=
+            IncrementalDraftFeaturePolicy::kFixedVerifyWidth &&
+        draft_feature_policy_ !=
+            IncrementalDraftFeaturePolicy::kCommittedPrefix) {
+      throw std::invalid_argument("unknown incremental Draft feature policy");
     }
     if (profile_model_executions_) {
       model_execution_trace_.reserve(4096);
@@ -639,6 +658,9 @@ class AclIncrementalExecutor::Impl {
   IncrementalDecodeCarrierPolicy decode_carrier_policy() const noexcept {
     return decode_carrier_policy_;
   }
+  IncrementalDraftFeaturePolicy draft_feature_policy() const noexcept {
+    return draft_feature_policy_;
+  }
   bool unified_target_step() const noexcept { return unified_target_step_; }
 
   void Reset(
@@ -665,6 +687,8 @@ class AclIncrementalExecutor::Impl {
     proposal_ready_ = false;
     prepared_proposal_count_ = 0;
     proposal_count_upload_staging_index_ = 0;
+    committed_feature_rows_ = 0;
+    committed_feature_rows_valid_ = false;
     decode_carrier_valid_ = false;
     decode_carrier_row_ = 0;
     feature_source_ = FeatureSource::kNone;
@@ -758,7 +782,10 @@ class AclIncrementalExecutor::Impl {
     if (prepare_draft && complete) {
       const std::size_t feature_rows =
           (staging_index + 1) * prefill_width_;
-      ExecuteDraft(FeatureSource::kPrefill, feature_rows);
+      ExecuteDraft(
+          FeatureSource::kPrefill,
+          feature_rows,
+          DraftFeatureRoute::kPrefill);
       proposal_ready_ = true;
       prepared_proposal_count_ = logical_proposal_count;
       ++executions;
@@ -832,6 +859,8 @@ class AclIncrementalExecutor::Impl {
         : FeatureSource::kNone;
     DownloadCompact(false, target_state_index_);
     Synchronize();
+    committed_feature_rows_ = unified_target_step_ ? 1 : 0;
+    committed_feature_rows_valid_ = unified_target_step_;
     return ReadCompactAndTrackCarrier(false, 1, target_state_index_);
   }
 
@@ -862,7 +891,9 @@ class AclIncrementalExecutor::Impl {
     const auto first = EnqueueSpeculative(
         logical_proposal_counts[0], false);
     const auto second = EnqueueSpeculative(
-        logical_proposal_counts[1], true);
+        logical_proposal_counts[1],
+        true,
+        logical_proposal_counts[0] + 1);
     if (first.compact_state_index == second.compact_state_index) {
       throw std::logic_error(
           "speculative pair did not alternate compact output arenas");
@@ -889,7 +920,8 @@ class AclIncrementalExecutor::Impl {
 
   PendingSpeculative EnqueueSpeculative(
       std::size_t logical_proposal_count,
-      bool allow_pending_stream_work) {
+      bool allow_pending_stream_work,
+      std::size_t pending_feature_upper_bound = 0) {
     RequireReset();
     RequirePrefilled();
     RequireCompletedPrefill(allow_pending_stream_work);
@@ -906,7 +938,30 @@ class AclIncrementalExecutor::Impl {
             "no committed Target feature carrier is available for Draft");
       }
       SetProposalCount(logical_proposal_count);
-      ExecuteDraft(FeatureSource::kVerify, verify_width_);
+      std::size_t feature_rows = verify_width_;
+      DraftFeatureRoute feature_route = DraftFeatureRoute::kFixedVerifyWidth;
+      if (draft_feature_policy_ ==
+          IncrementalDraftFeaturePolicy::kCommittedPrefix) {
+        if (allow_pending_stream_work) {
+          if (pending_feature_upper_bound == 0 ||
+              pending_feature_upper_bound > verify_width_) {
+            throw std::logic_error(
+                "pending Draft feature upper bound is invalid");
+          }
+          feature_rows = pending_feature_upper_bound;
+          feature_route = DraftFeatureRoute::kPendingUpperBound;
+        } else {
+          if (!committed_feature_rows_valid_ ||
+              committed_feature_rows_ == 0 ||
+              committed_feature_rows_ > verify_width_) {
+            throw std::logic_error(
+                "host-visible committed Draft feature prefix is unavailable");
+          }
+          feature_rows = committed_feature_rows_;
+          feature_route = DraftFeatureRoute::kCommittedPrefix;
+        }
+      }
+      ExecuteDraft(FeatureSource::kVerify, feature_rows, feature_route);
       ++executions;
     }
     const std::size_t physical_rows = logical_proposal_count + 1;
@@ -933,6 +988,13 @@ class AclIncrementalExecutor::Impl {
     kPrefill = 0,
     kVerify = 1,
     kNone = 2,
+  };
+
+  enum class DraftFeatureRoute : std::size_t {
+    kPrefill = 0,
+    kFixedVerifyWidth = 1,
+    kCommittedPrefix = 2,
+    kPendingUpperBound = 3,
   };
 
   static std::vector<TensorSpec> SelectSpecs(
@@ -1214,12 +1276,15 @@ class AclIncrementalExecutor::Impl {
           "Draft OM is missing required dynamic feature gear N=" +
           std::to_string(rows));
     };
-    draft_gear_verify_ = find(verify_width_);
+    draft_gear_verify_.reserve(verify_width_);
+    for (std::size_t rows = 1; rows <= verify_width_; ++rows) {
+      draft_gear_verify_.push_back(find(rows));
+    }
     const std::size_t prefill_gears =
         (sequence_length_ - 1) / prefill_width_ + 1;
-    if (draft_.dynamic_gears.size() != prefill_gears + 1) {
+    if (draft_.dynamic_gears.size() != prefill_gears + verify_width_) {
       throw std::runtime_error(
-          "Draft OM dynamic gear count differs from N=16 plus every "
+          "Draft OM dynamic gear count differs from N=1..16 plus every "
           "64-row prompt batch");
     }
     draft_gear_prefill_.reserve(prefill_gears);
@@ -1227,6 +1292,8 @@ class AclIncrementalExecutor::Impl {
       draft_gear_prefill_.push_back(find((index + 1) * prefill_width_));
     }
     stats_.draft_dynamic_gear_count = draft_.dynamic_gears.size();
+    stats_.draft_verify_dynamic_gear_count = draft_gear_verify_.size();
+    stats_.draft_prefill_dynamic_gear_count = draft_gear_prefill_.size();
   }
 
   std::vector<std::int64_t> FlattenTargetStepShape(
@@ -1456,6 +1523,7 @@ class AclIncrementalExecutor::Impl {
 
     prefill_plans_.resize(stats_.prefill_staging_slots);
     prefill_draft_plans_.resize(stats_.prefill_staging_slots);
+    verify_draft_plans_.resize(verify_width_);
     if (state_reset_policy_ == IncrementalStateResetPolicy::kImmutableZero) {
       initial_draft_plans_.resize(stats_.prefill_staging_slots);
     }
@@ -1948,16 +2016,18 @@ class AclIncrementalExecutor::Impl {
     for (std::size_t target = 0; target < 2; ++target) {
       for (std::size_t current = 0; current < 2; ++current) {
         const std::size_t next = 1 - current;
-        build_draft(
-            verify_draft_plans_[target][current],
-            target,
-            PrefillFeatureBatchView(),
-            committed_input_count_.View(),
-            draft_states_[current].tensors,
-            draft_states_[next].tensors,
-            verify_dynamic_control_.View(),
-            draft_gear_verify_,
-            "verify prebind");
+        for (std::size_t rows = 1; rows <= verify_width_; ++rows) {
+          build_draft(
+              verify_draft_plans_.at(rows - 1)[target][current],
+              target,
+              PrefillFeatureBatchView(),
+              committed_input_count_.View(),
+              draft_states_[current].tensors,
+              draft_states_[next].tensors,
+              verify_dynamic_control_.View(),
+              draft_gear_verify_.at(rows - 1),
+              "verify committed-prefix prebind");
+        }
         for (std::size_t slot = 0; slot < prefill_draft_plans_.size(); ++slot) {
           build_draft(
               prefill_draft_plans_[slot][target][current],
@@ -2095,16 +2165,22 @@ class AclIncrementalExecutor::Impl {
 
   void ExecuteDraft(
       FeatureSource source,
-      std::size_t feature_rows) {
+      std::size_t feature_rows,
+      DraftFeatureRoute feature_route) {
     if (source == FeatureSource::kNone) {
       throw std::logic_error("invalid Draft feature source/gear");
     }
     const bool prefill_source = source == FeatureSource::kPrefill;
-    if ((!prefill_source && feature_rows != verify_width_) ||
+    if ((!prefill_source &&
+         (feature_rows == 0 || feature_rows > verify_width_)) ||
         (prefill_source &&
          (feature_rows == 0 || feature_rows % prefill_width_ != 0 ||
           feature_rows > sequence_length_))) {
       throw std::logic_error("invalid Draft feature source/gear");
+    }
+    if ((prefill_source && feature_route != DraftFeatureRoute::kPrefill) ||
+        (!prefill_source && feature_route == DraftFeatureRoute::kPrefill)) {
+      throw std::logic_error("Draft feature route does not match its source");
     }
     const bool use_immutable_zero =
         draft_reset_pending_ &&
@@ -2124,13 +2200,32 @@ class AclIncrementalExecutor::Impl {
           : &prefill_draft_plans_.at(gear_index)
                  [target_state_index_][draft_state_index_];
     } else {
-      plan = &verify_draft_plans_[target_state_index_][draft_state_index_];
+      plan = &verify_draft_plans_.at(feature_rows - 1)
+                  [target_state_index_][draft_state_index_];
     }
     Execute(draft_, *plan, feature_rows);
     ++stats_.draft_propose_executions;
     if (prefill_source) {
       ++stats_.prefill_draft_propose_executions;
       stats_.prefill_feature_rows_batched += feature_rows;
+    } else {
+      stats_.draft_verify_feature_input_rows += feature_rows;
+      stats_.draft_verify_full_width_equivalent_rows += verify_width_;
+      stats_.draft_verify_feature_rows_elided +=
+          verify_width_ - feature_rows;
+      switch (feature_route) {
+        case DraftFeatureRoute::kFixedVerifyWidth:
+          ++stats_.draft_verify_fixed_width_executions;
+          break;
+        case DraftFeatureRoute::kCommittedPrefix:
+          ++stats_.draft_verify_committed_prefix_executions;
+          break;
+        case DraftFeatureRoute::kPendingUpperBound:
+          ++stats_.draft_verify_pending_upper_bound_executions;
+          break;
+        case DraftFeatureRoute::kPrefill:
+          throw std::logic_error("prefill Draft route reached verify stats");
+      }
     }
     draft_state_index_ = use_immutable_zero ? 0 : 1 - draft_state_index_;
     draft_reset_pending_ = false;
@@ -2319,6 +2414,14 @@ class AclIncrementalExecutor::Impl {
       std::size_t model_executions,
       std::size_t state_index) {
     StatefulStep result = ReadCompact(verify, model_executions, state_index);
+    if (verify) {
+      if (result.accepted_draft_tokens >= verify_width_) {
+        throw std::runtime_error(
+            "verify accepted count exceeds the feature carrier");
+      }
+      committed_feature_rows_ = result.accepted_draft_tokens + 1;
+      committed_feature_rows_valid_ = true;
+    }
     decode_carrier_valid_ =
         result.token_ids.size() == 1 ||
         decode_carrier_policy_ ==
@@ -2355,11 +2458,14 @@ class AclIncrementalExecutor::Impl {
       }
     }
     prefill_draft_plans_.clear();
-    for (auto& by_target : verify_draft_plans_) {
-      for (auto& plan : by_target) {
-        plan.Release();
+    for (auto& by_rows : verify_draft_plans_) {
+      for (auto& by_target : by_rows) {
+        for (auto& plan : by_target) {
+          plan.Release();
+        }
       }
     }
+    verify_draft_plans_.clear();
     for (auto& plan : verify_plans_) {
       plan.Release();
     }
@@ -2444,6 +2550,8 @@ class AclIncrementalExecutor::Impl {
       IncrementalStateResetPolicy::kAsyncMemset;
   IncrementalDecodeCarrierPolicy decode_carrier_policy_ =
       IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact;
+  IncrementalDraftFeaturePolicy draft_feature_policy_ =
+      IncrementalDraftFeaturePolicy::kFixedVerifyWidth;
   bool profile_model_executions_ = false;
   bool initialized_ = false;
   bool device_set_ = false;
@@ -2470,7 +2578,7 @@ class AclIncrementalExecutor::Impl {
   std::vector<TensorSpec> target_state_specs_;
   std::vector<TensorSpec> draft_state_specs_;
   std::vector<aclmdlIODims> draft_gear_prefill_;
-  aclmdlIODims draft_gear_verify_{};
+  std::vector<aclmdlIODims> draft_gear_verify_;
   std::vector<aclmdlIODims> target_step_gears_;
 
   std::array<StateArena, 2> target_states_;
@@ -2518,7 +2626,8 @@ class AclIncrementalExecutor::Impl {
   std::vector<std::array<DatasetPlan, 2>> target_step_plans_;
   std::vector<std::array<std::array<DatasetPlan, 2>, 2>>
       prefill_draft_plans_;
-  std::array<std::array<DatasetPlan, 2>, 2> verify_draft_plans_;
+  std::vector<std::array<std::array<DatasetPlan, 2>, 2>>
+      verify_draft_plans_;
   DatasetPlan initial_prefill_plan_;
   std::array<DatasetPlan, 2> prefill_head_plans_;
   std::vector<std::array<DatasetPlan, 2>> initial_draft_plans_;
@@ -2538,6 +2647,8 @@ class AclIncrementalExecutor::Impl {
   bool proposal_value_valid_ = false;
   std::size_t proposal_value_ = 0;
   std::size_t proposal_count_upload_staging_index_ = 0;
+  std::size_t committed_feature_rows_ = 0;
+  bool committed_feature_rows_valid_ = false;
   std::int64_t pad_token_id_ = 0;
   bool reset_pending_ = false;
   bool draft_reset_pending_ = false;
@@ -2555,14 +2666,16 @@ AclIncrementalExecutor::AclIncrementalExecutor(
     IncrementalModelProgress progress,
     IncrementalStateResetPolicy state_reset_policy,
     IncrementalDecodeCarrierPolicy decode_carrier_policy,
-    bool profile_model_executions)
+    bool profile_model_executions,
+    IncrementalDraftFeaturePolicy draft_feature_policy)
     : impl_(std::make_unique<Impl>(
           model_paths,
           device_id,
           progress,
           state_reset_policy,
           decode_carrier_policy,
-          profile_model_executions)) {}
+          profile_model_executions,
+          draft_feature_policy)) {}
 
 AclIncrementalExecutor::~AclIncrementalExecutor() = default;
 AclIncrementalExecutor::AclIncrementalExecutor(
@@ -2651,6 +2764,11 @@ AclIncrementalExecutor::state_reset_policy() const noexcept {
 IncrementalDecodeCarrierPolicy
 AclIncrementalExecutor::decode_carrier_policy() const noexcept {
   return impl_->decode_carrier_policy();
+}
+
+IncrementalDraftFeaturePolicy
+AclIncrementalExecutor::draft_feature_policy() const noexcept {
+  return impl_->draft_feature_policy();
 }
 
 bool AclIncrementalExecutor::unified_target_step() const noexcept {

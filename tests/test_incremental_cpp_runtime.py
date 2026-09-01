@@ -17,6 +17,8 @@ if str(FRAMEWORK_PYTHON) not in sys.path:
 
 from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     ASYNC_MEMSET_STATE_RESET_POLICY,
+    COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
+    FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     IMMUTABLE_ZERO_STATE_RESET_POLICY,
     INCREMENTAL_CPP_RUNNER_ID,
     INCREMENTAL_STATE_POLICY,
@@ -58,6 +60,7 @@ def _report(
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     prompt_token_ids: list[int] | None = None,
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+    draft_feature_policy: str = FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     dflash_sync_window: int = 1,
 ) -> dict[str, object]:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
@@ -68,6 +71,28 @@ def _report(
     dflash_request_count = request_count // 2
     draft_propose_executions = 39
     prefill_draft_executions = dflash_request_count
+    verify_draft_executions = (
+        draft_propose_executions - prefill_draft_executions
+    )
+    committed_prefix = (
+        draft_feature_policy == COMMITTED_PREFIX_DRAFT_FEATURE_POLICY
+    )
+    draft_verify_feature_rows = (
+        4 * verify_draft_executions
+        if committed_prefix
+        else 16 * verify_draft_executions
+    )
+    draft_verify_full_rows = 16 * verify_draft_executions
+    draft_verify_prefix_executions = (
+        verify_draft_executions
+        if committed_prefix and dflash_sync_window == 1
+        else 0
+    )
+    draft_verify_pending_executions = (
+        verify_draft_executions
+        if committed_prefix and dflash_sync_window == 2
+        else 0
+    )
     prefill_draft_elided = dflash_request_count * (prompt_chunks - 1)
     prefill_feature_rows = dflash_request_count * prompt_chunks * 64
     prefill_control_bytes = 896
@@ -127,7 +152,7 @@ def _report(
         for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -189,6 +214,17 @@ def _report(
             ),
             "state_reset_policy": state_reset_policy,
             "decode_carrier_policy": decode_carrier_policy,
+            "draft_feature_policy": draft_feature_policy,
+            "draft_feature_policy_description": (
+                "after a synchronized verify, Draft binds exactly accepted+1 "
+                "leading Target feature rows; an unsynchronized second "
+                "transaction binds the causal K+1 upper bound; masked suffix "
+                "cache writes are scratch and overwritten before becoming "
+                "visible"
+                if committed_prefix
+                else "verify-source Draft binds the original physical N=16; "
+                "this is the rollback and matched-baseline route"
+            ),
             "state_reset_only_barriers": 0,
             "state_reset_device_work_included_by_prefill_barrier": (
                 not immutable_zero
@@ -238,7 +274,9 @@ def _report(
             "proposal_count_staging_pinned_host_bytes": 8,
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
-            "draft_dynamic_gear_count": 3,
+            "draft_dynamic_gear_count": 18,
+            "draft_verify_dynamic_gear_count": 16,
+            "draft_prefill_dynamic_gear_count": 2,
             "target_step_zero_count_device_bytes": 0,
             "explicit_allocated_device_bytes_excluding_runtime": (
                 64 + 1088 + state_bytes + 4096
@@ -283,6 +321,22 @@ def _report(
             "prefill_draft_propose_executions": prefill_draft_executions,
             "prefill_draft_propose_executions_elided": prefill_draft_elided,
             "prefill_feature_rows_batched": prefill_feature_rows,
+            "draft_verify_feature_input_rows": draft_verify_feature_rows,
+            "draft_verify_full_width_equivalent_rows": (
+                draft_verify_full_rows
+            ),
+            "draft_verify_feature_rows_elided": (
+                draft_verify_full_rows - draft_verify_feature_rows
+            ),
+            "draft_verify_fixed_width_executions": (
+                0 if committed_prefix else verify_draft_executions
+            ),
+            "draft_verify_committed_prefix_executions": (
+                draft_verify_prefix_executions
+            ),
+            "draft_verify_pending_upper_bound_executions": (
+                draft_verify_pending_executions
+            ),
             "prefill_control_upload_operations": target_prefill_executions,
             "prefill_control_upload_bytes": prefill_control_upload_bytes,
             "prefill_control_full_upload_operations": (
@@ -368,7 +422,9 @@ def _report(
             "proposal_count_staging_pinned_host_bytes": 8,
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
-            "draft_dynamic_gear_count": 3,
+            "draft_dynamic_gear_count": 18,
+            "draft_verify_dynamic_gear_count": 16,
+            "draft_prefill_dynamic_gear_count": 2,
             "target_step_zero_count_device_bytes": 0,
             "target_step_zero_count_bindings": 0,
         },
@@ -467,6 +523,7 @@ def _validate(
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     prompt_token_ids: list[int] | None = None,
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+    draft_feature_policy: str = FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     dflash_sync_window: int = 1,
     unified_target_step: bool = False,
 ) -> None:
@@ -486,6 +543,7 @@ def _validate(
         max_draft_tokens=3,
         state_reset_policy=state_reset_policy,
         decode_carrier_policy=decode_carrier_policy,
+        draft_feature_policy=draft_feature_policy,
         dflash_sync_window=dflash_sync_window,
     )
 
@@ -542,6 +600,28 @@ def test_incremental_runner_rejects_decode_carrier_policy_mismatch() -> None:
         _validate(report)
 
 
+@pytest.mark.parametrize("dflash_sync_window", [1, 2])
+def test_incremental_runner_accepts_committed_prefix_draft_features(
+    dflash_sync_window: int,
+) -> None:
+    _validate(
+        _report(
+            draft_feature_policy=COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
+            dflash_sync_window=dflash_sync_window,
+        ),
+        draft_feature_policy=COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
+        dflash_sync_window=dflash_sync_window,
+    )
+
+
+def test_incremental_runner_rejects_draft_feature_policy_mismatch() -> None:
+    report = _report(
+        draft_feature_policy=COMMITTED_PREFIX_DRAFT_FEATURE_POLICY
+    )
+    with pytest.raises(RuntimeError, match="Draft feature policy differs"):
+        _validate(report)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -576,6 +656,12 @@ def test_incremental_runner_rejects_decode_carrier_policy_mismatch() -> None:
         ("compact_verify_result_bytes", 451),
         ("proposal_count_upload_bytes", 7),
         ("proposal_count_staging_pinned_host_bytes", 1),
+        ("draft_verify_feature_input_rows", 415),
+        ("draft_verify_full_width_equivalent_rows", 415),
+        ("draft_verify_feature_rows_elided", 1),
+        ("draft_verify_fixed_width_executions", 25),
+        ("draft_verify_committed_prefix_executions", 1),
+        ("draft_verify_pending_upper_bound_executions", 1),
     ],
 )
 def test_incremental_runner_rejects_inconsistent_execution_counters(
@@ -617,6 +703,7 @@ def test_incremental_runner_config_is_explicit() -> None:
             "state_policy": INCREMENTAL_STATE_POLICY,
             "state_reset_policy": IMMUTABLE_ZERO_STATE_RESET_POLICY,
             "decode_carrier_policy": ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
+            "draft_feature_policy": COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
             "dflash_sync_window": 2,
             "pad_token_id": 0,
         },
@@ -632,6 +719,10 @@ def test_incremental_runner_config_is_explicit() -> None:
         == ONE_TOKEN_H2D_DECODE_CARRIER_POLICY
     )
     assert identity["dflash_sync_window"] == 2
+    assert (
+        identity["draft_feature_policy"]
+        == COMMITTED_PREFIX_DRAFT_FEATURE_POLICY
+    )
 
 
 def test_incremental_runner_rejects_unknown_state_reset_policy() -> None:
@@ -661,6 +752,22 @@ def test_incremental_runner_rejects_unknown_decode_carrier_policy() -> None:
                 "runtime": "AscendCL",
                 "state_policy": INCREMENTAL_STATE_POLICY,
                 "decode_carrier_policy": "unknown",
+            },
+            0,
+        )
+
+
+def test_incremental_runner_rejects_unknown_draft_feature_policy() -> None:
+    with pytest.raises(ValueError, match="draft_feature_policy"):
+        validate_cpp_runner_options(
+            {
+                "device_model": "Ascend310P3",
+                "cann": "test-cann",
+                "driver": "test-driver",
+                "firmware": "test-firmware",
+                "runtime": "AscendCL",
+                "state_policy": INCREMENTAL_STATE_POLICY,
+                "draft_feature_policy": "unknown",
             },
             0,
         )
@@ -704,6 +811,12 @@ def test_resolve_incremental_oms_locks_all_five_abis_and_hashes(
                 "role": role,
                 "input_names": inputs,
                 "output_names": outputs,
+                "dynamic": role == "draft-propose",
+                "input_dim_gears": (
+                    {"0": {"1": list(range(1, 17)) + [64, 128]}}
+                    if role == "draft-propose"
+                    else {}
+                ),
                 "om": {
                     "path": om.name,
                     "sha256": hashlib.sha256(om.read_bytes()).hexdigest(),
@@ -734,6 +847,20 @@ def test_resolve_incremental_oms_locks_all_five_abis_and_hashes(
     with pytest.raises(ValueError, match="output order"):
         _resolve_incremental_oms(manifest_path)
 
+    graphs[2]["output_names"] = _INCREMENTAL_GRAPH_ABI[
+        "target-decode1"
+    ][1]
+    graphs[3]["input_dim_gears"] = {
+        "0": {"1": list(range(2, 17)) + [64, 128]}
+    }
+    manifest_path.write_text(json.dumps({
+        "artifact_kind": "qwen35-dflash-ascend310p-om-bundle",
+        "status": "PASS",
+        "graphs": graphs,
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="N=1..16"):
+        _resolve_incremental_oms(manifest_path)
+
 
 def test_resolve_incremental_oms_accepts_only_complete_t1_to_t16_target_step(
     tmp_path: Path,
@@ -756,6 +883,11 @@ def test_resolve_incremental_oms_accepts_only_complete_t1_to_t16_target_step(
             graph["dynamic"] = True
             graph["input_dim_gears"] = {
                 "0": {"1": list(range(1, 17))}
+            }
+        elif role == "draft-propose":
+            graph["dynamic"] = True
+            graph["input_dim_gears"] = {
+                "0": {"1": list(range(1, 17)) + [64, 128]}
             }
         graphs.append(graph)
     manifest_path = tmp_path / "deployment.json"
@@ -794,6 +926,12 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
                 "role": role,
                 "input_names": inputs,
                 "output_names": outputs,
+                "dynamic": role == "draft-propose",
+                "input_dim_gears": (
+                    {"0": {"1": list(range(1, 17)) + [64, 128]}}
+                    if role == "draft-propose"
+                    else {}
+                ),
                 "om": {
                     "path": om.name,
                     "sha256": hashlib.sha256(om.read_bytes()).hexdigest(),
@@ -868,6 +1006,9 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
     )
     assert command[command.index("--decode-carrier-policy") + 1] == (
         LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
+    )
+    assert command[command.index("--draft-feature-policy") + 1] == (
+        FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY
     )
     assert command[command.index("--dflash-sync-window") + 1] == "1"
     assert command[command.index("--measurement-protocol") + 1] == "evidence"

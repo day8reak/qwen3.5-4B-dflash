@@ -48,6 +48,10 @@ void RunPolicy(
   Require(
       executor.decode_carrier_policy() == decode_carrier_policy,
       "decode carrier policy differs");
+  Require(
+      executor.draft_feature_policy() ==
+          qwen35::dflash::IncrementalDraftFeaturePolicy::kFixedVerifyWidth,
+      "default Draft feature policy differs");
 
   qwen35::dflash::GenerationOptions options;
   options.max_new_tokens = 6;
@@ -147,8 +151,18 @@ void RunPolicy(
   Require(
       stats.prefill_feature_slab_bytes == 1024 &&
           stats.prefill_feature_arena_bytes == 2112 &&
-          stats.draft_dynamic_gear_count == 3,
+          stats.draft_dynamic_gear_count == 18 &&
+          stats.draft_verify_dynamic_gear_count == 16 &&
+          stats.draft_prefill_dynamic_gear_count == 2,
       "prefill feature arena or dynamic gear set differs");
+  Require(
+      stats.draft_verify_feature_input_rows == 0 &&
+          stats.draft_verify_full_width_equivalent_rows == 0 &&
+          stats.draft_verify_feature_rows_elided == 0 &&
+          stats.draft_verify_fixed_width_executions == 0 &&
+          stats.draft_verify_committed_prefix_executions == 0 &&
+          stats.draft_verify_pending_upper_bound_executions == 0,
+      "request set unexpectedly executed a verify-source Draft route");
   Require(
       stats.prefill_control_upload_operations ==
               stats.target_prefill_executions &&
@@ -395,6 +409,11 @@ void TestUnifiedTargetStep(
       stats.target_step_dynamic_gear_count == 16,
       "unified Target-step gears differ");
   Require(
+      stats.draft_dynamic_gear_count == 18 &&
+          stats.draft_verify_dynamic_gear_count == 16 &&
+          stats.draft_prefill_dynamic_gear_count == 2,
+      "unified Draft dynamic gears differ");
+  Require(
       stats.target_step_zero_count_device_bytes == sizeof(std::int32_t) &&
           stats.target_step_zero_count_bindings ==
               stats.target_decode1_executions,
@@ -432,6 +451,77 @@ void TestUnifiedTargetStep(
       "unified profile trace T1 count differs");
 }
 
+void TestCommittedDraftFeaturePrefix(
+    const std::array<std::filesystem::path, 5>& model_paths,
+    std::size_t sync_window) {
+  qwen35::dflash::IncrementalOmPaths paths{
+      model_paths[0], model_paths[1], model_paths[2], model_paths[3],
+      model_paths[4]};
+  qwen35::dflash::AclIncrementalExecutor executor(
+      std::move(paths),
+      0,
+      {},
+      qwen35::dflash::IncrementalStateResetPolicy::kAsyncMemset,
+      qwen35::dflash::IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact,
+      false,
+      qwen35::dflash::IncrementalDraftFeaturePolicy::kCommittedPrefix);
+  Require(
+      executor.draft_feature_policy() ==
+          qwen35::dflash::IncrementalDraftFeaturePolicy::kCommittedPrefix,
+      "committed-prefix Draft feature policy was not selected");
+
+  qwen35::dflash::GenerationOptions options;
+  options.max_new_tokens = 10;
+  options.max_draft_tokens = 3;
+  options.dflash_sync_window = sync_window;
+  const auto generated = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kDFlash,
+      options);
+  const std::vector<std::int64_t> expected{
+      11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
+  Require(
+      generated.generated_token_ids == expected,
+      "committed-prefix Draft route changed exact generated tokens");
+
+  const auto& stats = executor.execution_stats();
+  Require(
+      stats.draft_propose_executions >=
+          stats.prefill_draft_propose_executions,
+      "verify-source Draft execution count underflowed");
+  const std::size_t verify_draft_executions =
+      stats.draft_propose_executions -
+      stats.prefill_draft_propose_executions;
+  Require(verify_draft_executions > 0, "committed-prefix route was not exercised");
+  Require(
+      stats.draft_dynamic_gear_count == 18 &&
+          stats.draft_verify_dynamic_gear_count == 16 &&
+          stats.draft_prefill_dynamic_gear_count == 2 &&
+          stats.draft_verify_fixed_width_executions == 0 &&
+          stats.draft_verify_committed_prefix_executions +
+                  stats.draft_verify_pending_upper_bound_executions ==
+              verify_draft_executions &&
+          stats.draft_verify_full_width_equivalent_rows ==
+              16 * verify_draft_executions &&
+          stats.draft_verify_feature_input_rows +
+                  stats.draft_verify_feature_rows_elided ==
+              stats.draft_verify_full_width_equivalent_rows &&
+          stats.draft_verify_feature_rows_elided > 0,
+      "committed-prefix Draft row counters do not close");
+  if (sync_window == 1) {
+    Require(
+        stats.draft_verify_committed_prefix_executions ==
+                verify_draft_executions &&
+            stats.draft_verify_pending_upper_bound_executions == 0,
+        "window-one Draft did not use the host-visible committed prefix");
+  } else {
+    Require(
+        stats.draft_verify_pending_upper_bound_executions > 0,
+        "window-two Draft did not use its causal pending upper bound");
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -467,11 +557,13 @@ int main(int argc, char** argv) {
         qwen35::dflash::IncrementalDecodeCarrierPolicy::
             kOneTokenHostFallback);
     TestExplicitDecodeOverride(paths);
+    TestCommittedDraftFeaturePrefix(paths, 1);
+    TestCommittedDraftFeaturePrefix(paths, 2);
     TestUnifiedTargetStep(
         {paths[0], paths[1], paths[3], std::filesystem::path(argv[6])});
-    std::cout << "PASS: both reset and decode carrier policies preserve exact "
-                 "five-OM tokens, device state routing, compact "
-                 "synchronization and explicit decode override fallback\n";
+    std::cout << "PASS: reset, decode carrier and committed-prefix Draft "
+                 "feature policies preserve exact tokens, device state "
+                 "routing, compact synchronization and override fallback\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

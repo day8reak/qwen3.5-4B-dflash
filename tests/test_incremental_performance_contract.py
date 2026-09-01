@@ -207,6 +207,16 @@ def test_hot_loop_keeps_large_state_and_proposals_on_device() -> None:
     assert "target or Draft KV cache" in state["host_forbidden_payloads_per_round"]
     assert "stays on device" in contract["hot_loop"]["draft_to_verify"]
     assert "window 2" in contract["hot_loop"]["synchronization"]
+    assert set(contract["hot_loop"]["draft_feature_policies"]) == {
+        "fixed-16",
+        "committed-prefix",
+    }
+    assert "N=1..16" in contract["hot_loop"][
+        "draft_feature_dynamic_gears"
+    ]
+    assert "logical_draft_cursor" in contract["hot_loop"][
+        "draft_feature_liveness_proof"
+    ]
     assert set(contract["hot_loop"]["dflash_sync_window_policies"]) == {
         "1",
         "2",
@@ -241,6 +251,32 @@ def test_tensor_abi_persists_only_scalar_target_state() -> None:
     carriers = {item["name"]: item for item in tensor_abi["round_carriers"]}
     assert carriers["verify_input_ids"]["shape"] == [1, 16]
     assert carriers["logical_proposal_count"]["range"] == [1, 15]
+    assert carriers["target_feature_tail"]["shape"] == [1, "N", 20480]
+    assert "N=1..16" in carriers["target_feature_tail"]["dynamic_gears"]
+
+
+def test_draft_committed_prefix_work_ledger_matches_locked_dimensions() -> None:
+    contract = _contract()
+    symbols = contract["symbols"]
+    work = contract["draft_committed_prefix_work_model"]
+    feature_projection = (
+        symbols["target_feature_width"] * symbols["target_hidden"]
+    )
+    draft_kv_width = symbols["draft_kv_heads"] * symbols["draft_head_dim"]
+    context_kv_projection = (
+        symbols["draft_layers"]
+        * 2
+        * symbols["target_hidden"]
+        * draft_kv_width
+    )
+    per_row = feature_projection + context_kv_projection
+    assert work["target_feature_projection_mac_per_row"] == feature_projection
+    assert work["six_layer_context_kv_projection_mac_per_row"] == (
+        context_kv_projection
+    )
+    assert work["modeled_mac_per_elided_feature_row"] == per_row
+    assert work["elided_rows_at_k3_all_accepted"] == 12
+    assert work["modeled_mac_eliminated_at_k3_all_accepted"] == 12 * per_row
 
 
 def test_document_contains_memory_inspector_and_claim_boundary() -> None:
@@ -257,6 +293,9 @@ def test_document_contains_memory_inspector_and_claim_boundary() -> None:
     assert "one-token-h2d" in document
     assert "last-token-d2d" in document
     assert "--dflash-sync-window" in document
+    assert "--draft-feature-policy" in document
+    assert "committed-prefix" in document
+    assert "1,006,632,960" in document
     assert "K0=15,K1=14" in document
     assert "不能宣称" in document
 
@@ -266,7 +305,7 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 17
+    assert framework_lock["schema_version"] == 18
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -286,6 +325,7 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert "formal unprofiled 3+10" in runtime[
         "incremental_profile_attribution"
     ]
+    assert "N=1..16" in runtime["incremental_draft_feature_prefix"]
 
     cpp_runtime = deployment["cpp_runtime"]
     assert "changed contiguous range" in cpp_runtime["memory"]
@@ -308,6 +348,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
         for item in runner["required_io_counters"]
     )
     assert "maximum_target_elements_per_call" in runner["required_io_counters"]
+    assert "draft_verify_feature_input_rows" in runner[
+        "required_io_counters"
+    ]
 
 
 def test_decode_device_carrier_contract_closes_frozen_fake_acl_work() -> None:
@@ -448,3 +491,25 @@ def test_two_transaction_window_short_case_records_coalesced_d2h() -> None:
             - evidence["compact_verify_result_bytes_both"]
         )
     )
+
+
+def test_committed_prefix_fake_acl_evidence_closes_rows_and_routes() -> None:
+    evidence = _contract()["hot_loop"][
+        "fake_acl_committed_prefix_70_token_10_output_paired_3_plus_10"
+    ]
+    assert evidence["token_id_mismatches"] == 0
+    assert evidence["eos_mismatches"] == 0
+    assert evidence["fixed_16_feature_input_rows"] == 208
+    assert evidence["committed_prefix_feature_input_rows"] == 52
+    assert evidence["committed_prefix_feature_rows_elided"] == 156
+    assert (
+        evidence["committed_prefix_feature_input_rows"]
+        + evidence["committed_prefix_feature_rows_elided"]
+        == evidence["committed_prefix_full_width_equivalent_rows"]
+    )
+    assert evidence["window_1_committed_prefix_executions"] == 13
+    assert evidence["window_2_pending_upper_bound_executions"] == 13
+    assert evidence["matched_fixed_and_prefix_sync_window"] == 2
+    assert evidence[
+        "combined_four_om_window_2_committed_prefix_status"
+    ] == "PASS"

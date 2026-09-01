@@ -30,6 +30,9 @@ endif()
 if(NOT DEFINED DECODE_CARRIER_POLICY)
   set(DECODE_CARRIER_POLICY "last-token-d2d")
 endif()
+if(NOT DEFINED DRAFT_FEATURE_POLICY)
+  set(DRAFT_FEATURE_POLICY "fixed-16")
+endif()
 if(NOT DEFINED DFLASH_SYNC_WINDOW)
   set(DFLASH_SYNC_WINDOW 1)
 endif()
@@ -82,6 +85,7 @@ execute_process(
     --measurement-protocol "${MEASUREMENT_PROTOCOL}"
     --state-reset-policy "${RESET_POLICY}"
     --decode-carrier-policy "${DECODE_CARRIER_POLICY}"
+    --draft-feature-policy "${DRAFT_FEATURE_POLICY}"
   RESULT_VARIABLE result
   OUTPUT_VARIABLE stdout
   ERROR_VARIABLE stderr
@@ -131,6 +135,7 @@ string(JSON report_dflash_sync_window GET "${report}" protocol dflash_sync_windo
 string(JSON maximum_dflash_sync_window GET "${report}" protocol maximum_supported_dflash_sync_window)
 string(JSON report_reset_policy GET "${report}" protocol state_reset_policy)
 string(JSON report_decode_carrier_policy GET "${report}" protocol decode_carrier_policy)
+string(JSON report_draft_feature_policy GET "${report}" protocol draft_feature_policy)
 string(JSON report_zero_count_policy GET "${report}" protocol target_step_zero_count_policy)
 string(JSON reset_only_barriers GET "${report}" protocol state_reset_only_barriers)
 string(JSON state_memsets GET "${report}" execution_io_counters state_memset_operations)
@@ -163,6 +168,14 @@ string(JSON prefill_staging_bytes GET "${report}" execution_io_counters prefill_
 string(JSON prefill_feature_slab_bytes GET "${report}" execution_io_counters prefill_feature_slab_bytes)
 string(JSON prefill_feature_arena_bytes GET "${report}" execution_io_counters prefill_feature_arena_bytes)
 string(JSON draft_dynamic_gears GET "${report}" execution_io_counters draft_dynamic_gear_count)
+string(JSON draft_verify_dynamic_gears GET "${report}" execution_io_counters draft_verify_dynamic_gear_count)
+string(JSON draft_prefill_dynamic_gears GET "${report}" execution_io_counters draft_prefill_dynamic_gear_count)
+string(JSON draft_verify_feature_rows GET "${report}" execution_io_counters draft_verify_feature_input_rows)
+string(JSON draft_verify_full_rows GET "${report}" execution_io_counters draft_verify_full_width_equivalent_rows)
+string(JSON draft_verify_elided_rows GET "${report}" execution_io_counters draft_verify_feature_rows_elided)
+string(JSON draft_verify_fixed_executions GET "${report}" execution_io_counters draft_verify_fixed_width_executions)
+string(JSON draft_verify_prefix_executions GET "${report}" execution_io_counters draft_verify_committed_prefix_executions)
+string(JSON draft_verify_pending_executions GET "${report}" execution_io_counters draft_verify_pending_upper_bound_executions)
 string(JSON target_step_dynamic_gears GET "${report}" execution_io_counters target_step_dynamic_gear_count)
 string(JSON target_step_input_rows GET "${report}" execution_io_counters target_step_input_rows)
 string(JSON target_step_elided_rows GET "${report}" execution_io_counters target_step_padded_rows_elided)
@@ -238,6 +251,10 @@ math(EXPR closed_decode_routes "${decode_uploads} + ${decode_carrier_hits}")
 math(EXPR expected_proposal_upload_bytes "${proposal_uploads} * 4")
 math(EXPR closed_h2d_operations "${prefill_control_uploads} + ${decode_uploads} + ${proposal_uploads}")
 math(EXPR closed_h2d_bytes "${prefill_control_upload_bytes} + ${decode_upload_bytes} + ${proposal_upload_bytes}")
+math(EXPR verify_draft_executions "${draft_executions} - ${prefill_draft_executions}")
+math(EXPR closed_draft_feature_routes "${draft_verify_fixed_executions} + ${draft_verify_prefix_executions} + ${draft_verify_pending_executions}")
+math(EXPR expected_draft_verify_full_rows "16 * ${verify_draft_executions}")
+math(EXPR closed_draft_verify_rows "${draft_verify_feature_rows} + ${draft_verify_elided_rows}")
 if(MEASUREMENT_PROTOCOL STREQUAL "profile")
   if(NOT trace_enabled OR NOT trace_length EQUAL model_executions)
     message(FATAL_ERROR "fake profile execution trace does not close: ${report}")
@@ -325,6 +342,32 @@ elseif(DECODE_CARRIER_POLICY STREQUAL "one-token-h2d")
 else()
   message(FATAL_ERROR "unknown DECODE_CARRIER_POLICY=${DECODE_CARRIER_POLICY}")
 endif()
+if(DRAFT_FEATURE_POLICY STREQUAL "fixed-16")
+  if(NOT report_draft_feature_policy STREQUAL DRAFT_FEATURE_POLICY OR
+     NOT draft_verify_fixed_executions EQUAL verify_draft_executions OR
+     NOT draft_verify_prefix_executions EQUAL 0 OR
+     NOT draft_verify_pending_executions EQUAL 0 OR
+     NOT draft_verify_elided_rows EQUAL 0)
+    message(FATAL_ERROR "fake fixed-16 Draft feature counters failed: ${report}")
+  endif()
+elseif(DRAFT_FEATURE_POLICY STREQUAL "committed-prefix")
+  if(NOT report_draft_feature_policy STREQUAL DRAFT_FEATURE_POLICY OR
+     NOT draft_verify_fixed_executions EQUAL 0 OR
+     NOT closed_draft_feature_routes EQUAL verify_draft_executions OR
+     NOT draft_verify_elided_rows GREATER 0)
+    message(FATAL_ERROR "fake committed-prefix Draft feature counters failed: ${report}")
+  endif()
+  if(DFLASH_SYNC_WINDOW EQUAL 1 AND
+     NOT draft_verify_prefix_executions GREATER 0)
+    message(FATAL_ERROR "window-one committed-prefix route was not exercised: ${report}")
+  endif()
+  if(DFLASH_SYNC_WINDOW EQUAL 2 AND
+     NOT draft_verify_pending_executions GREATER 0)
+    message(FATAL_ERROR "window-two pending upper-bound route was not exercised: ${report}")
+  endif()
+else()
+  message(FATAL_ERROR "unknown DRAFT_FEATURE_POLICY=${DRAFT_FEATURE_POLICY}")
+endif()
 if(DFLASH_SYNC_WINDOW EQUAL 1)
   if(NOT speculative_syncs_elided EQUAL 0)
     message(FATAL_ERROR "window-one run elided a speculative synchronization: ${report}")
@@ -340,7 +383,7 @@ if(ADAPTIVE_PROPOSAL_COUNTS AND
    NOT proposal_uploads EQUAL expected_dflash_requests)
   message(FATAL_ERROR "adaptive-K proposal uploads differ: ${report}")
 endif()
-if(NOT schema_version EQUAL 5 OR
+if(NOT schema_version EQUAL 6 OR
    NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR
@@ -375,7 +418,12 @@ if(NOT schema_version EQUAL 5 OR
    NOT prefill_staging_bytes EQUAL EXPECTED_PREFILL_STAGING_BYTES OR
    NOT prefill_feature_slab_bytes EQUAL 1024 OR
    NOT prefill_feature_arena_bytes EQUAL 2112 OR
-   NOT draft_dynamic_gears EQUAL 3 OR
+   NOT draft_dynamic_gears EQUAL 18 OR
+   NOT draft_verify_dynamic_gears EQUAL 16 OR
+   NOT draft_prefill_dynamic_gears EQUAL prefill_staging_slots OR
+   NOT closed_draft_feature_routes EQUAL verify_draft_executions OR
+   NOT draft_verify_full_rows EQUAL expected_draft_verify_full_rows OR
+   NOT closed_draft_verify_rows EQUAL draft_verify_full_rows OR
    NOT prefill_control_uploads EQUAL prefill_executions OR
    NOT prefill_control_full_uploads EQUAL expected_prefill_control_full_uploads OR
    NOT prefill_control_base_uploads EQUAL expected_prefill_control_base_uploads OR

@@ -343,9 +343,11 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   始终留在 device。第 0 行直接绑定到下一次 `target-decode1`；多 token 结果的末行因模型输入
   起始地址必须 64-byte 对齐，先做一次 8-byte D2D 到现有对齐 scalar。标准 scheduler 不再上传
   decode ID，只有调用者显式改写 ID 才走 pinned-host H2D；token 语义和五个 OM 的 ABI 均不改变；
-- Draft 的 `N=16,64,128,...,kv_cache_max_len` 离散 gear 通过 TorchAir
+- Draft 的 verify-source `N=1..16` 与 prompt-source
+  `N=64,128,...,kv_cache_max_len` 离散 gear 通过 TorchAir
   `set_dim_gears` 写入 AIR；C++ 启动时逐档核验并预建 dataset，request 热循环不调用
-  `aclmdlSetInputDynamicDims`；
+  `aclmdlSetInputDynamicDims`。默认 `fixed-16` 仍绑定 N=16；候选 `committed-prefix` 在同步后绑定
+  `accepted+1` 行，在 window 2 尚未读回上一事务时绑定其严格因果上界 `K+1`；
 - ordinary 路径执行 `target-prefill` body、末尾一次 `target-prefill-head` 和后续
   `target-decode1`，不执行 Draft。
 
@@ -403,7 +405,7 @@ jq -r '.graphs[] | [.name,.role,.om.path,.om.sha256] | @tsv' \
 静默分解成普通 Tensor 子图。`draft-propose` 的 gear 由 exporter 在调用
 `torchair.dynamo_export` 前对第 0 个输入执行 `torchair.inference.set_dim_gears`；不要给
 `--framework=1` 的 AIR→OM ATC 命令额外拼 `--dynamic_dims`。生成 OM 后，C++ 启动会要求
-`N=16` 和从 64 到 `max_sequence_length` 的每个 64 倍数都能由
+`N=1..16` 和从 64 到 `max_sequence_length` 的每个 64 倍数都能由
 `aclmdlGetInputDynamicDims` 查询到，缺一档就直接失败。
 
 先用 manifest 确认拆图 ABI 和 head 自定义量化节点都被保留：
@@ -537,7 +539,8 @@ cp config/quant_air_om_incremental_runner.example.json \
 ```
 
 控制面会在启动前校验五个 role 的输入/输出顺序和 OM SHA-256；runner 自身会再次校验 hash，
-加载后再从真实 OM description 校验 dtype、shape、state 对齐、`N=16/N=64` gear。任何一层不符
+加载后再从真实 OM description 校验 dtype、shape、state 对齐、完整 `N=1..16` verify gear 和
+从 `N=64` 开始的 prompt gear。任何一层不符
 都会停止，不能进入时延比较。
 
 直接检查关键门禁：
@@ -1017,6 +1020,135 @@ msprof 的 3+10 中 DFlash median 和 p90 都稳定改善时才启用。若 acce
 抵消同步收益、EOS workload 变慢或结果落在噪声内，继续使用默认 window 1。Fake ACL 只能验证
 排队与 buffer 生命周期，不能作为这个选择门禁的时延输入。
 
+#### 5.5.2 A/B 选择 Draft 有效 feature 前缀
+
+`draft_feature_policy` 只改变同一个 `draft-propose.om` 的动态 N 档位，不增加 OM、不复制权重、
+不改变输入输出顺序。两个精确策略是：
+
+- `fixed-16`：默认回退基线；verify 后每次 Draft 都处理 16 行 Target feature；
+- `committed-prefix`：同步窗口 1 使用上一轮真实 `accepted+1` 行；同步窗口 2 的第二个未同步事务
+  尚不能读取 acceptance，因此使用上一轮逻辑 proposal 数的因果上界 `K+1`。真实有效行不会超过
+  这个上界。
+
+精确性的依据不是“尾行大概没用”，而是 Draft KV 的可见性规则：只有
+`logical_draft_cursor` 以下位置是 authoritative。`fixed-16` 在 cursor 之后写入的其余 feature
+位置一直被显式 mask；它们在 cursor 前进到该位置之前会被后续真实 feature 覆盖。
+`committed-prefix` 只是省掉这部分 scratch 写入。host/Fake ACL 测试会比较 proposal、cursor 以及
+cursor 以下全部 K/V，但真机仍必须重新过 AIR、ATC 和真实模型零差异门禁。
+
+这个候选的保守计算量账本如下。每省一行至少去掉：
+
+```text
+Target feature projection: 20480 * 2560                = 52,428,800 MAC
+6 层 Draft context K/V: 6 * 2 * 2560 * (8 * 128)      = 31,457,280 MAC
+合计                                                    = 83,886,080 MAC/行
+```
+
+常见 `K=3` 且三个 draft token 全接受时，下一轮只需要 4 行；相对 N=16 省 12 行，即账面
+`1,006,632,960` MAC。这个数字不包含 norm、rotary、scatter/cache update 等工作，也不代表
+端到端加速比；动态 gear 的真实 kernel 选择和耗时必须由 310P 测量。
+
+先复制两份配置，只改一个字段；两份配置必须引用同一 runner、同一 deployment manifest 和
+同一批 OM SHA-256：
+
+```bash
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-draft-fixed.json"
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-draft-prefix.json"
+
+jq '.draft_feature_policy = "fixed-16"' \
+  "$AI_RUN_DIR/runner-draft-fixed.json" > \
+  "$AI_RUN_DIR/runner-draft-fixed.tmp.json"
+mv "$AI_RUN_DIR/runner-draft-fixed.tmp.json" \
+  "$AI_RUN_DIR/runner-draft-fixed.json"
+jq '.draft_feature_policy = "committed-prefix"' \
+  "$AI_RUN_DIR/runner-draft-prefix.json" > \
+  "$AI_RUN_DIR/runner-draft-prefix.tmp.json"
+mv "$AI_RUN_DIR/runner-draft-prefix.tmp.json" \
+  "$AI_RUN_DIR/runner-draft-prefix.json"
+```
+
+先按 fixed→prefix 跑，再换新输出按 prefix→fixed 重跑，以排除温度、频率和顺序偏差。下面选择
+`max_draft_tokens=3` 是为了持续覆盖 N=4 左右的常见接受路径；部署的代表性 K 也要另做一组：
+
+```bash
+for DRAFT_POLICY in fixed prefix; do
+  "$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
+    --deployment-manifest "$INCREMENTAL_BUNDLE/deployment-manifest.json" \
+    --runner \
+      "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+    --runner-config "$AI_RUN_DIR/runner-draft-${DRAFT_POLICY}.json" \
+    --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
+    --prompt '请用一句话解释为什么天空是蓝色的。' \
+    --chat \
+    --max-new-tokens 32 \
+    --max-draft-tokens 3 \
+    --device-id 0 \
+    --output "$AI_RUN_DIR/reports/draft-${DRAFT_POLICY}.json"
+done
+```
+
+先检查 token、EOS、动态 gear 和所有行数/route 计数闭合：
+
+```bash
+jq -e -s '
+  (length == 2) and
+  (.[0].ordinary.stable_generated_token_ids ==
+   .[1].ordinary.stable_generated_token_ids) and
+  (.[0].dflash.stable_generated_token_ids ==
+   .[1].dflash.stable_generated_token_ids) and
+  (.[0].dflash.stable_stop_reason == .[1].dflash.stable_stop_reason) and
+  (all(.ordinary_parity.status == "PASS" and
+       .ordinary_parity.token_id_mismatches == 0 and
+       .ordinary_parity.eos_mismatches == 0)) and
+  (all(
+    .execution_io_counters as $io |
+    ($io.draft_verify_dynamic_gear_count == 16) and
+    ($io.draft_dynamic_gear_count ==
+     ($io.draft_verify_dynamic_gear_count +
+      $io.draft_prefill_dynamic_gear_count)) and
+    (($io.draft_verify_fixed_width_executions +
+      $io.draft_verify_committed_prefix_executions +
+      $io.draft_verify_pending_upper_bound_executions) ==
+     ($io.draft_propose_executions -
+      $io.prefill_draft_propose_executions)) and
+    (($io.draft_verify_feature_input_rows +
+      $io.draft_verify_feature_rows_elided) ==
+     $io.draft_verify_full_width_equivalent_rows) and
+    ($io.draft_verify_full_width_equivalent_rows ==
+     (16 * ($io.draft_propose_executions -
+            $io.prefill_draft_propose_executions)))
+  )) and
+  (.[0].protocol.draft_feature_policy == "fixed-16") and
+  (.[0].execution_io_counters.draft_verify_feature_rows_elided == 0) and
+  (.[1].protocol.draft_feature_policy == "committed-prefix") and
+  (.[1].execution_io_counters.draft_verify_fixed_width_executions == 0)
+' "$AI_RUN_DIR/reports/draft-fixed.json" \
+  "$AI_RUN_DIR/reports/draft-prefix.json"
+
+jq -s 'map({
+  policy: .protocol.draft_feature_policy,
+  feature_rows: .execution_io_counters.draft_verify_feature_input_rows,
+  full_width_rows:
+    .execution_io_counters.draft_verify_full_width_equivalent_rows,
+  elided_rows: .execution_io_counters.draft_verify_feature_rows_elided,
+  exact_prefix_calls:
+    .execution_io_counters.draft_verify_committed_prefix_executions,
+  pending_upper_bound_calls:
+    .execution_io_counters.draft_verify_pending_upper_bound_executions,
+  acceptance_rate: .dflash.acceptance_rate,
+  median_ms: .dflash.latency_ms.model_total.median,
+  p90_ms: .dflash.latency_ms.model_total.p90
+})' "$AI_RUN_DIR/reports/draft-fixed.json" \
+  "$AI_RUN_DIR/reports/draft-prefix.json"
+```
+
+只有同机正反顺序、未开 msprof 的 3+10 结果都保持零 token/EOS 差异，而且
+`committed-prefix` 的 median 和 p90 均稳定改善，才可以把配置默认值改掉。若 ATC 不接受完整
+N=1..16 gear、显存/workspace 增长、物理行没有收窄或结果落在测量噪声内，继续使用
+`fixed-16`。
+
 ### 5.6 直接运行二进制
 
 控制面是推荐路径。需要排除 Python 控制面时，可直接执行同一个 runner：
@@ -1054,6 +1186,7 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
   --state-reset-policy async-memset \
   --decode-carrier-policy last-token-d2d \
   --dflash-sync-window 1 \
+  --draft-feature-policy fixed-16 \
   --progress true
 ```
 
@@ -1061,6 +1194,8 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
 文件或 token 输入。把 `--decode-carrier-policy` 换成 `one-token-h2d` 可运行第 5.5 节的同二进制
 carrier 基线。`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，不能保留
 文字占位符。把 `--dflash-sync-window` 改成 `2` 可运行第 5.5.1 节候选；正式默认仍是 `1`。
+把 `--draft-feature-policy` 改成 `committed-prefix` 可运行第 5.5.2 节候选；完成真机 A/B 前默认仍是
+`fixed-16`。
 
 统一 Target-step 使用相同二进制，只改成四个 OM，**完全删除**两项 `--target-decode1` 参数：
 
@@ -1096,6 +1231,7 @@ export UNIFIED_TARGET_STEP_OM="$UNIFIED_BUNDLE/om/target-verify-commit.om"
   --state-reset-policy async-memset \
   --decode-carrier-policy last-token-d2d \
   --dflash-sync-window 1 \
+  --draft-feature-policy fixed-16 \
   --progress true
 ```
 
@@ -1115,10 +1251,11 @@ export TOKEN_IDS='REAL,COMMA,SEPARATED,TOKEN,IDS'
 export RESET_POLICY=async-memset
 export DECODE_CARRIER_POLICY=last-token-d2d
 export DFLASH_SYNC_WINDOW=1
+export DRAFT_FEATURE_POLICY=fixed-16
 mkdir -p "$PROFILE_ROOT"
 
 for AIC_METRIC in PipeUtilization Memory MemoryUB; do
-  LABEL="five-om-stateful-w${DFLASH_SYNC_WINDOW}-${AIC_METRIC}"
+  LABEL="five-om-stateful-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${AIC_METRIC}"
   CASE_ROOT="$PROFILE_ROOT/$LABEL"
   "$DFLASH_SOURCE/tools/run_msprof.sh" \
     --label "$LABEL" \
@@ -1152,11 +1289,14 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
       --state-reset-policy "$RESET_POLICY" \
       --decode-carrier-policy "$DECODE_CARRIER_POLICY" \
       --dflash-sync-window "$DFLASH_SYNC_WINDOW" \
+      --draft-feature-policy "$DRAFT_FEATURE_POLICY" \
       --progress false
 done
 ```
 
-上面默认 profile window 1。分析双轮候选时设 `DFLASH_SYNC_WINDOW=2`，换一个新的
+上面默认 profile window 1 和固定 16 行 Draft verify 输入。分析双轮候选时设
+`DFLASH_SYNC_WINDOW=2`；分析有效前缀候选时设
+`DRAFT_FEATURE_POLICY=committed-prefix`。每个候选都要换一个新的
 `PROFILE_ROOT`/`UNIFIED_PROFILE_ROOT` 后完整重跑，不能把两个窗口的 CSV 合并到同一 analysis
 目录。分析器会要求 `aclmdlExecuteAsync` 按 transaction 闭合、实际 D2H 加
 `speculative_d2h_operations_elided` 后按 transaction 闭合，而 `aclrtSynchronizeStream` 按
@@ -1170,7 +1310,7 @@ export UNIFIED_PROFILE_ROOT=/ABSOLUTE/PATH/qwen35-unified-target-step-msprof
 mkdir -p "$UNIFIED_PROFILE_ROOT"
 
 for AIC_METRIC in PipeUtilization Memory MemoryUB; do
-  LABEL="unified-target-step-w${DFLASH_SYNC_WINDOW}-${AIC_METRIC}"
+  LABEL="unified-target-step-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${AIC_METRIC}"
   CASE_ROOT="$UNIFIED_PROFILE_ROOT/$LABEL"
   "$DFLASH_SOURCE/tools/run_msprof.sh" \
     --label "$LABEL" \
@@ -1205,6 +1345,7 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
       --state-reset-policy "$RESET_POLICY" \
       --decode-carrier-policy "$DECODE_CARRIER_POLICY" \
       --dflash-sync-window "$DFLASH_SYNC_WINDOW" \
+      --draft-feature-policy "$DRAFT_FEATURE_POLICY" \
       --progress false
 done
 ```

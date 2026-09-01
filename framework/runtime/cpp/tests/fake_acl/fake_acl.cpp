@@ -401,7 +401,8 @@ aclError ExecuteDraft(const aclmdlDataset* input, aclmdlDataset* output) {
   }
   const auto feature_rows = input->dynamic_dims.dims[1];
   const auto committed_input_count = Scalar<std::int32_t>(input->buffers[1]);
-  if ((feature_rows != 16 && feature_rows != 64 && feature_rows != 128) ||
+  if (!((feature_rows >= 1 && feature_rows <= 16) ||
+        feature_rows == 64 || feature_rows == 128) ||
       committed_input_count <= 0 || committed_input_count > feature_rows ||
       input->buffers[0]->size <
           static_cast<std::size_t>(feature_rows) * 8 * sizeof(std::uint16_t)) {
@@ -762,7 +763,7 @@ aclError aclmdlGetInputDynamicGearCount(
        description->role != Role::kTargetStep)) {
     return 1;
   }
-  *gear_count = description->role == Role::kDraftPropose ? 3 : 16;
+  *gear_count = description->role == Role::kDraftPropose ? 18 : 16;
   return ACL_SUCCESS;
 }
 
@@ -777,14 +778,15 @@ aclError aclmdlGetInputDynamicDims(
     return 1;
   }
   const std::size_t expected_gears =
-      description->role == Role::kDraftPropose ? 3 : 16;
+      description->role == Role::kDraftPropose ? 18 : 16;
   if (gear_count != expected_gears) {
     return 1;
   }
   for (std::size_t gear = 0; gear < expected_gears; ++gear) {
-    const std::array<std::int64_t, 3> rows_by_gear{16, 64, 128};
     const std::int64_t rows = description->role == Role::kDraftPropose
-        ? rows_by_gear[gear]
+        ? (gear < 16
+               ? static_cast<std::int64_t>(gear + 1)
+               : static_cast<std::int64_t>((gear - 15) * 64))
         : static_cast<std::int64_t>(gear + 1);
     std::memset(&dimensions[gear], 0, sizeof(aclmdlIODims));
     std::vector<std::int64_t> flat;

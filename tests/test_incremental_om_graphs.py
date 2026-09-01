@@ -462,6 +462,66 @@ def test_draft_graph_keeps_kv_fixed_and_returns_device_verify_carrier() -> None:
         torch.testing.assert_close(actual, expected)
 
 
+def test_draft_committed_prefix_preserves_all_logically_visible_state() -> None:
+    draft = _FakeDraft().eval()
+    input_embedding = nn.Embedding(128, 2, dtype=torch.float16)
+    output_embedding = nn.Linear(2, 128, bias=False, dtype=torch.float16)
+    with torch.no_grad():
+        input_embedding.weight[:, 0] = torch.arange(128)
+        input_embedding.weight[:, 1] = 0
+    graph = DraftProposeStateGraph(
+        draft,
+        input_embedding,
+        output_embedding,
+        kv_cache_max_len=32,
+    ).eval()
+    features = torch.arange(64, dtype=torch.float16).reshape(1, 16, 4)
+    key = torch.arange(
+        2 * 32 * 2, dtype=torch.float16
+    ).reshape(2, 1, 1, 32, 2)
+    value = key + 1000
+    previous_ids = torch.tensor([[40, 41] + [0] * 14], dtype=torch.long)
+    previous_count = torch.tensor([2], dtype=torch.int32)
+    proposal_count = torch.tensor([5], dtype=torch.int32)
+    cursor = torch.tensor([3], dtype=torch.long)
+
+    for committed_rows in (1, 2, 4, 8, 16):
+        committed = torch.tensor([committed_rows], dtype=torch.int32)
+        fixed = graph(
+            features,
+            committed,
+            previous_ids,
+            previous_count,
+            proposal_count,
+            key.clone(),
+            value.clone(),
+            cursor,
+        )
+        prefix = graph(
+            features[:, :committed_rows],
+            committed,
+            previous_ids,
+            previous_count,
+            proposal_count,
+            key.clone(),
+            value.clone(),
+            cursor,
+        )
+        torch.testing.assert_close(prefix[0], fixed[0])
+        torch.testing.assert_close(prefix[3], fixed[3])
+        visible_end = int(prefix[3].item())
+        torch.testing.assert_close(
+            prefix[1][..., :visible_end, :],
+            fixed[1][..., :visible_end, :],
+        )
+        torch.testing.assert_close(
+            prefix[2][..., :visible_end, :],
+            fixed[2][..., :visible_end, :],
+        )
+        if committed_rows < 16:
+            assert not torch.equal(prefix[1], fixed[1])
+
+
 def test_draft_graph_batched_prompt_features_match_sequential_chunk_state() -> None:
     draft = _FakeDraft().eval()
     input_embedding = nn.Embedding(128, 2, dtype=torch.float16)
@@ -540,7 +600,9 @@ def test_five_physical_specs_freeze_binding_order_and_reuse_state_examples() -> 
     ]
     assert [item.role for item in specs] == [item.name for item in specs]
     assert specs[3].dynamic is True
-    assert specs[3].input_dim_gears == {0: {1: (16, 64)}}
+    assert specs[3].input_dim_gears == {
+        0: {1: tuple(range(1, 17)) + (64,)}
+    }
     assert specs[0].example_args[3].dtype == torch.float32
     assert specs[0].example_args[4].shape == (1, 1, 1, 64, 16)
     assert specs[3].example_args[5].shape == (2, 1, 1, 64, 2)
@@ -578,7 +640,7 @@ def test_draft_air_gears_cover_every_prompt_batch_capacity() -> None:
         verify_custom_ops=(),
     )
     assert specs[3].input_dim_gears == {
-        0: {1: (16, 64, 128, 192, 256)}
+        0: {1: tuple(range(1, 17)) + (64, 128, 192, 256)}
     }
 
 

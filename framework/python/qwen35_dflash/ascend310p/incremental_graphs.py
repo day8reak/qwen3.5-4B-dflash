@@ -809,9 +809,11 @@ def incremental_state_graph_specs(
             "full-attention layers"
         ),
         "draft_feature_tail": (
-            "TorchAir discrete dynamic N gears: verify N=16 and prompt feature "
-            "batches N=64..kv_cache_max_len in 64-row increments"
+            "TorchAir discrete dynamic N gears: committed verify prefixes "
+            "N=1..16 and prompt feature batches N=64..kv_cache_max_len in "
+            "64-row increments; the runtime retains fixed N=16 as rollback"
         ),
+        "draft_feature_prefix_policy": "exact-leading-committed-rows-v1",
         "claim_boundary": (
             "graph-construction candidate only; AIR/ATC, custom-node, "
             "real-model parity, complete-set memory and latency remain gated"
@@ -855,7 +857,7 @@ def incremental_state_graph_specs(
         output_embedding,
         kv_cache_max_len=kv_cache_max_len,
     ).eval()
-    draft_feature_gears = (VERIFY_ROWS,) + tuple(
+    draft_feature_gears = tuple(range(1, VERIFY_ROWS + 1)) + tuple(
         range(PREFILL_ROWS, kv_cache_max_len + 1, PREFILL_ROWS)
     )
 

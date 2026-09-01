@@ -347,6 +347,79 @@ def _validate_runner_report(
             raise MsprofAnalysisError("unified Target-step gear trace does not close")
     elif any(row != verify_width for row in target_rows):
         raise MsprofAnalysisError("baseline verify trace is not fixed-width")
+    if int(report.get("schema_version", 0)) >= 6:
+        draft_policy = protocol.get("draft_feature_policy")
+        if draft_policy not in {"fixed-16", "committed-prefix"}:
+            raise MsprofAnalysisError("runner Draft feature policy is invalid")
+        draft_counter_names = (
+            "prefill_draft_propose_executions",
+            "prefill_feature_rows_batched",
+            "draft_verify_feature_input_rows",
+            "draft_verify_full_width_equivalent_rows",
+            "draft_verify_feature_rows_elided",
+            "draft_verify_fixed_width_executions",
+            "draft_verify_committed_prefix_executions",
+            "draft_verify_pending_upper_bound_executions",
+            "draft_dynamic_gear_count",
+            "draft_verify_dynamic_gear_count",
+            "draft_prefill_dynamic_gear_count",
+        )
+        draft_values = [counters.get(name) for name in draft_counter_names]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in draft_values
+        ):
+            raise MsprofAnalysisError("runner Draft feature counters are invalid")
+        (
+            prefill_draft_count,
+            prefill_feature_rows,
+            verify_feature_rows,
+            verify_full_rows,
+            verify_elided_rows,
+            fixed_count,
+            prefix_count,
+            pending_count,
+            dynamic_gears,
+            verify_gears,
+            prefill_gears,
+        ) = (int(value) for value in draft_values)
+        total_draft_count = int(counters["draft_propose_executions"])
+        verify_draft_count = total_draft_count - prefill_draft_count
+        draft_rows = rows_by_role["draft-propose"]
+        prefill_trace_rows = [row for row in draft_rows if row > verify_width]
+        verify_trace_rows = [row for row in draft_rows if row <= verify_width]
+        if (
+            verify_draft_count < 0
+            or len(prefill_trace_rows) != prefill_draft_count
+            or len(verify_trace_rows) != verify_draft_count
+            or any(row % prefill_width for row in prefill_trace_rows)
+            or sum(prefill_trace_rows) != prefill_feature_rows
+            or sum(verify_trace_rows) != verify_feature_rows
+            or verify_full_rows != verify_draft_count * verify_width
+            or verify_feature_rows + verify_elided_rows != verify_full_rows
+            or fixed_count + prefix_count + pending_count != verify_draft_count
+            or verify_gears != verify_width
+            or dynamic_gears != verify_gears + prefill_gears
+        ):
+            raise MsprofAnalysisError(
+                "runner Draft feature trace/counters do not close"
+            )
+        if draft_policy == "fixed-16":
+            if (
+                any(row != verify_width for row in verify_trace_rows)
+                or fixed_count != verify_draft_count
+                or prefix_count != 0
+                or pending_count != 0
+                or verify_elided_rows != 0
+            ):
+                raise MsprofAnalysisError("fixed-16 Draft trace differs")
+        elif (
+            fixed_count != 0
+            or prefix_count + pending_count != verify_draft_count
+        ):
+            raise MsprofAnalysisError("committed-prefix Draft trace differs")
     return model_to_role, expected_by_role, normalized_trace, unified
 
 
@@ -826,6 +899,33 @@ def analyze_incremental_msprof(
                 "events; api_statistic has duration/count but no copy size."
             ),
         },
+        "expected_draft_feature_signature": (
+            {
+                "policy": report["protocol"]["draft_feature_policy"],
+                "physical_verify_rows": counters[
+                    "draft_verify_feature_input_rows"
+                ],
+                "full_width_equivalent_rows": counters[
+                    "draft_verify_full_width_equivalent_rows"
+                ],
+                "elided_rows": counters["draft_verify_feature_rows_elided"],
+                "fixed_width_executions": counters[
+                    "draft_verify_fixed_width_executions"
+                ],
+                "committed_prefix_executions": counters[
+                    "draft_verify_committed_prefix_executions"
+                ],
+                "pending_upper_bound_executions": counters[
+                    "draft_verify_pending_upper_bound_executions"
+                ],
+                "trace_gate": (
+                    "sum draft-propose T<=16 physical_rows equals "
+                    "draft_verify_feature_input_rows"
+                ),
+            }
+            if int(report.get("schema_version", 0)) >= 6
+            else {"status": "NOT_AVAILABLE_LEGACY_REPORT"}
+        ),
         "expected_synchronization_signature": {
             "stream_synchronizations": counters["stream_synchronizations"],
             "speculative_transactions": verify_transactions,

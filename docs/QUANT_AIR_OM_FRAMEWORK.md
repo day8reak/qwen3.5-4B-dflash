@@ -851,7 +851,8 @@ runner/OM/input 做未 profile 的 3+10 A/B，msprof API timeline 仅用于解�
 `speculative_d2h_operations_elided` 后按 transaction 闭合，stream synchronization 按
 `speculative_sync_windows` 闭合，完整命令见增量性能文档第 5.5.1 节。
 
-多 OM profile 必须使用报告 schema 5 中的运行时 model ID 和逐次执行 trace 做严格归因，
+多 OM profile 必须使用报告 schema 6 中的运行时 model ID、逐次执行 trace、Draft feature
+策略与逐次物理行数做严格归因，
 不能靠文件顺序猜测 OM 角色。采集完成后运行
 `python -m qwen35_dflash.ascend310p analyze-msprof`；完整命令、输入约束和判定规则见
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节。分析器会拒绝只导出单个 model/iteration 的

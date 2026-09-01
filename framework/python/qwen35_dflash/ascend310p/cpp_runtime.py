@@ -38,6 +38,12 @@ _INCREMENTAL_DECODE_CARRIER_POLICIES = {
     ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
     LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
 }
+FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY = "fixed-16"
+COMMITTED_PREFIX_DRAFT_FEATURE_POLICY = "committed-prefix"
+_INCREMENTAL_DRAFT_FEATURE_POLICIES = {
+    FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
+    COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
+}
 _INCREMENTAL_ABI_ID = (
     "qwen35-4b-dflash-ascend310p-incremental-performance-v2"
 )
@@ -232,6 +238,17 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
             f"{LAST_TOKEN_D2D_DECODE_CARRIER_POLICY!r} or "
             f"{ONE_TOKEN_H2D_DECODE_CARRIER_POLICY!r}"
         )
+    draft_feature_policy = str(
+        options.get(
+            "draft_feature_policy", FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY
+        )
+    ).strip()
+    if draft_feature_policy not in _INCREMENTAL_DRAFT_FEATURE_POLICIES:
+        raise ValueError(
+            "C++ runner draft_feature_policy must be "
+            f"{FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY!r} or "
+            f"{COMMITTED_PREFIX_DRAFT_FEATURE_POLICY!r}"
+        )
     dflash_sync_window = int(options.get("dflash_sync_window", 1))
     if dflash_sync_window not in {1, 2}:
         raise ValueError("C++ runner dflash_sync_window must be 1 or 2")
@@ -250,6 +267,7 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
         "state_policy": state_policy,
         "state_reset_policy": state_reset_policy,
         "decode_carrier_policy": decode_carrier_policy,
+        "draft_feature_policy": draft_feature_policy,
         "dflash_sync_window": dflash_sync_window,
         "pad_token_id": pad_token_id,
     }
@@ -505,6 +523,28 @@ def _resolve_incremental_oms(
         if not om_path.is_file() or sha256_file(om_path) != expected_hash:
             raise ValueError(f"{role} OM artifact integrity check failed")
         resolved[role] = (om_path, graph, record)
+    draft_graph = resolved["draft-propose"][1]
+    draft_gears = draft_graph.get("input_dim_gears")
+    draft_rows = (
+        draft_gears.get("0", {}).get("1", [])
+        if isinstance(draft_gears, Mapping)
+        and isinstance(draft_gears.get("0"), Mapping)
+        else []
+    )
+    if (
+        draft_graph.get("dynamic") is not True
+        or not isinstance(draft_rows, list)
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in draft_rows)
+        or draft_rows[:16] != list(range(1, 17))
+        or not draft_rows[16:]
+        or draft_rows[16:] != [
+            64 * index for index in range(1, len(draft_rows[16:]) + 1)
+        ]
+    ):
+        raise ValueError(
+            "draft-propose must lock input-0 axis-1 to N=1..16 followed by "
+            "every 64-row prompt gear through sequence capacity"
+        )
     if selected_abi is _UNIFIED_TARGET_STEP_GRAPH_ABI:
         target_step = resolved["target-verify-commit"][1]
         if target_step.get("dynamic") is not True or target_step.get(
@@ -686,11 +726,12 @@ def validate_incremental_cpp_runner_report(
     max_draft_tokens: int,
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+    draft_feature_policy: str = FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     dflash_sync_window: int = 1,
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
-    if report.get("schema_version") != 5:
+    if report.get("schema_version") != 6:
         raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
@@ -777,6 +818,23 @@ def validate_incremental_cpp_runner_report(
         raise ValueError("expected incremental decode carrier policy is invalid")
     if protocol.get("decode_carrier_policy") != decode_carrier_policy:
         raise RuntimeError("incremental runner decode carrier policy differs")
+    if draft_feature_policy not in _INCREMENTAL_DRAFT_FEATURE_POLICIES:
+        raise ValueError("expected incremental Draft feature policy is invalid")
+    if protocol.get("draft_feature_policy") != draft_feature_policy:
+        raise RuntimeError("incremental runner Draft feature policy differs")
+    expected_draft_feature_description = (
+        "after a synchronized verify, Draft binds exactly accepted+1 leading "
+        "Target feature rows; an unsynchronized second transaction binds the "
+        "causal K+1 upper bound; masked suffix cache writes are scratch and "
+        "overwritten before becoming visible"
+        if draft_feature_policy == COMMITTED_PREFIX_DRAFT_FEATURE_POLICY
+        else "verify-source Draft binds the original physical N=16; this is "
+        "the rollback and matched-baseline route"
+    )
+    if protocol.get("draft_feature_policy_description") != (
+        expected_draft_feature_description
+    ):
+        raise RuntimeError("incremental Draft feature claim boundary differs")
     if dflash_sync_window not in {1, 2}:
         raise ValueError("expected DFlash sync window is invalid")
     if (
@@ -928,6 +986,8 @@ def validate_incremental_cpp_runner_report(
         "prefill_feature_slab_bytes",
         "prefill_feature_arena_bytes",
         "draft_dynamic_gear_count",
+        "draft_verify_dynamic_gear_count",
+        "draft_prefill_dynamic_gear_count",
     ):
         value = memory.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -1011,7 +1071,11 @@ def validate_incremental_cpp_runner_report(
         or int(memory["prefill_feature_arena_bytes"]) % 64
         or memory["prefill_feature_arena_bytes"]
         < minimum_feature_arena_bytes
-        or memory["draft_dynamic_gear_count"] != expected_staging_slots + 1
+        or memory["draft_verify_dynamic_gear_count"] != verify_width
+        or memory["draft_prefill_dynamic_gear_count"]
+        != expected_staging_slots
+        or memory["draft_dynamic_gear_count"]
+        != verify_width + expected_staging_slots
     ):
         raise RuntimeError("incremental prefill feature arena or gears differ")
     expected_allocated = (
@@ -1105,6 +1169,63 @@ def validate_incremental_cpp_runner_report(
         or draft < expected_prefill_draft
     ):
         raise RuntimeError("incremental prefill chunk counters differ")
+    verify_draft_executions = draft - int(
+        execution["prefill_draft_propose_executions"]
+    )
+    draft_feature_fields = (
+        "draft_verify_feature_input_rows",
+        "draft_verify_full_width_equivalent_rows",
+        "draft_verify_feature_rows_elided",
+        "draft_verify_fixed_width_executions",
+        "draft_verify_committed_prefix_executions",
+        "draft_verify_pending_upper_bound_executions",
+    )
+    draft_feature_values = [execution.get(field) for field in draft_feature_fields]
+    if (
+        verify_draft_executions < 0
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in draft_feature_values
+        )
+    ):
+        raise RuntimeError("incremental Draft feature counters are invalid")
+    (
+        draft_feature_rows,
+        draft_full_width_rows,
+        draft_elided_rows,
+        draft_fixed_executions,
+        draft_prefix_executions,
+        draft_pending_executions,
+    ) = (int(value) for value in draft_feature_values)
+    if (
+        draft_fixed_executions
+        + draft_prefix_executions
+        + draft_pending_executions
+        != verify_draft_executions
+        or draft_full_width_rows != verify_draft_executions * verify_width
+        or draft_feature_rows + draft_elided_rows != draft_full_width_rows
+        or draft_feature_rows < verify_draft_executions
+        or draft_feature_rows > draft_full_width_rows
+    ):
+        raise RuntimeError("incremental Draft feature row counters do not close")
+    if draft_feature_policy == FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY:
+        if (
+            draft_fixed_executions != verify_draft_executions
+            or draft_prefix_executions != 0
+            or draft_pending_executions != 0
+            or draft_feature_rows != draft_full_width_rows
+            or draft_elided_rows != 0
+        ):
+            raise RuntimeError("incremental fixed-16 Draft feature route differs")
+    elif (
+        draft_fixed_executions != 0
+        or draft_prefix_executions + draft_pending_executions
+        != verify_draft_executions
+        or (dflash_sync_window == 1 and draft_pending_executions != 0)
+    ):
+        raise RuntimeError("incremental committed-prefix Draft feature route differs")
     transactions = int(prefill_completions) + decode + verify
     speculative_windows = execution.get("speculative_sync_windows")
     speculative_syncs_elided = execution.get(
@@ -1220,6 +1341,10 @@ def validate_incremental_cpp_runner_report(
         != memory["prefill_feature_arena_bytes"]
         or execution.get("draft_dynamic_gear_count")
         != memory["draft_dynamic_gear_count"]
+        or execution.get("draft_verify_dynamic_gear_count")
+        != memory["draft_verify_dynamic_gear_count"]
+        or execution.get("draft_prefill_dynamic_gear_count")
+        != memory["draft_prefill_dynamic_gear_count"]
         or execution.get("target_step_zero_count_device_bytes", 0)
         != memory.get("target_step_zero_count_device_bytes", 0)
     ):
@@ -1507,6 +1632,8 @@ def run_cpp_pair(
                 identity["state_reset_policy"],
                 "--decode-carrier-policy",
                 identity["decode_carrier_policy"],
+                "--draft-feature-policy",
+                identity["draft_feature_policy"],
                 "--dflash-sync-window",
                 str(identity["dflash_sync_window"]),
             ]
@@ -1556,6 +1683,7 @@ def run_cpp_pair(
             max_draft_tokens=max_draft_tokens,
             state_reset_policy=identity["state_reset_policy"],
             decode_carrier_policy=identity["decode_carrier_policy"],
+            draft_feature_policy=identity["draft_feature_policy"],
             dflash_sync_window=identity["dflash_sync_window"],
         )
     else:

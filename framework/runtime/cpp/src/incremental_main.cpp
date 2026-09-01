@@ -30,6 +30,7 @@ using qwen35::dflash::Distribution;
 using qwen35::dflash::GenerationMeasurement;
 using qwen35::dflash::IncrementalModelMemory;
 using qwen35::dflash::IncrementalDecodeCarrierPolicy;
+using qwen35::dflash::IncrementalDraftFeaturePolicy;
 using qwen35::dflash::IncrementalStateResetPolicy;
 using qwen35::dflash::PairedBenchmarkResult;
 using qwen35::dflash::ProgressCallback;
@@ -69,6 +70,8 @@ struct Arguments {
       IncrementalStateResetPolicy::kAsyncMemset;
   IncrementalDecodeCarrierPolicy decode_carrier_policy =
       IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact;
+  IncrementalDraftFeaturePolicy draft_feature_policy =
+      IncrementalDraftFeaturePolicy::kFixedVerifyWidth;
   MeasurementProtocol measurement_protocol = MeasurementProtocol::kEvidence;
 };
 
@@ -100,6 +103,8 @@ void Usage(std::ostream& stream) {
          "immutable-zero\n"
       << "  --decode-carrier-policy POLICY          last-token-d2d (default) or "
          "one-token-h2d\n"
+      << "  --draft-feature-policy POLICY          fixed-16 (default) or "
+         "committed-prefix\n"
       << "  --progress true|false                    live stderr progress\n";
 }
 
@@ -323,6 +328,18 @@ Arguments ParseArguments(int argc, char** argv) {
   } else {
     throw std::invalid_argument(
         "decode-carrier-policy must be last-token-d2d or one-token-h2d");
+  }
+  const std::string draft_feature_policy = TakeOptional(
+      &values, "draft-feature-policy", "fixed-16");
+  if (draft_feature_policy == "fixed-16") {
+    result.draft_feature_policy =
+        IncrementalDraftFeaturePolicy::kFixedVerifyWidth;
+  } else if (draft_feature_policy == "committed-prefix") {
+    result.draft_feature_policy =
+        IncrementalDraftFeaturePolicy::kCommittedPrefix;
+  } else {
+    throw std::invalid_argument(
+        "draft-feature-policy must be fixed-16 or committed-prefix");
   }
   const std::int64_t device_id = ParseInt64(
       TakeOptional(&values, "device-id", "0"), "device-id");
@@ -552,13 +569,57 @@ void WriteReport(
     throw std::runtime_error(
         "speculative synchronization window counters do not close");
   }
+  if (execution.draft_propose_executions <
+      execution.prefill_draft_propose_executions) {
+    throw std::runtime_error(
+        "verify-source Draft execution count underflowed");
+  }
+  const std::size_t verify_draft_executions =
+      execution.draft_propose_executions -
+      execution.prefill_draft_propose_executions;
+  if (execution.draft_verify_fixed_width_executions +
+              execution.draft_verify_committed_prefix_executions +
+              execution.draft_verify_pending_upper_bound_executions !=
+          verify_draft_executions ||
+      execution.draft_verify_full_width_equivalent_rows !=
+          verify_draft_executions * (executor.proposal_width() + 1) ||
+      execution.draft_verify_feature_input_rows +
+              execution.draft_verify_feature_rows_elided !=
+          execution.draft_verify_full_width_equivalent_rows ||
+      execution.draft_verify_dynamic_gear_count !=
+          executor.proposal_width() + 1 ||
+      execution.draft_prefill_dynamic_gear_count !=
+          execution.prefill_staging_slots ||
+      execution.draft_dynamic_gear_count !=
+          execution.draft_verify_dynamic_gear_count +
+              execution.draft_prefill_dynamic_gear_count) {
+    throw std::runtime_error(
+        "Draft committed-feature row counters or dynamic gears do not close");
+  }
+  if (executor.draft_feature_policy() ==
+      IncrementalDraftFeaturePolicy::kFixedVerifyWidth) {
+    if (execution.draft_verify_fixed_width_executions !=
+            verify_draft_executions ||
+        execution.draft_verify_committed_prefix_executions != 0 ||
+        execution.draft_verify_pending_upper_bound_executions != 0 ||
+        execution.draft_verify_feature_rows_elided != 0) {
+      throw std::runtime_error(
+          "fixed-16 Draft feature policy counters do not close");
+    }
+  } else if (execution.draft_verify_fixed_width_executions != 0 ||
+             execution.draft_verify_committed_prefix_executions +
+                     execution.draft_verify_pending_upper_bound_executions !=
+                 verify_draft_executions) {
+    throw std::runtime_error(
+        "committed-prefix Draft feature policy counters do not close");
+  }
   const double speedup = result.dflash.model_total_ms.median > 0.0
       ? result.ordinary.model_total_ms.median /
             result.dflash.model_total_ms.median
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":5,\"status\":\"PASS\","
+         << "{\"schema_version\":6,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
          << (executor.unified_target_step() ? "four" : "five")
          << "-resident-OM paired model loop\","
@@ -632,6 +693,10 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
+         << ",\"draft_verify_dynamic_gear_count\":"
+         << execution.draft_verify_dynamic_gear_count
+         << ",\"draft_prefill_dynamic_gear_count\":"
+         << execution.draft_prefill_dynamic_gear_count
          << ",\"target_step_dynamic_gear_count\":"
          << execution.target_step_dynamic_gear_count
          << ",\"target_step_zero_count_device_bytes\":"
@@ -695,6 +760,19 @@ void WriteReport(
                  : "one-token compact Target results bind row zero directly; "
                    "multi-token commits and caller overrides use the "
                    "pinned-host 8-byte H2D fallback")
+         << "\",\"draft_feature_policy\":\""
+         << qwen35::dflash::IncrementalDraftFeaturePolicyName(
+                executor.draft_feature_policy())
+         << "\",\"draft_feature_policy_description\":\""
+         << (executor.draft_feature_policy() ==
+                     IncrementalDraftFeaturePolicy::kCommittedPrefix
+                 ? "after a synchronized verify, Draft binds exactly accepted+1 "
+                   "leading Target feature rows; an unsynchronized second "
+                   "transaction binds the causal K+1 upper bound; masked "
+                   "suffix cache writes are scratch and overwritten before "
+                   "becoming visible"
+                 : "verify-source Draft binds the original physical N=16; "
+                   "this is the rollback and matched-baseline route")
          << "\",\"target_step_zero_count_policy\":\""
          << (executor.unified_target_step()
                  ? "T=1 datasets bind a process-resident aligned INT32 zero; "
@@ -779,6 +857,18 @@ void WriteReport(
          << execution.prefill_draft_propose_executions_elided
          << ",\"prefill_feature_rows_batched\":"
          << execution.prefill_feature_rows_batched
+         << ",\"draft_verify_feature_input_rows\":"
+         << execution.draft_verify_feature_input_rows
+         << ",\"draft_verify_full_width_equivalent_rows\":"
+         << execution.draft_verify_full_width_equivalent_rows
+         << ",\"draft_verify_feature_rows_elided\":"
+         << execution.draft_verify_feature_rows_elided
+         << ",\"draft_verify_fixed_width_executions\":"
+         << execution.draft_verify_fixed_width_executions
+         << ",\"draft_verify_committed_prefix_executions\":"
+         << execution.draft_verify_committed_prefix_executions
+         << ",\"draft_verify_pending_upper_bound_executions\":"
+         << execution.draft_verify_pending_upper_bound_executions
          << ",\"prefill_control_upload_operations\":"
          << execution.prefill_control_upload_operations
          << ",\"prefill_control_upload_bytes\":"
@@ -866,6 +956,10 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
+         << ",\"draft_verify_dynamic_gear_count\":"
+         << execution.draft_verify_dynamic_gear_count
+         << ",\"draft_prefill_dynamic_gear_count\":"
+         << execution.draft_prefill_dynamic_gear_count
          << ",\"target_step_dynamic_gear_count\":"
          << execution.target_step_dynamic_gear_count
          << ",\"target_step_zero_count_device_bytes\":"
@@ -987,7 +1081,8 @@ int main(int argc, char** argv) {
         },
         arguments.state_reset_policy,
         arguments.decode_carrier_policy,
-        arguments.measurement_protocol == MeasurementProtocol::kProfile);
+        arguments.measurement_protocol == MeasurementProtocol::kProfile,
+        arguments.draft_feature_policy);
     const auto load_end = std::chrono::steady_clock::now();
     const double load_ms = std::chrono::duration<double, std::milli>(
         load_end - load_start).count();

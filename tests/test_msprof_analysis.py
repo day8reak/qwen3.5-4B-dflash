@@ -33,14 +33,14 @@ def _runner_report() -> dict[str, object]:
         {"ordinal": 3, "model_id": 4, "physical_rows": 1},
         {"ordinal": 4, "model_id": 3, "physical_rows": 128},
         {"ordinal": 5, "model_id": 4, "physical_rows": 4},
-        {"ordinal": 6, "model_id": 3, "physical_rows": 16},
+        {"ordinal": 6, "model_id": 3, "physical_rows": 4},
         {"ordinal": 7, "model_id": 4, "physical_rows": 1},
     ]
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "status": "PASS",
         "runner_id": "qwen35-dflash-ascendcl-cpp-incremental-v3",
-        "runner_version": "1.13.0",
+        "runner_version": "1.14.0",
         "cpu_fallback": False,
         "device_id": 0,
         "models": models,
@@ -56,6 +56,7 @@ def _runner_report() -> dict[str, object]:
             "formal_latency_evidence": False,
             "profile_model_execution_trace_enabled": True,
             "dflash_sync_window": 1,
+            "draft_feature_policy": "committed-prefix",
         },
         "execution_io_counters": {
             "model_executions": 8,
@@ -64,6 +65,17 @@ def _runner_report() -> dict[str, object]:
             "target_decode1_executions": 2,
             "draft_propose_executions": 2,
             "target_verify_commit_executions": 1,
+            "prefill_draft_propose_executions": 1,
+            "prefill_feature_rows_batched": 128,
+            "draft_verify_feature_input_rows": 4,
+            "draft_verify_full_width_equivalent_rows": 16,
+            "draft_verify_feature_rows_elided": 12,
+            "draft_verify_fixed_width_executions": 0,
+            "draft_verify_committed_prefix_executions": 1,
+            "draft_verify_pending_upper_bound_executions": 0,
+            "draft_dynamic_gear_count": 18,
+            "draft_verify_dynamic_gear_count": 16,
+            "draft_prefill_dynamic_gear_count": 2,
             "host_to_device_operations": 3,
             "host_to_device_bytes": 1024,
             "device_to_host_operations": 4,
@@ -203,6 +215,22 @@ def test_msprof_analysis_attributes_every_role_and_dynamic_gear(
     assert payload["by_role_and_physical_rows"][
         "target-verify-commit:T=4"
     ]["invocation_task_duration"]["count"] == 1
+    assert payload["by_role_and_physical_rows"][
+        "draft-propose:T=4"
+    ]["invocation_task_duration"]["count"] == 1
+    assert payload["expected_draft_feature_signature"] == {
+        "policy": "committed-prefix",
+        "physical_verify_rows": 4,
+        "full_width_equivalent_rows": 16,
+        "elided_rows": 12,
+        "fixed_width_executions": 0,
+        "committed_prefix_executions": 1,
+        "pending_upper_bound_executions": 0,
+        "trace_gate": (
+            "sum draft-propose T<=16 physical_rows equals "
+            "draft_verify_feature_input_rows"
+        ),
+    }
     assert payload["api_count_gates"]["aclmdlExecuteAsync"] == {
         "status": "PASS",
         "expected": 8,
