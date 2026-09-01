@@ -215,8 +215,9 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   仍分配自己的 `weightSize`，不假设跨文件共享权重；
 - Target/Draft state 双缓冲留在 device，proposal 与 feature carrier 不回 host；
 - `draft-propose -> target-verify-commit -> compact D2H -> synchronize` 每轮一个 barrier；
-- reset 的 state memset 在第一次 prefill 计时区间内排入同一 stream，不再增加 reset-only
-  barrier，也不会把清零设备时间藏到模型时延之外；
+- reset 支持两个精确策略：默认 `async-memset` 把 state clear 排入第一次 prefill；候选
+  `immutable-zero` 在进程启动时建立只读零状态，使每次请求不再清零大状态。二者都没有
+  reset-only barrier，后者以额外一套 Target+Draft 状态显存换 TTFT；
 - EOS 表和 `logical_proposal_count` 仅在值变化时 H2D；
 - Draft 的 `N=64/N=16` 动态 gear 在 dataset 建立时预绑定，不在 decode 热循环反复配置；
 - ordinary 路径只执行 `target-prefill`/`target-decode1`，不执行 Draft。
@@ -316,7 +317,97 @@ jq '{
 `stream_synchronizations` 等于 prefill + decode1 + verify-commit 的事务数，不包含 Draft 的额外
 barrier；`device_to_host_operations` 与该事务数相同；paired 3+10 的 `state_resets` 固定为 26。
 
-### 5.4 直接运行二进制
+### 5.4 A/B 选择状态重置策略
+
+`async-memset` 不增加常驻状态内存，但每个请求会清零一套 Target+Draft 输入状态。
+`immutable-zero` 只在 runner 构造阶段清零一次只读状态，第一次 prefill 从它读、向普通 ping-pong
+状态写；后续 chunk/decode/verify 仍使用原来的双缓冲。因此它不改变四个 OM 的输入输出、token
+语义或 AIR/OM，属于 C++ buffer plan 的精确候选。代价是
+`immutable_zero_state_device_bytes == state_reset_bytes_per_request` 的额外常驻显存。
+
+先生成两份只差一个字段的配置：
+
+```bash
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-reset-memset.json"
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-reset-zero.json"
+
+jq '.state_reset_policy = "async-memset"' \
+  "$AI_RUN_DIR/runner-reset-memset.json" > \
+  "$AI_RUN_DIR/runner-reset-memset.tmp.json"
+mv "$AI_RUN_DIR/runner-reset-memset.tmp.json" \
+  "$AI_RUN_DIR/runner-reset-memset.json"
+jq '.state_reset_policy = "immutable-zero"' \
+  "$AI_RUN_DIR/runner-reset-zero.json" > \
+  "$AI_RUN_DIR/runner-reset-zero.tmp.json"
+mv "$AI_RUN_DIR/runner-reset-zero.tmp.json" \
+  "$AI_RUN_DIR/runner-reset-zero.json"
+# 两份文件中的 device_model/cann/driver/firmware 仍须改成同一台真机身份。
+```
+
+用完全相同的代码、四个 OM、prompt、token 上限和 device 依次运行；如果差异接近噪声，再反向
+顺序重跑一组，不能只保留较快的一次：
+
+```bash
+for RESET_POLICY in memset zero; do
+  "$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
+    --deployment-manifest "$FOUR_OM_BUNDLE/deployment-manifest.json" \
+    --runner \
+      "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+    --runner-config "$AI_RUN_DIR/runner-reset-${RESET_POLICY}.json" \
+    --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
+    --prompt '请用一句话解释为什么天空是蓝色的。' \
+    --chat \
+    --max-new-tokens 32 \
+    --max-draft-tokens 15 \
+    --device-id 0 \
+    --output "$AI_RUN_DIR/reports/reset-${RESET_POLICY}.json"
+done
+```
+
+先检查计数闭合和显存，不要先看最快的一行：
+
+```bash
+jq -s 'map({
+  policy: .protocol.state_reset_policy,
+  parity: .ordinary_parity,
+  state_bytes: .model_memory_query.state_device_bytes,
+  working_state_bytes: .model_memory_query.working_state_device_bytes,
+  zero_state_bytes: .model_memory_query.immutable_zero_state_device_bytes,
+  reset_bytes_per_request: .model_memory_query.state_reset_bytes_per_request,
+  explicit_device_bytes:
+    .model_memory_query.explicit_allocated_device_bytes_excluding_runtime,
+  request_memset_ops: .execution_io_counters.state_memset_operations,
+  request_memset_bytes: .execution_io_counters.state_memset_bytes,
+  startup_memset_ops:
+    .execution_io_counters.state_initialization_memset_operations,
+  startup_syncs:
+    .execution_io_counters.state_initialization_stream_synchronizations,
+  transaction_syncs: .execution_io_counters.stream_synchronizations,
+  ordinary_median_ms: .ordinary.latency_ms.model_total.median,
+  ordinary_p90_ms: .ordinary.latency_ms.model_total.p90,
+  dflash_median_ms: .dflash.latency_ms.model_total.median,
+  dflash_p90_ms: .dflash.latency_ms.model_total.p90
+})' \
+  "$AI_RUN_DIR/reports/reset-memset.json" \
+  "$AI_RUN_DIR/reports/reset-zero.json"
+```
+
+预期结构门禁：
+
+- `async-memset`：`zero_state_bytes=0`，请求内 `state_memset_operations=2*state_resets`，启动
+  初始化计数为 0；
+- `immutable-zero`：请求内 memset 为 0，启动时恰好 2 次 memset 和 1 次同步，且
+  `zero_state_bytes=reset_bytes_per_request`；
+- 两者的 transaction sync 数都仍等于 `prefill + decode1 + verify`，token/EOS 必须一致；
+- 只有 `immutable-zero` 的完整四 OM 集合真实 load 成功、显存峰值有余量，且未开 msprof 的
+  10 次 `dflash` median/p90 明确更好时，才在部署配置中选择它；否则保留 `async-memset`。
+
+这个优化主要影响每次请求的第一次 prefill/TTFT，对长生成的稳态 TPOT 理论上帮助较小。报告中
+的 `acl_and_four_model_load` 包含 `immutable-zero` 的一次性初始化；正式 model latency 不包含它。
+
+### 5.5 直接运行二进制
 
 控制面是推荐路径。需要排除 Python 控制面时，可直接执行同一个 runner：
 
@@ -342,15 +433,19 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
   --pad-token-id 0 \
   --max-new-tokens 32 \
   --max-draft-tokens 15 \
+  --measurement-protocol evidence \
   --warmup 3 \
   --repetitions 10 \
   --device-id 0 \
+  --state-reset-policy async-memset \
   --progress true
 ```
 
-`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，不能保留文字占位符。
+把 `--state-reset-policy` 的值换成 `immutable-zero` 即可运行另一 buffer plan；不要改变 OM
+文件或 token 输入。`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，
+不能保留文字占位符。
 
-### 5.5 用 msprof 分角色确认四 OM 耗时
+### 5.6 用 msprof 分角色确认四 OM 耗时
 
 四个 OM 是独立 model ID，因此最可靠的 profile 是运行完整状态机，再在 msprof 导出的
 model/task/op 表中按 model ID 和 role 文件名分组。不要分别喂随机 state 跑四个 OM 后把数字相加；
@@ -360,6 +455,7 @@ model/task/op 表中按 model ID 和 role 文件名分组。不要分别喂随�
 export DFLASH_SOURCE=/ABSOLUTE/PATH/qwen3.5-4B-dflash
 export PROFILE_ROOT=/ABSOLUTE/PATH/qwen35-four-om-msprof
 export TOKEN_IDS='REAL,COMMA,SEPARATED,TOKEN,IDS'
+export RESET_POLICY=async-memset
 mkdir -p "$PROFILE_ROOT"
 
 for AIC_METRIC in PipeUtilization Memory MemoryUB; do
@@ -387,9 +483,11 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
       --pad-token-id 0 \
       --max-new-tokens 32 \
       --max-draft-tokens 15 \
-      --warmup 3 \
-      --repetitions 10 \
+      --measurement-protocol profile \
+      --warmup 1 \
+      --repetitions 1 \
       --device-id 0 \
+      --state-reset-policy "$RESET_POLICY" \
       --progress false
 done
 ```
@@ -406,7 +504,8 @@ rg --files "$PROF_DIR" | \
 用 model/task 表建立 `model_id -> target-prefill/target-decode1/draft-propose/
 target-verify-commit` 映射，再按 model ID 汇总 duration。`runner-report.json` 的各 role execution
 次数是交叉校验依据。msprof 仅用于定位 kernel、Memcpy、launch、同步和空洞；最终 median/p90
-必须重新关闭 profiling 跑上面的 paired 3+10。
+必须重新关闭 profiling，以 `--measurement-protocol evidence --warmup 3 --repetitions 10` 跑上面
+的正式命令。profile report 会明确写入 `formal_latency_evidence=false`，不能混入候选提升依据。
 
 ## 6. 真机选择顺序
 

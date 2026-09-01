@@ -16,6 +16,8 @@ if str(FRAMEWORK_PYTHON) not in sys.path:
     sys.path.insert(0, str(FRAMEWORK_PYTHON))
 
 from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
+    ASYNC_MEMSET_STATE_RESET_POLICY,
+    IMMUTABLE_ZERO_STATE_RESET_POLICY,
     INCREMENTAL_CPP_RUNNER_ID,
     INCREMENTAL_STATE_POLICY,
     _INCREMENTAL_GRAPH_ABI,
@@ -49,7 +51,16 @@ def _hashes() -> dict[str, str]:
     }
 
 
-def _report() -> dict[str, object]:
+def _report(
+    state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
+) -> dict[str, object]:
+    immutable_zero = (
+        state_reset_policy == IMMUTABLE_ZERO_STATE_RESET_POLICY
+    )
+    working_state_bytes = 2048
+    reset_bytes = 1024
+    zero_state_bytes = reset_bytes if immutable_zero else 0
+    state_bytes = working_state_bytes + zero_state_bytes
     hashes = _hashes()
     models = [
         {
@@ -72,10 +83,14 @@ def _report() -> dict[str, object]:
         "protocol": {
             "warmup": 3,
             "repetitions": 10,
-            "state_reset_policy": (
-                "async clear queued inside first prefill; no reset-only barrier"
+            "kind": "evidence",
+            "formal_latency_evidence": True,
+            "state_reset_policy": state_reset_policy,
+            "state_reset_only_barriers": 0,
+            "state_reset_device_work_included_by_prefill_barrier": (
+                not immutable_zero
             ),
-            "state_reset_device_work_included_by_prefill_barrier": True,
+            "state_zero_initialization_included_in_startup": immutable_zero,
         },
         "abi": {
             "id": (
@@ -90,9 +105,14 @@ def _report() -> dict[str, object]:
             "sum_work_bytes": 256,
             "max_work_bytes": 64,
             "sum_weight_bytes": 1024,
-            "state_device_bytes": 2048,
+            "state_device_bytes": state_bytes,
+            "working_state_device_bytes": working_state_bytes,
+            "immutable_zero_state_device_bytes": zero_state_bytes,
+            "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 512,
-            "explicit_allocated_device_bytes_excluding_runtime": 3648,
+            "explicit_allocated_device_bytes_excluding_runtime": (
+                64 + 1024 + state_bytes + 512
+            ),
             "load_policy": (
                 "four aclmdlLoadFromFileWithMem sessions; one max-sized serial "
                 "workspace; separate per-artifact weights; no cross-OM weight "
@@ -107,13 +127,21 @@ def _report() -> dict[str, object]:
             "target_verify_commit_executions": 26,
             "stream_synchronizations": 117,
             "state_resets": 26,
-            "state_memset_operations": 52,
-            "state_memset_bytes": 4096,
+            "state_memset_operations": 0 if immutable_zero else 52,
+            "state_memset_bytes": 0 if immutable_zero else 26 * reset_bytes,
+            "state_initialization_memset_operations": 2 if immutable_zero else 0,
+            "state_initialization_memset_bytes": zero_state_bytes,
+            "state_initialization_stream_synchronizations": (
+                1 if immutable_zero else 0
+            ),
             "host_to_device_operations": 80,
             "host_to_device_bytes": 4096,
             "device_to_host_operations": 117,
             "device_to_host_bytes": 8192,
-            "state_device_bytes": 2048,
+            "state_device_bytes": state_bytes,
+            "working_state_device_bytes": working_state_bytes,
+            "immutable_zero_state_device_bytes": zero_state_bytes,
+            "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 512,
         },
         "ordinary": _mode("ordinary-greedy"),
@@ -126,7 +154,10 @@ def _report() -> dict[str, object]:
     }
 
 
-def _validate(report: dict[str, object]) -> None:
+def _validate(
+    report: dict[str, object],
+    state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
+) -> None:
     validate_incremental_cpp_runner_report(
         report,
         prompt_token_ids=[10],
@@ -134,11 +165,21 @@ def _validate(report: dict[str, object]) -> None:
         device_id=0,
         max_new_tokens=6,
         max_draft_tokens=3,
+        state_reset_policy=state_reset_policy,
     )
 
 
-def test_incremental_runner_report_closes_state_and_transaction_counters() -> None:
-    _validate(_report())
+@pytest.mark.parametrize(
+    "state_reset_policy",
+    [
+        ASYNC_MEMSET_STATE_RESET_POLICY,
+        IMMUTABLE_ZERO_STATE_RESET_POLICY,
+    ],
+)
+def test_incremental_runner_report_closes_state_and_transaction_counters(
+    state_reset_policy: str,
+) -> None:
+    _validate(_report(state_reset_policy), state_reset_policy)
 
 
 @pytest.mark.parametrize(
@@ -160,6 +201,14 @@ def test_incremental_runner_rejects_inconsistent_execution_counters(
         _validate(report)
 
 
+def test_incremental_runner_rejects_profile_timing_as_formal_evidence() -> None:
+    report = _report()
+    report["protocol"]["kind"] = "profile"
+    report["protocol"]["formal_latency_evidence"] = False
+    with pytest.raises(RuntimeError, match="diagnostic-only"):
+        _validate(report)
+
+
 def test_incremental_runner_config_is_explicit() -> None:
     identity = validate_cpp_runner_options(
         {
@@ -169,11 +218,32 @@ def test_incremental_runner_config_is_explicit() -> None:
             "firmware": "test-firmware",
             "runtime": "AscendCL",
             "state_policy": INCREMENTAL_STATE_POLICY,
+            "state_reset_policy": IMMUTABLE_ZERO_STATE_RESET_POLICY,
             "pad_token_id": 0,
         },
         0,
     )
     assert identity["state_policy"] == INCREMENTAL_STATE_POLICY
+    assert (
+        identity["state_reset_policy"]
+        == IMMUTABLE_ZERO_STATE_RESET_POLICY
+    )
+
+
+def test_incremental_runner_rejects_unknown_state_reset_policy() -> None:
+    with pytest.raises(ValueError, match="state_reset_policy"):
+        validate_cpp_runner_options(
+            {
+                "device_model": "Ascend310P3",
+                "cann": "test-cann",
+                "driver": "test-driver",
+                "firmware": "test-firmware",
+                "runtime": "AscendCL",
+                "state_policy": INCREMENTAL_STATE_POLICY,
+                "state_reset_policy": "unknown",
+            },
+            0,
+        )
 
 
 def test_resolve_incremental_oms_locks_all_four_abis_and_hashes(
@@ -274,7 +344,10 @@ def test_run_cpp_pair_routes_all_four_hash_locked_oms(
     def execute(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         captured["command"] = command
         output = Path(command[command.index("--output") + 1])
-        output.write_text(json.dumps(_report()), encoding="utf-8")
+        output.write_text(
+            json.dumps(_report(IMMUTABLE_ZERO_STATE_RESET_POLICY)),
+            encoding="utf-8",
+        )
         return subprocess.CompletedProcess(command, 0, stdout="fake PASS\n")
 
     payload = cpp_runtime.run_cpp_pair(
@@ -287,6 +360,7 @@ def test_run_cpp_pair_routes_all_four_hash_locked_oms(
             "firmware": "fake-firmware",
             "runtime": "fake-AscendCL",
             "state_policy": INCREMENTAL_STATE_POLICY,
+            "state_reset_policy": IMMUTABLE_ZERO_STATE_RESET_POLICY,
             "pad_token_id": 0,
         },
         prompt_token_ids=[10],
@@ -304,6 +378,10 @@ def test_run_cpp_pair_routes_all_four_hash_locked_oms(
         assert f"--{role}" in command
         assert f"--{role}-sha256" in command
     assert "--model" not in command
+    assert command[command.index("--state-reset-policy") + 1] == (
+        IMMUTABLE_ZERO_STATE_RESET_POLICY
+    )
+    assert command[command.index("--measurement-protocol") + 1] == "evidence"
     assert payload["backend_metadata"]["state_policy"] == (
         INCREMENTAL_STATE_POLICY
     )

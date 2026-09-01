@@ -26,6 +26,12 @@ CPP_RUNNER_ID = "qwen35-dflash-ascendcl-cpp-v1"
 INCREMENTAL_CPP_RUNNER_ID = "qwen35-dflash-ascendcl-cpp-incremental-v2"
 RECOMPUTE_STATE_POLICY = "recompute-committed-prefixes"
 INCREMENTAL_STATE_POLICY = "incremental-explicit-state-v2"
+ASYNC_MEMSET_STATE_RESET_POLICY = "async-memset"
+IMMUTABLE_ZERO_STATE_RESET_POLICY = "immutable-zero"
+_INCREMENTAL_STATE_RESET_POLICIES = {
+    ASYNC_MEMSET_STATE_RESET_POLICY,
+    IMMUTABLE_ZERO_STATE_RESET_POLICY,
+}
 _INCREMENTAL_ABI_ID = (
     "qwen35-4b-dflash-ascend310p-incremental-performance-v2"
 )
@@ -187,6 +193,17 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
     pad_token_id = int(options.get("pad_token_id", 0))
     if pad_token_id < 0:
         raise ValueError("C++ runner pad_token_id must be non-negative")
+    state_reset_policy = str(
+        options.get(
+            "state_reset_policy", ASYNC_MEMSET_STATE_RESET_POLICY
+        )
+    ).strip()
+    if state_reset_policy not in _INCREMENTAL_STATE_RESET_POLICIES:
+        raise ValueError(
+            "C++ runner state_reset_policy must be "
+            f"{ASYNC_MEMSET_STATE_RESET_POLICY!r} or "
+            f"{IMMUTABLE_ZERO_STATE_RESET_POLICY!r}"
+        )
     return {
         "cpu_fallback": False,
         "device": {
@@ -200,6 +217,7 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
         "runtime": str(options["runtime"]),
         "graph_name": graph_name,
         "state_policy": state_policy,
+        "state_reset_policy": state_reset_policy,
         "pad_token_id": pad_token_id,
     }
 
@@ -609,6 +627,7 @@ def validate_incremental_cpp_runner_report(
     device_id: int,
     max_new_tokens: int,
     max_draft_tokens: int,
+    state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
 ) -> None:
     """Validate four resident models, device state routing and paired parity."""
 
@@ -655,12 +674,26 @@ def validate_incremental_cpp_runner_report(
     protocol = report.get("protocol", {})
     if protocol.get("warmup") != 3 or protocol.get("repetitions") != 10:
         raise RuntimeError("incremental runner protocol is not locked 3+10")
-    if protocol.get("state_reset_policy") != (
-        "async clear queued inside first prefill; no reset-only barrier"
+    if (
+        protocol.get("kind") != "evidence"
+        or protocol.get("formal_latency_evidence") is not True
     ):
-        raise RuntimeError("incremental runner added an unexpected reset barrier")
-    if protocol.get("state_reset_device_work_included_by_prefill_barrier") is not True:
-        raise RuntimeError("incremental runner excluded state clear device work")
+        raise RuntimeError("incremental runner returned diagnostic-only timing")
+    if state_reset_policy not in _INCREMENTAL_STATE_RESET_POLICIES:
+        raise ValueError("expected incremental state reset policy is invalid")
+    if protocol.get("state_reset_policy") != state_reset_policy:
+        raise RuntimeError("incremental runner state reset policy differs")
+    if protocol.get("state_reset_only_barriers") != 0:
+        raise RuntimeError("incremental runner added a reset-only barrier")
+    immutable_zero = state_reset_policy == IMMUTABLE_ZERO_STATE_RESET_POLICY
+    if protocol.get(
+        "state_reset_device_work_included_by_prefill_barrier"
+    ) is not (not immutable_zero):
+        raise RuntimeError("incremental reset timing scope differs")
+    if protocol.get(
+        "state_zero_initialization_included_in_startup"
+    ) is not immutable_zero:
+        raise RuntimeError("incremental zero initialization timing scope differs")
     abi = report.get("abi", {})
     if abi.get("id") != _INCREMENTAL_ABI_ID:
         raise RuntimeError("incremental runner ABI identity differs")
@@ -693,10 +726,33 @@ def validate_incremental_cpp_runner_report(
         or memory.get("sum_weight_bytes") != expected_sum_weight
     ):
         raise RuntimeError("incremental model memory totals do not close")
-    for field in ("state_device_bytes", "carrier_device_bytes"):
+    for field in (
+        "state_device_bytes",
+        "working_state_device_bytes",
+        "state_reset_bytes_per_request",
+        "carrier_device_bytes",
+    ):
         value = memory.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise RuntimeError(f"incremental {field} is invalid")
+    zero_state_bytes = memory.get("immutable_zero_state_device_bytes")
+    if (
+        isinstance(zero_state_bytes, bool)
+        or not isinstance(zero_state_bytes, int)
+        or zero_state_bytes < 0
+    ):
+        raise RuntimeError("incremental immutable zero state bytes are invalid")
+    expected_zero_state_bytes = (
+        int(memory["state_reset_bytes_per_request"])
+        if immutable_zero
+        else 0
+    )
+    if zero_state_bytes != expected_zero_state_bytes:
+        raise RuntimeError("incremental immutable zero state size differs")
+    if memory["state_device_bytes"] != (
+        memory["working_state_device_bytes"] + zero_state_bytes
+    ):
+        raise RuntimeError("incremental state allocation does not close")
     expected_allocated = (
         expected_max_work
         + expected_sum_weight
@@ -731,15 +787,40 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental transaction synchronization policy differs")
     if execution.get("state_resets") != 2 * (3 + 10):
         raise RuntimeError("incremental paired run reset count differs")
-    if execution.get("state_memset_operations") != 2 * execution["state_resets"]:
-        raise RuntimeError("incremental state clear counter differs")
-    if execution.get("state_device_bytes") != memory.get("state_device_bytes"):
-        raise RuntimeError("incremental state byte reports differ")
+    if immutable_zero:
+        if (
+            execution.get("state_memset_operations") != 0
+            or execution.get("state_memset_bytes") != 0
+            or execution.get("state_initialization_memset_operations") != 2
+            or execution.get("state_initialization_memset_bytes")
+            != expected_zero_state_bytes
+            or execution.get("state_initialization_stream_synchronizations")
+            != 1
+        ):
+            raise RuntimeError("incremental immutable zero counters differ")
+    elif (
+        execution.get("state_memset_operations")
+        != 2 * execution["state_resets"]
+        or execution.get("state_memset_bytes")
+        != memory["state_reset_bytes_per_request"] * execution["state_resets"]
+        or execution.get("state_initialization_memset_operations") != 0
+        or execution.get("state_initialization_memset_bytes") != 0
+        or execution.get("state_initialization_stream_synchronizations") != 0
+    ):
+        raise RuntimeError("incremental async state clear counters differ")
+    for field in (
+        "state_device_bytes",
+        "working_state_device_bytes",
+        "immutable_zero_state_device_bytes",
+        "state_reset_bytes_per_request",
+    ):
+        if execution.get(field) != memory.get(field):
+            raise RuntimeError(f"incremental {field} reports differ")
     if execution.get("carrier_device_bytes") != memory.get("carrier_device_bytes"):
         raise RuntimeError("incremental carrier byte reports differ")
     for field in (
         "host_to_device_operations", "host_to_device_bytes",
-        "device_to_host_bytes", "state_memset_bytes",
+        "device_to_host_bytes",
     ):
         value = execution.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -858,11 +939,16 @@ def run_cpp_pair(
         "3",
         "--repetitions",
         "10",
+        "--measurement-protocol",
+        "evidence",
         "--device-id",
         str(int(device_id)),
-        "--progress",
-        "true" if progress else "false",
     ])
+    if incremental:
+        command.extend(
+            ["--state-reset-policy", identity["state_reset_policy"]]
+        )
+    command.extend(["--progress", "true" if progress else "false"])
     _progress(
         progress,
         "stage=runner-start live child output follows; "
@@ -905,6 +991,7 @@ def run_cpp_pair(
             device_id=device_id,
             max_new_tokens=max_new_tokens,
             max_draft_tokens=max_draft_tokens,
+            state_reset_policy=identity["state_reset_policy"],
         )
     else:
         assert om_record is not None

@@ -29,9 +29,15 @@ using qwen35::dflash::BenchmarkResult;
 using qwen35::dflash::Distribution;
 using qwen35::dflash::GenerationMeasurement;
 using qwen35::dflash::IncrementalModelMemory;
+using qwen35::dflash::IncrementalStateResetPolicy;
 using qwen35::dflash::PairedBenchmarkResult;
 using qwen35::dflash::ProgressCallback;
 using qwen35::dflash::ProgressEvent;
+
+enum class MeasurementProtocol {
+  kEvidence,
+  kProfile,
+};
 
 struct ModelArgument {
   const char* role;
@@ -56,6 +62,9 @@ struct Arguments {
   std::size_t repetitions = 10;
   int device_id = 0;
   bool progress = true;
+  IncrementalStateResetPolicy state_reset_policy =
+      IncrementalStateResetPolicy::kAsyncMemset;
+  MeasurementProtocol measurement_protocol = MeasurementProtocol::kEvidence;
 };
 
 void Usage(std::ostream& stream) {
@@ -75,9 +84,12 @@ void Usage(std::ostream& stream) {
       << "  --pad-token-id ID                        default 0\n"
       << "  --max-new-tokens N                       default 32\n"
       << "  --max-draft-tokens N                     default 15\n"
-      << "  --warmup N                               target evidence requires 3\n"
-      << "  --repetitions N                          target evidence requires 10\n"
+      << "  --warmup N                               evidence=3, profile=1\n"
+      << "  --repetitions N                          evidence=10, profile=1\n"
       << "  --device-id N                            default 0\n"
+      << "  --measurement-protocol MODE             evidence (default) or profile\n"
+      << "  --state-reset-policy POLICY             async-memset (default) or "
+         "immutable-zero\n"
       << "  --progress true|false                    live stderr progress\n";
 }
 
@@ -250,6 +262,26 @@ Arguments ParseArguments(int argc, char** argv) {
       TakeOptional(&values, "repetitions", "10"), "repetitions");
   result.progress = ParseBool(
       TakeOptional(&values, "progress", "true"), "progress");
+  const std::string measurement_protocol = TakeOptional(
+      &values, "measurement-protocol", "evidence");
+  if (measurement_protocol == "evidence") {
+    result.measurement_protocol = MeasurementProtocol::kEvidence;
+  } else if (measurement_protocol == "profile") {
+    result.measurement_protocol = MeasurementProtocol::kProfile;
+  } else {
+    throw std::invalid_argument(
+        "measurement-protocol must be evidence or profile");
+  }
+  const std::string state_reset_policy = TakeOptional(
+      &values, "state-reset-policy", "async-memset");
+  if (state_reset_policy == "async-memset") {
+    result.state_reset_policy = IncrementalStateResetPolicy::kAsyncMemset;
+  } else if (state_reset_policy == "immutable-zero") {
+    result.state_reset_policy = IncrementalStateResetPolicy::kImmutableZero;
+  } else {
+    throw std::invalid_argument(
+        "state-reset-policy must be async-memset or immutable-zero");
+  }
   const std::int64_t device_id = ParseInt64(
       TakeOptional(&values, "device-id", "0"), "device-id");
   if (device_id < 0 || result.pad_token_id < 0) {
@@ -259,9 +291,15 @@ Arguments ParseArguments(int argc, char** argv) {
   if (!values.empty()) {
     throw std::invalid_argument("unknown option --" + values.begin()->first);
   }
-  if (result.warmup != 3 || result.repetitions != 10) {
+  if (result.measurement_protocol == MeasurementProtocol::kEvidence &&
+      (result.warmup != 3 || result.repetitions != 10)) {
     throw std::invalid_argument(
-        "target evidence requires exactly 3 warmups and 10 repetitions");
+        "evidence protocol requires exactly 3 warmups and 10 repetitions");
+  }
+  if (result.measurement_protocol == MeasurementProtocol::kProfile &&
+      (result.warmup != 1 || result.repetitions != 1)) {
+    throw std::invalid_argument(
+        "profile protocol requires exactly 1 warmup and 1 repetition");
   }
   return result;
 }
@@ -423,6 +461,8 @@ void WriteReport(
         return left.work_bytes < right.work_bytes;
       })->work_bytes;
   const auto& execution = executor.execution_stats();
+  const bool formal_latency_evidence =
+      arguments.measurement_protocol == MeasurementProtocol::kEvidence;
   const std::size_t model_executions =
       execution.target_prefill_executions +
       execution.target_decode1_executions +
@@ -466,6 +506,12 @@ void WriteReport(
          << ",\"max_work_bytes\":" << max_work
          << ",\"sum_weight_bytes\":" << sum_weight
          << ",\"state_device_bytes\":" << execution.state_device_bytes
+         << ",\"working_state_device_bytes\":"
+         << execution.working_state_device_bytes
+         << ",\"immutable_zero_state_device_bytes\":"
+         << execution.immutable_zero_state_device_bytes
+         << ",\"state_reset_bytes_per_request\":"
+         << execution.state_reset_bytes_per_request
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
          << ",\"explicit_allocated_device_bytes_excluding_runtime\":"
          << max_work + sum_weight + execution.state_device_bytes +
@@ -475,11 +521,32 @@ void WriteReport(
             "no cross-OM weight sharing assumed\"},"
          << "\"protocol\":{\"warmup\":" << arguments.warmup
          << ",\"repetitions\":" << arguments.repetitions
+         << ",\"kind\":\""
+         << (formal_latency_evidence ? "evidence" : "profile")
+         << "\",\"formal_latency_evidence\":"
+         << (formal_latency_evidence ? "true" : "false")
          << ",\"order\":\"alternating ordinary/DFlash in one four-model process\","
          << "\"model_load_excluded_from_latency\":true,"
-         << "\"state_reset_policy\":\"async clear queued inside first prefill; "
-            "no reset-only barrier\","
-         << "\"state_reset_device_work_included_by_prefill_barrier\":true,"
+         << "\"state_reset_policy\":\""
+         << qwen35::dflash::IncrementalStateResetPolicyName(
+                executor.state_reset_policy())
+         << "\",\"state_reset_description\":\""
+         << (executor.state_reset_policy() ==
+                     IncrementalStateResetPolicy::kAsyncMemset
+                 ? "per-request Target/Draft clear queued inside first prefill"
+                 : "read-only Target/Draft zero state initialized at startup")
+         << "\",\"state_reset_only_barriers\":0,"
+         << "\"state_reset_device_work_included_by_prefill_barrier\":"
+         << (executor.state_reset_policy() ==
+                     IncrementalStateResetPolicy::kAsyncMemset
+                 ? "true"
+                 : "false")
+         << ",\"state_zero_initialization_included_in_startup\":"
+         << (executor.state_reset_policy() ==
+                     IncrementalStateResetPolicy::kImmutableZero
+                 ? "true"
+                 : "false")
+         << ','
          << "\"progress_emission_excluded_from_model_timers\":true,"
          << "\"live_progress_enabled\":"
          << (arguments.progress ? "true" : "false") << "},"
@@ -503,6 +570,12 @@ void WriteReport(
          << ",\"state_memset_operations\":"
          << execution.state_memset_operations
          << ",\"state_memset_bytes\":" << execution.state_memset_bytes
+         << ",\"state_initialization_memset_operations\":"
+         << execution.state_initialization_memset_operations
+         << ",\"state_initialization_memset_bytes\":"
+         << execution.state_initialization_memset_bytes
+         << ",\"state_initialization_stream_synchronizations\":"
+         << execution.state_initialization_stream_synchronizations
          << ",\"host_to_device_operations\":"
          << execution.host_to_device_operations
          << ",\"host_to_device_bytes\":" << execution.host_to_device_bytes
@@ -510,6 +583,12 @@ void WriteReport(
          << execution.device_to_host_operations
          << ",\"device_to_host_bytes\":" << execution.device_to_host_bytes
          << ",\"state_device_bytes\":" << execution.state_device_bytes
+         << ",\"working_state_device_bytes\":"
+         << execution.working_state_device_bytes
+         << ",\"immutable_zero_state_device_bytes\":"
+         << execution.immutable_zero_state_device_bytes
+         << ",\"state_reset_bytes_per_request\":"
+         << execution.state_reset_bytes_per_request
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
          << "},\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
@@ -529,9 +608,13 @@ void WriteReport(
          << ",\"eos_mismatches\":" << result.eos_mismatches
          << "},\"dflash_speedup_over_ordinary_model_total_median\":"
          << speedup
-         << ",\"claim_boundary\":\"Candidate execution report only; promotion "
-            "requires real Ascend310P ordinary parity, memory fit and unprofiled "
-            "latency evidence.\"}";
+         << ",\"claim_boundary\":\""
+         << (formal_latency_evidence
+                 ? "Candidate execution report only; promotion requires real "
+                   "Ascend310P ordinary parity, memory fit and matched evidence."
+                 : "Diagnostic profiling run only; collector-perturbed latency "
+                   "is not promotion evidence.")
+         << "\"}";
 }
 
 void AtomicWrite(const std::filesystem::path& path, const std::string& payload) {
@@ -596,7 +679,8 @@ int main(int argc, char** argv) {
             message << " work_bytes=" << work << " weight_bytes=" << weight;
           }
           PrintProgress(arguments.progress, message.str());
-        });
+        },
+        arguments.state_reset_policy);
     const auto load_end = std::chrono::steady_clock::now();
     const double load_ms = std::chrono::duration<double, std::milli>(
         load_end - load_start).count();
@@ -617,7 +701,9 @@ int main(int argc, char** argv) {
     options.eos_token_ids = arguments.eos_token_ids;
     PrintProgress(
         arguments.progress,
-        "stage=benchmark-start protocol=paired-3-warmup-plus-10-measurements");
+        arguments.measurement_protocol == MeasurementProtocol::kEvidence
+            ? "stage=benchmark-start protocol=evidence-paired-3-plus-10"
+            : "stage=benchmark-start protocol=profile-paired-1-plus-1");
     const auto benchmark_start = std::chrono::steady_clock::now();
     const PairedBenchmarkResult result =
         qwen35::dflash::BenchmarkPairStateful(

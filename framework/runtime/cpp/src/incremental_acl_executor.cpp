@@ -431,15 +431,31 @@ Value ReadAt(const MirrorBuffer& buffer, std::size_t offset) {
 
 }  // namespace
 
+const char* IncrementalStateResetPolicyName(
+    IncrementalStateResetPolicy policy) noexcept {
+  switch (policy) {
+    case IncrementalStateResetPolicy::kAsyncMemset:
+      return "async-memset";
+    case IncrementalStateResetPolicy::kImmutableZero:
+      return "immutable-zero";
+  }
+  return "unknown";
+}
+
 class AclIncrementalExecutor::Impl {
  public:
   Impl(
       const IncrementalOmPaths& paths,
       int device_id,
-      const IncrementalModelProgress& progress)
-      : device_id_(device_id) {
+      const IncrementalModelProgress& progress,
+      IncrementalStateResetPolicy state_reset_policy)
+      : device_id_(device_id), state_reset_policy_(state_reset_policy) {
     if (device_id < 0) {
       throw std::invalid_argument("device ID must be non-negative");
+    }
+    if (state_reset_policy_ != IncrementalStateResetPolicy::kAsyncMemset &&
+        state_reset_policy_ != IncrementalStateResetPolicy::kImmutableZero) {
+      throw std::invalid_argument("unknown incremental state reset policy");
     }
     try {
       Check(aclInit(nullptr), "aclInit");
@@ -498,6 +514,7 @@ class AclIncrementalExecutor::Impl {
       load(verify_, model_weights_[3], false);
       ValidateAbi();
       AllocateBuffers();
+      InitializeImmutableZeroState();
       BuildPlans();
     } catch (...) {
       Cleanup();
@@ -516,6 +533,9 @@ class AclIncrementalExecutor::Impl {
   }
   const IncrementalAclExecutionStats& execution_stats() const noexcept {
     return stats_;
+  }
+  IncrementalStateResetPolicy state_reset_policy() const noexcept {
+    return state_reset_policy_;
   }
 
   void Reset(
@@ -573,7 +593,7 @@ class AclIncrementalExecutor::Impl {
     } else if (logical_proposal_count != 0) {
       throw std::invalid_argument("proposal count supplied without Draft execution");
     }
-    ApplyPendingReset();
+    const bool use_immutable_zero = ApplyPendingReset();
     if (prepare_draft) {
       SetProposalCount(logical_proposal_count);
     }
@@ -586,13 +606,19 @@ class AclIncrementalExecutor::Impl {
     Upload(prefill_ids_, prefill_ids_.bytes);
     Upload(effective_length_, effective_length_.bytes);
 
-    Execute(prefill_, prefill_plans_[target_state_index_]);
+    if (use_immutable_zero) {
+      Execute(prefill_, initial_prefill_plan_);
+      target_state_index_ = 0;
+    } else {
+      Execute(prefill_, prefill_plans_[target_state_index_]);
+      target_state_index_ = 1 - target_state_index_;
+    }
     ++stats_.target_prefill_executions;
-    target_state_index_ = 1 - target_state_index_;
     feature_source_ = FeatureSource::kPrefill;
     std::size_t executions = 1;
     if (prepare_draft) {
-      ExecuteDraft(FeatureSource::kPrefill, prefill_width_);
+      ExecuteDraft(
+          FeatureSource::kPrefill, prefill_width_, use_immutable_zero);
       proposal_ready_ = true;
       prepared_proposal_count_ = logical_proposal_count;
       ++executions;
@@ -638,7 +664,7 @@ class AclIncrementalExecutor::Impl {
             "no committed Target feature carrier is available for Draft");
       }
       SetProposalCount(logical_proposal_count);
-      ExecuteDraft(FeatureSource::kVerify, verify_width_);
+      ExecuteDraft(FeatureSource::kVerify, verify_width_, false);
       ++executions;
     }
     Execute(verify_, verify_plans_[target_state_index_]);
@@ -884,11 +910,29 @@ class AclIncrementalExecutor::Impl {
     target_states_[1].Allocate(target_state_specs_);
     draft_states_[0].Allocate(draft_state_specs_);
     draft_states_[1].Allocate(draft_state_specs_);
-    stats_.state_device_bytes =
+    stats_.working_state_device_bytes =
         target_states_[0].allocation.bytes +
         target_states_[1].allocation.bytes +
         draft_states_[0].allocation.bytes +
         draft_states_[1].allocation.bytes;
+    stats_.state_reset_bytes_per_request =
+        target_states_[0].allocation.bytes +
+        draft_states_[0].allocation.bytes;
+    if (state_reset_policy_ ==
+        IncrementalStateResetPolicy::kImmutableZero) {
+      target_zero_state_.Allocate(target_state_specs_);
+      draft_zero_state_.Allocate(draft_state_specs_);
+      stats_.immutable_zero_state_device_bytes =
+          target_zero_state_.allocation.bytes +
+          draft_zero_state_.allocation.bytes;
+      if (stats_.immutable_zero_state_device_bytes !=
+          stats_.state_reset_bytes_per_request) {
+        throw std::logic_error("immutable zero state size differs from reset set");
+      }
+    }
+    stats_.state_device_bytes =
+        stats_.working_state_device_bytes +
+        stats_.immutable_zero_state_device_bytes;
 
     prefill_ids_.Allocate(prefill_.PublicInput(0).bytes);
     effective_length_.Allocate(prefill_.PublicInput(1).bytes);
@@ -933,6 +977,39 @@ class AclIncrementalExecutor::Impl {
         verify_features_.bytes + committed_input_count_.bytes +
         verify_ids_.bytes + dynamic_controls_[0].bytes +
         dynamic_controls_[1].bytes;
+  }
+
+  void InitializeImmutableZeroState() {
+    if (state_reset_policy_ !=
+        IncrementalStateResetPolicy::kImmutableZero) {
+      return;
+    }
+    Check(
+        aclrtMemsetAsync(
+            target_zero_state_.allocation.data,
+            target_zero_state_.allocation.bytes,
+            0,
+            target_zero_state_.allocation.bytes,
+            stream_),
+        "aclrtMemsetAsync(immutable Target zero state)");
+    ++stats_.state_initialization_memset_operations;
+    stats_.state_initialization_memset_bytes +=
+        target_zero_state_.allocation.bytes;
+    Check(
+        aclrtMemsetAsync(
+            draft_zero_state_.allocation.data,
+            draft_zero_state_.allocation.bytes,
+            0,
+            draft_zero_state_.allocation.bytes,
+            stream_),
+        "aclrtMemsetAsync(immutable Draft zero state)");
+    ++stats_.state_initialization_memset_operations;
+    stats_.state_initialization_memset_bytes +=
+        draft_zero_state_.allocation.bytes;
+    Check(
+        aclrtSynchronizeStream(stream_),
+        "aclrtSynchronizeStream(immutable zero state initialization)");
+    ++stats_.state_initialization_stream_synchronizations;
   }
 
   BufferView CompactView(std::size_t offset, std::size_t bytes) const {
@@ -1040,6 +1117,53 @@ class AclIncrementalExecutor::Impl {
             "draft-propose: aclmdlSetInputDynamicDims(prebind)");
       }
     }
+    if (state_reset_policy_ ==
+        IncrementalStateResetPolicy::kImmutableZero) {
+      initial_prefill_plan_.Build(
+          prefill_,
+          [&]() {
+            std::vector<BufferView> inputs{
+                prefill_ids_.View(), effective_length_.View(), eos_ids_.View(),
+                eos_count_.View()};
+            inputs.insert(
+                inputs.end(),
+                target_zero_state_.tensors.begin(),
+                target_zero_state_.tensors.end());
+            return inputs;
+          }(),
+          {CompactView(compact_token_offset_, prefill_.outputs[0].bytes),
+           CompactView(compact_commit_offset_, prefill_.outputs[1].bytes),
+           CompactView(compact_finished_offset_, prefill_.outputs[2].bytes),
+           prefill_features_.View(prefill_.outputs[3].bytes),
+           committed_input_count_.View(),
+           target_states_[0].tensors[0],
+           target_states_[0].tensors[1],
+           target_states_[0].tensors[2],
+           target_states_[0].tensors[3],
+           target_states_[0].tensors[4]});
+      initial_draft_plan_.Build(
+          draft_,
+          {prefill_features_.View(draft_.PublicInput(0).bytes),
+           committed_input_count_.View(),
+           CompactView(compact_token_offset_, draft_.PublicInput(2).bytes),
+           CompactView(compact_commit_offset_, draft_.PublicInput(3).bytes),
+           proposal_count_.View(),
+           draft_zero_state_.tensors[0],
+           draft_zero_state_.tensors[1],
+           draft_zero_state_.tensors[2]},
+          {verify_ids_.View(),
+           draft_states_[0].tensors[0],
+           draft_states_[0].tensors[1],
+           draft_states_[0].tensors[2]},
+          dynamic_controls_[0].View());
+      Check(
+          aclmdlSetInputDynamicDims(
+              draft_.id,
+              initial_draft_plan_.input,
+              draft_.dynamic_input_index,
+              &draft_gear_prefill_),
+          "draft-propose: aclmdlSetInputDynamicDims(immutable zero prebind)");
+    }
   }
 
   void RequireReset() const {
@@ -1055,30 +1179,34 @@ class AclIncrementalExecutor::Impl {
     }
   }
 
-  void ApplyPendingReset() {
+  bool ApplyPendingReset() {
     if (!reset_pending_) {
-      return;
+      return false;
     }
-    Check(
-        aclrtMemsetAsync(
-            target_states_[0].allocation.data,
-            target_states_[0].allocation.bytes,
-            0,
-            target_states_[0].allocation.bytes,
-            stream_),
-        "aclrtMemsetAsync(target state)");
-    ++stats_.state_memset_operations;
-    stats_.state_memset_bytes += target_states_[0].allocation.bytes;
-    Check(
-        aclrtMemsetAsync(
-            draft_states_[0].allocation.data,
-            draft_states_[0].allocation.bytes,
-            0,
-            draft_states_[0].allocation.bytes,
-            stream_),
-        "aclrtMemsetAsync(draft state)");
-    ++stats_.state_memset_operations;
-    stats_.state_memset_bytes += draft_states_[0].allocation.bytes;
+    const bool use_immutable_zero = state_reset_policy_ ==
+        IncrementalStateResetPolicy::kImmutableZero;
+    if (!use_immutable_zero) {
+      Check(
+          aclrtMemsetAsync(
+              target_states_[0].allocation.data,
+              target_states_[0].allocation.bytes,
+              0,
+              target_states_[0].allocation.bytes,
+              stream_),
+          "aclrtMemsetAsync(target state)");
+      ++stats_.state_memset_operations;
+      stats_.state_memset_bytes += target_states_[0].allocation.bytes;
+      Check(
+          aclrtMemsetAsync(
+              draft_states_[0].allocation.data,
+              draft_states_[0].allocation.bytes,
+              0,
+              draft_states_[0].allocation.bytes,
+              stream_),
+          "aclrtMemsetAsync(draft state)");
+      ++stats_.state_memset_operations;
+      stats_.state_memset_bytes += draft_states_[0].allocation.bytes;
+    }
     if (eos_upload_pending_) {
       Upload(eos_ids_, eos_ids_.bytes);
       Upload(eos_count_, eos_count_.bytes);
@@ -1087,6 +1215,7 @@ class AclIncrementalExecutor::Impl {
       eos_upload_pending_ = false;
     }
     reset_pending_ = false;
+    return use_immutable_zero;
   }
 
   void RequireProposalCount(std::size_t value) const {
@@ -1107,16 +1236,24 @@ class AclIncrementalExecutor::Impl {
     proposal_value_valid_ = true;
   }
 
-  void ExecuteDraft(FeatureSource source, std::size_t feature_rows) {
+  void ExecuteDraft(
+      FeatureSource source,
+      std::size_t feature_rows,
+      bool use_immutable_zero) {
     if (source == FeatureSource::kNone ||
         (feature_rows != prefill_width_ && feature_rows != verify_width_)) {
       throw std::logic_error("invalid Draft feature source/gear");
     }
-    DatasetPlan& plan =
-        draft_plans_[static_cast<std::size_t>(source)][draft_state_index_];
+    if (use_immutable_zero && source != FeatureSource::kPrefill) {
+      throw std::logic_error(
+          "immutable Draft zero state is valid only for first prefill");
+    }
+    DatasetPlan& plan = use_immutable_zero
+        ? initial_draft_plan_
+        : draft_plans_[static_cast<std::size_t>(source)][draft_state_index_];
     Execute(draft_, plan);
     ++stats_.draft_propose_executions;
-    draft_state_index_ = 1 - draft_state_index_;
+    draft_state_index_ = use_immutable_zero ? 0 : 1 - draft_state_index_;
   }
 
   void Execute(const ModelSession& session, DatasetPlan& plan) {
@@ -1200,6 +1337,8 @@ class AclIncrementalExecutor::Impl {
   }
 
   void Cleanup() noexcept {
+    initial_draft_plan_.Release();
+    initial_prefill_plan_.Release();
     for (auto& by_source : draft_plans_) {
       for (auto& plan : by_source) {
         plan.Release();
@@ -1235,6 +1374,8 @@ class AclIncrementalExecutor::Impl {
     for (auto& state : target_states_) {
       state.Release();
     }
+    draft_zero_state_.Release();
+    target_zero_state_.Release();
 
     verify_.Release();
     draft_.Release();
@@ -1263,6 +1404,8 @@ class AclIncrementalExecutor::Impl {
   }
 
   int device_id_ = 0;
+  IncrementalStateResetPolicy state_reset_policy_ =
+      IncrementalStateResetPolicy::kAsyncMemset;
   bool initialized_ = false;
   bool device_set_ = false;
   bool reset_ = false;
@@ -1290,6 +1433,8 @@ class AclIncrementalExecutor::Impl {
 
   std::array<StateArena, 2> target_states_;
   std::array<StateArena, 2> draft_states_;
+  StateArena target_zero_state_;
+  StateArena draft_zero_state_;
   MirrorBuffer prefill_ids_;
   MirrorBuffer effective_length_;
   MirrorBuffer eos_ids_;
@@ -1316,6 +1461,8 @@ class AclIncrementalExecutor::Impl {
   std::array<DatasetPlan, 2> decode_plans_;
   std::array<DatasetPlan, 2> verify_plans_;
   std::array<std::array<DatasetPlan, 2>, 2> draft_plans_;
+  DatasetPlan initial_prefill_plan_;
+  DatasetPlan initial_draft_plan_;
 
   std::size_t target_state_index_ = 0;
   std::size_t draft_state_index_ = 0;
@@ -1336,8 +1483,10 @@ class AclIncrementalExecutor::Impl {
 AclIncrementalExecutor::AclIncrementalExecutor(
     IncrementalOmPaths model_paths,
     int device_id,
-    IncrementalModelProgress progress)
-    : impl_(std::make_unique<Impl>(model_paths, device_id, progress)) {}
+    IncrementalModelProgress progress,
+    IncrementalStateResetPolicy state_reset_policy)
+    : impl_(std::make_unique<Impl>(
+          model_paths, device_id, progress, state_reset_policy)) {}
 
 AclIncrementalExecutor::~AclIncrementalExecutor() = default;
 AclIncrementalExecutor::AclIncrementalExecutor(
@@ -1393,6 +1542,11 @@ AclIncrementalExecutor::model_memory() const noexcept {
 const IncrementalAclExecutionStats&
 AclIncrementalExecutor::execution_stats() const noexcept {
   return impl_->execution_stats();
+}
+
+IncrementalStateResetPolicy
+AclIncrementalExecutor::state_reset_policy() const noexcept {
+  return impl_->state_reset_policy();
 }
 
 }  // namespace qwen35::dflash

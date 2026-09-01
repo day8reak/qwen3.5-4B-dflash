@@ -25,6 +25,18 @@ struct IncrementalModelMemory {
   std::size_t weight_bytes = 0;
 };
 
+enum class IncrementalStateResetPolicy {
+  // Clear the first Target and Draft input arenas on the execution stream for
+  // every request. The clear is consumed by the first prefill barrier.
+  kAsyncMemset,
+  // Keep one read-only zero Target/Draft arena initialized at process startup.
+  // The first prefill reads it and writes into the ordinary ping-pong arenas.
+  kImmutableZero,
+};
+
+const char* IncrementalStateResetPolicyName(
+    IncrementalStateResetPolicy policy) noexcept;
+
 struct IncrementalAclExecutionStats {
   std::size_t target_prefill_executions = 0;
   std::size_t target_decode1_executions = 0;
@@ -34,11 +46,17 @@ struct IncrementalAclExecutionStats {
   std::size_t state_resets = 0;
   std::size_t state_memset_operations = 0;
   std::size_t state_memset_bytes = 0;
+  std::size_t state_initialization_memset_operations = 0;
+  std::size_t state_initialization_memset_bytes = 0;
+  std::size_t state_initialization_stream_synchronizations = 0;
   std::size_t host_to_device_operations = 0;
   std::size_t host_to_device_bytes = 0;
   std::size_t device_to_host_operations = 0;
   std::size_t device_to_host_bytes = 0;
   std::size_t state_device_bytes = 0;
+  std::size_t working_state_device_bytes = 0;
+  std::size_t immutable_zero_state_device_bytes = 0;
+  std::size_t state_reset_bytes_per_request = 0;
   std::size_t carrier_device_bytes = 0;
 };
 
@@ -53,14 +71,17 @@ using IncrementalModelProgress = std::function<void(
 // Target features and cursors never cross the host boundary.  A speculative
 // method enqueues Draft -> Target verify/commit and performs one stream sync
 // only after a compact transaction result has been queued for D2H. The first
-// prefill after Reset enqueues state clears on the same stream, so their device
-// work is inside prefill timing without adding a second synchronization.
+// prefill after Reset either enqueues state clears on the same stream or reads
+// immutable zero state initialized at startup. Neither policy adds a reset-only
+// synchronization to a request.
 class AclIncrementalExecutor final : public StatefulGraphExecutor {
  public:
   explicit AclIncrementalExecutor(
       IncrementalOmPaths model_paths,
       int device_id = 0,
-      IncrementalModelProgress progress = {});
+      IncrementalModelProgress progress = {},
+      IncrementalStateResetPolicy state_reset_policy =
+          IncrementalStateResetPolicy::kAsyncMemset);
   ~AclIncrementalExecutor() override;
 
   AclIncrementalExecutor(const AclIncrementalExecutor&) = delete;
@@ -86,6 +107,7 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
 
   const std::vector<IncrementalModelMemory>& model_memory() const noexcept;
   const IncrementalAclExecutionStats& execution_stats() const noexcept;
+  IncrementalStateResetPolicy state_reset_policy() const noexcept;
 
  private:
   class Impl;
