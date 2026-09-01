@@ -66,6 +66,10 @@ class GraphExecutor {
 // executor defers state initialization and EOS upload to the first
 // PrefillChunk so their device work remains inside prefill latency.
 // PrefillChunk and DecodeOne each expose one Target completion barrier.
+// PrefillChunkDeferred may leave an intermediate prompt chunk queued without
+// returning its unused compact result; the next completing executor call must
+// preserve stream order. The default implementation remains synchronous so
+// non-ACL executors do not need a specialized asynchronous path.
 // SpeculativeStep enqueues Draft -> Target verify/commit and exposes exactly
 // one completion barrier for the whole transaction.
 class StatefulGraphExecutor {
@@ -85,6 +89,14 @@ class StatefulGraphExecutor {
       const std::vector<std::int64_t>& token_ids,
       bool prepare_draft,
       std::size_t logical_proposal_count) = 0;
+
+  virtual std::size_t PrefillChunkDeferred(
+      const std::vector<std::int64_t>& token_ids,
+      bool prepare_draft,
+      std::size_t logical_proposal_count) {
+    return PrefillChunk(
+        token_ids, prepare_draft, logical_proposal_count).model_executions;
+  }
 
   virtual StatefulStep DecodeOne(std::int64_t input_token_id) = 0;
 

@@ -815,7 +815,9 @@ msprof 只能回答重计算基线 OM 中每个算子、device task 和 AscendCL
 
 分支同时提供 `create_quant_incremental_state_graphs` 和四常驻 OM C++ runner。生成四个独立 OM
 后，应使用 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.6 节的完整状态机 msprof 命令，并按
-model ID/role 分组；两类 profile 不得混成同一份时延基线。
+model ID/role 分组；两类 profile 不得混成同一份时延基线。该 runner 会把长 prompt 的中间
+64-row chunk 留在同一 stream，仅最后一个 chunk 下载 compact 结果并同步；报告中的 elided
+prefill 计数必须与 `ceil(prompt_tokens/64)-1` 按请求数闭合。
 
 正式时延基线仍然使用 11.3 中未开 profiling 的 3 次 warmup + 10 次
 measurement 报告。下面的 msprof 命令只做瓶颈定位，采集器引入的开销不能算入

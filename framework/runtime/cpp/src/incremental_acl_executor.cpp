@@ -308,6 +308,28 @@ struct MirrorBuffer {
   }
 };
 
+struct HostAllocation {
+  void* data = nullptr;
+  std::size_t bytes = 0;
+
+  void Allocate(std::size_t requested) {
+    if (requested == 0 || data != nullptr) {
+      throw std::logic_error("invalid pinned host allocation request");
+    }
+    bytes = requested;
+    Check(aclrtMallocHost(&data, bytes), "aclrtMallocHost(staging)");
+    std::memset(data, 0, bytes);
+  }
+
+  void Release() noexcept {
+    if (data != nullptr) {
+      static_cast<void>(aclrtFreeHost(data));
+      data = nullptr;
+    }
+    bytes = 0;
+  }
+};
+
 struct StateArena {
   DeviceAllocation allocation;
   std::vector<BufferView> tensors;
@@ -541,6 +563,10 @@ class AclIncrementalExecutor::Impl {
   void Reset(
       std::int64_t pad_token_id,
       const std::vector<std::int64_t>& eos_token_ids) {
+    if (deferred_prefill_pending_ || stream_work_pending_) {
+      throw std::logic_error(
+          "cannot reset while deferred prefill work is pending");
+    }
     if (pad_token_id < 0) {
       throw std::invalid_argument("pad token ID must be non-negative");
     }
@@ -558,6 +584,7 @@ class AclIncrementalExecutor::Impl {
     proposal_ready_ = false;
     prepared_proposal_count_ = 0;
     feature_source_ = FeatureSource::kNone;
+    prefill_staging_index_ = 0;
 
     if (!eos_uploaded_ || eos_token_ids != uploaded_eos_ids_) {
       auto* eos_values = static_cast<std::int64_t*>(eos_ids_.host);
@@ -579,6 +606,24 @@ class AclIncrementalExecutor::Impl {
       const std::vector<std::int64_t>& token_ids,
       bool prepare_draft,
       std::size_t logical_proposal_count) {
+    return PrefillChunkImpl(
+        token_ids, prepare_draft, logical_proposal_count, true);
+  }
+
+  std::size_t PrefillChunkDeferred(
+      const std::vector<std::int64_t>& token_ids,
+      bool prepare_draft,
+      std::size_t logical_proposal_count) {
+    return PrefillChunkImpl(
+        token_ids, prepare_draft, logical_proposal_count, false)
+        .model_executions;
+  }
+
+  StatefulStep PrefillChunkImpl(
+      const std::vector<std::int64_t>& token_ids,
+      bool prepare_draft,
+      std::size_t logical_proposal_count,
+      bool complete) {
     RequireReset();
     if (token_ids.empty() || token_ids.size() > prefill_width_) {
       throw std::invalid_argument("prefill chunk is outside the fixed 64-row gear");
@@ -593,18 +638,25 @@ class AclIncrementalExecutor::Impl {
     } else if (logical_proposal_count != 0) {
       throw std::invalid_argument("proposal count supplied without Draft execution");
     }
+    if (prefill_staging_index_ >= stats_.prefill_staging_slots) {
+      throw std::length_error("prefill staging ring capacity was exceeded");
+    }
+    const std::size_t staging_index = prefill_staging_index_++;
     const bool use_immutable_zero = ApplyPendingReset();
     if (prepare_draft) {
-      SetProposalCount(logical_proposal_count);
+      SetProposalCount(
+          logical_proposal_count, ProposalCountHost(staging_index));
     }
 
-    auto* values = static_cast<std::int64_t*>(prefill_ids_.host);
+    auto* values = static_cast<std::int64_t*>(PrefillIdsHost(staging_index));
     std::fill_n(values, prefill_width_, pad_token_id_);
     std::copy(token_ids.begin(), token_ids.end(), values);
-    *static_cast<std::int16_t*>(effective_length_.host) =
+    void* effective_length_host = EffectiveLengthHost(staging_index);
+    *static_cast<std::int16_t*>(effective_length_host) =
         static_cast<std::int16_t>(token_ids.size());
-    Upload(prefill_ids_, prefill_ids_.bytes);
-    Upload(effective_length_, effective_length_.bytes);
+    UploadFromHost(prefill_ids_, values, prefill_ids_.bytes);
+    UploadFromHost(
+        effective_length_, effective_length_host, effective_length_.bytes);
 
     if (use_immutable_zero) {
       Execute(prefill_, initial_prefill_plan_);
@@ -625,14 +677,27 @@ class AclIncrementalExecutor::Impl {
     } else {
       proposal_ready_ = false;
     }
+    if (!complete) {
+      deferred_prefill_pending_ = true;
+      ++stats_.deferred_prefill_chunks;
+      ++stats_.prefill_synchronizations_elided;
+      ++stats_.prefill_compact_downloads_elided;
+      StatefulStep deferred;
+      deferred.model_executions = executions;
+      return deferred;
+    }
     DownloadCompact(false);
     Synchronize();
+    ++stats_.prefill_completion_synchronizations;
+    deferred_prefill_pending_ = false;
+    prefill_staging_index_ = 0;
     return ReadCompact(false, executions);
   }
 
   StatefulStep DecodeOne(std::int64_t input_token_id) {
     RequireReset();
     RequirePrefilled();
+    RequireCompletedPrefill();
     if (input_token_id < 0) {
       throw std::invalid_argument("decode input token ID must be non-negative");
     }
@@ -651,6 +716,7 @@ class AclIncrementalExecutor::Impl {
   StatefulStep SpeculativeStep(std::size_t logical_proposal_count) {
     RequireReset();
     RequirePrefilled();
+    RequireCompletedPrefill();
     RequireProposalCount(logical_proposal_count);
     std::size_t executions = 1;
     if (proposal_ready_) {
@@ -940,6 +1006,28 @@ class AclIncrementalExecutor::Impl {
     eos_count_.Allocate(prefill_.PublicInput(3).bytes);
     decode_id_.Allocate(decode_.PublicInput(0).bytes);
     proposal_count_.Allocate(verify_.PublicInput(1).bytes);
+    stats_.prefill_staging_slots =
+        (sequence_length_ - 1) / prefill_width_ + 1;
+    if (stats_.prefill_staging_slots == 0) {
+      throw std::logic_error("prefill staging ring has no slots");
+    }
+    const std::size_t staging_bytes_per_slot =
+        prefill_ids_.bytes + effective_length_.bytes + proposal_count_.bytes;
+    if (stats_.prefill_staging_slots >
+        std::numeric_limits<std::size_t>::max() / staging_bytes_per_slot) {
+      throw std::overflow_error("prefill pinned host staging size overflow");
+    }
+    stats_.prefill_staging_pinned_host_bytes =
+        stats_.prefill_staging_slots * staging_bytes_per_slot;
+    const std::size_t extra_slots = stats_.prefill_staging_slots - 1;
+    extra_prefill_ids_host_.resize(extra_slots);
+    extra_effective_length_host_.resize(extra_slots);
+    extra_proposal_count_host_.resize(extra_slots);
+    for (std::size_t index = 0; index < extra_slots; ++index) {
+      extra_prefill_ids_host_[index].Allocate(prefill_ids_.bytes);
+      extra_effective_length_host_[index].Allocate(effective_length_.bytes);
+      extra_proposal_count_host_[index].Allocate(proposal_count_.bytes);
+    }
 
     compact_token_offset_ = 0;
     compact_commit_offset_ = Align(prefill_.outputs[0].bytes, 4);
@@ -979,6 +1067,42 @@ class AclIncrementalExecutor::Impl {
         dynamic_controls_[1].bytes;
   }
 
+  static void* StagingHost(
+      MirrorBuffer& primary,
+      std::vector<HostAllocation>& extra,
+      std::size_t index,
+      const char* description) {
+    if (index == 0) {
+      return primary.host;
+    }
+    if (index - 1 >= extra.size() || extra[index - 1].data == nullptr) {
+      throw std::out_of_range(
+          std::string(description) + " staging index is invalid");
+    }
+    return extra[index - 1].data;
+  }
+
+  void* PrefillIdsHost(std::size_t index) {
+    return StagingHost(
+        prefill_ids_, extra_prefill_ids_host_, index, "prefill IDs");
+  }
+
+  void* EffectiveLengthHost(std::size_t index) {
+    return StagingHost(
+        effective_length_,
+        extra_effective_length_host_,
+        index,
+        "effective length");
+  }
+
+  void* ProposalCountHost(std::size_t index) {
+    return StagingHost(
+        proposal_count_,
+        extra_proposal_count_host_,
+        index,
+        "proposal count");
+  }
+
   void InitializeImmutableZeroState() {
     if (state_reset_policy_ !=
         IncrementalStateResetPolicy::kImmutableZero) {
@@ -992,6 +1116,7 @@ class AclIncrementalExecutor::Impl {
             target_zero_state_.allocation.bytes,
             stream_),
         "aclrtMemsetAsync(immutable Target zero state)");
+    stream_work_pending_ = true;
     ++stats_.state_initialization_memset_operations;
     stats_.state_initialization_memset_bytes +=
         target_zero_state_.allocation.bytes;
@@ -1003,12 +1128,14 @@ class AclIncrementalExecutor::Impl {
             draft_zero_state_.allocation.bytes,
             stream_),
         "aclrtMemsetAsync(immutable Draft zero state)");
+    stream_work_pending_ = true;
     ++stats_.state_initialization_memset_operations;
     stats_.state_initialization_memset_bytes +=
         draft_zero_state_.allocation.bytes;
     Check(
         aclrtSynchronizeStream(stream_),
         "aclrtSynchronizeStream(immutable zero state initialization)");
+    stream_work_pending_ = false;
     ++stats_.state_initialization_stream_synchronizations;
   }
 
@@ -1179,6 +1306,13 @@ class AclIncrementalExecutor::Impl {
     }
   }
 
+  void RequireCompletedPrefill() const {
+    if (deferred_prefill_pending_ || stream_work_pending_) {
+      throw std::logic_error(
+          "incremental executor requires a completing prefill chunk");
+    }
+  }
+
   bool ApplyPendingReset() {
     if (!reset_pending_) {
       return false;
@@ -1194,6 +1328,7 @@ class AclIncrementalExecutor::Impl {
               target_states_[0].allocation.bytes,
               stream_),
           "aclrtMemsetAsync(target state)");
+      stream_work_pending_ = true;
       ++stats_.state_memset_operations;
       stats_.state_memset_bytes += target_states_[0].allocation.bytes;
       Check(
@@ -1204,6 +1339,7 @@ class AclIncrementalExecutor::Impl {
               draft_states_[0].allocation.bytes,
               stream_),
           "aclrtMemsetAsync(draft state)");
+      stream_work_pending_ = true;
       ++stats_.state_memset_operations;
       stats_.state_memset_bytes += draft_states_[0].allocation.bytes;
     }
@@ -1224,14 +1360,15 @@ class AclIncrementalExecutor::Impl {
     }
   }
 
-  void SetProposalCount(std::size_t value) {
+  void SetProposalCount(std::size_t value, void* staging_host = nullptr) {
     RequireProposalCount(value);
     if (proposal_value_valid_ && proposal_value_ == value) {
       return;
     }
-    *static_cast<std::int32_t*>(proposal_count_.host) =
+    void* host = staging_host == nullptr ? proposal_count_.host : staging_host;
+    *static_cast<std::int32_t*>(host) =
         static_cast<std::int32_t>(value);
-    Upload(proposal_count_, proposal_count_.bytes);
+    UploadFromHost(proposal_count_, host, proposal_count_.bytes);
     proposal_value_ = value;
     proposal_value_valid_ = true;
   }
@@ -1260,21 +1397,33 @@ class AclIncrementalExecutor::Impl {
     Check(
         aclmdlExecuteAsync(session.id, plan.input, plan.output, stream_),
         session.role + ": aclmdlExecuteAsync");
+    stream_work_pending_ = true;
   }
 
   void Upload(const MirrorBuffer& buffer, std::size_t bytes) {
+    UploadFromHost(buffer, buffer.host, bytes);
+  }
+
+  void UploadFromHost(
+      const MirrorBuffer& buffer,
+      const void* host,
+      std::size_t bytes) {
     if (bytes == 0 || bytes > buffer.bytes) {
       throw std::out_of_range("host-to-device copy exceeds mirrored buffer");
+    }
+    if (host == nullptr) {
+      throw std::invalid_argument("host-to-device source is null");
     }
     Check(
         aclrtMemcpyAsync(
             buffer.device.data,
             buffer.device.bytes,
-            buffer.host,
+            host,
             bytes,
             ACL_MEMCPY_HOST_TO_DEVICE,
             stream_),
         "aclrtMemcpyAsync(host-to-device)");
+    stream_work_pending_ = true;
     ++stats_.host_to_device_operations;
     stats_.host_to_device_bytes += bytes;
   }
@@ -1291,12 +1440,14 @@ class AclIncrementalExecutor::Impl {
             ACL_MEMCPY_DEVICE_TO_HOST,
             stream_),
         "aclrtMemcpyAsync(compact device-to-host)");
+    stream_work_pending_ = true;
     ++stats_.device_to_host_operations;
     stats_.device_to_host_bytes += bytes;
   }
 
   void Synchronize() {
     Check(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+    stream_work_pending_ = false;
     ++stats_.stream_synchronizations;
   }
 
@@ -1337,6 +1488,10 @@ class AclIncrementalExecutor::Impl {
   }
 
   void Cleanup() noexcept {
+    if (stream_ != nullptr && stream_work_pending_) {
+      static_cast<void>(aclrtSynchronizeStream(stream_));
+      stream_work_pending_ = false;
+    }
     initial_draft_plan_.Release();
     initial_prefill_plan_.Release();
     for (auto& by_source : draft_plans_) {
@@ -1362,6 +1517,18 @@ class AclIncrementalExecutor::Impl {
     verify_features_.Release();
     prefill_features_.Release();
     compact_.Release();
+    for (auto& host : extra_proposal_count_host_) {
+      host.Release();
+    }
+    for (auto& host : extra_effective_length_host_) {
+      host.Release();
+    }
+    for (auto& host : extra_prefill_ids_host_) {
+      host.Release();
+    }
+    extra_proposal_count_host_.clear();
+    extra_effective_length_host_.clear();
+    extra_prefill_ids_host_.clear();
     proposal_count_.Release();
     decode_id_.Release();
     eos_count_.Release();
@@ -1441,6 +1608,9 @@ class AclIncrementalExecutor::Impl {
   MirrorBuffer eos_count_;
   MirrorBuffer decode_id_;
   MirrorBuffer proposal_count_;
+  std::vector<HostAllocation> extra_prefill_ids_host_;
+  std::vector<HostAllocation> extra_effective_length_host_;
+  std::vector<HostAllocation> extra_proposal_count_host_;
   MirrorBuffer compact_;
   DeviceAllocation prefill_features_;
   DeviceAllocation verify_features_;
@@ -1466,6 +1636,9 @@ class AclIncrementalExecutor::Impl {
 
   std::size_t target_state_index_ = 0;
   std::size_t draft_state_index_ = 0;
+  std::size_t prefill_staging_index_ = 0;
+  bool deferred_prefill_pending_ = false;
+  bool stream_work_pending_ = false;
   bool proposal_ready_ = false;
   std::size_t prepared_proposal_count_ = 0;
   FeatureSource feature_source_ = FeatureSource::kNone;
@@ -1521,6 +1694,14 @@ StatefulStep AclIncrementalExecutor::PrefillChunk(
     bool prepare_draft,
     std::size_t logical_proposal_count) {
   return impl_->PrefillChunk(
+      token_ids, prepare_draft, logical_proposal_count);
+}
+
+std::size_t AclIncrementalExecutor::PrefillChunkDeferred(
+    const std::vector<std::int64_t>& token_ids,
+    bool prepare_draft,
+    std::size_t logical_proposal_count) {
+  return impl_->PrefillChunkDeferred(
       token_ids, prepare_draft, logical_proposal_count);
 }
 

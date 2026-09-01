@@ -694,6 +694,11 @@ def validate_incremental_cpp_runner_report(
         "state_zero_initialization_included_in_startup"
     ) is not immutable_zero:
         raise RuntimeError("incremental zero initialization timing scope differs")
+    if protocol.get("prefill_completion_policy") != (
+        "intermediate prompt chunks stay queued; final chunk performs the "
+        "only compact D2H and stream synchronization"
+    ):
+        raise RuntimeError("incremental prefill completion policy differs")
     abi = report.get("abi", {})
     if abi.get("id") != _INCREMENTAL_ABI_ID:
         raise RuntimeError("incremental runner ABI identity differs")
@@ -701,6 +706,8 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental state is not device resident")
     proposal_width = abi.get("proposal_width")
     verify_width = abi.get("verify_width")
+    sequence_capacity = abi.get("sequence_capacity")
+    prefill_width = abi.get("prefill_width")
     if (
         isinstance(proposal_width, bool)
         or not isinstance(proposal_width, int)
@@ -708,6 +715,17 @@ def validate_incremental_cpp_runner_report(
         or verify_width != proposal_width + 1
     ):
         raise RuntimeError("incremental proposal/verify width differs")
+    if (
+        isinstance(sequence_capacity, bool)
+        or not isinstance(sequence_capacity, int)
+        or sequence_capacity <= 0
+        or isinstance(prefill_width, bool)
+        or not isinstance(prefill_width, int)
+        or prefill_width != 64
+        or sequence_capacity % prefill_width
+        or len(prompt_token_ids) > sequence_capacity
+    ):
+        raise RuntimeError("incremental sequence/prefill capacity differs")
     memory = report.get("model_memory_query", {})
     if memory.get("source") != "aclmdlQuerySize":
         raise RuntimeError("incremental runner omitted model memory queries")
@@ -731,6 +749,7 @@ def validate_incremental_cpp_runner_report(
         "working_state_device_bytes",
         "state_reset_bytes_per_request",
         "carrier_device_bytes",
+        "prefill_staging_pinned_host_bytes",
     ):
         value = memory.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -753,6 +772,15 @@ def validate_incremental_cpp_runner_report(
         memory["working_state_device_bytes"] + zero_state_bytes
     ):
         raise RuntimeError("incremental state allocation does not close")
+    expected_staging_slots = sequence_capacity // prefill_width
+    expected_staging_host_bytes = expected_staging_slots * (
+        prefill_width * 8 + 2 + 4
+    )
+    if (
+        memory["prefill_staging_pinned_host_bytes"]
+        != expected_staging_host_bytes
+    ):
+        raise RuntimeError("incremental prefill pinned-host staging differs")
     expected_allocated = (
         expected_max_work
         + expected_sum_weight
@@ -779,13 +807,29 @@ def validate_incremental_cpp_runner_report(
     prefill, decode, draft, verify = (int(value) for value in role_counts)
     if execution.get("model_executions") != sum(role_counts):
         raise RuntimeError("incremental model execution counters do not close")
-    transactions = prefill + decode + verify
+    request_count = 2 * (3 + 10)
+    prompt_chunks = (len(prompt_token_ids) + prefill_width - 1) // prefill_width
+    expected_prefill = request_count * prompt_chunks
+    expected_deferred = request_count * (prompt_chunks - 1)
+    prefill_completions = execution.get("prefill_completion_synchronizations")
+    deferred_prefill = execution.get("deferred_prefill_chunks")
+    if (
+        prefill != expected_prefill
+        or prefill_completions != request_count
+        or deferred_prefill != expected_deferred
+        or execution.get("prefill_synchronizations_elided")
+        != expected_deferred
+        or execution.get("prefill_compact_downloads_elided")
+        != expected_deferred
+    ):
+        raise RuntimeError("incremental prefill chunk counters differ")
+    transactions = int(prefill_completions) + decode + verify
     if (
         execution.get("stream_synchronizations") != transactions
         or execution.get("device_to_host_operations") != transactions
     ):
         raise RuntimeError("incremental transaction synchronization policy differs")
-    if execution.get("state_resets") != 2 * (3 + 10):
+    if execution.get("state_resets") != request_count:
         raise RuntimeError("incremental paired run reset count differs")
     if immutable_zero:
         if (
@@ -818,6 +862,12 @@ def validate_incremental_cpp_runner_report(
             raise RuntimeError(f"incremental {field} reports differ")
     if execution.get("carrier_device_bytes") != memory.get("carrier_device_bytes"):
         raise RuntimeError("incremental carrier byte reports differ")
+    if (
+        execution.get("prefill_staging_slots") != expected_staging_slots
+        or execution.get("prefill_staging_pinned_host_bytes")
+        != expected_staging_host_bytes
+    ):
+        raise RuntimeError("incremental prefill staging reports differ")
     for field in (
         "host_to_device_operations", "host_to_device_bytes",
         "device_to_host_bytes",

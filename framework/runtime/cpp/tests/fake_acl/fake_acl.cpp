@@ -36,6 +36,7 @@ struct Spec {
 };
 
 constexpr std::size_t kSequenceLength = 32;
+constexpr std::size_t kIncrementalSequenceLength = 128;
 constexpr std::size_t kIntegratedDraftWidth = 15;
 constexpr std::size_t kPrefillRows = 64;
 constexpr std::size_t kVerifyRows = 16;
@@ -46,20 +47,25 @@ const Spec kTargetConv{ACL_FLOAT16, {2, 1, 8, 4}, "target_conv_state"};
 const Spec kTargetRecurrent{
     ACL_FLOAT, {2, 1, 2, 4, 4}, "target_recurrent_state"};
 const Spec kTargetKey{
-    ACL_FLOAT16, {8, 1, 1, 64, 16}, "target_key_cache"};
+    ACL_FLOAT16, {8, 2, 1, 64, 16}, "target_key_cache"};
 const Spec kTargetValue{
-    ACL_FLOAT16, {8, 1, 1, 64, 16}, "target_value_cache"};
+    ACL_FLOAT16, {8, 2, 1, 64, 16}, "target_value_cache"};
 const Spec kTargetCursor{ACL_INT64, {1}, "logical_target_cursor"};
 const Spec kDraftKey{
-    ACL_FLOAT16, {6, 1, 2, 64, 4}, "draft_key_cache"};
+    ACL_FLOAT16,
+    {6, 1, 2, static_cast<std::int64_t>(kIncrementalSequenceLength), 4},
+    "draft_key_cache"};
 const Spec kDraftValue{
-    ACL_FLOAT16, {6, 1, 2, 64, 4}, "draft_value_cache"};
+    ACL_FLOAT16,
+    {6, 1, 2, static_cast<std::int64_t>(kIncrementalSequenceLength), 4},
+    "draft_value_cache"};
 const Spec kDraftCursor{ACL_INT64, {1}, "logical_draft_cursor"};
 
 std::map<std::uint32_t, Role> g_models;
 std::uint32_t g_next_model_id = 1;
 void* g_incremental_shared_work = nullptr;
 std::vector<void*> g_incremental_weights;
+std::vector<const void*> g_pending_h2d_sources;
 
 Role RoleFromPath(const char* path) {
   const std::string value = path == nullptr ? "" : path;
@@ -457,7 +463,10 @@ aclError aclrtDestroyStream(aclrtStream stream) {
   return ACL_SUCCESS;
 }
 
-aclError aclrtSynchronizeStream(aclrtStream) { return ACL_SUCCESS; }
+aclError aclrtSynchronizeStream(aclrtStream) {
+  g_pending_h2d_sources.clear();
+  return ACL_SUCCESS;
+}
 
 aclError aclrtMallocHost(void** host_ptr, std::size_t size) {
   if (host_ptr == nullptr || size == 0) {
@@ -490,10 +499,19 @@ aclError aclrtMemcpyAsync(
     std::size_t destination_max,
     const void* source,
     std::size_t count,
-    aclrtMemcpyKind,
+    aclrtMemcpyKind kind,
     aclrtStream) {
   if (destination == nullptr || source == nullptr || count > destination_max) {
     return 1;
+  }
+  if (kind == ACL_MEMCPY_HOST_TO_DEVICE) {
+    if (std::find(
+            g_pending_h2d_sources.begin(),
+            g_pending_h2d_sources.end(),
+            source) != g_pending_h2d_sources.end()) {
+      return 1;
+    }
+    g_pending_h2d_sources.push_back(source);
   }
   std::memcpy(destination, source, count);
   return ACL_SUCCESS;

@@ -43,6 +43,10 @@ struct IncrementalAclExecutionStats {
   std::size_t draft_propose_executions = 0;
   std::size_t target_verify_commit_executions = 0;
   std::size_t stream_synchronizations = 0;
+  std::size_t prefill_completion_synchronizations = 0;
+  std::size_t deferred_prefill_chunks = 0;
+  std::size_t prefill_synchronizations_elided = 0;
+  std::size_t prefill_compact_downloads_elided = 0;
   std::size_t state_resets = 0;
   std::size_t state_memset_operations = 0;
   std::size_t state_memset_bytes = 0;
@@ -58,6 +62,8 @@ struct IncrementalAclExecutionStats {
   std::size_t immutable_zero_state_device_bytes = 0;
   std::size_t state_reset_bytes_per_request = 0;
   std::size_t carrier_device_bytes = 0;
+  std::size_t prefill_staging_slots = 0;
+  std::size_t prefill_staging_pinned_host_bytes = 0;
 };
 
 using IncrementalModelProgress = std::function<void(
@@ -98,6 +104,10 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
       std::int64_t pad_token_id,
       const std::vector<std::int64_t>& eos_token_ids) override;
   StatefulStep PrefillChunk(
+      const std::vector<std::int64_t>& token_ids,
+      bool prepare_draft,
+      std::size_t logical_proposal_count) override;
+  std::size_t PrefillChunkDeferred(
       const std::vector<std::int64_t>& token_ids,
       bool prepare_draft,
       std::size_t logical_proposal_count) override;

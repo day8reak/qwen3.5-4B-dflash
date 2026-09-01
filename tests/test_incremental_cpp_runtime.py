@@ -53,7 +53,14 @@ def _hashes() -> dict[str, str]:
 
 def _report(
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
+    prompt_token_ids: list[int] | None = None,
 ) -> dict[str, object]:
+    prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
+    request_count = 26
+    prompt_chunks = (len(prompt) + 63) // 64
+    deferred_prefill = request_count * (prompt_chunks - 1)
+    target_prefill_executions = request_count * prompt_chunks
+    draft_propose_executions = 39 + 13 * (prompt_chunks - 1)
     immutable_zero = (
         state_reset_policy == IMMUTABLE_ZERO_STATE_RESET_POLICY
     )
@@ -78,13 +85,17 @@ def _report(
         "cpu_fallback": False,
         "device_id": 0,
         "models": models,
-        "prompt_token_ids": [10],
+        "prompt_token_ids": prompt,
         "limits": {"max_new_tokens": 6, "max_draft_tokens": 3},
         "protocol": {
             "warmup": 3,
             "repetitions": 10,
             "kind": "evidence",
             "formal_latency_evidence": True,
+            "prefill_completion_policy": (
+                "intermediate prompt chunks stay queued; final chunk performs "
+                "the only compact D2H and stream synchronization"
+            ),
             "state_reset_policy": state_reset_policy,
             "state_reset_only_barriers": 0,
             "state_reset_device_work_included_by_prefill_barrier": (
@@ -97,6 +108,8 @@ def _report(
                 "qwen35-4b-dflash-ascend310p-incremental-performance-v2"
             ),
             "state_policy": "explicit device-resident ping-pong",
+            "sequence_capacity": 128,
+            "prefill_width": 64,
             "proposal_width": 15,
             "verify_width": 16,
         },
@@ -110,6 +123,7 @@ def _report(
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 512,
+            "prefill_staging_pinned_host_bytes": 1036,
             "explicit_allocated_device_bytes_excluding_runtime": (
                 64 + 1024 + state_bytes + 512
             ),
@@ -120,12 +134,21 @@ def _report(
             ),
         },
         "execution_io_counters": {
-            "model_executions": 156,
-            "target_prefill_executions": 26,
+            "model_executions": (
+                target_prefill_executions
+                + 65
+                + draft_propose_executions
+                + 26
+            ),
+            "target_prefill_executions": target_prefill_executions,
             "target_decode1_executions": 65,
-            "draft_propose_executions": 39,
+            "draft_propose_executions": draft_propose_executions,
             "target_verify_commit_executions": 26,
             "stream_synchronizations": 117,
+            "prefill_completion_synchronizations": request_count,
+            "deferred_prefill_chunks": deferred_prefill,
+            "prefill_synchronizations_elided": deferred_prefill,
+            "prefill_compact_downloads_elided": deferred_prefill,
             "state_resets": 26,
             "state_memset_operations": 0 if immutable_zero else 52,
             "state_memset_bytes": 0 if immutable_zero else 26 * reset_bytes,
@@ -143,6 +166,8 @@ def _report(
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 512,
+            "prefill_staging_slots": 2,
+            "prefill_staging_pinned_host_bytes": 1036,
         },
         "ordinary": _mode("ordinary-greedy"),
         "dflash": _mode("dflash-strict-greedy"),
@@ -157,10 +182,12 @@ def _report(
 def _validate(
     report: dict[str, object],
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
+    prompt_token_ids: list[int] | None = None,
 ) -> None:
+    prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
     validate_incremental_cpp_runner_report(
         report,
-        prompt_token_ids=[10],
+        prompt_token_ids=prompt,
         om_sha256_by_role=_hashes(),
         device_id=0,
         max_new_tokens=6,
@@ -180,6 +207,11 @@ def test_incremental_runner_report_closes_state_and_transaction_counters(
     state_reset_policy: str,
 ) -> None:
     _validate(_report(state_reset_policy), state_reset_policy)
+
+
+def test_incremental_runner_report_closes_multi_chunk_prefill() -> None:
+    prompt = [1] * 69 + [10]
+    _validate(_report(prompt_token_ids=prompt), prompt_token_ids=prompt)
 
 
 @pytest.mark.parametrize(

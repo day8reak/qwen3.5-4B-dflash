@@ -513,6 +513,8 @@ void WriteReport(
          << ",\"state_reset_bytes_per_request\":"
          << execution.state_reset_bytes_per_request
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
+         << ",\"prefill_staging_pinned_host_bytes\":"
+         << execution.prefill_staging_pinned_host_bytes
          << ",\"explicit_allocated_device_bytes_excluding_runtime\":"
          << max_work + sum_weight + execution.state_device_bytes +
                 execution.carrier_device_bytes
@@ -527,6 +529,9 @@ void WriteReport(
          << (formal_latency_evidence ? "true" : "false")
          << ",\"order\":\"alternating ordinary/DFlash in one four-model process\","
          << "\"model_load_excluded_from_latency\":true,"
+         << "\"prefill_completion_policy\":\"intermediate prompt chunks "
+            "stay queued; final chunk performs the only compact D2H and "
+            "stream synchronization\","
          << "\"state_reset_policy\":\""
          << qwen35::dflash::IncrementalStateResetPolicyName(
                 executor.state_reset_policy())
@@ -554,7 +559,8 @@ void WriteReport(
          << "\"scope\":\"paired warmups and measurements\","
          << "\"proposal_policy\":\"Draft-to-verify device carrier; no proposal D2H/H2D\","
          << "\"result_policy\":\"one compact D2H and one barrier per "
-            "prefill/decode/speculative transaction\","
+            "complete prompt/decode/speculative transaction; no host-visible "
+            "result for intermediate prefill chunks\","
          << "\"model_executions\":" << model_executions
          << ",\"target_prefill_executions\":"
          << execution.target_prefill_executions
@@ -566,6 +572,14 @@ void WriteReport(
          << execution.target_verify_commit_executions
          << ",\"stream_synchronizations\":"
          << execution.stream_synchronizations
+         << ",\"prefill_completion_synchronizations\":"
+         << execution.prefill_completion_synchronizations
+         << ",\"deferred_prefill_chunks\":"
+         << execution.deferred_prefill_chunks
+         << ",\"prefill_synchronizations_elided\":"
+         << execution.prefill_synchronizations_elided
+         << ",\"prefill_compact_downloads_elided\":"
+         << execution.prefill_compact_downloads_elided
          << ",\"state_resets\":" << execution.state_resets
          << ",\"state_memset_operations\":"
          << execution.state_memset_operations
@@ -590,6 +604,10 @@ void WriteReport(
          << ",\"state_reset_bytes_per_request\":"
          << execution.state_reset_bytes_per_request
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
+         << ",\"prefill_staging_slots\":"
+         << execution.prefill_staging_slots
+         << ",\"prefill_staging_pinned_host_bytes\":"
+         << execution.prefill_staging_pinned_host_bytes
          << "},\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
   output << ",\"eos_token_ids\":";

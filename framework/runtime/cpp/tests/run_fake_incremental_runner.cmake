@@ -25,6 +25,9 @@ else()
   message(FATAL_ERROR "unknown MEASUREMENT_PROTOCOL=${MEASUREMENT_PROTOCOL}")
 endif()
 
+string(REPEAT "1," 69 PROMPT_PREFIX)
+set(PROMPT_IDS "${PROMPT_PREFIX}10")
+
 file(REMOVE "${OUTPUT}" "${OUTPUT}.tmp")
 execute_process(
   COMMAND "${RUNNER}"
@@ -37,7 +40,7 @@ execute_process(
     --target-verify-commit "${VERIFY}"
     --target-verify-commit-sha256 "${VERIFY_SHA}"
     --output "${OUTPUT}"
-    --prompt-token-ids 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,10
+    --prompt-token-ids "${PROMPT_IDS}"
     --eos-token-ids 999
     --pad-token-id 0
     --max-new-tokens 6
@@ -86,14 +89,21 @@ string(JSON zero_state_bytes GET "${report}" execution_io_counters immutable_zer
 string(JSON reset_bytes GET "${report}" execution_io_counters state_reset_bytes_per_request)
 string(JSON d2h_operations GET "${report}" execution_io_counters device_to_host_operations)
 string(JSON prefill_executions GET "${report}" execution_io_counters target_prefill_executions)
+string(JSON prefill_completions GET "${report}" execution_io_counters prefill_completion_synchronizations)
+string(JSON deferred_prefill GET "${report}" execution_io_counters deferred_prefill_chunks)
+string(JSON prefill_syncs_elided GET "${report}" execution_io_counters prefill_synchronizations_elided)
+string(JSON prefill_d2h_elided GET "${report}" execution_io_counters prefill_compact_downloads_elided)
+string(JSON prefill_staging_slots GET "${report}" execution_io_counters prefill_staging_slots)
+string(JSON prefill_staging_bytes GET "${report}" execution_io_counters prefill_staging_pinned_host_bytes)
 string(JSON decode_executions GET "${report}" execution_io_counters target_decode1_executions)
 string(JSON draft_executions GET "${report}" execution_io_counters draft_propose_executions)
 string(JSON verify_executions GET "${report}" execution_io_counters target_verify_commit_executions)
-math(EXPR transactions "${prefill_executions} + ${decode_executions} + ${verify_executions}")
+math(EXPR transactions "${prefill_completions} + ${decode_executions} + ${verify_executions}")
 math(EXPR role_total
   "${prefill_executions} + ${decode_executions} + ${draft_executions} + ${verify_executions}"
 )
 math(EXPR closed_state_bytes "${working_state_bytes} + ${zero_state_bytes}")
+math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
 if(RESET_POLICY STREQUAL "async-memset")
   math(EXPR expected_state_memsets "2 * ${resets}")
   math(EXPR expected_state_memset_bytes "${reset_bytes} * ${resets}")
@@ -121,6 +131,13 @@ if(NOT status STREQUAL "PASS" OR
    NOT synchronizations EQUAL transactions OR
    NOT d2h_operations EQUAL transactions OR
    NOT resets EQUAL EXPECTED_RESETS OR
+   NOT prefill_executions EQUAL expected_prefill_executions OR
+   NOT prefill_completions EQUAL EXPECTED_RESETS OR
+   NOT deferred_prefill EQUAL EXPECTED_RESETS OR
+   NOT prefill_syncs_elided EQUAL deferred_prefill OR
+   NOT prefill_d2h_elided EQUAL deferred_prefill OR
+   NOT prefill_staging_slots EQUAL 2 OR
+   NOT prefill_staging_bytes GREATER 0 OR
    NOT report_reset_policy STREQUAL RESET_POLICY OR
    NOT reset_only_barriers EQUAL 0 OR
    NOT state_bytes EQUAL closed_state_bytes OR

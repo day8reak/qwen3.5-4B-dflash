@@ -215,6 +215,8 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   仍分配自己的 `weightSize`，不假设跨文件共享权重；
 - Target/Draft state 双缓冲留在 device，proposal 与 feature carrier 不回 host；
 - `draft-propose -> target-verify-commit -> compact D2H -> synchronize` 每轮一个 barrier；
+- 多 chunk prompt 的中间 `target-prefill`/`draft-propose` 只排入同一 stream，不下载 compact
+  结果、不同步；最后一个 chunk 才执行整个 prompt 唯一一次 prefill D2H 和 barrier；
 - reset 支持两个精确策略：默认 `async-memset` 把 state clear 排入第一次 prefill；候选
   `immutable-zero` 在进程启动时建立只读零状态，使每次请求不再清零大状态。二者都没有
   reset-only barrier，后者以额外一套 Target+Draft 状态显存换 TTFT；
@@ -228,6 +230,8 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
 `draft-propose` 来推进 Draft KV；非末 chunk 产生的 proposal 会被丢弃。它避免了历史前缀重算，
 但还没有独立的“只 ingest context、不跑 proposal head”Draft prefill 图。是否值得增加该物理
 角色必须由长 prompt 的 msprof 证明，并需要单独审批 ABI/拓扑变更，不能在本候选中暗改语义。
+当前 C++ runner 已消除这些非末 chunk 的 host round-trip，但并没有把其中的 Draft proposal head
+伪装成已消除：device 计算仍会出现在 `draft-propose` 的 msprof 汇总中。
 
 ### 5.2 生成四个 AIR/OM
 
@@ -313,9 +317,30 @@ jq '{
 }' "$AI_RUN_DIR/reports/cpp-incremental.json"
 ```
 
-正确的多 OM report 中：`model_executions` 等于四个 role execution 之和；
-`stream_synchronizations` 等于 prefill + decode1 + verify-commit 的事务数，不包含 Draft 的额外
-barrier；`device_to_host_operations` 与该事务数相同；paired 3+10 的 `state_resets` 固定为 26。
+正确的多 OM report 中，`model_executions` 等于四个 role execution 之和。设 prompt token 数为
+`P`、`C=ceil(P/64)`，paired 3+10 的请求数 `R=2*(3+10)=26`，则必须满足：
+
+```text
+target_prefill_executions          = R * C
+prefill_completion_synchronizations = R
+deferred_prefill_chunks            = R * (C - 1)
+prefill_synchronizations_elided     = deferred_prefill_chunks
+prefill_compact_downloads_elided    = deferred_prefill_chunks
+stream_synchronizations             = R + decode1 + verify-commit
+device_to_host_operations           = stream_synchronizations
+```
+
+因此 2048-token prompt 的每次请求会把原来的 32 次 prefill host completion 降为 1 次；整个
+paired 报告应消除 `26*31=806` 次 stream sync 和 compact D2H。它不减少 Target/Draft 的 device
+执行次数。为保证异步 H2D 源不在最终同步前被覆盖，runner 会常驻 `2048/64=32` 个 pinned-host
+staging slot；每个 slot 只有 `64*8 + 2 + 4 = 518` 字节，总计 16,576 字节，不增加 device buffer。
+
+这条排队规则依赖 AscendCL 的公开异步语义：[Stream 内任务按原始顺序执行](https://www.hiascend.com/document/detail/en/canncommercial/800/appdevg/aclcppdevg/aclcppdevg_000004.html)，
+[`aclmdlExecuteAsync` 是异步模型执行接口](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/apiref/appdevgapi/aclcppdevg_03_0299.html)，
+而锁页 host 内存上的 [`aclrtMemcpyAsync` 仅表示任务已下发，必须同步后才能确认复制完成](https://www.hiascend.com/document/detail/en/canncommercial/850/API/appdevgapi/aclcppdevg_03_0106.html)。
+因此四个 OM、所有 H2D 和最终 D2H 必须使用同一个 stream；最终同步前不得覆写或释放已下发
+H2D 的 host 源。Fake ACL 回归会主动拒绝这种过早复用，但真实 CANN/310P 的首轮仍须按 5.6 节
+采集 timeline，确认调用顺序和输出一致后才能把该候选作为正式时延证据。
 
 ### 5.4 A/B 选择状态重置策略
 
@@ -384,6 +409,20 @@ jq -s 'map({
     .execution_io_counters.state_initialization_memset_operations,
   startup_syncs:
     .execution_io_counters.state_initialization_stream_synchronizations,
+  prefill_executions:
+    .execution_io_counters.target_prefill_executions,
+  prefill_completion_syncs:
+    .execution_io_counters.prefill_completion_synchronizations,
+  deferred_prefill_chunks:
+    .execution_io_counters.deferred_prefill_chunks,
+  prefill_syncs_elided:
+    .execution_io_counters.prefill_synchronizations_elided,
+  prefill_d2h_elided:
+    .execution_io_counters.prefill_compact_downloads_elided,
+  prefill_staging_slots:
+    .execution_io_counters.prefill_staging_slots,
+  prefill_staging_host_bytes:
+    .execution_io_counters.prefill_staging_pinned_host_bytes,
   transaction_syncs: .execution_io_counters.stream_synchronizations,
   ordinary_median_ms: .ordinary.latency_ms.model_total.median,
   ordinary_p90_ms: .ordinary.latency_ms.model_total.p90,
@@ -400,7 +439,8 @@ jq -s 'map({
   初始化计数为 0；
 - `immutable-zero`：请求内 memset 为 0，启动时恰好 2 次 memset 和 1 次同步，且
   `zero_state_bytes=reset_bytes_per_request`；
-- 两者的 transaction sync 数都仍等于 `prefill + decode1 + verify`，token/EOS 必须一致；
+- 两者的 transaction sync 数都必须等于 `prefill_completion_synchronizations + decode1 + verify`；
+  中间 prefill chunk 的 elided sync/D2H 计数必须闭合，token/EOS 必须一致；
 - 只有 `immutable-zero` 的完整四 OM 集合真实 load 成功、显存峰值有余量，且未开 msprof 的
   10 次 `dflash` median/p90 明确更好时，才在部署配置中选择它；否则保留 `async-memset`。
 

@@ -526,6 +526,8 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
 
   StatefulStep final_prefill;
   std::size_t prompt_offset = 0;
+  std::vector<std::int64_t> chunk;
+  chunk.reserve(executor.prefill_width());
   while (prompt_offset < prompt_token_ids.size()) {
     const std::size_t chunk_size = std::min(
         executor.prefill_width(), prompt_token_ids.size() - prompt_offset);
@@ -543,16 +545,24 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
                      options.max_draft_tokens,
                      executor.proposal_width()))
         : 0;
-    std::vector<std::int64_t> chunk(
+    chunk.assign(
         prompt_token_ids.begin() + static_cast<std::ptrdiff_t>(prompt_offset),
         prompt_token_ids.begin() +
             static_cast<std::ptrdiff_t>(prompt_offset + chunk_size));
-    StatefulStep step = executor.PrefillChunk(
-        chunk, prepare_draft, proposal_count);
-    ValidateStatefulStep(step, eos, false, 0);
-    result.counters.graph_calls += step.model_executions;
     if (last_chunk) {
+      StatefulStep step = executor.PrefillChunk(
+          chunk, prepare_draft, proposal_count);
+      ValidateStatefulStep(step, eos, false, 0);
+      result.counters.graph_calls += step.model_executions;
       final_prefill = std::move(step);
+    } else {
+      const std::size_t model_executions = executor.PrefillChunkDeferred(
+          chunk, prepare_draft, proposal_count);
+      if (model_executions == 0) {
+        throw std::runtime_error(
+            "stateful executor reported no deferred prefill execution");
+      }
+      result.counters.graph_calls += model_executions;
     }
     prompt_offset += chunk_size;
   }

@@ -34,7 +34,7 @@ void RunPolicy(
       },
       reset_policy);
   Require(loaded_roles.size() == 4, "not all fake OMs were loaded");
-  Require(executor.sequence_length() == 64, "fake state capacity differs");
+  Require(executor.sequence_length() == 128, "fake state capacity differs");
   Require(executor.prefill_width() == 64, "fake prefill gear differs");
   Require(executor.proposal_width() == 15, "fake proposal width differs");
   Require(executor.eos_table_width() == 4, "fake EOS width differs");
@@ -69,6 +69,26 @@ void RunPolicy(
       "fake ACL EOS tokens differ");
   Require(eos.stop_reason == "eos", "fake ACL EOS stop differs");
 
+  options.eos_token_ids.clear();
+  std::vector<std::int64_t> long_prompt(70, 1);
+  long_prompt.back() = 10;
+  const auto long_ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      long_prompt,
+      qwen35::dflash::GenerationMode::kOrdinary,
+      options);
+  const auto long_dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      long_prompt,
+      qwen35::dflash::GenerationMode::kDFlash,
+      options);
+  Require(
+      long_ordinary.generated_token_ids == expected,
+      "multi-chunk fake ACL ordinary differs");
+  Require(
+      long_dflash.generated_token_ids == expected,
+      "multi-chunk fake ACL DFlash differs");
+
   const auto& stats = executor.execution_stats();
   Require(stats.target_prefill_executions > 0, "prefill OM was not executed");
   Require(stats.target_decode1_executions > 0, "decode OM was not executed");
@@ -76,7 +96,22 @@ void RunPolicy(
   Require(
       stats.target_verify_commit_executions > 0,
       "verify OM was not executed");
-  Require(stats.state_resets == 3, "state reset count differs");
+  Require(stats.state_resets == 5, "state reset count differs");
+  Require(stats.target_prefill_executions == 7, "prefill chunk count differs");
+  Require(
+      stats.prefill_completion_synchronizations == stats.state_resets,
+      "prefill completion count differs from request count");
+  Require(stats.deferred_prefill_chunks == 2, "deferred prefill count differs");
+  Require(
+      stats.prefill_synchronizations_elided ==
+              stats.deferred_prefill_chunks &&
+          stats.prefill_compact_downloads_elided ==
+              stats.deferred_prefill_chunks,
+      "multi-chunk prefill did not elide one sync/D2H per intermediate chunk");
+  Require(
+      stats.prefill_staging_slots == 2 &&
+          stats.prefill_staging_pinned_host_bytes > 0,
+      "prefill pinned-host staging ring differs");
   Require(stats.working_state_device_bytes > 0, "working state is missing");
   Require(stats.state_reset_bytes_per_request > 0, "reset byte set is empty");
   Require(
@@ -114,7 +149,7 @@ void RunPolicy(
   }
   Require(
       stats.stream_synchronizations ==
-          stats.target_prefill_executions +
+          stats.prefill_completion_synchronizations +
               stats.target_decode1_executions +
               stats.target_verify_commit_executions,
       "reset or Draft introduced an extra transaction barrier");

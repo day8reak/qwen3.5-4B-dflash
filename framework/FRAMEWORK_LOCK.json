@@ -169,13 +169,14 @@
     "model_memory_query": "aclmdlQuerySize is recorded for the active integrated OM; qwen35_dflash_om_inspect sums weights and uses the maximum serial workspace across a proposed multi-OM set",
     "execute": "aclmdlExecuteAsync",
     "memory": "persistent pinned host/device buffers; input device mirrors upload only changed contiguous ranges after the first call; target D2H is limited to the last K+1 rows required by every current scheduler read",
-    "synchronization": "one stream synchronization per OM invocation",
+    "synchronization": "four-OM runner queues every non-final 64-row prompt chunk without compact D2H or host synchronization, completes the prompt once after the final chunk, and retains one synchronization per decode/verify transaction",
     "generation": "ordinary greedy and strict-greedy DFlash",
-    "execution_io_evidence": "runner JSON records actual/full-equivalent H2D and D2H bytes, copy counts, model executions, and one synchronization per model execution",
+    "execution_io_evidence": "runner JSON records actual/full-equivalent H2D and D2H bytes, copy counts, role executions, one completion per full prompt, elided intermediate-prefill D2H/synchronizations, and one synchronization per decode/verify transaction",
     "incremental_performance_candidate": "framework/abi/incremental-performance-v2.json is APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE; exact device-state implementation is authorized, while activation still requires export/ATC/parity/memory and same-device latency gates",
     "incremental_approval_record": "framework/abi/approvals/incremental-performance-v2.json",
     "incremental_transaction_tail": "ExactAcceptCommitStateGraph uses fixed physical T=16, logical K=1..15, device-side longest-prefix acceptance, EOS truncation, scalar state selection and compact output",
-    "incremental_state_reset_candidates": "async-memset clears one Target/Draft input state set inside first-prefill timing; immutable-zero initializes one extra read-only state set at process startup and removes per-request state clears; both preserve the v2 OM ABI and require same-device memory/latency selection"
+    "incremental_state_reset_candidates": "async-memset clears one Target/Draft input state set inside first-prefill timing; immutable-zero initializes one extra read-only state set at process startup and removes per-request state clears; both preserve the v2 OM ABI and require same-device memory/latency selection",
+    "incremental_prefill_completion": "non-final prompt chunks keep Target/Draft state and features ordered on one stream; a pinned-host staging slot per maximum 64-row chunk prevents asynchronous H2D source reuse, and only the final chunk returns compact output and synchronizes"
   },
   "correctness_gate": {
     "token_id_mismatches": 0,
