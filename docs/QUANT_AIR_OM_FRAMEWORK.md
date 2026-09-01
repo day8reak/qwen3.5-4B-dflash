@@ -948,15 +948,18 @@ rg --files "$PROF_DIR" | \
 ## 13. 下一性能阶段
 
 当前 C++ 已消除 Python token 热循环、重复 OM load、重复 host/device buffer 分配和多余 stream
-同步。若真实 profile 显示 OM 计算主导，下一步应基于 `quant` 已有 rollback 语义拆分：
+同步。若真实 profile 显示 OM 计算主导，下一步应基于 `quant` 已有 rollback 语义拆分四个**逻辑
+角色**：
 
 1. `target_prefill_64.om`：分块 prompt prefill；
 2. `target_decode_1.om`：ordinary 单 token decode；
 3. `target_verify_16.om`：anchor + 最多 15 proposals；
 4. `draft_16.om`：增量 Draft KV；
-5. 显式输入/输出 32 层 paged KV、24 层 GDR/conv state bank、8 层 feature 和 Draft KV；
-6. C++ 负责同一 accepted count 下的原子 commit/abort；
-7. 对每一个 state 分支做 ordinary token/EOS 零差异门禁。
+5. C++ request context 持有 Target/Draft state 的 persistent device buffer；
+6. proposal 直接在 device 上从 Draft 传给 Target verify；
+7. verify graph 尾部精确计算 accepted count 并选择 state slot，只把 compact commit result 搬回
+   host；
+8. 对每一个 state 分支做 ordinary token/EOS 零差异门禁。
 
 四个 OM 更快的原因不是“文件数量更多”，而是它们允许把已经计算过的状态留在
 NPU，后续调用只处理新增 token：
@@ -969,19 +972,28 @@ NPU，后续调用只处理新增 token：
 | `draft_16.om` | 复用 Draft KV/feature state 生成一块 proposals | 不再为每轮 proposal 重算 Draft 全前缀 |
 | `target_verify_16.om` | 一次验证 anchor + 最多 15 个 proposals | 接受多个 token 时，一次 Target 调用被多个输出 token 分摊 |
 
-拆分后 ATC 还可以针对 `S=1`、`S=16` 和 `S=64` 分别选择内核、tiling 和工作区，
-避免用一个大的静态 shape 覆盖所有阶段。但这不是无条件的加速保证。要得到端到端收益，
-必须同时满足：
+拆分后 ATC 还可以针对 `S=1`、`S=16` 和 `S=64` 分别选择内核、tiling 和工作区，避免用一个
+大的静态 shape 覆盖所有阶段。但物理文件不一定正好是四个：若 verify 能证明 `T=1` gear，decode
+可与 verify 合并成 3 OM；若多 gear、自定义算子和分支均通过，可测试 2 个动态 OM。要得到端到端
+收益，必须同时满足：
 
 - 四个 OM 只加载一次，device buffer 复用；
 - KV/GDR/conv/Draft state 常驻 device，不在每轮整体 H2D/D2H；
-- verify 的 candidate state 只提交 accepted 部分，拒绝时不重建全部历史；
+- verify 的 candidate bank 留在 graph workspace，尾部只持久化 accepted slot，拒绝时不重建全部
+  历史；
 - C++ 尽量使用同一 stream 上的异步执行，不在每个小操作后同步；
 - Draft 接受率和每轮接受 token 数足以摊薄 `draft + verify` 两次调度开销。
 
 如果巨大 state 每轮搬回 CPU、新增了过多 stream synchronize、小 shape 的启动开销占主导，
-或 Draft 几乎全被拒绝，四 OM 路径可能反而更慢。所以门禁顺序必须是：先做单 OM
-msprof 和状态搬运审计，再做未 profiling 的端到端 3+10，最后与同身份闭源基线比较。
+或 Draft 几乎全被拒绝，多 OM 路径可能反而更慢。不同 Target OM 还可能各自携带一份 Target
+权重，不能假设自动共享。新增的 `qwen35_dflash_om_inspect` 会记录每个 OM 的
+`aclmdlQuerySize(workSize, weightSize)`，按 `sum(weights) + max(serial workspace) + state + margin`
+计算候选集；当前 C++ runner 的 JSON 也会记录单 OM 的查询值。
+
+完整状态字节公式、2/3/4 OM 候选、inspector 构建/执行命令、一次同步热循环和审批门禁见
+[增量 OM 与 C++ 高性能路线](INCREMENTAL_OM_PERFORMANCE.md)。门禁顺序必须是：先做单 OM
+msprof、候选集合内存/load 和状态搬运审计，再做未 profiling 的端到端 3+10，最后与同身份闭源
+基线比较。
 
 这一步是新的状态 ABI，不能在没有真实 baseline 和 state-branch 测试时悄悄替换当前功能基线。
 

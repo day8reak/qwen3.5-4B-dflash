@@ -429,7 +429,10 @@ void WriteReport(
          << "\"output_names\":[\"target_top1\",\"draft_top1\"],"
          << "\"dtype\":\"int64\",\"sequence_length\":"
          << executor.sequence_length() << ",\"draft_width\":"
-         << executor.draft_width() << "},\"protocol\":{\"warmup\":"
+         << executor.draft_width() << "},\"model_memory_query\":{"
+         << "\"work_bytes\":" << executor.model_work_bytes()
+         << ",\"weight_bytes\":" << executor.model_weight_bytes()
+         << ",\"source\":\"aclmdlQuerySize\"},\"protocol\":{\"warmup\":"
          << arguments.warmup << ",\"repetitions\":"
          << arguments.repetitions
          << ",\"order\":\"alternating ordinary/DFlash in one loaded process\","
@@ -509,7 +512,9 @@ int main(int argc, char** argv) {
       std::ostringstream message;
       message << "stage=load-om-done sequence_length="
               << executor.sequence_length() << " draft_width="
-              << executor.draft_width() << " elapsed_ms=" << std::fixed
+              << executor.draft_width() << " work_bytes="
+              << executor.model_work_bytes() << " weight_bytes="
+              << executor.model_weight_bytes() << " elapsed_ms=" << std::fixed
               << std::setprecision(3) << load_ms;
       PrintProgress(arguments.progress, message.str());
     }

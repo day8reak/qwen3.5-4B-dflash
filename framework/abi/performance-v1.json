@@ -51,6 +51,13 @@
     },
     "separate_metric_passes": ["PipeUtilization", "Memory", "MemoryUB"]
   },
+  "multi_om_planning": {
+    "proposal_contract": "incremental-performance-v2.json",
+    "query_tool": "qwen35_dflash_om_inspect",
+    "weight_policy": "sum aclmdlQuerySize weightSize across different OM files",
+    "serial_workspace_policy": "use maximum workSize only after serial execution and explicit shared-workspace loading are proven",
+    "selection": "zero-mismatch candidate with the lowest same-device unprofiled end-to-end median"
+  },
   "artifacts": {
     "root": "$AI_RUN_DIR",
     "benchmark_report": "out/performance/<mode>.json",

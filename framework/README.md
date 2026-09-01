@@ -24,11 +24,15 @@ ordinary greedy 与 strict-greedy DFlash 逐 token 生成
   门禁、tokenizer 控制面和 C++ runner 启动器；
 - `runtime/cpp/`：不经过 Python 热循环的 AscendCL OM runner；
 - `abi/`：OM、运行时、性能和闭源框架 A/B 合同；
+- `runtime/cpp/qwen35_dflash_om_inspect`：用 `aclmdlQuerySize` 计算多 OM 候选的权重、共享
+  workspace 和状态预算，不假设不同 OM 自动共享权重；
 - `scripts/compare_cpp_closed_runtime.py`：同设备、同 token、同计时范围的性能对比；
 - `FRAMEWORK_LOCK.json`：本分支冻结的量化、图和运行时 ABI。
 
 详细构建、运行与验证命令见
 [docs/QUANT_AIR_OM_FRAMEWORK.md](../docs/QUANT_AIR_OM_FRAMEWORK.md)。
+增量状态 ABI、2/3/4 OM 选择门禁和内存检查命令见
+[docs/INCREMENTAL_OM_PERFORMANCE.md](../docs/INCREMENTAL_OM_PERFORMANCE.md)。
 
 当前第一版 OM 使用固定 gear 的完整前缀重算，以先冻结可验证的两输入/两输出 ABI。它确实由
 C++ 调用 OM 完成 token 推理，但尚未把 `quant` 分支已有的 persistent rollback cache/state

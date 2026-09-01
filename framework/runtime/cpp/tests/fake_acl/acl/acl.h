@@ -79,6 +79,10 @@ aclError aclrtMemcpyAsync(
     aclrtStream stream);
 
 aclError aclmdlLoadFromFile(const char* model_path, std::uint32_t* model_id);
+aclError aclmdlQuerySize(
+    const char* model_path,
+    std::size_t* work_size,
+    std::size_t* weight_size);
 aclError aclmdlUnload(std::uint32_t model_id);
 aclmdlDesc* aclmdlCreateDesc();
 aclError aclmdlDestroyDesc(aclmdlDesc* description);

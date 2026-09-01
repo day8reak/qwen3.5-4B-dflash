@@ -370,6 +370,20 @@ def validate_cpp_runner_report(
         raise RuntimeError("C++ runner output ABI differs")
     if str(abi.get("dtype", "")).lower() != "int64":
         raise RuntimeError("C++ runner ABI dtype differs")
+    memory_query = report.get("model_memory_query", {})
+    if memory_query.get("source") != "aclmdlQuerySize":
+        raise RuntimeError("C++ runner omitted the locked OM memory query")
+    work_bytes = memory_query.get("work_bytes")
+    weight_bytes = memory_query.get("weight_bytes")
+    if (
+        isinstance(work_bytes, bool)
+        or not isinstance(work_bytes, int)
+        or work_bytes < 0
+        or isinstance(weight_bytes, bool)
+        or not isinstance(weight_bytes, int)
+        or weight_bytes <= 0
+    ):
+        raise RuntimeError("C++ runner returned invalid OM work/weight bytes")
     ordinary = report.get("ordinary")
     dflash = report.get("dflash")
     if not isinstance(ordinary, Mapping) or not isinstance(dflash, Mapping):

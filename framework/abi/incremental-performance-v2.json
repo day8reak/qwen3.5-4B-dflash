@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2-proposal",
+  "status": "PROPOSED_NOT_ACTIVE",
+  "objective": "strict-greedy batch-1 generation with persistent device state, no historical-prefix recompute, and one host-visible synchronization per speculative round",
+  "non_negotiable_correctness": {
+    "ordinary_target_is_authoritative": true,
+    "allowed_token_id_mismatches": 0,
+    "allowed_eos_mismatches": 0,
+    "sampling": "strict greedy only",
+    "draft_checkpoint_and_15_tensor_names": "unchanged",
+    "approximation_allowed": false
+  },
+  "symbols": {
+    "batch": 1,
+    "target_layers": 32,
+    "linear_attention_layers": 24,
+    "full_attention_layers": 8,
+    "draft_layers": 6,
+    "target_hidden": 2560,
+    "target_feature_width": 20480,
+    "vocab": 248320,
+    "gdr_channels": 8192,
+    "gdr_value_heads": 32,
+    "gdr_key_dim": 128,
+    "gdr_value_dim": 128,
+    "conv_window": 4,
+    "target_kv_heads": 4,
+    "target_head_dim": 256,
+    "draft_kv_heads": 8,
+    "draft_head_dim": 128,
+    "paged_kv_block": 64,
+    "maximum_verify_rows": 16,
+    "maximum_proposals": 15
+  },
+  "logical_roles": [
+    {
+      "role": "target-prefill",
+      "rows": "real prompt chunks of 1..64",
+      "purpose": "run the original ChunkGatedDeltaRule prefill path once over the prompt and produce the first clean anchor",
+      "required_outputs": [
+        "first_target_top1",
+        "committed scalar target GDR/conv state",
+        "updated target paged KV",
+        "projectable target features for real prompt rows"
+      ]
+    },
+    {
+      "role": "target-decode1",
+      "rows": 1,
+      "purpose": "ordinary greedy and the exact zero-accept fallback without Draft execution",
+      "required_outputs": [
+        "next_target_top1",
+        "committed scalar target GDR/conv state",
+        "updated target paged KV"
+      ]
+    },
+    {
+      "role": "draft-propose",
+      "rows": "anchor plus 1..15 masks",
+      "purpose": "reuse committed Draft KV and only newly committed Target features to produce proposal IDs",
+      "required_outputs": [
+        "proposal IDs in a device-resident buffer",
+        "updated committed Draft KV"
+      ]
+    },
+    {
+      "role": "target-verify-commit",
+      "rows": "anchor plus proposals, exact T in 2..16",
+      "purpose": "verify once, compute the longest matching proposal prefix, select the committed Target state slot, and emit a compact transaction result",
+      "required_outputs": [
+        "committed token IDs and count",
+        "drafted/accepted/rejected counts",
+        "selected scalar target GDR/conv state",
+        "updated logical target KV cursor",
+        "projectable features for anchor plus accepted proposals"
+      ]
+    }
+  ],
+  "state_ownership": {
+    "owner": "one C++ request context with persistent device buffers",
+    "host_forbidden_payloads_per_round": [
+      "target GDR state banks",
+      "target conv state banks",
+      "target or Draft KV cache",
+      "full-vocabulary logits",
+      "Target feature tensors"
+    ],
+    "host_visible_after_speculative_round": [
+      "at most 16 committed token IDs",
+      "one commit count",
+      "drafted/accepted/rejected counters",
+      "terminal/error status"
+    ],
+    "target_full_attention": "provisional physical KV writes are allowed; only the logical cursor advances by anchor plus accepted proposals and rejected slots are overwritten later",
+    "target_gdr_and_conv": "verify may materialize per-row banks as graph workspace, but its graph tail gathers slot a and persists only the selected scalar state",
+    "draft": "committed KV persists; the transient mask block is never committed"
+  },
+  "strict_greedy_transaction": {
+    "verify_input": "[anchor, p0, ..., p(K-1)]",
+    "target_top1": "[t0, t1, ..., tK]",
+    "accepted": "largest a in [0,K] such that p[j] == t[j] for every j < a",
+    "selected_target_state_slot": "a because slot a is the state after anchor plus a accepted proposals",
+    "mismatch_commit": "p[0:a] followed by t[a]",
+    "all_match_commit": "p[0:K] followed by t[K], unless an accepted proposal is EOS",
+    "next_anchor": "the correction t[a] or all-match bonus t[K]; it is emitted but not processed by Target until the next call",
+    "committed_target_input_rows": "1 + a",
+    "eos": "never emit a token after the first EOS"
+  },
+  "bytes_at_batch1_kv_max_len_2048_verify_t16": {
+    "target_scalar_conv_fp16": 1572864,
+    "target_scalar_recurrent_fp16": 25165824,
+    "target_full_attention_kv_fp16": 67108864,
+    "target_persistent_state_total": 93847552,
+    "draft_persistent_kv_fp16": 50331648,
+    "persistent_state_subtotal": 144179200,
+    "transient_target_conv_bank_fp16": 25165824,
+    "transient_target_recurrent_bank_fp32": 805306368,
+    "transient_verify_bank_subtotal": 830472192,
+    "notes": "excludes model weights, model workspaces, I/O buffers, allocator/runtime overhead and optional feature/logit intermediates"
+  },
+  "physical_topology_candidates": [
+    {
+      "id": "three-resident",
+      "physical_oms": [
+        "target-prefill",
+        "draft-propose",
+        "target-verify-commit with a proven T=1 decode gear"
+      ],
+      "preference": 1,
+      "condition": "custom operators, TorchAir and ATC preserve exact T=1 and T=2..16 gears in one Target step artifact",
+      "risk": "Target weights may still exist in both prefill and verify artifacts"
+    },
+    {
+      "id": "four-resident",
+      "physical_oms": [
+        "target-prefill",
+        "target-decode1",
+        "draft-propose",
+        "target-verify-commit"
+      ],
+      "preference": 2,
+      "condition": "static graphs outperform multi-gear and the summed queried/loaded weight memory fits the declared device budget",
+      "risk": "three different Target artifacts can duplicate the 4B Target weights; four files alone do not imply speedup"
+    },
+    {
+      "id": "two-dynamic",
+      "physical_oms": [
+        "multi-role Target with prefill/decode/verify gears",
+        "draft-propose"
+      ],
+      "preference": 3,
+      "condition": "the different original-GDR and GDR-MTP branches compile, preserve custom nodes, pass parity, and beat static alternatives",
+      "risk": "dynamic control/shape support and workspace inflation are unproven for the receiver custom operators"
+    },
+    {
+      "id": "fused-speculative-step",
+      "physical_oms": [
+        "target-prefill",
+        "device-side Draft to Target verify/accept supergraph"
+      ],
+      "preference": 4,
+      "condition": "profile proves launch/host boundaries dominate and duplicated weights/workspace remain acceptable",
+      "risk": "large graph compile risk and possible Target/Draft weight duplication"
+    }
+  ],
+  "topology_selection_gates": {
+    "query_each_artifact": "aclmdlQuerySize workSize and weightSize",
+    "serial_workspace_budget": "maximum queried workSize when all resident models are proven to execute serially with one shared workspace",
+    "weight_budget": "sum queried weightSize; cross-artifact weight sharing must not be assumed",
+    "state_budget": "persistent state plus peak transient state/workspace plus I/O and a declared safety margin",
+    "load_test": "load the complete candidate set together on the exact 310P product before timing",
+    "profile": "unprofiled 3 warmups plus 10 measurements for promotion; msprof 1..3 iterations only for diagnosis",
+    "winner": "lowest median end-to-end model-loop latency among zero-mismatch candidates, not the candidate with the most or fewest OM files"
+  },
+  "hot_loop": {
+    "resident_models": true,
+    "resident_datasets_and_device_buffers": true,
+    "stream": "one request stream unless profile proves overlap safe and beneficial",
+    "draft_to_verify": "proposal IDs stay on device and bind directly to Target verify",
+    "synchronization": "one host-visible synchronization after verify/commit per speculative round",
+    "ordinary": "never execute Draft",
+    "prefill": "never execute Draft proposal or full LM head for non-final prompt chunks",
+    "verify": "never recompute the committed historical prefix"
+  },
+  "activation_gate": {
+    "requires_explicit_approval": true,
+    "approval_scope": "replace the active full-prefix integrated OM ABI with explicit device-state graph boundaries and a device-side exact accept/commit tail",
+    "required_before_default": [
+      "AIR custom-node preservation for every role",
+      "ATC success for every selected gear",
+      "ordinary and DFlash zero token/EOS mismatch",
+      "state rejection tests across positions 62/63/64/65",
+      "full candidate-set memory/load report",
+      "same-device unprofiled performance comparison"
+    ]
+  },
+  "claim_boundary": "This file freezes a proposed exact ABI and measurement decision rule. It is not evidence that any topology exports, loads, fits, is correct, or is faster on a physical Ascend310P device."
+}

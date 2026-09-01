@@ -1,6 +1,6 @@
 {
-  "schema_version": 8,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v8",
+  "schema_version": 9,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v9",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -166,10 +166,12 @@
     "language": "C++17",
     "api": "AscendCL",
     "model_load": "aclmdlLoadFromFile",
+    "model_memory_query": "aclmdlQuerySize is recorded for the active integrated OM; qwen35_dflash_om_inspect sums weights and uses the maximum serial workspace across a proposed multi-OM set",
     "execute": "aclmdlExecuteAsync",
     "memory": "persistent pinned host and device buffers",
     "synchronization": "one stream synchronization per OM invocation",
-    "generation": "ordinary greedy and strict-greedy DFlash"
+    "generation": "ordinary greedy and strict-greedy DFlash",
+    "incremental_performance_proposal": "framework/abi/incremental-performance-v2.json is PROPOSED_NOT_ACTIVE; physical OM count is selected by exactness, complete-set memory/load, and same-device latency gates"
   },
   "correctness_gate": {
     "token_id_mismatches": 0,

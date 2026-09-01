@@ -21,6 +21,8 @@ namespace {
 
 constexpr std::size_t kSequenceLength = 32;
 constexpr std::size_t kDraftWidth = 15;
+constexpr std::size_t kModelWorkBytes = 64;
+constexpr std::size_t kModelWeightBytes = 256;
 
 aclError SetDims(aclmdlIODims* dimensions, std::int64_t width) {
   if (dimensions == nullptr) {
@@ -117,6 +119,16 @@ aclError aclmdlLoadFromFile(const char*, std::uint32_t* model_id) {
     return 1;
   }
   *model_id = 1;
+  return ACL_SUCCESS;
+}
+
+aclError aclmdlQuerySize(
+    const char*, std::size_t* work_size, std::size_t* weight_size) {
+  if (work_size == nullptr || weight_size == nullptr) {
+    return 1;
+  }
+  *work_size = kModelWorkBytes;
+  *weight_size = kModelWeightBytes;
   return ACL_SUCCESS;
 }
 

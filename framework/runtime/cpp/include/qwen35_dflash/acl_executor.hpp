@@ -28,6 +28,8 @@ class AclExecutor final : public GraphExecutor {
 
   std::size_t sequence_length() const noexcept override;
   std::size_t draft_width() const noexcept override;
+  std::size_t model_work_bytes() const noexcept;
+  std::size_t model_weight_bytes() const noexcept;
   const GraphOutputs& Execute(
       const std::vector<std::int64_t>& committed_prefix,
       std::int64_t pad_token_id) override;

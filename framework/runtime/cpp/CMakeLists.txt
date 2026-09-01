@@ -48,10 +48,18 @@ if(QWEN35_DFLASH_BUILD_ACL_RUNNER)
     src/acl_executor.cpp
     src/main.cpp
   )
+  add_executable(qwen35_dflash_om_inspect src/om_inspect.cpp)
   target_include_directories(qwen35_dflash_acl_runner PRIVATE
     "${ASCENDCL_INCLUDE_DIR}"
   )
+  target_include_directories(qwen35_dflash_om_inspect PRIVATE
+    "${ASCENDCL_INCLUDE_DIR}"
+  )
   target_link_libraries(qwen35_dflash_acl_runner PRIVATE
+    qwen35_dflash_core
+    "${ASCENDCL_LIBRARY}"
+  )
+  target_link_libraries(qwen35_dflash_om_inspect PRIVATE
     qwen35_dflash_core
     "${ASCENDCL_LIBRARY}"
   )
@@ -59,6 +67,9 @@ if(QWEN35_DFLASH_BUILD_ACL_RUNNER)
     QWEN35_DFLASH_RUNNER_VERSION="${PROJECT_VERSION}"
   )
   target_compile_options(qwen35_dflash_acl_runner PRIVATE
+    -Wall -Wextra -Wpedantic
+  )
+  target_compile_options(qwen35_dflash_om_inspect PRIVATE
     -Wall -Wextra -Wpedantic
   )
 endif()
@@ -80,8 +91,14 @@ if(QWEN35_DFLASH_BUILD_TESTS)
     src/acl_executor.cpp
     src/main.cpp
   )
+  add_executable(qwen35_dflash_om_inspect_fake src/om_inspect.cpp)
   target_include_directories(qwen35_dflash_acl_runner_fake PRIVATE tests/fake_acl)
+  target_include_directories(qwen35_dflash_om_inspect_fake PRIVATE tests/fake_acl)
   target_link_libraries(qwen35_dflash_acl_runner_fake PRIVATE
+    qwen35_dflash_core
+    qwen35_dflash_fake_acl
+  )
+  target_link_libraries(qwen35_dflash_om_inspect_fake PRIVATE
     qwen35_dflash_core
     qwen35_dflash_fake_acl
   )
@@ -89,6 +106,9 @@ if(QWEN35_DFLASH_BUILD_TESTS)
     QWEN35_DFLASH_RUNNER_VERSION="${PROJECT_VERSION}-fake-acl"
   )
   target_compile_options(qwen35_dflash_acl_runner_fake PRIVATE
+    -Wall -Wextra -Wpedantic
+  )
+  target_compile_options(qwen35_dflash_om_inspect_fake PRIVATE
     -Wall -Wextra -Wpedantic
   )
 
@@ -102,5 +122,13 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DMODEL_SHA=${_fake_om_sha256}
       -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-runner-report.json
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_om_inspect
+    COMMAND "${CMAKE_COMMAND}"
+      -DINSPECTOR=$<TARGET_FILE:qwen35_dflash_om_inspect_fake>
+      -DMODEL=${CMAKE_CURRENT_BINARY_DIR}/fake.om
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-om-memory.json
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_om_inspect.cmake
   )
 endif()

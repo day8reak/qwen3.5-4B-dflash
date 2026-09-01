@@ -61,6 +61,7 @@
     "model_load": "once per paired benchmark process and excluded from model-loop latency",
     "memory": "aclrtMallocHost plus persistent aclrtMalloc buffers and datasets",
     "execution": "one stream queues H2D, aclmdlExecuteAsync and D2H, followed by one aclrtSynchronizeStream per OM call",
+    "memory_query": "runner report records aclmdlQuerySize work_bytes and weight_bytes before load",
     "measurement_order": "ordinary and DFlash warmups/measurements alternate in one process",
     "integrity": "C++ recomputes the expected OM SHA-256 before aclmdlLoadFromFile",
     "fallback": "none"

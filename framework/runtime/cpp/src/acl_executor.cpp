@@ -143,6 +143,12 @@ class AclExecutor::Impl {
       Check(aclrtSetCurrentContext(context_), "aclrtSetCurrentContext");
       Check(aclrtCreateStream(&stream_), "aclrtCreateStream");
       Check(
+          aclmdlQuerySize(
+              model_path.c_str(),
+              &model_work_bytes_,
+              &model_weight_bytes_),
+          "aclmdlQuerySize");
+      Check(
           aclmdlLoadFromFile(model_path.c_str(), &model_id_),
           "aclmdlLoadFromFile");
       model_loaded_ = true;
@@ -162,6 +168,8 @@ class AclExecutor::Impl {
 
   std::size_t sequence_length() const noexcept { return sequence_length_; }
   std::size_t draft_width() const noexcept { return draft_width_; }
+  std::size_t model_work_bytes() const noexcept { return model_work_bytes_; }
+  std::size_t model_weight_bytes() const noexcept { return model_weight_bytes_; }
 
   const GraphOutputs& Execute(
       const std::vector<std::int64_t>& prefix,
@@ -331,6 +339,8 @@ class AclExecutor::Impl {
   std::vector<Buffer> outputs_;
   std::size_t sequence_length_ = 0;
   std::size_t draft_width_ = 0;
+  std::size_t model_work_bytes_ = 0;
+  std::size_t model_weight_bytes_ = 0;
   GraphOutputs graph_outputs_;
 };
 
@@ -349,6 +359,14 @@ std::size_t AclExecutor::sequence_length() const noexcept {
 
 std::size_t AclExecutor::draft_width() const noexcept {
   return impl_->draft_width();
+}
+
+std::size_t AclExecutor::model_work_bytes() const noexcept {
+  return impl_->model_work_bytes();
+}
+
+std::size_t AclExecutor::model_weight_bytes() const noexcept {
+  return impl_->model_weight_bytes();
 }
 
 const GraphOutputs& AclExecutor::Execute(
