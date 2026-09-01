@@ -1428,6 +1428,42 @@ def test_quant_matmul_helper_encodes_float_scale_at_eager_boundary(
     assert observed_scales[0].dtype == torch.int64
 
 
+def test_eager_scale_encoder_falls_back_to_dispatcher_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch_npu = ModuleType("torch_npu")
+    fake_torch_npu.__spec__ = importlib.machinery.ModuleSpec(
+        "torch_npu",
+        loader=None,
+    )
+    observed: list[torch.Tensor] = []
+
+    def trans_quant_param(scale: torch.Tensor) -> torch.Tensor:
+        observed.append(scale)
+        return torch.zeros_like(scale, dtype=torch.int64)
+
+    modeling = importlib.import_module("models.modeling_qwen3_5_hiai_nd")
+    monkeypatch.setattr(modeling, "torch_npu", fake_torch_npu)
+    monkeypatch.setattr(
+        modeling.torch,
+        "ops",
+        SimpleNamespace(
+            npu=SimpleNamespace(
+                npu_trans_quant_param=SimpleNamespace(
+                    default=trans_quant_param,
+                )
+            )
+        ),
+    )
+    scale = torch.tensor([0.25, 0.5, 0.75], dtype=torch.float32)
+    encoded = modeling._encode_eager_npu_quant_scale(scale)
+
+    assert len(observed) == 1
+    assert observed[0] is scale
+    assert encoded.dtype == torch.int64
+    assert tuple(encoded.shape) == tuple(scale.shape)
+
+
 def test_air_factory_enables_private_quant_frontend_on_every_qlinear() -> None:
     class ExportAwareLinear(nn.Module):
         def __init__(self) -> None:

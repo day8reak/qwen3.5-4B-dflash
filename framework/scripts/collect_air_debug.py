@@ -56,6 +56,7 @@ CUSTOM_OPERATORS = (
     "npu::npu_cache_update_",
     "npu::npu_dynamic_quant",
     "npu::npu_quant_matmul",
+    "npu::npu_trans_quant_param",
     "npu::npu_scatter_nd_update_",
 )
 ENVIRONMENT_KEYS = (
@@ -238,9 +239,14 @@ def _operator_dispatch() -> dict[str, object]:
 
     torch_npu_import: dict[str, object]
     try:
-        import torch_npu  # noqa: F401
+        import torch_npu
 
-        torch_npu_import = {"status": "IMPORTED"}
+        torch_npu_import = {
+            "status": "IMPORTED",
+            "npu_trans_quant_param_callable": callable(
+                getattr(torch_npu, "npu_trans_quant_param", None)
+            ),
+        }
     except BaseException as error:  # noqa: BLE001
         torch_npu_import = {"status": "IMPORT_ERROR", "error": repr(error)}
 

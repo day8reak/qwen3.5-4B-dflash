@@ -112,12 +112,7 @@ def _encode_eager_npu_quant_scale(scale: torch.Tensor) -> torch.Tensor:
         raise TypeError(
             "eager QLinear scale must be FP32 or an encoded INT64/UINT64 Tensor"
         )
-    converter = getattr(torch_npu, "npu_trans_quant_param", None)
-    if not callable(converter):
-        raise RuntimeError(
-            "this torch_npu build lacks npu_trans_quant_param required by "
-            "the Ascend310P ACLNN QuantMatmulV4 eager route"
-        )
+    converter = _resolve_eager_npu_quant_scale_converter()
     encoded = converter(scale.contiguous())
     if not isinstance(encoded, torch.Tensor):
         raise TypeError("npu_trans_quant_param must return one Tensor")
@@ -132,6 +127,34 @@ def _encode_eager_npu_quant_scale(scale: torch.Tensor) -> torch.Tensor:
             f"{tuple(scale.shape)} to {tuple(encoded.shape)}"
         )
     return encoded
+
+
+def _resolve_eager_npu_quant_scale_converter() -> Callable[..., torch.Tensor]:
+    """Resolve both public torch-npu spellings of TransQuantParam.
+
+    Receiver images have exposed this exact operator either as the top-level
+    ``torch_npu.npu_trans_quant_param`` wrapper or only through its dispatcher
+    packet.  AIR capture never calls this resolver: its V4444 frontend must
+    continue to consume the checkpoint's FP32 scale.
+    """
+
+    converter = getattr(torch_npu, "npu_trans_quant_param", None)
+    if callable(converter):
+        return converter
+    namespace = getattr(torch.ops, "npu", None)
+    packet = (
+        None
+        if namespace is None
+        else getattr(namespace, "npu_trans_quant_param", None)
+    )
+    operation = None if packet is None else getattr(packet, "default", None)
+    if callable(operation):
+        return operation
+    raise RuntimeError(
+        "this torch_npu build lacks both torch_npu.npu_trans_quant_param and "
+        "torch.ops.npu.npu_trans_quant_param.default required by the "
+        "Ascend310P ACLNN QuantMatmulV4 eager route"
+    )
 
 
 def _cache_update_for_export(
