@@ -53,7 +53,7 @@ flowchart LR
   P --> H[Target prefill head<br/>final chunk only]
   H --> I[Optional initial Draft<br/>compact D2H + prefill sync]
   I --> M{generation mode}
-  M -->|ordinary| T1[Target step T=1<br/>proposal count 0]
+  M -->|ordinary| T1[Target step T=1<br/>bind resident INT32 zero]
   M -->|DFlash; proposal ready| TK[Target step T=K+1]
   D[Draft propose K] --> TK
   T1 --> C[Exact commit + state slot]
@@ -70,6 +70,12 @@ flowchart LR
 因此 13 个输出及 state ping-pong ABI 不变；昂贵的 Target body 和 GDR-MTP 只处理物理 T 行。
 这些是非目标证据。`npu_gated_delta_rule_mtp` 的 T=1、TorchAir 16 档 gear、ATC、自定义节点保留、
 真实 checkpoint ordinary parity 和时延都仍需 310P 证明，候选继续保持 `NOT_ACTIVE`。
+
+统一候选的 T=1 dataset 不再把可变 proposal-count carrier 改写成 0。runner 在首次完整 prefill
+control H2D 中一并初始化一个进程常驻、64-byte 对齐的 INT32 零值；所有 ordinary T=1 dataset
+直接绑定该地址，而 T=2..16 始终绑定只保存正 K 的原 proposal carrier。这样 ordinary decode 不会
+产生独立的 4-byte `K=0` H2D，也不会迫使下一次 DFlash prefill 把正 K 恢复回来。这个改动只改变
+C++ 内部 buffer/view 路由；统一 Target-step 的输入名、shape、动态 gear、AIR/OM 和算子 ABI 都不变。
 
 ## 2. 为什么不能按 OM 数量认定更快
 
@@ -302,11 +308,14 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   `immutable-zero` 在进程启动时建立只读零状态，使每次请求不再清零大状态。二者都没有
   reset-only barrier，后者以额外一套 Target+Draft 状态显存换 TTFT；
 - 每个 prompt chunk 的 64 个 ID、有效长度、累计 prompt token 数、proposal count 和 EOS 表共用
-  一个 896-byte host/device control carrier，仍只下发一次 H2D；但复制长度按本次图真正消费的
-  live prefix 收窄为 base/count/proposal/full 四档（默认宽度分别为 578/644/708/896 bytes）。中间
-  Target chunk 只复制 ID 与有效长度，最终 Draft 才复制累计 token 数，proposal 变化时延伸到 proposal，
-  EOS 表仅在进程首次使用或 Reset 改变 EOS 身份时刷新；每个 device 子段仍按 64 bytes 对齐并保留
-  AscendCL 要求的分段 padding，prefill 后只有 proposal count 真正变化时才单独下发 4-byte H2D；
+  一个 packed host/device control carrier，仍只下发一次 H2D；但复制长度按本次图真正消费的 live
+  prefix 收窄为 base/count/proposal/full 四档。五图默认宽度为 578/644/708/896 bytes；统一四图在
+  EOS count 后追加一个对齐的常驻 INT32 零值，前三档仍为 578/644/708 bytes，full/slot 变为
+  960 bytes。中间 Target chunk 只复制 ID 与有效长度，最终 Draft 才复制累计 token 数，正 proposal
+  变化时延伸到 proposal，EOS 表和常驻零值仅在进程首次使用或 Reset 改变 EOS 身份时刷新；每个
+  device 子段仍按 64 bytes 对齐并保留 AscendCL 要求的分段 padding。prefill 后只有正 proposal
+  count 真正变化时才单独下发 4-byte H2D；统一候选的 ordinary T=1 直接绑定常驻零值，不改写该
+  carrier；
 - Target/Draft state arena 与 compact result arena 也使用同一条 64-byte 起始地址、
   `ALIGN_UP(payload,32)+32` 分段规则；Fake ACL 会拒绝任何未对齐的模型输入/输出绑定；
 - compact result 使用与 Target state 同步翻转的两套 device arena；上一事务最后提交的 token
@@ -462,6 +471,12 @@ jq -e '
     "split-prefill-head-four-resident-unified-target-step-v1") and
   (.models | length == 4) and
   (.execution_io_counters.target_step_dynamic_gear_count == 16) and
+  (.protocol.target_step_zero_count_policy ==
+    "T=1 datasets bind a process-resident aligned INT32 zero; positive K stays in the mutable proposal carrier") and
+  (.model_memory_query.target_step_zero_count_device_bytes == 4) and
+  (.execution_io_counters.target_step_zero_count_device_bytes == 4) and
+  (.execution_io_counters.target_step_zero_count_bindings ==
+    .execution_io_counters.target_decode1_executions) and
   ((.execution_io_counters.target_step_input_rows +
     .execution_io_counters.target_step_padded_rows_elided) ==
    (16 * (.execution_io_counters.target_decode1_executions +
@@ -576,12 +591,15 @@ host_to_device_operations           = prefill_control_upload_operations
 ```
 
 其中每个字段的 device offset 都按 64 bytes 对齐，每段物理跨度为
-`ALIGN_UP(tensor_bytes,32)+32`，最终 carrier 再按 64 bytes 对齐；默认 `eos_table_width=4` 时完整
-carrier 为 896 bytes，base/count/proposal prefix 分别为 578/644/708 bytes，持久 EOS tail 为
-188 bytes。四条 prefill 路径仍各自只有一次 H2D，operation 之和必须等于 prefill 总数，实际
-byte 与相对全量复制省掉的 byte 之和必须等于 `operations*896`。总 H2D 的最后三个加数分别代表
-prefill control prefix、仅供显式调用者覆盖使用的 decode ID 回退，以及 prefill 后 proposal count
-改值；三类 operation/byte 分项之和必须严格等于总 H2D 计数。
+`ALIGN_UP(tensor_bytes,32)+32`，最终 carrier 再按 64 bytes 对齐。默认 `eos_table_width=4` 时，五图
+完整 carrier 为 896 bytes，base/count/proposal prefix 为 578/644/708 bytes，持久 tail 为
+188 bytes；统一四图的三个 prefix 不变，追加对齐常驻零值后完整 carrier 为 960 bytes，持久 tail
+为 252 bytes。以 report 的 `prefill_control_bytes_per_slot` 为准，四条 prefill 路径仍各自只有一次
+H2D，operation 之和必须等于 prefill 总数，实际 byte 与相对全量复制省掉的 byte 之和必须等于
+`operations*prefill_control_bytes_per_slot`。总 H2D 的最后三个加数分别代表 prefill control prefix、
+仅供显式调用者覆盖使用的 decode ID 回退，以及 prefill 后正 proposal count 改值；三类
+operation/byte 分项之和必须严格等于总 H2D 计数。统一候选中，ordinary T=1 的
+`target_step_zero_count_bindings` 必须等于逻辑 decode 次数；该绑定不计入 H2D。
 每次 `target-decode1` 必须恰好落入 device carrier 或 host upload 两条路径之一；选择
 `last-token-d2d` 时，多 token carrier 还必须以一条 8-byte D2D compaction 闭合；选择
 `one-token-h2d` 时，这两个 multi-token/D2D 计数必须都为 0。这个布局遵守
@@ -591,9 +609,10 @@ prefill control prefix、仅供显式调用者覆盖使用的 decode ID 回退�
 LM head 从 32 次降为 1 次；整个
 paired 报告应消除 `26*31=806` 次 stream sync 和 compact D2H。它不减少 Target prefill 的
 device 执行次数，但会消除 `13*31=403` 次中间 Draft 执行。为保证异步 H2D 源不在
-最终同步前被覆盖，runner 会常驻 `2048/64=32` 个 pinned-host staging slot；每个 slot 仍按完整
-896 字节分配，总计 28,672 字节，device 侧也仍只需同一个 896-byte packed control buffer；
-prefix liveness 只收窄每次 DMA 的复制范围，不改变 buffer/OM ABI。相对于每 chunk 分别上传 ID
+最终同步前被覆盖，runner 会常驻 `2048/64=32` 个 pinned-host staging slot。五图每个 slot 为
+896 bytes，总计 28,672 bytes，device control buffer 也是 896 bytes；统一四图每个 slot 为
+960 bytes，总计 30,720 bytes，device control buffer 为 960 bytes。新增空间仅承载进程常驻零值
+及其对齐跨度，prefix liveness 只收窄每次 DMA 的复制范围，不改变 OM ABI。相对于每 chunk 分别上传 ID
 和有效长度，2048-token paired 报告至少再消除
 `26*32=832` 次小 H2D API 调用。
 
@@ -611,6 +630,15 @@ prefill chunk 上命中 full/base/count/proposal=`1/38/12/1`，把 payload 进�
 1,024 bytes；D2H operations/bytes 保持 117/32,604 不变。这些都只证明 Fake ACL
 下的调用结构、路由闭合和字节计数，不是 310P 时延结论；真机必须比较 8-byte H2D 与 D2D 的
 API/timeline，并以未开 msprof 的同源 3+10 median/p90 决定是否保留该候选。
+
+同一 70-token、paired 3+10 Fake ACL workload 下，统一四图改造前每个 ordinary request 都把
+proposal carrier 写成 0，下一次 DFlash 又恢复正 K：prefill full/base/count/proposal 路由为
+`1/38/0/13`，另有 14 次、56 bytes 的 proposal-count H2D，总 H2D 为 66 次、32,120 bytes。
+常驻零值改造后路由恢复为 `1/38/12/1`，独立 proposal-count H2D 为 0，总 H2D 为 52 次、
+31,360 bytes，即少 14 次 API、760 bytes。代价是 unified device carrier 从 6,228 增至
+6,292 bytes（增加一个 64-byte 对齐跨度），两槽 pinned staging 从 1,792 增至 1,920 bytes。
+78 次 ordinary decode 全部以 resident-zero binding 闭合。这个 A/B 只证明 C++ 路由和计数差异；
+是否降低 310P wall time 仍必须由真实 OM 的未 profile 3+10 和 msprof timeline 共同判定。
 
 这条排队规则依赖 AscendCL 的公开异步语义：[Stream 内任务按原始顺序执行](https://www.hiascend.com/document/detail/en/canncommercial/800/appdevg/aclcppdevg/aclcppdevg_000004.html)，
 [`aclmdlExecuteAsync` 是异步模型执行接口](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/apiref/appdevgapi/aclcppdevg_03_0299.html)，
@@ -1020,7 +1048,9 @@ duration，并用 gear/T 行数拆分 T=1 与 T>1。`runner-report.json` 的各 
 
 另外必须把 `api_statistic`/timeline 中的 memcpy 与 report 对齐：每个 prefill chunk 必须恰好
 出现一次 control H2D，其长度只能是 report 声明的 base/count/proposal/full 四档；连续请求中
-896-byte full 路径只应在首次使用或 Reset 改变 EOS 表身份时出现。carrier hit 都不得出现
+full 路径（五图 896 bytes、统一四图 960 bytes）只应在首次使用或 Reset 改变 EOS 表身份时出现。
+统一四图的 T=1 必须绑定已随该 full 路径初始化的常驻零值，timeline 不应为 ordinary decode 出现
+独立 4-byte `K=0` H2D；独立 proposal-count H2D 只能对应正 K 自适应变化。carrier hit 都不得出现
 8-byte decode-ID H2D。`last-token-d2d` 的多 token 尾槽必须恰好出现一次 8-byte D2D；
 `one-token-h2d` 的 multi-token/D2D 计数必须为 0，multi-token commit 改走 8-byte H2D。以下门禁
 先验证 report 自闭合，再人工用时间线定位对应 memcpy：
@@ -1057,6 +1087,17 @@ jq -e '
    (8 * $io.decode_id_device_compaction_operations)) and
   ($io.decode_id_upload_bytes ==
    (8 * $io.decode_id_upload_operations)) and
+  (if .abi.physical_topology ==
+      "split-prefill-head-four-resident-unified-target-step-v1" then
+     (.model_memory_query.target_step_zero_count_device_bytes == 4) and
+     ($io.target_step_zero_count_device_bytes == 4) and
+     ($io.target_step_zero_count_bindings ==
+      $io.target_decode1_executions)
+   else
+     (.model_memory_query.target_step_zero_count_device_bytes == 0) and
+     ($io.target_step_zero_count_device_bytes == 0) and
+     ($io.target_step_zero_count_bindings == 0)
+   end) and
   (if .protocol.decode_carrier_policy == "last-token-d2d" then
      ($io.decode_id_upload_operations == 0) and
      ($io.decode_id_device_carrier_hits ==

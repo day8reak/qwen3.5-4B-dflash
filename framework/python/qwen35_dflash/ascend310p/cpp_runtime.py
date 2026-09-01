@@ -810,6 +810,14 @@ def validate_incremental_cpp_runner_report(
     )
     if protocol.get("decode_input_policy") != expected_decode_input_policy:
         raise RuntimeError("incremental decode input carrier policy differs")
+    expected_zero_count_policy = (
+        "T=1 datasets bind a process-resident aligned INT32 zero; positive K "
+        "stays in the mutable proposal carrier"
+        if unified_target_step
+        else "not applicable; target-decode1 is a separate static OM"
+    )
+    if protocol.get("target_step_zero_count_policy") != expected_zero_count_policy:
+        raise RuntimeError("incremental Target-step zero-count policy differs")
     abi = report.get("abi", {})
     if abi.get("id") != _INCREMENTAL_ABI_ID:
         raise RuntimeError("incremental runner ABI identity differs")
@@ -889,6 +897,11 @@ def validate_incremental_cpp_runner_report(
     expected_target_step_gears = 16 if unified_target_step else 0
     if memory.get("target_step_dynamic_gear_count", 0) != expected_target_step_gears:
         raise RuntimeError("incremental unified Target-step gear count differs")
+    expected_zero_count_bytes = 4 if unified_target_step else 0
+    if memory.get("target_step_zero_count_device_bytes", 0) != (
+        expected_zero_count_bytes
+    ):
+        raise RuntimeError("incremental Target-step zero-count allocation differs")
     zero_state_bytes = memory.get("immutable_zero_state_device_bytes")
     if (
         isinstance(zero_state_bytes, bool)
@@ -925,6 +938,8 @@ def validate_incremental_cpp_runner_report(
     expected_proposal_control_bytes = proposal_count_offset + 4
     reserve_control(eos_table_width * 8)
     reserve_control(4)
+    if unified_target_step:
+        reserve_control(expected_zero_count_bytes)
     expected_control_bytes = (control_cursor + 63) // 64 * 64
     expected_persistent_control_tail_bytes = (
         expected_control_bytes - expected_proposal_control_bytes
@@ -993,6 +1008,15 @@ def validate_incremental_cpp_runner_report(
         16 if unified_target_step else 0
     ):
         raise RuntimeError("incremental execution Target-step gears differ")
+    if execution.get("target_step_zero_count_device_bytes", 0) != (
+        expected_zero_count_bytes
+    ):
+        raise RuntimeError("incremental execution zero-count allocation differs")
+    expected_zero_count_bindings = decode if unified_target_step else 0
+    if execution.get("target_step_zero_count_bindings", 0) != (
+        expected_zero_count_bindings
+    ):
+        raise RuntimeError("incremental Target-step zero-count bindings differ")
     if unified_target_step:
         target_step_rows = execution.get("target_step_input_rows")
         elided_rows = execution.get("target_step_padded_rows_elided")
@@ -1107,6 +1131,8 @@ def validate_incremental_cpp_runner_report(
         != memory["prefill_feature_arena_bytes"]
         or execution.get("draft_dynamic_gear_count")
         != memory["draft_dynamic_gear_count"]
+        or execution.get("target_step_zero_count_device_bytes", 0)
+        != memory.get("target_step_zero_count_device_bytes", 0)
     ):
         raise RuntimeError("incremental prefill staging reports differ")
     prefill_upload_operations = execution.get(
@@ -1196,22 +1222,14 @@ def validate_incremental_cpp_runner_report(
         if max_new_tokens > 1
         else 0
     )
-    if unified_target_step:
-        # Every paired ordinary request selects proposal_count=0 for T=1.
-        # The following DFlash request must therefore restore K in its final
-        # prefill upload.  That transition is part of the selected topology,
-        # not an unexpected control-plane regression.
-        expected_proposal_upload_operations = expected_prefill_draft
-        expected_count_upload_operations = 0
-    else:
-        expected_proposal_upload_operations = (
-            1
-            if expected_prefill_draft > 0 and expected_proposal_count != 1
-            else 0
-        )
-        expected_count_upload_operations = (
-            expected_prefill_draft - expected_proposal_upload_operations
-        )
+    expected_proposal_upload_operations = (
+        1
+        if expected_prefill_draft > 0 and expected_proposal_count != 1
+        else 0
+    )
+    expected_count_upload_operations = (
+        expected_prefill_draft - expected_proposal_upload_operations
+    )
     expected_base_upload_operations = (
         prefill
         - expected_full_upload_operations

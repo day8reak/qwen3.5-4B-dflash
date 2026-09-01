@@ -583,6 +583,8 @@ void WriteReport(
          << execution.draft_dynamic_gear_count
          << ",\"target_step_dynamic_gear_count\":"
          << execution.target_step_dynamic_gear_count
+         << ",\"target_step_zero_count_device_bytes\":"
+         << execution.target_step_zero_count_device_bytes
          << ",\"explicit_allocated_device_bytes_excluding_runtime\":"
          << max_work + sum_weight + execution.state_device_bytes +
                 execution.carrier_device_bytes
@@ -633,6 +635,11 @@ void WriteReport(
                  : "one-token compact Target results bind row zero directly; "
                    "multi-token commits and caller overrides use the "
                    "pinned-host 8-byte H2D fallback")
+         << "\",\"target_step_zero_count_policy\":\""
+         << (executor.unified_target_step()
+                 ? "T=1 datasets bind a process-resident aligned INT32 zero; "
+                   "positive K stays in the mutable proposal carrier"
+                 : "not applicable; target-decode1 is a separate static OM")
          << "\","
          << "\"state_reset_policy\":\""
          << qwen35::dflash::IncrementalStateResetPolicyName(
@@ -682,6 +689,10 @@ void WriteReport(
          << execution.target_step_input_rows
          << ",\"target_step_padded_rows_elided\":"
          << execution.target_step_padded_rows_elided
+         << ",\"target_step_zero_count_device_bytes\":"
+         << execution.target_step_zero_count_device_bytes
+         << ",\"target_step_zero_count_bindings\":"
+         << execution.target_step_zero_count_bindings
          << ",\"stream_synchronizations\":"
          << execution.stream_synchronizations
          << ",\"prefill_completion_synchronizations\":"
@@ -780,6 +791,10 @@ void WriteReport(
          << execution.draft_dynamic_gear_count
          << ",\"target_step_dynamic_gear_count\":"
          << execution.target_step_dynamic_gear_count
+         << ",\"target_step_zero_count_device_bytes\":"
+         << execution.target_step_zero_count_device_bytes
+         << ",\"target_step_zero_count_bindings\":"
+         << execution.target_step_zero_count_bindings
          << "},\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
   output << ",\"eos_token_ids\":";

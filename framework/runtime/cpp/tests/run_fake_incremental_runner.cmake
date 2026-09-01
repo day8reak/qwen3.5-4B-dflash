@@ -102,6 +102,7 @@ string(JSON synchronizations GET "${report}" execution_io_counters stream_synchr
 string(JSON resets GET "${report}" execution_io_counters state_resets)
 string(JSON report_reset_policy GET "${report}" protocol state_reset_policy)
 string(JSON report_decode_carrier_policy GET "${report}" protocol decode_carrier_policy)
+string(JSON report_zero_count_policy GET "${report}" protocol target_step_zero_count_policy)
 string(JSON reset_only_barriers GET "${report}" protocol state_reset_only_barriers)
 string(JSON state_memsets GET "${report}" execution_io_counters state_memset_operations)
 string(JSON state_memset_bytes GET "${report}" execution_io_counters state_memset_bytes)
@@ -136,6 +137,9 @@ string(JSON draft_dynamic_gears GET "${report}" execution_io_counters draft_dyna
 string(JSON target_step_dynamic_gears GET "${report}" execution_io_counters target_step_dynamic_gear_count)
 string(JSON target_step_input_rows GET "${report}" execution_io_counters target_step_input_rows)
 string(JSON target_step_elided_rows GET "${report}" execution_io_counters target_step_padded_rows_elided)
+string(JSON target_step_zero_count_bytes GET "${report}" execution_io_counters target_step_zero_count_device_bytes)
+string(JSON target_step_zero_count_bindings GET "${report}" execution_io_counters target_step_zero_count_bindings)
+string(JSON memory_target_step_zero_count_bytes GET "${report}" model_memory_query target_step_zero_count_device_bytes)
 string(JSON prefill_control_uploads GET "${report}" execution_io_counters prefill_control_upload_operations)
 string(JSON prefill_control_upload_bytes GET "${report}" execution_io_counters prefill_control_upload_bytes)
 string(JSON prefill_control_full_uploads GET "${report}" execution_io_counters prefill_control_full_upload_operations)
@@ -171,13 +175,8 @@ math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
 math(EXPR expected_dflash_requests "${EXPECTED_RESETS} / 2")
 math(EXPR expected_prefill_feature_rows "${expected_dflash_requests} * 128")
 math(EXPR expected_prefill_control_full_uploads "1")
-if(UNIFIED_TARGET_STEP)
-  set(expected_prefill_control_proposal_uploads ${expected_dflash_requests})
-  set(expected_prefill_control_count_uploads 0)
-else()
-  set(expected_prefill_control_proposal_uploads 1)
-  math(EXPR expected_prefill_control_count_uploads "${expected_dflash_requests} - 1")
-endif()
+set(expected_prefill_control_proposal_uploads 1)
+math(EXPR expected_prefill_control_count_uploads "${expected_dflash_requests} - 1")
 math(EXPR expected_prefill_control_base_uploads
   "${prefill_executions} - ${expected_prefill_control_full_uploads} - ${expected_prefill_control_proposal_uploads} - ${expected_prefill_control_count_uploads}"
 )
@@ -213,21 +212,38 @@ else()
 endif()
 if(UNIFIED_TARGET_STEP)
   set(EXPECTED_TOPOLOGY "split-prefill-head-four-resident-unified-target-step-v1")
+  set(EXPECTED_ZERO_COUNT_POLICY "T=1 datasets bind a process-resident aligned INT32 zero; positive K stays in the mutable proposal carrier")
+  set(EXPECTED_ZERO_COUNT_BYTES 4)
+  set(EXPECTED_PREFILL_CONTROL_BYTES 960)
+  set(EXPECTED_PREFILL_PERSISTENT_TAIL_BYTES 252)
+  set(EXPECTED_PREFILL_STAGING_BYTES 1920)
   string(JSON topology_model_load GET "${report}" startup_ms acl_and_four_model_load)
   if(NOT target_step_dynamic_gears EQUAL 16 OR
      NOT target_step_closed_rows EQUAL target_step_fixed_rows OR
-     NOT target_step_elided_rows GREATER 0)
+     NOT target_step_elided_rows GREATER 0 OR
+     NOT target_step_zero_count_bytes EQUAL EXPECTED_ZERO_COUNT_BYTES OR
+     NOT memory_target_step_zero_count_bytes EQUAL EXPECTED_ZERO_COUNT_BYTES OR
+     NOT target_step_zero_count_bindings EQUAL decode_executions)
     message(FATAL_ERROR "fake unified Target-step row gates failed: ${report}")
   endif()
 else()
   set(EXPECTED_TOPOLOGY "split-prefill-head-five-resident-v1")
+  set(EXPECTED_ZERO_COUNT_POLICY "not applicable; target-decode1 is a separate static OM")
+  set(EXPECTED_ZERO_COUNT_BYTES 0)
+  set(EXPECTED_PREFILL_CONTROL_BYTES 896)
+  set(EXPECTED_PREFILL_PERSISTENT_TAIL_BYTES 188)
+  set(EXPECTED_PREFILL_STAGING_BYTES 1792)
   string(JSON topology_model_load GET "${report}" startup_ms acl_and_five_model_load)
-  if(NOT target_step_dynamic_gears EQUAL 0)
+  if(NOT target_step_dynamic_gears EQUAL 0 OR
+     NOT target_step_zero_count_bytes EQUAL 0 OR
+     NOT memory_target_step_zero_count_bytes EQUAL 0 OR
+     NOT target_step_zero_count_bindings EQUAL 0)
     message(FATAL_ERROR "fake baseline unexpectedly reported Target-step gears: ${report}")
   endif()
 endif()
 if(NOT physical_topology STREQUAL EXPECTED_TOPOLOGY OR
-   NOT resident_model_load EQUAL topology_model_load)
+   NOT resident_model_load EQUAL topology_model_load OR
+   NOT report_zero_count_policy STREQUAL EXPECTED_ZERO_COUNT_POLICY)
   message(FATAL_ERROR "fake topology/startup identity differs: ${report}")
 endif()
 if(DECODE_CARRIER_POLICY STREQUAL "last-token-d2d")
@@ -272,12 +288,12 @@ if(NOT status STREQUAL "PASS" OR
    NOT prefill_feature_rows EQUAL expected_prefill_feature_rows OR
    NOT draft_executions EQUAL expected_dflash_requests OR
    NOT prefill_staging_slots EQUAL 2 OR
-   NOT prefill_control_slot_bytes EQUAL 896 OR
+   NOT prefill_control_slot_bytes EQUAL EXPECTED_PREFILL_CONTROL_BYTES OR
    NOT prefill_base_control_slot_bytes EQUAL 578 OR
    NOT prefill_count_control_slot_bytes EQUAL 644 OR
    NOT prefill_proposal_control_slot_bytes EQUAL 708 OR
-   NOT prefill_persistent_control_tail_bytes EQUAL 188 OR
-   NOT prefill_staging_bytes EQUAL 1792 OR
+   NOT prefill_persistent_control_tail_bytes EQUAL EXPECTED_PREFILL_PERSISTENT_TAIL_BYTES OR
+   NOT prefill_staging_bytes EQUAL EXPECTED_PREFILL_STAGING_BYTES OR
    NOT prefill_feature_slab_bytes EQUAL 1024 OR
    NOT prefill_feature_arena_bytes EQUAL 2112 OR
    NOT draft_dynamic_gears EQUAL 3 OR

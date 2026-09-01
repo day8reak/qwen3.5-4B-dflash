@@ -172,6 +172,9 @@ def _report(
                 "directly; multi-token commits and caller overrides use the "
                 "pinned-host 8-byte H2D fallback"
             ),
+            "target_step_zero_count_policy": (
+                "not applicable; target-decode1 is a separate static OM"
+            ),
             "state_reset_policy": state_reset_policy,
             "decode_carrier_policy": decode_carrier_policy,
             "state_reset_only_barriers": 0,
@@ -220,6 +223,7 @@ def _report(
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
             "draft_dynamic_gear_count": 3,
+            "target_step_zero_count_device_bytes": 0,
             "explicit_allocated_device_bytes_excluding_runtime": (
                 64 + 1088 + state_bytes + 4096
             ),
@@ -328,6 +332,8 @@ def _report(
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
             "draft_dynamic_gear_count": 3,
+            "target_step_zero_count_device_bytes": 0,
+            "target_step_zero_count_bindings": 0,
         },
         "ordinary": _mode("ordinary-greedy"),
         "dflash": _mode("dflash-strict-greedy"),
@@ -339,17 +345,103 @@ def _report(
     }
 
 
+def _unified_report(
+    state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
+    prompt_token_ids: list[int] | None = None,
+    decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+) -> dict[str, object]:
+    report = _report(
+        state_reset_policy,
+        prompt_token_ids,
+        decode_carrier_policy,
+    )
+    report["models"] = [
+        item
+        for item in report["models"]
+        if item["role"] != "target-decode1"
+    ]
+    report["protocol"]["target_step_zero_count_policy"] = (
+        "T=1 datasets bind a process-resident aligned INT32 zero; positive K "
+        "stays in the mutable proposal carrier"
+    )
+    report["abi"]["physical_topology"] = (
+        "split-prefill-head-four-resident-unified-target-step-v1"
+    )
+
+    memory = report["model_memory_query"]
+    memory["sum_work_bytes"] = sum(
+        int(item["work_bytes"]) for item in report["models"]
+    )
+    memory["sum_weight_bytes"] = sum(
+        int(item["weight_bytes"]) for item in report["models"]
+    )
+    memory["carrier_device_bytes"] = int(memory["carrier_device_bytes"]) + 64
+    memory["prefill_control_bytes_per_slot"] = 960
+    memory["prefill_persistent_control_tail_bytes_per_slot"] = 252
+    memory["prefill_staging_pinned_host_bytes"] = 1920
+    memory["target_step_dynamic_gear_count"] = 16
+    memory["target_step_zero_count_device_bytes"] = 4
+    memory["load_policy"] = (
+        "four aclmdlLoadFromFileWithMem sessions; one max-sized serial "
+        "workspace; separate per-artifact weights; no cross-OM weight "
+        "sharing assumed"
+    )
+    memory["explicit_allocated_device_bytes_excluding_runtime"] = (
+        int(memory["max_work_bytes"])
+        + int(memory["sum_weight_bytes"])
+        + int(memory["state_device_bytes"])
+        + int(memory["carrier_device_bytes"])
+    )
+
+    execution = report["execution_io_counters"]
+    prefill = int(execution["target_prefill_executions"])
+    full = int(execution["prefill_control_full_upload_operations"])
+    base = int(execution["prefill_control_base_upload_operations"])
+    count = int(execution["prefill_control_count_upload_operations"])
+    proposal = int(execution["prefill_control_proposal_upload_operations"])
+    prefill_bytes = full * 960 + base * 578 + count * 644 + proposal * 708
+    execution["prefill_control_upload_bytes"] = prefill_bytes
+    execution["prefill_control_h2d_bytes_elided"] = prefill * 960 - prefill_bytes
+    execution["carrier_device_bytes"] = memory["carrier_device_bytes"]
+    execution["prefill_control_bytes_per_slot"] = 960
+    execution["prefill_persistent_control_tail_bytes_per_slot"] = 252
+    execution["prefill_staging_pinned_host_bytes"] = 1920
+    execution["host_to_device_bytes"] = (
+        prefill_bytes
+        + int(execution["decode_id_upload_bytes"])
+        + int(execution["proposal_count_upload_bytes"])
+    )
+    execution["target_step_dynamic_gear_count"] = 16
+    decode = int(execution["target_decode1_executions"])
+    verify = int(execution["target_verify_commit_executions"])
+    target_rows = decode + 3 * verify
+    execution["target_step_input_rows"] = target_rows
+    execution["target_step_padded_rows_elided"] = (
+        16 * (decode + verify) - target_rows
+    )
+    execution["target_step_zero_count_device_bytes"] = 4
+    execution["target_step_zero_count_bindings"] = decode
+    return report
+
+
 def _validate(
     report: dict[str, object],
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     prompt_token_ids: list[int] | None = None,
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+    unified_target_step: bool = False,
 ) -> None:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
+    hashes = _hashes()
+    if unified_target_step:
+        hashes = {
+            role: hashes[role]
+            for role in _UNIFIED_TARGET_STEP_GRAPH_ABI
+        }
     validate_incremental_cpp_runner_report(
         report,
         prompt_token_ids=prompt,
-        om_sha256_by_role=_hashes(),
+        om_sha256_by_role=hashes,
         device_id=0,
         max_new_tokens=6,
         max_draft_tokens=3,
@@ -389,6 +481,17 @@ def test_incremental_runner_report_closes_state_and_transaction_counters(
 def test_incremental_runner_report_closes_multi_chunk_prefill() -> None:
     prompt = [1] * 69 + [10]
     _validate(_report(prompt_token_ids=prompt), prompt_token_ids=prompt)
+
+
+def test_unified_incremental_runner_report_closes_resident_zero_count() -> None:
+    _validate(_unified_report(), unified_target_step=True)
+
+
+def test_unified_incremental_runner_rejects_missing_zero_count_binding() -> None:
+    report = _unified_report()
+    report["execution_io_counters"]["target_step_zero_count_bindings"] -= 1
+    with pytest.raises(RuntimeError, match="zero-count bindings"):
+        _validate(report, unified_target_step=True)
 
 
 def test_incremental_runner_rejects_decode_carrier_policy_mismatch() -> None:

@@ -54,6 +54,10 @@ void RunPolicy(
       {10},
       qwen35::dflash::GenerationMode::kOrdinary,
       options);
+  const auto ordinary_stats = executor.execution_stats();
+  Require(
+      ordinary_stats.proposal_count_upload_operations == 0,
+      "unified ordinary decode uploaded a mutable zero proposal count");
   const auto dflash = qwen35::dflash::GenerateStatefulOnce(
       executor,
       {10},
@@ -356,6 +360,16 @@ void TestUnifiedTargetStep(
   Require(
       stats.target_step_dynamic_gear_count == 16,
       "unified Target-step gears differ");
+  Require(
+      stats.target_step_zero_count_device_bytes == sizeof(std::int32_t) &&
+          stats.target_step_zero_count_bindings ==
+              stats.target_decode1_executions,
+      "unified Target-step resident zero-count bindings differ");
+  Require(
+      stats.prefill_control_bytes_per_slot == 960 &&
+          stats.prefill_persistent_control_tail_bytes_per_slot == 252 &&
+          stats.prefill_staging_pinned_host_bytes == 1920,
+      "unified Target-step control carrier layout differs");
   Require(
       stats.target_step_input_rows + stats.target_step_padded_rows_elided ==
           16 * (stats.target_decode1_executions +

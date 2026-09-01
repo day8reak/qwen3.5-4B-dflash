@@ -768,8 +768,9 @@ class AclIncrementalExecutor::Impl {
     if (input_token_id < 0) {
       throw std::invalid_argument("decode input token ID must be non-negative");
     }
-    if (unified_target_step_) {
-      SetTargetStepProposalCount(0);
+    if (unified_target_step_ && !target_step_zero_count_valid_) {
+      throw std::logic_error(
+          "unified Target-step zero count was not initialized by prefill");
     }
     DatasetPlan* plan = nullptr;
     if (decode_carrier_valid_ && decode_carrier_token_id_ == input_token_id) {
@@ -795,6 +796,7 @@ class AclIncrementalExecutor::Impl {
     Execute(unified_target_step_ ? verify_ : decode_, *plan);
     ++stats_.target_decode1_executions;
     if (unified_target_step_) {
+      ++stats_.target_step_zero_count_bindings;
       ++stats_.target_step_input_rows;
       stats_.target_step_padded_rows_elided += verify_width_ - 1;
     }
@@ -1251,12 +1253,26 @@ class AclIncrementalExecutor::Impl {
         &control_cursor, prefill_head_.PublicInput(1).bytes);
     eos_count_offset_ = ReserveDeviceSegment(
         &control_cursor, prefill_head_.PublicInput(2).bytes);
+    if (unified_target_step_) {
+      target_step_zero_count_offset_ = ReserveDeviceSegment(
+          &control_cursor, verify_.PublicInput(1).bytes);
+      stats_.target_step_zero_count_device_bytes =
+          verify_.PublicInput(1).bytes;
+    }
     prefill_control_.Allocate(Align(control_cursor, kBufferAlignment));
     if (prefill_base_control_bytes_ == 0 ||
         prefill_base_control_bytes_ >= prefill_count_control_bytes_ ||
         prefill_count_control_bytes_ >= prefill_proposal_control_bytes_ ||
         prefill_proposal_control_bytes_ >= prefill_control_.bytes) {
       throw std::logic_error("prefill control prefix layout is invalid");
+    }
+    if (unified_target_step_ &&
+        (target_step_zero_count_offset_ % kBufferAlignment != 0 ||
+         target_step_zero_count_offset_ > prefill_control_.bytes ||
+         verify_.PublicInput(1).bytes >
+             prefill_control_.bytes - target_step_zero_count_offset_)) {
+      throw std::logic_error(
+          "unified Target-step zero count layout is invalid");
     }
     decode_id_.Allocate(
         unified_target_step_ ? sizeof(std::int64_t)
@@ -1410,6 +1426,17 @@ class AclIncrementalExecutor::Impl {
         eos_count_offset_;
   }
 
+  void* TargetStepZeroCountHost(std::size_t index) {
+    if (!unified_target_step_ ||
+        target_step_zero_count_offset_ ==
+            std::numeric_limits<std::size_t>::max()) {
+      throw std::logic_error(
+          "Target-step zero count is unavailable in the five-OM topology");
+    }
+    return static_cast<std::byte*>(PrefillControlHost(index)) +
+        target_step_zero_count_offset_;
+  }
+
   BufferView PrefillControlView(
       std::size_t offset,
       std::size_t bytes) const {
@@ -1446,6 +1473,17 @@ class AclIncrementalExecutor::Impl {
   BufferView ProposalCountView() const {
     return PrefillControlView(
         proposal_count_offset_, verify_.PublicInput(1).bytes);
+  }
+
+  BufferView TargetStepZeroCountView() const {
+    if (!unified_target_step_ ||
+        target_step_zero_count_offset_ ==
+            std::numeric_limits<std::size_t>::max()) {
+      throw std::logic_error(
+          "Target-step zero count is unavailable in the five-OM topology");
+    }
+    return PrefillControlView(
+        target_step_zero_count_offset_, verify_.PublicInput(1).bytes);
   }
 
   BufferView PrefillTotalCountView() const {
@@ -1516,6 +1554,10 @@ class AclIncrementalExecutor::Impl {
           eos_ids);
       *static_cast<std::int32_t*>(EosCountHost(staging_index)) =
           static_cast<std::int32_t>(configured_eos_token_ids_.size());
+      if (unified_target_step_) {
+        *static_cast<std::int32_t*>(
+            TargetStepZeroCountHost(staging_index)) = 0;
+      }
       upload_bytes = prefill_control_.bytes;
     }
     return upload_bytes;
@@ -1541,6 +1583,15 @@ class AclIncrementalExecutor::Impl {
       device_eos_token_ids_ = configured_eos_token_ids_;
       device_eos_token_ids_valid_ = true;
       eos_control_upload_pending_ = false;
+      if (unified_target_step_) {
+        const auto zero_count = *static_cast<const std::int32_t*>(
+            TargetStepZeroCountHost(staging_index));
+        if (zero_count != 0) {
+          throw std::logic_error(
+              "unified Target-step zero count is not zero");
+        }
+        target_step_zero_count_valid_ = true;
+      }
     } else if (bytes == prefill_proposal_control_bytes_) {
       ++stats_.prefill_control_proposal_upload_operations;
     } else if (bytes == prefill_count_control_bytes_) {
@@ -1713,11 +1764,12 @@ class AclIncrementalExecutor::Impl {
         const auto build_target_step = [this, current, &verify_outputs](
                                            DatasetPlan& plan,
                                            const BufferView& input_ids,
-                                           std::size_t rows) {
+                                           std::size_t rows,
+                                           const BufferView& proposal_count) {
           plan.Build(
               verify_,
               TargetInputs(
-                  {input_ids, ProposalCountView(), EosIdsView(), EosCountView()},
+                  {input_ids, proposal_count, EosIdsView(), EosCountView()},
                   current),
               verify_outputs(),
               target_step_dynamic_control_.View());
@@ -1733,17 +1785,20 @@ class AclIncrementalExecutor::Impl {
         build_target_step(
             decode_upload_plans_[current],
             decode_id_.View(),
-            1);
+            1,
+            TargetStepZeroCountView());
         build_target_step(
             decode_carrier_plans_[current],
             CompactView(
                 current, compact_token_offset_, sizeof(std::int64_t)),
-            1);
+            1,
+            TargetStepZeroCountView());
         for (std::size_t rows = 2; rows <= verify_width_; ++rows) {
           build_target_step(
               target_step_plans_[rows - 1][current],
               verify_ids_.View(rows * sizeof(std::int64_t)),
-              rows);
+              rows,
+              ProposalCountView());
         }
       } else {
         const auto decode_outputs = [this, next]() {
@@ -1929,14 +1984,6 @@ class AclIncrementalExecutor::Impl {
 
   void SetProposalCount(std::size_t value) {
     RequireProposalCount(value);
-    SetTargetStepProposalCount(value);
-  }
-
-  void SetTargetStepProposalCount(std::size_t value) {
-    if (value > proposal_width_) {
-      throw std::invalid_argument(
-          "Target-step logical proposal count is outside 0..15");
-    }
     if (proposal_value_valid_ && proposal_value_ == value) {
       return;
     }
@@ -2319,6 +2366,8 @@ class AclIncrementalExecutor::Impl {
   std::size_t prefill_base_control_bytes_ = 0;
   std::size_t prefill_count_control_bytes_ = 0;
   std::size_t prefill_proposal_control_bytes_ = 0;
+  std::size_t target_step_zero_count_offset_ =
+      std::numeric_limits<std::size_t>::max();
 
   std::vector<std::array<DatasetPlan, 2>> prefill_plans_;
   std::array<DatasetPlan, 2> decode_upload_plans_;
@@ -2353,6 +2402,7 @@ class AclIncrementalExecutor::Impl {
   std::vector<std::int64_t> device_eos_token_ids_;
   bool device_eos_token_ids_valid_ = false;
   bool eos_control_upload_pending_ = true;
+  bool target_step_zero_count_valid_ = false;
   IncrementalAclExecutionStats stats_;
 };
 

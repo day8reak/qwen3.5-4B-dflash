@@ -112,6 +112,8 @@ struct IncrementalAclExecutionStats {
   std::size_t target_step_dynamic_gear_count = 0;
   std::size_t target_step_input_rows = 0;
   std::size_t target_step_padded_rows_elided = 0;
+  std::size_t target_step_zero_count_device_bytes = 0;
+  std::size_t target_step_zero_count_bindings = 0;
 };
 
 using IncrementalModelProgress = std::function<void(
