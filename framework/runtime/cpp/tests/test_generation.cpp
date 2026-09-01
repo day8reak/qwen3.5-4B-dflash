@@ -55,7 +55,7 @@ class FakeStatefulExecutor final
   explicit FakeStatefulExecutor(bool corrupt_second_proposal = false)
       : corrupt_second_proposal_(corrupt_second_proposal) {}
 
-  std::size_t sequence_length() const noexcept override { return 64; }
+  std::size_t sequence_length() const noexcept override { return 256; }
   std::size_t prefill_width() const noexcept override { return 4; }
   std::size_t proposal_width() const noexcept override { return 15; }
   std::size_t eos_table_width() const noexcept override { return 4; }
@@ -167,7 +167,7 @@ class FakeStatefulExecutor final
   }
 
   std::size_t max_speculative_sync_window() const noexcept override {
-    return 2;
+    return 8;
   }
 
   std::vector<qwen35::dflash::StatefulStep> SpeculativeWindow(
@@ -464,6 +464,58 @@ void TestTwoTransactionWindowStopsAtFirstTransactionEos() {
       "EOS case did not account for the queued second transaction");
 }
 
+void TestEightTransactionWindowUsesBudgetSafeProposalCounts() {
+  FakeStatefulExecutor executor;
+  auto options = Options();
+  options.max_new_tokens = 128;
+  options.max_draft_tokens = 15;
+  options.dflash_sync_window = 8;
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kOrdinary, options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(
+      ordinary.generated_token_ids == dflash.generated_token_ids,
+      "eight-transaction window changed authoritative tokens");
+  Require(
+      executor.speculative_windows().size() == 1 &&
+          executor.speculative_windows().front() ==
+              std::vector<std::size_t>(
+                  {15, 15, 15, 15, 15, 15, 15, 14}),
+      "eight-transaction window did not reserve the exact worst-case budget");
+  Require(
+      dflash.counters.speculative_transactions == 8 &&
+          dflash.counters.decode_iterations == 1,
+      "eight-transaction window counters differ");
+}
+
+void TestEightTransactionWindowStopsAtFirstTransactionEos() {
+  FakeStatefulExecutor executor;
+  auto options = Options();
+  options.max_new_tokens = 32;
+  options.max_draft_tokens = 3;
+  options.dflash_sync_window = 8;
+  options.eos_token_ids = {13};
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kOrdinary, options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  const std::vector<std::int64_t> expected{11, 12, 13};
+  Require(
+      ordinary.generated_token_ids == expected &&
+          dflash.generated_token_ids == expected,
+      "eight-transaction window committed output after first-window EOS");
+  Require(
+      executor.speculative_windows().size() == 1 &&
+          executor.speculative_windows().front() ==
+              std::vector<std::size_t>({3, 3, 3, 3, 3, 3, 3, 2}),
+      "EOS case did not queue the budget-safe eight-transaction window");
+  Require(
+      dflash.counters.speculative_transactions == 8 &&
+          dflash.counters.decode_iterations == 1,
+      "EOS case did not account for all queued transactions");
+}
+
 void TestSmallGenerationBudgetsPrepareOnlyBudgetSafeDraft() {
   FakeStatefulExecutor executor;
   auto options = Options();
@@ -570,6 +622,8 @@ int main() {
     TestStatefulPairedBenchmarkAndProgress();
     TestTwoTransactionWindowUsesBudgetSafeSecondProposalCount();
     TestTwoTransactionWindowStopsAtFirstTransactionEos();
+    TestEightTransactionWindowUsesBudgetSafeProposalCounts();
+    TestEightTransactionWindowStopsAtFirstTransactionEos();
     TestSmallGenerationBudgetsPrepareOnlyBudgetSafeDraft();
     TestPrefillFirstVerifyCoalescingIsExactAndAccounted();
     TestPrefillFirstVerifyCoalescingDoesNotCommitAfterPrefillEos();

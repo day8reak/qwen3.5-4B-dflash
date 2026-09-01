@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "abi_id": "qwen35-4b-ascend310p-performance-v1",
   "scope": "text-only batch-1 strict-greedy ordinary versus quant DFlash C++ OM timing",
   "prerequisites": {
@@ -38,12 +38,13 @@
     ],
     "stable_token_ids_across_repetitions": true,
     "current_integrated_om_io": "persistent input device mirror with changed-range H2D; Target D2H tail is bounded by K+1; full Draft ID D2H; one stream synchronization per model execution",
-    "incremental_five_om_io": "one aligned prefill control carrier uploads only the live base/count/proposal/full prefix while its EOS tail stays process-resident; compact Target results ping-pong with Target state; one-token-h2d retains direct row-zero binding and falls back to pinned-host H2D after multi-token commits, while last-token-d2d retains every last committed token and copies later rows D2D into the aligned scalar; an explicit caller override uses the exact 8-byte H2D fallback in either policy; exact DFlash synchronization window 2 may queue two complete transactions before one barrier; exact coalesce-first-verify may queue final prefill and the first verify before one contiguous compact D2H/barrier; the same Draft OM exposes N=1..16 verify gears so committed-prefix can omit masked scratch feature rows without changing tensor order or weights",
+    "incremental_five_om_io": "one aligned prefill control carrier uploads only the live base/count/proposal/full prefix while its EOS tail stays process-resident; compact Target results ping-pong with Target state; one-token-h2d retains direct row-zero binding and falls back to pinned-host H2D after multi-token commits, while last-token-d2d retains every last committed token and copies later rows D2D into the aligned scalar; an explicit caller override uses the exact 8-byte H2D fallback in either policy; exact DFlash synchronization windows 2..8 may queue budget-safe complete transactions before one barrier, with window 2 using the ping-pong slots directly and windows 3..8 staging compact results D2D into an eight-slot arena; exact coalesce-first-verify may queue final prefill and the first verify before one contiguous compact D2H/barrier; the same Draft OM exposes N=1..16 verify gears so committed-prefix can omit masked scratch feature rows without changing tensor order or weights",
     "required_io_counters": [
       "model_executions",
       "stream_synchronizations",
       "speculative_sync_windows and speculative_synchronizations_elided",
       "speculative_d2h_operations_elided and speculative_d2h_padding_bytes",
+      "speculative_window_staging_operations, bytes, device bytes and pinned-host bytes",
       "prefill_verify_coalesced_windows and prefill_verify_synchronizations_elided",
       "prefill_verify_d2h_operations_elided, slot counts and padding bytes",
       "compact_slot_bytes, compact_ordinary_result_bytes and compact_verify_result_bytes",

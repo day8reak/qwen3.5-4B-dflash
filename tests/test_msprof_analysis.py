@@ -106,21 +106,28 @@ def _runner_report() -> dict[str, object]:
     }
 
 
+def _schema_nine_runner_report() -> dict[str, object]:
+    report = _runner_report()
+    report["schema_version"] = 9
+    report["runner_version"] = "1.17.0"
+    protocol = report["protocol"]
+    protocol["device_memory_allocation_policy"] = "normal-only"
+    protocol["maximum_supported_dflash_sync_window"] = 8
+    counters = report["execution_io_counters"]
+    counters["speculative_window_staging_operations"] = 0
+    counters["speculative_window_staging_bytes"] = 0
+    counters["speculative_window_staging_device_bytes"] = 4096
+    counters["speculative_window_staging_pinned_host_bytes"] = 4096
+    return report
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _op_rows() -> list[dict[str, object]]:
-    invocations = [
-        (1, 1),
-        (1, 2),
-        (2, 1),
-        (4, 1),
-        (3, 1),
-        (4, 2),
-        (3, 2),
-        (4, 3),
-    ]
+def _op_rows_for_invocations(
+    invocations: list[tuple[int, int]],
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     timestamp = 100.0
     for index, (model_id, infer_id) in enumerate(invocations, start=1):
@@ -146,6 +153,21 @@ def _op_rows() -> list[dict[str, object]]:
         )
         timestamp += 100.0
     return rows
+
+
+def _op_rows() -> list[dict[str, object]]:
+    return _op_rows_for_invocations(
+        [
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (4, 1),
+            (3, 1),
+            (4, 2),
+            (3, 2),
+            (4, 3),
+        ]
+    )
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -262,6 +284,8 @@ def test_msprof_analysis_attributes_every_role_and_dynamic_gear(
         "speculative_synchronizations_elided": 0,
         "speculative_d2h_operations_elided": 0,
         "speculative_d2h_padding_bytes": 0,
+        "speculative_window_staging_operations": 0,
+        "speculative_window_staging_bytes": 0,
         "prefill_verify_coalesced_windows": 0,
         "prefill_verify_synchronizations_elided": 0,
         "prefill_verify_d2h_operations_elided": 0,
@@ -347,6 +371,122 @@ def test_msprof_analysis_rejects_sync_window_counter_drift(
         "speculative_synchronizations_elided"
     ] = 1
     _write_json(report_path, report)
+    with pytest.raises(MsprofAnalysisError, match="do not close"):
+        analyze_incremental_msprof(
+            profile_dir=profile,
+            runner_report=report_path,
+        )
+
+
+def test_msprof_analysis_accepts_schema_nine_staging_contract(
+    tmp_path: Path,
+) -> None:
+    report_path, profile = _case(tmp_path)
+    _write_json(report_path, _schema_nine_runner_report())
+
+    payload = analyze_incremental_msprof(
+        profile_dir=profile,
+        runner_report=report_path,
+    )
+
+    assert payload["status"] == "PASS"
+    assert payload["expected_memcpy_signature"][
+        "device_to_device_speculative_staging"
+    ] == {"operations": 0, "bytes": 0}
+
+
+def test_msprof_analysis_counts_extended_window_staging_memcpy(
+    tmp_path: Path,
+) -> None:
+    report_path, profile = _case(tmp_path)
+    report = _schema_nine_runner_report()
+    report["protocol"]["dflash_sync_window"] = 8
+    counters = report["execution_io_counters"]
+    counters.update(
+        {
+            "model_executions": 9,
+            "target_decode1_executions": 0,
+            "draft_propose_executions": 3,
+            "target_verify_commit_executions": 3,
+            "draft_verify_feature_input_rows": 16,
+            "draft_verify_full_width_equivalent_rows": 32,
+            "draft_verify_feature_rows_elided": 16,
+            "draft_verify_committed_prefix_executions": 0,
+            "draft_verify_pending_upper_bound_executions": 2,
+            "device_to_host_operations": 2,
+            "decode_id_device_compaction_operations": 0,
+            "decode_id_device_compaction_bytes": 0,
+            "stream_synchronizations": 2,
+            "speculative_sync_windows": 1,
+            "speculative_synchronizations_elided": 2,
+            "speculative_d2h_operations_elided": 2,
+            "speculative_d2h_padding_bytes": 120,
+            "speculative_window_staging_operations": 3,
+            "speculative_window_staging_bytes": 1356,
+        }
+    )
+    report["profile_model_execution_trace"] = [
+        {"ordinal": 0, "model_id": 1, "physical_rows": 64},
+        {"ordinal": 1, "model_id": 1, "physical_rows": 64},
+        {"ordinal": 2, "model_id": 2, "physical_rows": 1},
+        {"ordinal": 3, "model_id": 3, "physical_rows": 128},
+        {"ordinal": 4, "model_id": 4, "physical_rows": 8},
+        {"ordinal": 5, "model_id": 3, "physical_rows": 8},
+        {"ordinal": 6, "model_id": 4, "physical_rows": 8},
+        {"ordinal": 7, "model_id": 3, "physical_rows": 8},
+        {"ordinal": 8, "model_id": 4, "physical_rows": 5},
+    ]
+    _write_json(report_path, report)
+    op_path = next(profile.rglob("op_summary_*.csv"))
+    _write_csv(
+        op_path,
+        _op_rows_for_invocations(
+            [
+                (1, 1),
+                (1, 2),
+                (2, 1),
+                (3, 1),
+                (4, 1),
+                (3, 2),
+                (4, 2),
+                (3, 3),
+                (4, 3),
+            ]
+        ),
+    )
+    api_path = next(profile.rglob("api_statistic_*.csv"))
+    _write_api_csv(
+        api_path,
+        execute_count=9,
+        memcpy_count=8,
+        synchronize_count=2,
+    )
+
+    payload = analyze_incremental_msprof(
+        profile_dir=profile,
+        runner_report=report_path,
+    )
+
+    assert payload["api_count_gates"]["aclrtMemcpyAsync"] == {
+        "status": "PASS",
+        "expected": 8,
+        "observed": 8,
+    }
+    assert payload["expected_memcpy_signature"][
+        "device_to_device_speculative_staging"
+    ] == {"operations": 3, "bytes": 1356}
+
+
+def test_msprof_analysis_rejects_staging_for_window_one(
+    tmp_path: Path,
+) -> None:
+    report_path, profile = _case(tmp_path)
+    report = _schema_nine_runner_report()
+    counters = report["execution_io_counters"]
+    counters["speculative_window_staging_operations"] = 1
+    counters["speculative_window_staging_bytes"] = 452
+    _write_json(report_path, report)
+
     with pytest.raises(MsprofAnalysisError, match="do not close"):
         analyze_incremental_msprof(
             profile_dir=profile,

@@ -58,6 +58,7 @@ DEVICE_MEMORY_ALLOCATION_POLICIES = frozenset(
         HUGE_FIRST_DEVICE_MEMORY_POLICY,
     }
 )
+MAX_DFLASH_SYNC_WINDOW = 8
 _INCREMENTAL_ABI_ID = (
     "qwen35-4b-dflash-ascend310p-incremental-performance-v2"
 )
@@ -264,8 +265,8 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
             f"{COMMITTED_PREFIX_DRAFT_FEATURE_POLICY!r}"
         )
     dflash_sync_window = int(options.get("dflash_sync_window", 1))
-    if dflash_sync_window not in {1, 2}:
-        raise ValueError("C++ runner dflash_sync_window must be 1 or 2")
+    if not 1 <= dflash_sync_window <= MAX_DFLASH_SYNC_WINDOW:
+        raise ValueError("C++ runner dflash_sync_window must be in 1..8")
     prefill_completion_policy = str(
         options.get(
             "prefill_completion_policy",
@@ -779,7 +780,7 @@ def validate_incremental_cpp_runner_report(
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
-    if report.get("schema_version") != 8:
+    if report.get("schema_version") != 9:
         raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
@@ -879,9 +880,9 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental runner Draft feature policy differs")
     expected_draft_feature_description = (
         "after a synchronized verify, Draft binds exactly accepted+1 leading "
-        "Target feature rows; an unsynchronized second transaction binds the "
-        "causal K+1 upper bound; masked suffix cache writes are scratch and "
-        "overwritten before becoming visible"
+        "Target feature rows; each later unsynchronized transaction binds its "
+        "predecessor's causal K+1 upper bound; masked suffix cache writes are "
+        "scratch and overwritten before becoming visible"
         if draft_feature_policy == COMMITTED_PREFIX_DRAFT_FEATURE_POLICY
         else "verify-source Draft binds the original physical N=16; this is "
         "the rollback and matched-baseline route"
@@ -890,16 +891,17 @@ def validate_incremental_cpp_runner_report(
         expected_draft_feature_description
     ):
         raise RuntimeError("incremental Draft feature claim boundary differs")
-    if dflash_sync_window not in {1, 2}:
+    if not 1 <= dflash_sync_window <= MAX_DFLASH_SYNC_WINDOW:
         raise ValueError("expected DFlash sync window is invalid")
     if (
         protocol.get("dflash_sync_window") != dflash_sync_window
-        or protocol.get("maximum_supported_dflash_sync_window") != 2
+        or protocol.get("maximum_supported_dflash_sync_window")
+        != MAX_DFLASH_SYNC_WINDOW
     ):
         raise RuntimeError("incremental DFlash sync window differs")
     if protocol.get("decode_iteration_scope") != (
         "one host-visible synchronization window; a DFlash window may "
-        "contain one or two complete speculative transactions"
+        "contain one to eight complete speculative transactions"
     ):
         raise RuntimeError("incremental decode iteration scope differs")
     if protocol.get("state_reset_only_barriers") != 0:
@@ -1041,6 +1043,8 @@ def validate_incremental_cpp_runner_report(
         "state_reset_bytes_per_request",
         "carrier_device_bytes",
         "compact_ping_pong_device_bytes",
+        "speculative_window_staging_device_bytes",
+        "speculative_window_staging_pinned_host_bytes",
         "compact_slot_bytes",
         "compact_ordinary_result_bytes",
         "compact_verify_result_bytes",
@@ -1126,7 +1130,12 @@ def validate_incremental_cpp_runner_report(
         != expected_persistent_control_tail_bytes
         or memory["prefill_staging_pinned_host_bytes"]
         != expected_staging_host_bytes
-        or memory["proposal_count_staging_pinned_host_bytes"] != 8
+        or memory["proposal_count_staging_pinned_host_bytes"]
+        != 4 * MAX_DFLASH_SYNC_WINDOW
+        or memory["speculative_window_staging_device_bytes"]
+        != MAX_DFLASH_SYNC_WINDOW * memory["compact_slot_bytes"]
+        or memory["speculative_window_staging_pinned_host_bytes"]
+        != memory["speculative_window_staging_device_bytes"]
     ):
         raise RuntimeError("incremental prefill pinned-host staging differs")
     minimum_feature_arena_bytes = (
@@ -1305,6 +1314,12 @@ def validate_incremental_cpp_runner_report(
     speculative_d2h_padding = execution.get(
         "speculative_d2h_padding_bytes"
     )
+    speculative_staging_operations = execution.get(
+        "speculative_window_staging_operations"
+    )
+    speculative_staging_bytes = execution.get(
+        "speculative_window_staging_bytes"
+    )
     prefill_verify_fields = (
         "prefill_verify_coalesced_windows",
         "prefill_verify_synchronizations_elided",
@@ -1363,6 +1378,17 @@ def validate_incremental_cpp_runner_report(
         or isinstance(speculative_d2h_padding, bool)
         or not isinstance(speculative_d2h_padding, int)
         or speculative_d2h_padding < 0
+        or isinstance(speculative_staging_operations, bool)
+        or not isinstance(speculative_staging_operations, int)
+        or speculative_staging_operations < 0
+        or isinstance(speculative_staging_bytes, bool)
+        or not isinstance(speculative_staging_bytes, int)
+        or speculative_staging_bytes < 0
+        or speculative_staging_bytes
+        != speculative_staging_operations
+        * memory["compact_verify_result_bytes"]
+        or speculative_staging_operations > verify
+        or (dflash_sync_window <= 2 and speculative_staging_operations != 0)
         or prefill_verify_windows != expected_prefill_verify_windows
         or prefill_verify_syncs_elided != prefill_verify_windows
         or prefill_verify_d2h_elided != prefill_verify_windows
@@ -1425,6 +1451,12 @@ def validate_incremental_cpp_runner_report(
         "compact_ping_pong_device_bytes"
     ):
         raise RuntimeError("incremental compact ping-pong byte reports differ")
+    for field in (
+        "speculative_window_staging_device_bytes",
+        "speculative_window_staging_pinned_host_bytes",
+    ):
+        if execution.get(field) != memory.get(field):
+            raise RuntimeError(f"incremental {field} reports differ")
     if memory["compact_ping_pong_device_bytes"] > memory["carrier_device_bytes"]:
         raise RuntimeError("incremental compact ping-pong exceeds carrier bytes")
     if (

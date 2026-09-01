@@ -635,9 +635,11 @@ $AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner
 候选。`build-cpp` 会同时构建并 host-test 两者。五图的导出 factory、runner 配置、直接运行、
 report 门禁、同二进制 `one-token-h2d`/`last-token-d2d` A/B 和 msprof 命令见
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5 节。runner 配置中的 `decode_carrier_policy` 只改变
-C++ buffer/copy 路由，不要求重新生成 AIR 或 OM；`dflash_sync_window=1|2` 同样不改 AIR/OM ABI，
-候选 2 可把两个完整 speculative transaction 合并到一个 host-visible barrier，并在第二轮按剩余
-token budget 自适应缩小 K。独立的 `prefill_completion_policy=separate|coalesce-first-verify`
+C++ buffer/copy 路由，不要求重新生成 AIR 或 OM；`dflash_sync_window=1..8` 同样不改 AIR/OM
+ABI。候选 2 直接合并两槽 compact result，候选 3..8 通过 4 KiB staging arena 把多个完整
+speculative transaction 合并到一个 host-visible barrier，并逐轮按剩余 token budget 自适应缩小
+K；默认仍为 1，必须完成同机正反顺序 1/2/4/8 A/B。独立的
+`prefill_completion_policy=separate|coalesce-first-verify`
 也不改 AIR/OM ABI；候选策略把最后 prefill 与第一次 verify 合为一次 D2H/同步，但会延迟首 token
 host 可见时间，必须分别比较 TTFT 与总时延。prefill control 按 base/count/proposal/full 四档
 live prefix 复制：五图 slot 为 896 bytes；统一四图在 EOS count 后追加一个 64-byte 对齐的常驻

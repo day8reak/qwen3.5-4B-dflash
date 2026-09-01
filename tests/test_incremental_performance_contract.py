@@ -33,7 +33,7 @@ def _batched_cache_update_proposal() -> dict[str, object]:
 def test_incremental_contract_has_exact_approval_but_is_not_active() -> None:
     contract = _contract()
     approval = json.loads(APPROVAL_PATH.read_text(encoding="utf-8"))
-    assert contract["schema_version"] == 5
+    assert contract["schema_version"] == 6
     assert contract["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
     assert approval["status"] == "APPROVED"
     assert approval["approval_statement"] == "批准多OM状态图"
@@ -207,7 +207,7 @@ def test_hot_loop_keeps_large_state_and_proposals_on_device() -> None:
     assert "target GDR state banks" in state["host_forbidden_payloads_per_round"]
     assert "target or Draft KV cache" in state["host_forbidden_payloads_per_round"]
     assert "stays on device" in contract["hot_loop"]["draft_to_verify"]
-    assert "window 2" in contract["hot_loop"]["synchronization"]
+    assert "candidates 2..8" in contract["hot_loop"]["synchronization"]
     assert set(contract["hot_loop"]["draft_feature_policies"]) == {
         "fixed-16",
         "committed-prefix",
@@ -221,8 +221,9 @@ def test_hot_loop_keeps_large_state_and_proposals_on_device() -> None:
     assert set(contract["hot_loop"]["dflash_sync_window_policies"]) == {
         "1",
         "2",
+        "3..8",
     }
-    assert "K1 may be smaller" in contract["hot_loop"][
+    assert "final Ki may shrink" in contract["hot_loop"][
         "dflash_sync_window_budget_guard"
     ]
     assert set(contract["hot_loop"]["prefill_completion_policies"]) == {
@@ -314,7 +315,8 @@ def test_document_contains_memory_inspector_and_claim_boundary() -> None:
     assert "ACL_MEM_MALLOC_HUGE_FIRST" in document
     assert "committed-prefix" in document
     assert "1,006,632,960" in document
-    assert "K0=15,K1=14" in document
+    assert "`K0=15`" in document
+    assert "`K1=14`" in document
     assert "不能宣称" in document
 
 
@@ -323,9 +325,12 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 20
+    assert framework_lock["schema_version"] == 21
+    assert framework_lock["framework_id"] == (
+        "qwen3.5-4b-quant-air-om-ascendcl-v21"
+    )
     assert deployment["schema_version"] == 2
-    assert performance["schema_version"] == 2
+    assert performance["schema_version"] == 3
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -531,7 +536,27 @@ def test_two_transaction_window_contract_closes_matched_fake_acl_work() -> None:
     assert evidence["per_dflash_measurement_transactions_both"] == 2
     assert evidence["per_dflash_measurement_windows_before"] == 2
     assert evidence["per_dflash_measurement_windows_after"] == 1
-    assert evidence["proposal_count_staging_pinned_host_bytes_both"] == 8
+    assert evidence["proposal_count_staging_pinned_host_bytes_both"] == 32
+
+
+def test_extended_sync_window_records_exact_structural_evidence() -> None:
+    contract = _contract()
+    assert contract["symbols"]["maximum_dflash_sync_window"] == 8
+    evidence = contract["hot_loop"][
+        "fake_acl_extended_sync_window_70_token_58_output_paired_3_plus_10"
+    ]
+    assert evidence["requested_sync_window"] == 8
+    assert evidence["actual_transactions_per_dflash_request"] == 4
+    assert evidence["proposal_counts_per_dflash_request"] == [15, 15, 15, 8]
+    assert evidence["token_id_mismatches"] == 0
+    assert evidence["eos_mismatches"] == 0
+    assert evidence["target_verify_commit_executions"] == 52
+    assert evidence["speculative_sync_windows"] == 13
+    assert evidence["speculative_synchronizations_elided"] == 39
+    assert evidence["speculative_window_staging_operations"] == 52
+    assert evidence["speculative_window_staging_bytes"] == 52 * 452
+    assert evidence["speculative_window_staging_device_bytes"] == 4096
+    assert evidence["proposal_count_staging_pinned_host_bytes"] == 32
 
 
 def test_two_transaction_window_short_case_records_coalesced_d2h() -> None:

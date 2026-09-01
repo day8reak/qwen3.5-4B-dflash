@@ -692,20 +692,18 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
       steps.push_back(executor.DecodeOne(prefix.back()));
     } else {
       speculative = true;
-      const std::size_t first_proposal_count = std::min(
-          {options.max_draft_tokens,
-           executor.proposal_width(),
-           remaining - 1});
-      proposal_counts.push_back(first_proposal_count);
-      if (options.dflash_sync_window > 1) {
-        const std::size_t remaining_after_worst_first =
-            remaining - (first_proposal_count + 1);
-        if (remaining_after_worst_first > 1) {
-          proposal_counts.push_back(std::min(
-              {options.max_draft_tokens,
-               executor.proposal_width(),
-               remaining_after_worst_first - 1}));
-        }
+      std::size_t worst_case_remaining = remaining;
+      while (proposal_counts.size() < options.dflash_sync_window &&
+             worst_case_remaining > 1) {
+        const std::size_t proposal_count = std::min(
+            {options.max_draft_tokens,
+             executor.proposal_width(),
+             worst_case_remaining - 1});
+        proposal_counts.push_back(proposal_count);
+        // Reserve the largest possible commit (K accepted Draft tokens plus
+        // one authoritative Target token) before queueing another transaction.
+        // This makes every queued window exact even when all proposals match.
+        worst_case_remaining -= proposal_count + 1;
       }
       steps = executor.SpeculativeWindow(proposal_counts);
       if (steps.empty() || steps.size() > proposal_counts.size()) {

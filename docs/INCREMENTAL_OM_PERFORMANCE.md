@@ -327,8 +327,9 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   仍分配自己的 `weightSize`，不假设跨文件共享权重；
 - Target/Draft state 双缓冲留在 device，proposal 与 feature carrier 不回 host；
 - 默认 `draft-propose -> target-verify-commit -> compact D2H -> synchronize` 每轮一个 barrier；
-  `dflash_sync_window=2` 在 token budget 安全时复用现有两套 compact arena，连续排两个完整事务和
-  一次合并 compact D2H 后只同步一次，不改变 AIR/OM 输入输出；
+  `dflash_sync_window=2` 直接合并两套 compact arena，`3..8` 则把结果 D2D 到 4 KiB staging
+  arena；所有候选都在 token budget 安全时连续排完整事务，最后只做一次 D2H/同步，不改变
+  AIR/OM 输入输出；
 - 默认 `prefill_completion_policy=separate` 在最后一个 prefill 后暴露首 token；精确候选
   `coalesce-first-verify` 复用相同的两套 compact arena，把最后 prefill、已准备好的 Draft 和第一次
   Target verify 连续排入同一 stream，再用一次连续 D2H 和一次同步同时取回 prefill/verify 结果。
@@ -360,7 +361,8 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   `N=64,128,...,kv_cache_max_len` 离散 gear 通过 TorchAir
   `set_dim_gears` 写入 AIR；C++ 启动时逐档核验并预建 dataset，request 热循环不调用
   `aclmdlSetInputDynamicDims`。默认 `fixed-16` 仍绑定 N=16；候选 `committed-prefix` 在同步后绑定
-  `accepted+1` 行，在 window 2 尚未读回上一事务时绑定其严格因果上界 `K+1`；
+  `accepted+1` 行；同一 window 内尚未读回上一事务时，后续事务绑定其前驱严格因果上界
+  `K+1`；
 - ordinary 路径执行 `target-prefill` body、末尾一次 `target-prefill-head` 和后续
   `target-decode1`，不执行 Draft。
 
@@ -706,8 +708,9 @@ prefill/first-verify 合并的结构证据：`separate` 和 `coalesce-first-veri
 proposal carrier 写成 0，下一次 DFlash 又恢复正 K：prefill full/base/count/proposal 路由为
 `1/38/0/13`，另有 14 次、56 bytes 的 proposal-count H2D，总 H2D 为 66 次、32,120 bytes。
 常驻零值改造后路由恢复为 `1/38/12/1`，独立 proposal-count H2D 为 0，总 H2D 为 52 次、
-31,360 bytes，即少 14 次 API、760 bytes。代价是 unified device carrier 从 6,228 增至
-6,292 bytes（增加一个 64-byte 对齐跨度），两槽 pinned staging 从 1,792 增至 1,920 bytes。
+31,360 bytes，即少 14 次 API、760 bytes。计入常驻 4,096-byte speculative staging arena 后，
+unified device carrier 从 10,324 增至 10,388 bytes（增加一个 64-byte 对齐跨度），prefill
+pinned staging 从 1,792 增至 1,920 bytes。
 78 次 ordinary decode 全部以 resident-zero binding 闭合。这个 A/B 只证明 C++ 路由和计数差异；
 是否降低 310P wall time 仍必须由真实 OM 的未 profile 3+10 和 msprof timeline 共同判定。
 
@@ -723,12 +726,20 @@ Fake ACL 耗时不能用于声称 310P 加速。
 
 常用的 `max_new_tokens=32,max_draft_tokens=15` 还覆盖了边界调度：prefill 已生成 1 token 后剩余
 31 个，第一事务取 `K0=15`，预留其最坏 16-token commit 后，第二事务自动取 `K1=14`，两次最坏
-commit 正好填满 31 个 token。两套独立 4-byte pinned-host scalar staging（总计 8 bytes）保证 K0/K1 的 proposal-count
+commit 正好填满 31 个 token。实现为所有合法窗口常驻八套独立 4-byte pinned-host scalar
+staging（总计 32 bytes），保证任意 K 序列的 proposal-count
 H2D 源在异步执行期间不会被覆盖。匹配的 Fake ACL paired 3+10 中，两种窗口的模型执行均为 533，
 H2D 均为 65 次/32,180 bytes；window 1 的 D2H 为 455 次/122,005 bytes，window 2 为
 442 次/122,785 bytes。候选由此少 13 次 D2H API、少 13 次同步，并增加 780 bytes padding；每个
 DFlash measurement 的两个 transaction 从两个 host window 合并为一个。这个用例
 证明 `K=15/14` 路由真实执行，不代表真机时延已经改善。
+
+扩展 staging 路径也冻结了结构证据：70-token prompt、`max_new_tokens=58`、K 上限 15 时，每个
+DFlash request 实际预算安全序列为 `15,15,15,8`。paired 3+10 的 13 个 DFlash request 共执行
+52 个 verify，但只形成 13 个 host-visible window，省 39 次 D2H/同步；52 次 compact D2D 共
+23,504 bytes，连续 D2H padding 共 2,340 bytes。五图与统一 Target-step 都保持 token `11..68`
+和零 token/EOS mismatch。它同样只是 Fake ACL 结构证据；新增 D2D 是否值得，必须在 310P 上
+比较 window 1/2/4/8。
 
 这条排队规则依赖 AscendCL 的公开异步语义：[Stream 内任务按原始顺序执行](https://www.hiascend.com/document/detail/en/canncommercial/800/appdevg/aclcppdevg/aclcppdevg_000004.html)，
 [`aclmdlExecuteAsync` 是异步模型执行接口](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/apiref/appdevgapi/aclcppdevg_03_0299.html)，
@@ -832,6 +843,12 @@ jq -s 'map({
     .execution_io_counters.decode_id_device_compaction_bytes,
   compact_ping_pong_bytes:
     .model_memory_query.compact_ping_pong_device_bytes,
+  speculative_staging_device_bytes:
+    .model_memory_query.speculative_window_staging_device_bytes,
+  speculative_staging_host_bytes:
+    .model_memory_query.speculative_window_staging_pinned_host_bytes,
+  proposal_count_staging_host_bytes:
+    .model_memory_query.proposal_count_staging_pinned_host_bytes,
   transaction_syncs: .execution_io_counters.stream_synchronizations,
   ordinary_median_ms: .ordinary.latency_ms.model_total.median,
   ordinary_p90_ms: .ordinary.latency_ms.model_total.p90,
@@ -943,59 +960,75 @@ jq -s 'map({
 #### 5.5.1 A/B 选择 DFlash 同步窗口
 
 `dflash_sync_window` 也是同一二进制、同一 AIR/OM ABI 的精确运行时开关。默认 `1` 每个
-speculative transaction 同步一次；候选 `2` 最多把两个依赖事务和两份 compact D2H 排入同一
-stream 后同步一次。第二事务的 K 由第一事务的最坏 commit 预算决定，可能小于第一事务；因此这
-不仅是 host barrier 数变化，实际 acceptance、物理 T 和 graph call 也必须一起记录。
+speculative transaction 同步一次；候选范围现在是 `2..8`。runner 从剩余生成预算出发，为每个
+事务先预留最坏的 `K+1` 个 commit，再决定是否还能排下一个事务，因此请求 `8` 不代表每轮一定
+执行 8 个事务，最后一个 K 也可能收窄。例如 prefill 已生成 1 个 token、剩余预算为 127 时，
+`max_draft_tokens=15` 会得到 `15,15,15,15,15,15,15,14`。
 
-先生成两份只差该字段的配置：
+buffer 路径分成三类：
+
+- window 1：直接下载一份 452-byte verify compact result；
+- window 2：直接合并两个 512-byte ping-pong slot，只做一次 `512+452` bytes D2H；
+- window 3..8：每个事务结束后，把 452 bytes 从与 Target state 绑定的两槽 ping-pong D2D 到
+  一个常驻的 8×512=4096-byte staging arena，最后只做一次连续 D2H 和一次同步。
+
+后两类减少 host barrier，但 window 3..8 额外增加 D2D，且在拒绝或早 EOS 时可能执行后续无用
+事务，所以不能假设窗口越大越快。它没有增加 OM，也没有改变 AIR/OM tensor ABI；默认仍是 1。
+
+先生成四份只差该字段的配置：
 
 ```bash
-cp config/quant_air_om_incremental_runner.example.json \
-  "$AI_RUN_DIR/runner-window-1.json"
-cp config/quant_air_om_incremental_runner.example.json \
-  "$AI_RUN_DIR/runner-window-2.json"
-
-jq '.dflash_sync_window = 1' "$AI_RUN_DIR/runner-window-1.json" > \
-  "$AI_RUN_DIR/runner-window-1.tmp.json"
-mv "$AI_RUN_DIR/runner-window-1.tmp.json" \
-  "$AI_RUN_DIR/runner-window-1.json"
-jq '.dflash_sync_window = 2' "$AI_RUN_DIR/runner-window-2.json" > \
-  "$AI_RUN_DIR/runner-window-2.tmp.json"
-mv "$AI_RUN_DIR/runner-window-2.tmp.json" \
-  "$AI_RUN_DIR/runner-window-2.json"
-# 两份配置中的设备身份、reset/carrier policy 和 pad_token_id 必须相同。
+for DFLASH_WINDOW in 1 2 4 8; do
+  cp config/quant_air_om_incremental_runner.example.json \
+    "$AI_RUN_DIR/runner-window-${DFLASH_WINDOW}.json"
+  jq --argjson window "$DFLASH_WINDOW" \
+    '.dflash_sync_window = $window' \
+    "$AI_RUN_DIR/runner-window-${DFLASH_WINDOW}.json" > \
+    "$AI_RUN_DIR/runner-window-${DFLASH_WINDOW}.tmp.json"
+  mv "$AI_RUN_DIR/runner-window-${DFLASH_WINDOW}.tmp.json" \
+    "$AI_RUN_DIR/runner-window-${DFLASH_WINDOW}.json"
+done
+# 四份配置中的设备身份、reset/carrier/draft/prefill policy 和 pad_token_id 必须相同。
 ```
 
-按 1→2 跑完后再按 2→1 反向重复；下面的 32/15 用例会实际覆盖 `K0=15,K1=14`，不能改成只
-生成少量 token 后却声称 window 2 生效：
+先按 1→2→4→8 跑，再换新输出按 8→4→2→1 反向跑。下面使用 128/15 是为了让高接受率用例
+确实能排满 window 8；还必须另外保留代表性的低接受率和早 EOS 用例：
 
 ```bash
-for DFLASH_WINDOW in 1 2; do
-  "$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
-    --deployment-manifest "$INCREMENTAL_BUNDLE/deployment-manifest.json" \
-    --runner \
-      "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
-    --runner-config "$AI_RUN_DIR/runner-window-${DFLASH_WINDOW}.json" \
-    --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
-    --prompt '请用一句话解释为什么天空是蓝色的。' \
-    --chat \
-    --max-new-tokens 32 \
-    --max-draft-tokens 15 \
-    --device-id 0 \
-    --output "$AI_RUN_DIR/reports/window-${DFLASH_WINDOW}.json"
+for ORDER in forward reverse; do
+  if [ "$ORDER" = forward ]; then
+    WINDOWS='1 2 4 8'
+  else
+    WINDOWS='8 4 2 1'
+  fi
+  for DFLASH_WINDOW in $WINDOWS; do
+    "$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
+      --deployment-manifest "$INCREMENTAL_BUNDLE/deployment-manifest.json" \
+      --runner \
+        "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+      --runner-config "$AI_RUN_DIR/runner-window-${DFLASH_WINDOW}.json" \
+      --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
+      --prompt '请用一句话解释为什么天空是蓝色的。' \
+      --chat \
+      --max-new-tokens 128 \
+      --max-draft-tokens 15 \
+      --device-id 0 \
+      --output \
+        "$AI_RUN_DIR/reports/window-${DFLASH_WINDOW}-${ORDER}.json"
+  done
 done
 ```
 
-先做精确性和计数闭合，再看 latency：
+先对同一顺序的四份报告做精确性和计数闭合，再看 latency。window 1/2 的 staging 操作必须为
+0；window 4/8 只有实际组成了至少 3 事务的窗口才会大于 0：
 
 ```bash
 jq -e -s '
-  (length == 2) and
-  (.[0].ordinary.stable_generated_token_ids ==
-   .[1].ordinary.stable_generated_token_ids) and
-  (.[0].dflash.stable_generated_token_ids ==
-   .[1].dflash.stable_generated_token_ids) and
-  (.[0].dflash.stable_stop_reason == .[1].dflash.stable_stop_reason) and
+  (length == 4) and
+  (([.[].protocol.dflash_sync_window] | sort) == [1,2,4,8]) and
+  ([.[].ordinary.stable_generated_token_ids] | unique | length == 1) and
+  ([.[].dflash.stable_generated_token_ids] | unique | length == 1) and
+  ([.[].dflash.stable_stop_reason] | unique | length == 1) and
   (all(.ordinary_parity.status == "PASS" and
        .ordinary_parity.token_id_mismatches == 0 and
        .ordinary_parity.eos_mismatches == 0)) and
@@ -1017,10 +1050,21 @@ jq -e -s '
     ($io.speculative_d2h_padding_bytes ==
      ($io.speculative_d2h_operations_elided *
       ($io.compact_slot_bytes -
-       $io.compact_verify_result_bytes)))
+       $io.compact_verify_result_bytes))) and
+    ($io.speculative_window_staging_bytes ==
+     ($io.speculative_window_staging_operations *
+      $io.compact_verify_result_bytes)) and
+    ((.protocol.dflash_sync_window > 2) or
+     ($io.speculative_window_staging_operations == 0)) and
+    ($io.speculative_window_staging_device_bytes ==
+     (8 * $io.compact_slot_bytes)) and
+    ($io.speculative_window_staging_pinned_host_bytes ==
+     $io.speculative_window_staging_device_bytes)
   )
-' "$AI_RUN_DIR/reports/window-1.json" \
-  "$AI_RUN_DIR/reports/window-2.json"
+' "$AI_RUN_DIR/reports/window-1-forward.json" \
+  "$AI_RUN_DIR/reports/window-2-forward.json" \
+  "$AI_RUN_DIR/reports/window-4-forward.json" \
+  "$AI_RUN_DIR/reports/window-8-forward.json"
 
 jq -s 'map({
   window: .protocol.dflash_sync_window,
@@ -1037,6 +1081,10 @@ jq -s 'map({
     .execution_io_counters.speculative_d2h_operations_elided,
   d2h_padding_bytes:
     .execution_io_counters.speculative_d2h_padding_bytes,
+  staging_d2d_operations:
+    .execution_io_counters.speculative_window_staging_operations,
+  staging_d2d_bytes:
+    .execution_io_counters.speculative_window_staging_bytes,
   compact_slot_bytes: .execution_io_counters.compact_slot_bytes,
   compact_verify_result_bytes:
     .execution_io_counters.compact_verify_result_bytes,
@@ -1052,14 +1100,17 @@ jq -s 'map({
   accepted: .dflash.totals.accepted_draft_tokens,
   dflash_median_ms: .dflash.latency_ms.model_total.median,
   dflash_p90_ms: .dflash.latency_ms.model_total.p90
-})' "$AI_RUN_DIR/reports/window-1.json" \
-  "$AI_RUN_DIR/reports/window-2.json"
+})' "$AI_RUN_DIR/reports/window-1-forward.json" \
+  "$AI_RUN_DIR/reports/window-2-forward.json" \
+  "$AI_RUN_DIR/reports/window-4-forward.json" \
+  "$AI_RUN_DIR/reports/window-8-forward.json"
 ```
 
-只有 window 2 的 `speculative_synchronizations_elided>0`，token/EOS 全部一致，且正反顺序未开
-msprof 的 3+10 中 DFlash median 和 p90 都稳定改善时才启用。若 acceptance 下降、额外 graph work
-抵消同步收益、EOS workload 变慢或结果落在噪声内，继续使用默认 window 1。Fake ACL 只能验证
-排队与 buffer 生命周期，不能作为这个选择门禁的时延输入。
+把相同检查再用于 reverse 四份报告。只有某个候选在同机正反顺序、未开 msprof 的 3+10 中
+token/EOS 全部一致，且代表性的长度、接受率和早 EOS 用例里 DFlash median 与 p90 都稳定改善，
+才可以选择它。若额外 D2D/graph work 抵消同步收益、拒绝或 EOS workload 变慢，或结果落在噪声
+内，继续使用默认 window 1。Fake ACL 只能验证排队、预算和 buffer 生命周期，不能作为选择门禁
+的时延输入。
 
 #### 5.5.2 A/B 选择 Draft 有效 feature 前缀
 
@@ -1067,9 +1118,9 @@ msprof 的 3+10 中 DFlash median 和 p90 都稳定改善时才启用。若 acce
 不改变输入输出顺序。两个精确策略是：
 
 - `fixed-16`：默认回退基线；verify 后每次 Draft 都处理 16 行 Target feature；
-- `committed-prefix`：同步窗口 1 使用上一轮真实 `accepted+1` 行；同步窗口 2 的第二个未同步事务
-  尚不能读取 acceptance，因此使用上一轮逻辑 proposal 数的因果上界 `K+1`。真实有效行不会超过
-  这个上界。
+- `committed-prefix`：同步窗口 1 使用上一轮真实 `accepted+1` 行；同一窗口内的后续未同步事务
+  尚不能读取前驱 acceptance，因此逐个使用前驱逻辑 proposal 数的因果上界 `K+1`。真实有效行
+  不会超过这个上界。
 
 精确性的依据不是“尾行大概没用”，而是 Draft KV 的可见性规则：只有
 `logical_draft_cursor` 以下位置是 authoritative。`fixed-16` 在 cursor 之后写入的其余 feature
@@ -1474,7 +1525,8 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
 把 `--state-reset-policy` 的值换成 `immutable-zero` 即可运行另一 buffer plan；不要改变 OM
 文件或 token 输入。把 `--decode-carrier-policy` 换成 `one-token-h2d` 可运行第 5.5 节的同二进制
 carrier 基线。`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，不能保留
-文字占位符。把 `--dflash-sync-window` 改成 `2` 可运行第 5.5.1 节候选；正式默认仍是 `1`。
+文字占位符。把 `--dflash-sync-window` 改成 `2`、`4` 或 `8` 可运行第 5.5.1 节候选；正式默认仍
+是 `1`。
 把 `--prefill-completion-policy` 改成 `coalesce-first-verify` 可运行第 5.5.3 节候选；它会推迟
 首 token 的 host 可见时间，正式默认仍是 `separate`。
 把 `--draft-feature-policy` 改成 `committed-prefix` 可运行第 5.5.2 节候选；完成真机 A/B 前默认仍是
@@ -1580,15 +1632,16 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
 done
 ```
 
-上面默认 profile window 1 和固定 16 行 Draft verify 输入。分析双轮候选时设
-`DFLASH_SYNC_WINDOW=2`；分析有效前缀候选时设
+上面默认 profile window 1 和固定 16 行 Draft verify 输入。分析同步窗口候选时分别设
+`DFLASH_SYNC_WINDOW=2/4/8`；分析有效前缀候选时设
 `DRAFT_FEATURE_POLICY=committed-prefix`；分析 prefill 合并候选时设
 `PREFILL_COMPLETION_POLICY=coalesce-first-verify`。每个候选都要换一个新的
 `PROFILE_ROOT`/`UNIFIED_PROFILE_ROOT` 后完整重跑，不能把两个窗口的 CSV 合并到同一 analysis
 目录。分析器会要求 `aclmdlExecuteAsync` 按 transaction 闭合、实际 D2H 加
 `speculative_d2h_operations_elided` 和 `prefill_verify_d2h_operations_elided` 后按 transaction
 闭合，而 `aclrtSynchronizeStream` 按
-`speculative_sync_windows` 闭合；window 2 不应伪装成少执行了 verify。
+`speculative_sync_windows` 闭合；window 3..8 的 `aclrtMemcpyAsync` 还必须加上
+`speculative_window_staging_operations`，任何候选都不应伪装成少执行了 verify。
 
 统一 Target-step 必须单独采一组 profile，仍然不带 `target-decode1`；三组 metric 不要塞进同一
 采集进程：
@@ -1794,7 +1847,8 @@ jq -e '
    正式 latency 基线。
 5. 关闭 msprof，以同 prompt/token 上限运行 3 warmup + 10 measurement。
 6. 先要求 ordinary/DFlash token ID、EOS、stop reason 全部零差异，再比较 median、p90、TTFT、
-   TPOT、每轮同步数、实际 transaction/物理 T 和接受率；同步窗口 1/2 也必须正反顺序单独 A/B。
+   TPOT、每轮同步数、实际 transaction/物理 T 和接受率；同步窗口 1/2/4/8 也必须正反顺序
+   单独 A/B。
 7. 只提升通过上述门禁且端到端最快的拓扑。
 
 单 OM 的 msprof 命令已经写在 `docs/QUANT_AIR_OM_FRAMEWORK.md` 的“单独 profile 每个 OM”章节。

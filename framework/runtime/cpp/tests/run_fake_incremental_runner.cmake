@@ -140,6 +140,10 @@ string(JSON speculative_windows GET "${report}" execution_io_counters speculativ
 string(JSON speculative_syncs_elided GET "${report}" execution_io_counters speculative_synchronizations_elided)
 string(JSON speculative_d2h_elided GET "${report}" execution_io_counters speculative_d2h_operations_elided)
 string(JSON speculative_d2h_padding GET "${report}" execution_io_counters speculative_d2h_padding_bytes)
+string(JSON speculative_staging_operations GET "${report}" execution_io_counters speculative_window_staging_operations)
+string(JSON speculative_staging_bytes GET "${report}" execution_io_counters speculative_window_staging_bytes)
+string(JSON speculative_staging_device_bytes GET "${report}" execution_io_counters speculative_window_staging_device_bytes)
+string(JSON speculative_staging_host_bytes GET "${report}" execution_io_counters speculative_window_staging_pinned_host_bytes)
 string(JSON prefill_verify_windows GET "${report}" execution_io_counters prefill_verify_coalesced_windows)
 string(JSON prefill_verify_syncs_elided GET "${report}" execution_io_counters prefill_verify_synchronizations_elided)
 string(JSON prefill_verify_d2h_elided GET "${report}" execution_io_counters prefill_verify_d2h_operations_elided)
@@ -221,6 +225,8 @@ string(JSON compact_verify_bytes GET "${report}" execution_io_counters compact_v
 string(JSON memory_compact_slot_bytes GET "${report}" model_memory_query compact_slot_bytes)
 string(JSON memory_compact_ordinary_bytes GET "${report}" model_memory_query compact_ordinary_result_bytes)
 string(JSON memory_compact_verify_bytes GET "${report}" model_memory_query compact_verify_result_bytes)
+string(JSON memory_speculative_staging_device_bytes GET "${report}" model_memory_query speculative_window_staging_device_bytes)
+string(JSON memory_speculative_staging_host_bytes GET "${report}" model_memory_query speculative_window_staging_pinned_host_bytes)
 string(JSON proposal_uploads GET "${report}" execution_io_counters proposal_count_upload_operations)
 string(JSON proposal_upload_bytes GET "${report}" execution_io_counters proposal_count_upload_bytes)
 string(JSON proposal_staging_bytes GET "${report}" execution_io_counters proposal_count_staging_pinned_host_bytes)
@@ -235,6 +241,7 @@ math(EXPR expected_synchronizations "${prefill_completions} + ${decode_execution
 math(EXPR closed_speculative_transactions "${speculative_windows} + ${speculative_syncs_elided} + ${prefill_verify_windows}")
 math(EXPR closed_d2h_transactions "${d2h_operations} + ${speculative_d2h_elided} + ${prefill_verify_d2h_elided}")
 math(EXPR expected_speculative_d2h_padding "${speculative_d2h_elided} * (${compact_slot_bytes} - ${compact_verify_bytes})")
+math(EXPR expected_speculative_staging_bytes "${speculative_staging_operations} * ${compact_verify_bytes}")
 math(EXPR closed_prefill_verify_slots "${prefill_verify_slot0} + ${prefill_verify_slot1}")
 math(EXPR expected_prefill_verify_padding
   "${prefill_verify_slot0} * (${compact_slot_bytes} - ${compact_ordinary_bytes}) + ${prefill_verify_slot1} * (${compact_slot_bytes} - ${compact_verify_bytes})"
@@ -358,7 +365,7 @@ if(DECODE_CARRIER_POLICY STREQUAL "last-token-d2d")
      NOT decode_device_compactions EQUAL decode_multi_token_carrier_hits)
     message(FATAL_ERROR "fake last-token D2D counters failed: ${report}")
   endif()
-  if(NOT ADAPTIVE_PROPOSAL_COUNTS AND
+  if(NOT ADAPTIVE_PROPOSAL_COUNTS AND DFLASH_SYNC_WINDOW LESS_EQUAL 2 AND
      NOT decode_multi_token_carrier_hits GREATER 0)
     message(FATAL_ERROR "fake last-token D2D route had no multi-token hit: ${report}")
   endif()
@@ -404,18 +411,29 @@ if(DFLASH_SYNC_WINDOW EQUAL 1)
   if(NOT speculative_syncs_elided EQUAL 0)
     message(FATAL_ERROR "window-one run elided a speculative synchronization: ${report}")
   endif()
-elseif(DFLASH_SYNC_WINDOW EQUAL 2)
+elseif(DFLASH_SYNC_WINDOW GREATER 1 AND DFLASH_SYNC_WINDOW LESS_EQUAL 8)
   if(NOT speculative_syncs_elided GREATER 0)
-    message(FATAL_ERROR "window-two run did not elide a speculative synchronization: ${report}")
+    message(FATAL_ERROR "multi-transaction run did not elide a speculative synchronization: ${report}")
   endif()
 else()
   message(FATAL_ERROR "unknown DFLASH_SYNC_WINDOW=${DFLASH_SYNC_WINDOW}")
+endif()
+if(DFLASH_SYNC_WINDOW LESS_EQUAL 2)
+  if(NOT speculative_staging_operations EQUAL 0 OR
+     NOT speculative_staging_bytes EQUAL 0)
+    message(FATAL_ERROR "one/two transaction path unexpectedly staged compact results: ${report}")
+  endif()
+else()
+  if(NOT speculative_staging_operations GREATER 0 OR
+     NOT speculative_staging_bytes EQUAL expected_speculative_staging_bytes)
+    message(FATAL_ERROR "extended window did not stage compact results: ${report}")
+  endif()
 endif()
 if(ADAPTIVE_PROPOSAL_COUNTS AND
    NOT proposal_uploads EQUAL expected_dflash_requests)
   message(FATAL_ERROR "adaptive-K proposal uploads differ: ${report}")
 endif()
-if(NOT schema_version EQUAL 8 OR
+if(NOT schema_version EQUAL 9 OR
    NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR
@@ -424,11 +442,15 @@ if(NOT schema_version EQUAL 8 OR
    NOT device_memory_policy_valid OR
    NOT report_dflash_sync_window EQUAL DFLASH_SYNC_WINDOW OR
    NOT report_prefill_completion_policy STREQUAL PREFILL_COMPLETION_POLICY OR
-   NOT maximum_dflash_sync_window EQUAL 2 OR
+   NOT maximum_dflash_sync_window EQUAL 8 OR
    NOT model_executions EQUAL role_total OR
    NOT closed_speculative_transactions EQUAL verify_executions OR
    NOT speculative_d2h_elided EQUAL speculative_syncs_elided OR
    NOT speculative_d2h_padding EQUAL expected_speculative_d2h_padding OR
+   NOT speculative_staging_device_bytes EQUAL 4096 OR
+   NOT speculative_staging_host_bytes EQUAL 4096 OR
+   NOT memory_speculative_staging_device_bytes EQUAL speculative_staging_device_bytes OR
+   NOT memory_speculative_staging_host_bytes EQUAL speculative_staging_host_bytes OR
    NOT prefill_verify_windows EQUAL expected_prefill_verify_windows OR
    NOT prefill_verify_syncs_elided EQUAL prefill_verify_windows OR
    NOT prefill_verify_d2h_elided EQUAL prefill_verify_windows OR
@@ -484,7 +506,7 @@ if(NOT schema_version EQUAL 8 OR
    NOT memory_compact_ordinary_bytes EQUAL compact_ordinary_bytes OR
    NOT memory_compact_verify_bytes EQUAL compact_verify_bytes OR
    NOT proposal_upload_bytes EQUAL expected_proposal_upload_bytes OR
-   NOT proposal_staging_bytes EQUAL 8 OR
+   NOT proposal_staging_bytes EQUAL 32 OR
    NOT memory_proposal_staging_bytes EQUAL proposal_staging_bytes OR
    NOT h2d_operations EQUAL closed_h2d_operations OR
    NOT h2d_bytes EQUAL closed_h2d_bytes OR

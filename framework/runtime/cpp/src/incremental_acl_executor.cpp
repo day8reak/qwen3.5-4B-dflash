@@ -23,6 +23,7 @@ namespace {
 constexpr const char* kDynamicTensorName = "ascend_mbatch_shape_data";
 constexpr std::size_t kBufferAlignment = 64;
 constexpr std::size_t kCompactSlotCount = 2;
+constexpr std::size_t kMaxSpeculativeSyncWindow = 8;
 
 void Check(aclError code, const std::string& operation) {
   if (code != ACL_SUCCESS) {
@@ -915,41 +916,73 @@ class AclIncrementalExecutor::Impl {
         true, pending.model_executions, pending.compact_state_index);
   }
 
-  std::size_t max_speculative_sync_window() const noexcept { return 2; }
+  std::size_t max_speculative_sync_window() const noexcept {
+    return kMaxSpeculativeSyncWindow;
+  }
 
   std::vector<StatefulStep> SpeculativeWindow(
       const std::vector<std::size_t>& logical_proposal_counts) {
     if (logical_proposal_counts.size() == 1) {
       return {SpeculativeStep(logical_proposal_counts.front())};
     }
-    if (logical_proposal_counts.size() != 2) {
+    if (logical_proposal_counts.empty() ||
+        logical_proposal_counts.size() > max_speculative_sync_window()) {
       throw std::invalid_argument(
-          "ACL speculative sync window must be one or two");
+          "ACL speculative sync window must be in 1..8");
     }
     for (const std::size_t count : logical_proposal_counts) {
       RequireProposalCount(count);
     }
-    const auto first = EnqueueSpeculative(
-        logical_proposal_counts[0], false);
-    const auto second = EnqueueSpeculative(
-        logical_proposal_counts[1],
-        true,
-        logical_proposal_counts[0] + 1);
-    if (first.compact_state_index == second.compact_state_index) {
-      throw std::logic_error(
-          "speculative pair did not alternate compact output arenas");
+    if (logical_proposal_counts.size() == 2) {
+      const auto first = EnqueueSpeculative(
+          logical_proposal_counts[0], false);
+      const auto second = EnqueueSpeculative(
+          logical_proposal_counts[1],
+          true,
+          logical_proposal_counts[0] + 1);
+      if (first.compact_state_index == second.compact_state_index) {
+        throw std::logic_error(
+            "speculative pair did not alternate compact output arenas");
+      }
+      DownloadCompactPair(
+          first.compact_state_index, second.compact_state_index);
+      Synchronize();
+      ++stats_.speculative_sync_windows;
+      ++stats_.speculative_synchronizations_elided;
+      std::vector<StatefulStep> result;
+      result.reserve(2);
+      result.push_back(ReadCompactAndTrackCarrier(
+          true, first.model_executions, first.compact_state_index));
+      result.push_back(ReadCompactAndTrackCarrier(
+          true, second.model_executions, second.compact_state_index));
+      return result;
     }
-    DownloadCompactPair(
-        first.compact_state_index, second.compact_state_index);
+
+    std::vector<PendingSpeculative> pending;
+    pending.reserve(logical_proposal_counts.size());
+    for (std::size_t index = 0;
+         index < logical_proposal_counts.size(); ++index) {
+      pending.push_back(EnqueueSpeculative(
+          logical_proposal_counts[index],
+          index != 0,
+          index == 0 ? 0 : logical_proposal_counts[index - 1] + 1));
+      StageCompactForSpeculativeWindow(
+          pending.back().compact_state_index, index);
+    }
+    DownloadStagedSpeculativeWindow(pending.size());
     Synchronize();
     ++stats_.speculative_sync_windows;
-    ++stats_.speculative_synchronizations_elided;
+    stats_.speculative_synchronizations_elided += pending.size() - 1;
     std::vector<StatefulStep> result;
-    result.reserve(2);
-    result.push_back(ReadCompactAndTrackCarrier(
-        true, first.model_executions, first.compact_state_index));
-    result.push_back(ReadCompactAndTrackCarrier(
-        true, second.model_executions, second.compact_state_index));
+    result.reserve(pending.size());
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+      result.push_back(ReadCompactAndTrackCarrierFrom(
+          speculative_window_compact_,
+          kMaxSpeculativeSyncWindow,
+          true,
+          pending[index].model_executions,
+          index));
+    }
     return result;
   }
 
@@ -1522,6 +1555,18 @@ class AclIncrementalExecutor::Impl {
     compact_.Allocate(compact_slot_bytes_ * kCompactSlotCount);
     stats_.compact_slot_bytes = compact_slot_bytes_;
     stats_.compact_ping_pong_device_bytes = compact_.device.bytes;
+    if (compact_slot_bytes_ >
+        std::numeric_limits<std::size_t>::max() /
+            kMaxSpeculativeSyncWindow) {
+      throw std::overflow_error(
+          "speculative compact staging arena size overflow");
+    }
+    speculative_window_compact_.Allocate(
+        compact_slot_bytes_ * kMaxSpeculativeSyncWindow);
+    stats_.speculative_window_staging_device_bytes =
+        speculative_window_compact_.device.bytes;
+    stats_.speculative_window_staging_pinned_host_bytes =
+        speculative_window_compact_.bytes;
 
     const std::size_t prefill_feature_payload = prefill_.outputs[1].bytes;
     if (prefill_feature_payload % kBufferAlignment != 0) {
@@ -1571,7 +1616,9 @@ class AclIncrementalExecutor::Impl {
 
     stats_.carrier_device_bytes =
         prefill_control_.device.bytes + decode_id_.device.bytes +
-        stats_.compact_ping_pong_device_bytes + prefill_features_.bytes +
+        stats_.compact_ping_pong_device_bytes +
+        stats_.speculative_window_staging_device_bytes +
+        prefill_features_.bytes +
         prefill_last_hidden_.bytes + committed_input_count_.bytes +
         verify_ids_.bytes +
         verify_dynamic_control_.bytes;
@@ -2192,7 +2239,8 @@ class AclIncrementalExecutor::Impl {
     HostAllocation& staging =
         proposal_count_upload_host_[proposal_count_upload_staging_index_];
     proposal_count_upload_staging_index_ =
-        1 - proposal_count_upload_staging_index_;
+        (proposal_count_upload_staging_index_ + 1) %
+        proposal_count_upload_host_.size();
     void* host = staging.data;
     *static_cast<std::int32_t*>(host) =
         static_cast<std::int32_t>(value);
@@ -2395,6 +2443,59 @@ class AclIncrementalExecutor::Impl {
         compact_slot_bytes_ - compact_verify_bytes_;
   }
 
+  void StageCompactForSpeculativeWindow(
+      std::size_t state_index,
+      std::size_t staging_index) {
+    if (state_index >= kCompactSlotCount ||
+        staging_index >= kMaxSpeculativeSyncWindow) {
+      throw std::out_of_range(
+          "speculative compact staging index is invalid");
+    }
+    const std::size_t source_offset = state_index * compact_slot_bytes_;
+    const std::size_t destination_offset = staging_index * compact_slot_bytes_;
+    Check(
+        aclrtMemcpyAsync(
+            static_cast<std::byte*>(speculative_window_compact_.device.data) +
+                destination_offset,
+            speculative_window_compact_.device.bytes - destination_offset,
+            static_cast<const std::byte*>(compact_.device.data) +
+                source_offset,
+            compact_verify_bytes_,
+            ACL_MEMCPY_DEVICE_TO_DEVICE,
+            stream_),
+        "aclrtMemcpyAsync(speculative compact device staging)");
+    stream_work_pending_ = true;
+    ++stats_.speculative_window_staging_operations;
+    stats_.speculative_window_staging_bytes += compact_verify_bytes_;
+  }
+
+  void DownloadStagedSpeculativeWindow(std::size_t transaction_count) {
+    if (transaction_count < 3 ||
+        transaction_count > kMaxSpeculativeSyncWindow) {
+      throw std::out_of_range(
+          "staged speculative transaction count is invalid");
+    }
+    const std::size_t bytes =
+        (transaction_count - 1) * compact_slot_bytes_ +
+        compact_verify_bytes_;
+    Check(
+        aclrtMemcpyAsync(
+            speculative_window_compact_.host,
+            speculative_window_compact_.bytes,
+            speculative_window_compact_.device.data,
+            bytes,
+            ACL_MEMCPY_DEVICE_TO_HOST,
+            stream_),
+        "aclrtMemcpyAsync(staged speculative window device-to-host)");
+    stream_work_pending_ = true;
+    ++stats_.device_to_host_operations;
+    stats_.device_to_host_bytes += bytes;
+    stats_.speculative_d2h_operations_elided += transaction_count - 1;
+    stats_.speculative_d2h_padding_bytes +=
+        (transaction_count - 1) *
+        (compact_slot_bytes_ - compact_verify_bytes_);
+  }
+
   void DownloadPrefillVerifyPair(
       std::size_t prefill_state_index,
       std::size_t verify_state_index) {
@@ -2442,17 +2543,22 @@ class AclIncrementalExecutor::Impl {
     ++stats_.stream_synchronizations;
   }
 
-  StatefulStep ReadCompact(
+  StatefulStep ReadCompactFrom(
+      const MirrorBuffer& source,
+      std::size_t source_slot_count,
       bool verify,
       std::size_t model_executions,
       std::size_t state_index) const {
-    if (state_index >= kCompactSlotCount) {
+    if (source_slot_count == 0 || state_index >= source_slot_count ||
+        source_slot_count >
+            std::numeric_limits<std::size_t>::max() / compact_slot_bytes_ ||
+        source.bytes < source_slot_count * compact_slot_bytes_) {
       throw std::out_of_range("compact read state index is invalid");
     }
     const std::size_t slot_offset = state_index * compact_slot_bytes_;
     const std::int32_t commit_count =
         ReadAt<std::int32_t>(
-            compact_, slot_offset + compact_commit_offset_);
+            source, slot_offset + compact_commit_offset_);
     if (commit_count <= 0 ||
         static_cast<std::size_t>(commit_count) > verify_width_) {
       throw std::runtime_error("Target graph returned an invalid commit count");
@@ -2461,12 +2567,12 @@ class AclIncrementalExecutor::Impl {
         static_cast<std::size_t>(commit_count));
     std::memcpy(
         tokens.data(),
-        static_cast<const std::byte*>(compact_.host) + slot_offset +
+        static_cast<const std::byte*>(source.host) + slot_offset +
             compact_token_offset_,
         tokens.size() * sizeof(std::int64_t));
     const bool finished =
         ReadAt<std::uint8_t>(
-            compact_, slot_offset + compact_finished_offset_) != 0;
+            source, slot_offset + compact_finished_offset_) != 0;
     StatefulStep result;
     result.token_ids = std::move(tokens);
     result.model_executions = model_executions;
@@ -2474,13 +2580,13 @@ class AclIncrementalExecutor::Impl {
     if (verify) {
       const std::int32_t drafted =
           ReadAt<std::int32_t>(
-              compact_, slot_offset + compact_drafted_offset_);
+              source, slot_offset + compact_drafted_offset_);
       const std::int32_t accepted =
           ReadAt<std::int32_t>(
-              compact_, slot_offset + compact_accepted_offset_);
+              source, slot_offset + compact_accepted_offset_);
       const std::int32_t rejected =
           ReadAt<std::int32_t>(
-              compact_, slot_offset + compact_rejected_offset_);
+              source, slot_offset + compact_rejected_offset_);
       if (drafted <= 0 || accepted < 0 || rejected < 0) {
         throw std::runtime_error("verify graph returned negative/zero counters");
       }
@@ -2491,11 +2597,38 @@ class AclIncrementalExecutor::Impl {
     return result;
   }
 
+  StatefulStep ReadCompact(
+      bool verify,
+      std::size_t model_executions,
+      std::size_t state_index) const {
+    return ReadCompactFrom(
+        compact_, kCompactSlotCount, verify, model_executions, state_index);
+  }
+
+  StatefulStep ReadCompactAndTrackCarrierFrom(
+      const MirrorBuffer& source,
+      std::size_t source_slot_count,
+      bool verify,
+      std::size_t model_executions,
+      std::size_t state_index) {
+    StatefulStep result = ReadCompactFrom(
+        source,
+        source_slot_count,
+        verify,
+        model_executions,
+        state_index);
+    return TrackCompactCarrier(verify, std::move(result));
+  }
+
   StatefulStep ReadCompactAndTrackCarrier(
       bool verify,
       std::size_t model_executions,
       std::size_t state_index) {
     StatefulStep result = ReadCompact(verify, model_executions, state_index);
+    return TrackCompactCarrier(verify, std::move(result));
+  }
+
+  StatefulStep TrackCompactCarrier(bool verify, StatefulStep result) {
     if (verify) {
       if (result.accepted_draft_tokens >= verify_width_) {
         throw std::runtime_error(
@@ -2580,6 +2713,7 @@ class AclIncrementalExecutor::Impl {
     committed_input_count_.Release();
     prefill_last_hidden_.Release();
     prefill_features_.Release();
+    speculative_window_compact_.Release();
     compact_.Release();
     for (auto& host : extra_prefill_control_host_) {
       host.Release();
@@ -2670,8 +2804,10 @@ class AclIncrementalExecutor::Impl {
   MirrorBuffer prefill_control_;
   MirrorBuffer decode_id_;
   std::vector<HostAllocation> extra_prefill_control_host_;
-  std::array<HostAllocation, 2> proposal_count_upload_host_;
+  std::array<HostAllocation, kMaxSpeculativeSyncWindow>
+      proposal_count_upload_host_;
   MirrorBuffer compact_;
+  MirrorBuffer speculative_window_compact_;
   DeviceAllocation prefill_features_;
   DeviceAllocation prefill_last_hidden_;
   DeviceAllocation committed_input_count_;

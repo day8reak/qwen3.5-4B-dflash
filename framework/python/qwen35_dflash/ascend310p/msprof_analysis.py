@@ -175,6 +175,13 @@ def _validate_runner_report(
         raise MsprofAnalysisError(
             "runner device memory allocation policy is invalid"
         )
+    requested_sync_window = protocol.get("dflash_sync_window", 1)
+    if int(report.get("schema_version", 0)) >= 9 and (
+        isinstance(requested_sync_window, bool)
+        or not isinstance(requested_sync_window, int)
+        or not 1 <= requested_sync_window <= 8
+    ):
+        raise MsprofAnalysisError("runner DFlash sync window is invalid")
     models = report.get("models")
     if not isinstance(models, list) or not models:
         raise MsprofAnalysisError("runner report omitted resident models")
@@ -219,6 +226,24 @@ def _validate_runner_report(
         compact_slot_bytes = counters.get("compact_slot_bytes")
         compact_ordinary_bytes = counters.get("compact_ordinary_result_bytes")
         compact_verify_bytes = counters.get("compact_verify_result_bytes")
+        if int(report.get("schema_version", 0)) >= 9:
+            speculative_staging_operations = counters.get(
+                "speculative_window_staging_operations"
+            )
+            speculative_staging_bytes = counters.get(
+                "speculative_window_staging_bytes"
+            )
+            speculative_staging_device_bytes = counters.get(
+                "speculative_window_staging_device_bytes"
+            )
+            speculative_staging_host_bytes = counters.get(
+                "speculative_window_staging_pinned_host_bytes"
+            )
+        else:
+            speculative_staging_operations = 0
+            speculative_staging_bytes = 0
+            speculative_staging_device_bytes = 0
+            speculative_staging_host_bytes = 0
         prefill_completions = counters.get(
             "prefill_completion_synchronizations"
         )
@@ -277,6 +302,10 @@ def _validate_runner_report(
             prefill_verify_padding,
             prefill_verify_slot0,
             prefill_verify_slot1,
+            speculative_staging_operations,
+            speculative_staging_bytes,
+            speculative_staging_device_bytes,
+            speculative_staging_host_bytes,
         )
         if any(
             isinstance(value, bool)
@@ -312,6 +341,24 @@ def _validate_runner_report(
             or speculative_d2h_padding
             != speculative_d2h_elided
             * (compact_slot_bytes - compact_verify_bytes)
+            or speculative_staging_bytes
+            != speculative_staging_operations * compact_verify_bytes
+            or speculative_staging_operations > verify_transactions
+            or (
+                int(report.get("schema_version", 0)) >= 9
+                and requested_sync_window <= 2
+                and speculative_staging_operations != 0
+            )
+            or (
+                int(report.get("schema_version", 0)) >= 9
+                and (
+                    protocol.get("maximum_supported_dflash_sync_window") != 8
+                    or speculative_staging_device_bytes
+                    != 8 * compact_slot_bytes
+                    or speculative_staging_host_bytes
+                    != speculative_staging_device_bytes
+                )
+            )
             or prefill_verify_padding
             != prefill_verify_slot0
             * (compact_slot_bytes - compact_ordinary_bytes)
@@ -852,6 +899,12 @@ def analyze_incremental_msprof(
     speculative_d2h_padding = int(
         counters.get("speculative_d2h_padding_bytes", 0)
     )
+    speculative_staging_operations = int(
+        counters.get("speculative_window_staging_operations", 0)
+    )
+    speculative_staging_bytes = int(
+        counters.get("speculative_window_staging_bytes", 0)
+    )
     prefill_verify_windows = int(
         counters.get("prefill_verify_coalesced_windows", 0)
     )
@@ -870,6 +923,7 @@ def analyze_incremental_msprof(
             int(counters["host_to_device_operations"])
             + int(counters["device_to_host_operations"])
             + int(counters["decode_id_device_compaction_operations"])
+            + speculative_staging_operations
         ),
         "aclrtMemsetAsync": (
             int(counters["state_memset_operations"])
@@ -969,6 +1023,10 @@ def analyze_incremental_msprof(
                 "operations": counters["decode_id_device_compaction_operations"],
                 "bytes": counters["decode_id_device_compaction_bytes"],
             },
+            "device_to_device_speculative_staging": {
+                "operations": speculative_staging_operations,
+                "bytes": speculative_staging_bytes,
+            },
             "manual_timeline_gate": (
                 "Match these direction/count/byte totals against MemcpyAsync "
                 "events; api_statistic has duration/count but no copy size."
@@ -1011,6 +1069,10 @@ def analyze_incremental_msprof(
             "speculative_synchronizations_elided": speculative_elided,
             "speculative_d2h_operations_elided": speculative_d2h_elided,
             "speculative_d2h_padding_bytes": speculative_d2h_padding,
+            "speculative_window_staging_operations": (
+                speculative_staging_operations
+            ),
+            "speculative_window_staging_bytes": speculative_staging_bytes,
             "prefill_verify_coalesced_windows": prefill_verify_windows,
             "prefill_verify_synchronizations_elided": (
                 prefill_verify_syncs_elided

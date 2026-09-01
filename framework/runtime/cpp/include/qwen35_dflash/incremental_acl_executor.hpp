@@ -62,7 +62,8 @@ enum class IncrementalDraftFeaturePolicy {
   // Preserve the original physical Draft context input N=16 after verify.
   kFixedVerifyWidth,
   // Bind only the leading committed Target feature rows when host-visible;
-  // an unsynchronized second transaction uses the exact causal upper bound.
+  // each later unsynchronized transaction uses its predecessor's exact causal
+  // upper bound.
   kCommittedPrefix,
 };
 
@@ -81,6 +82,10 @@ struct IncrementalAclExecutionStats {
   std::size_t speculative_synchronizations_elided = 0;
   std::size_t speculative_d2h_operations_elided = 0;
   std::size_t speculative_d2h_padding_bytes = 0;
+  std::size_t speculative_window_staging_operations = 0;
+  std::size_t speculative_window_staging_bytes = 0;
+  std::size_t speculative_window_staging_device_bytes = 0;
+  std::size_t speculative_window_staging_pinned_host_bytes = 0;
   std::size_t prefill_verify_coalesced_windows = 0;
   std::size_t prefill_verify_synchronizations_elided = 0;
   std::size_t prefill_verify_d2h_operations_elided = 0;

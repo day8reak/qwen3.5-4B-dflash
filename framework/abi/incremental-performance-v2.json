@@ -1,5 +1,5 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
   "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
   "approval": {
@@ -9,7 +9,7 @@
     "scope": "explicit multi-OM device-state graph boundaries and exact device-side accept/commit",
     "approximation_approved": false
   },
-  "objective": "strict-greedy batch-1 generation with persistent device state, no historical-prefix recompute, a measured one- or two-transaction decode synchronization window, and an optional final-prefill/first-verify completion window",
+  "objective": "strict-greedy batch-1 generation with persistent device state, no historical-prefix recompute, an exact selectable one-to-eight-transaction decode synchronization window, and an optional final-prefill/first-verify completion window",
   "non_negotiable_correctness": {
     "ordinary_target_is_authoritative": true,
     "allowed_token_id_mismatches": 0,
@@ -39,6 +39,7 @@
     "paged_kv_block": 64,
     "maximum_verify_rows": 16,
     "maximum_proposals": 15,
+    "maximum_dflash_sync_window": 8,
     "physical_verify_rows": 16,
     "physical_proposal_rows": 15,
     "eos_table_width": "fixed at export time and at least one"
@@ -327,7 +328,7 @@
     "draft_feature_dynamic_gears": "one Draft OM contains verify-source N=1..16 plus prompt-source N=64,128,...,kv_cache_max_len; tensor order and weights are unchanged",
     "draft_feature_policies": {
       "fixed-16": "default rollback and matched baseline; every verify-source Draft execution binds N=16",
-      "committed-prefix": "inactive exact candidate; after a synchronized verify bind N=accepted_count+1, while an unsynchronized second transaction binds the causal upper bound N=previous logical K+1"
+      "committed-prefix": "inactive exact candidate; after a synchronized verify bind N=accepted_count+1, while each later unsynchronized transaction binds its predecessor's causal upper bound N=previous logical K+1"
     },
     "draft_feature_liveness_proof": "only Draft KV positions below logical_draft_cursor are authoritative; fixed-16 suffix writes are masked scratch, and every omitted position is overwritten before the logical cursor can expose it",
     "draft_feature_selection_gate": "hold runner binary, all OM hashes, prompt/token limits, reset/decode/sync-window policies and device identity fixed; require zero token/EOS mismatch and closed row/route counters; select committed-prefix only when real 310P unprofiled 3+10 median and p90 improve outside measurement noise, otherwise retain fixed-16",
@@ -339,7 +340,7 @@
     },
     "decode_carrier_selection_gate": "compare both policies with the same runner binary, OM hashes, prompt/token limits, reset policy, device identity and alternating order; require zero token/EOS mismatch and unprofiled 3 warmups plus 10 measurements, then select last-token-d2d only when its median and p90 improve measurably; retain one-token-h2d when the result is a tie or within measurement noise; msprof is diagnostic only",
     "rejected_unaligned_multi_row_binding": "compact token rows 1 through 15 begin at 8-byte strides and cannot be bound directly as model inputs under the 64-byte AscendCL input-address rule; Fake ACL must reject that plan, so later rows use the aligned scalar D2D route",
-    "synchronization": "default window 1 exposes one host-visible synchronization after each verify/commit; exact candidate window 2 queues two complete dependent Draft-to-verify transactions; an independent exact prefill completion candidate queues final prefill plus first verify before one contiguous D2H and one stream synchronization",
+    "synchronization": "default window 1 exposes one host-visible synchronization after each verify/commit; exact candidates 2..8 queue that many budget-safe dependent Draft-to-verify transactions; an independent exact prefill completion candidate queues final prefill plus first verify before one contiguous D2H and one stream synchronization",
     "prefill_completion_policies": {
       "separate": "default rollback baseline; final prefill compact result is downloaded and synchronized before the first verify",
       "coalesce-first-verify": "inactive exact candidate; when max_new_tokens is greater than two, final prefill and the already-prepared first verify share one contiguous compact D2H and one stream synchronization"
@@ -351,13 +352,14 @@
     "prefill_first_verify_selection_gate": "hold runner binary, OM hashes, prompt, token limits and all other policies fixed; require zero token/EOS mismatch and closed counters, then select coalesce-first-verify only when real 310P unprofiled 3+10 model_total median/p90 improves and the delayed TTFT is acceptable; otherwise retain separate",
     "dflash_sync_window_policies": {
       "1": "default and rollback baseline; one speculative transaction per host-visible synchronization",
-      "2": "inactive performance candidate; at most two complete speculative transactions use the existing compact ping-pong arenas and one host-visible synchronization"
+      "2": "inactive performance candidate; at most two complete speculative transactions use the existing compact ping-pong arenas and one host-visible synchronization",
+      "3..8": "inactive exact performance candidates; every compact result is copied D2D from the two state-coupled ping-pong slots into an eight-slot staging arena, followed by one contiguous D2H and one host-visible synchronization"
     },
-    "dflash_sync_window_budget_guard": "the first transaction chooses K0=min(max_draft,15,remaining-1); after reserving its worst-case K0+1 commit, window 2 is used only when at least two tokens remain, with K1=min(max_draft,15,residual-1), so K1 may be smaller and neither transaction can exceed max_new_tokens",
-    "dflash_sync_window_proposal_count_staging": "two dedicated 4-byte pinned-host scalar slots (8 bytes total) preserve asynchronous H2D source lifetime when K0 and K1 differ; the single device proposal-count carrier is updated in stream order before the corresponding Draft/verify execution",
-    "dflash_sync_window_compact_download": "the two 64-byte-aligned compact slots share one contiguous 1024-byte arena; window 1 downloads the exact 257-byte ordinary or 452-byte verify result, while a two-transaction window downloads 512+452=964 contiguous bytes in one D2H call, trading 60 padding bytes for one fewer D2H API call and one fewer stream barrier",
-    "dflash_sync_window_eos_policy": "the second transaction may already be queued when the first compact result reports EOS; host commit still stops at the first EOS and ignores the later result, so token IDs remain exact but EOS-heavy requests may perform bounded useless device work",
-    "dflash_sync_window_selection_gate": "hold runner binary, OM hashes, prompt, token limits, state reset, decode carrier, device identity and paired alternating order fixed; require identical ordinary/DFlash token IDs and EOS, record any adaptive-K change in transactions, physical rows, acceptance, H2D and D2H, and select window 2 only when unprofiled 3+10 DFlash median and p90 improve outside measurement noise; otherwise retain window 1",
+    "dflash_sync_window_budget_guard": "starting from remaining, repeatedly choose Ki=min(max_draft,15,residual-1), reserve the worst-case Ki+1 commit, and stop at the requested window or residual<=1; every queued transaction therefore fits max_new_tokens even under full acceptance, and the final Ki may shrink",
+    "dflash_sync_window_proposal_count_staging": "eight dedicated 4-byte pinned-host scalar slots (32 bytes total) preserve asynchronous H2D source lifetime for every legal caller-supplied K sequence; the single device proposal-count carrier is updated in stream order before the corresponding Draft/verify execution",
+    "dflash_sync_window_compact_download": "the two 64-byte-aligned state-coupled compact slots share one 1024-byte ping-pong arena; window 1 downloads one exact result and window 2 downloads 512+452=964 bytes directly, while windows 3..8 copy each 452-byte result D2D into a separate eight-slot 4096-byte device/pinned-host arena and issue one contiguous D2H with 60 padding bytes per elided result",
+    "dflash_sync_window_eos_policy": "later transactions may already be queued when an earlier compact result reports EOS; host commit reads results in order, stops at the first EOS and ignores later results, so token IDs remain exact but rejection- or EOS-heavy requests may perform bounded useless device work that grows with the selected window",
+    "dflash_sync_window_selection_gate": "hold runner binary, OM hashes, prompt, token limits, state reset, decode carrier, device identity and paired alternating order fixed; sweep 1,2,4,8 in forward and reverse order, require identical ordinary/DFlash token IDs and EOS, record adaptive-K transactions, physical rows, acceptance, H2D, D2H, D2D staging and barriers, and select a window above 1 only when real Ascend310P unprofiled 3+10 DFlash median and p90 improve outside measurement noise on representative length/acceptance/EOS cases; otherwise retain window 1",
     "ordinary": "never execute Draft",
     "prefill": "never execute Draft proposal or full LM head for non-final prompt chunks",
     "prefill_control_prefix_policy": "one aligned carrier uses exactly one H2D per chunk: base ends after IDs/effective length, count extends through the final-Draft cumulative prompt count, proposal extends through a changed proposal count, and full extends through the process-resident EOS table/count only on first use or EOS identity change",
@@ -377,6 +379,8 @@
       "device_to_host_operations + speculative_d2h_operations_elided + prefill_verify_d2h_operations_elided == prefill_completion_synchronizations + target_decode1_executions + target_verify_commit_executions",
       "speculative_d2h_operations_elided == speculative_synchronizations_elided",
       "speculative_d2h_padding_bytes == speculative_d2h_operations_elided * (compact_slot_bytes - compact_verify_result_bytes)",
+      "speculative_window_staging_bytes == speculative_window_staging_operations * compact_verify_result_bytes",
+      "speculative_window_staging_device_bytes == 8 * compact_slot_bytes and speculative_window_staging_pinned_host_bytes == speculative_window_staging_device_bytes",
       "prefill_verify_synchronizations_elided == prefill_verify_coalesced_windows",
       "prefill_verify_d2h_operations_elided == prefill_verify_coalesced_windows",
       "prefill_verify_prefill_slot0_windows + prefill_verify_prefill_slot1_windows == prefill_verify_coalesced_windows",
@@ -387,7 +391,7 @@
       "draft_dynamic_gear_count == draft_verify_dynamic_gear_count + draft_prefill_dynamic_gear_count, with verify gears 16 and prefill gears kv_cache_max_len/64",
       "unified target_step_zero_count_device_bytes == 4 and target_step_zero_count_bindings == target_decode1_executions",
       "five-artifact target_step_zero_count_device_bytes == 0 and target_step_zero_count_bindings == 0",
-      "compact_ping_pong_device_bytes is positive and included in carrier_device_bytes"
+      "compact_ping_pong_device_bytes and speculative_window_staging_device_bytes are positive and included in carrier_device_bytes"
     ],
     "fake_acl_70_token_paired_3_plus_10": {
       "classification": "host structural evidence only; not Ascend310P latency",
@@ -543,7 +547,7 @@
       "host_to_device_operations_both": 65,
       "host_to_device_bytes_both": 32180,
       "proposal_count_upload_operations_both": 13,
-      "proposal_count_staging_pinned_host_bytes_both": 8,
+      "proposal_count_staging_pinned_host_bytes_both": 32,
       "window_1_device_to_host_operations": 455,
       "window_2_device_to_host_operations": 442,
       "window_1_device_to_host_bytes": 122005,
@@ -562,6 +566,32 @@
       "per_dflash_measurement_windows_before": 2,
       "per_dflash_measurement_windows_after": 1,
       "claim_boundary": "adaptive K, asynchronous proposal-count lifetime and exact host barrier reduction close under Fake ACL; no physical-device speedup is claimed and window 1 remains the default"
+    },
+    "fake_acl_extended_sync_window_70_token_58_output_paired_3_plus_10": {
+      "classification": "host structural evidence only for the extended staging route; Fake ACL timing is not Ascend310P latency",
+      "requested_sync_window": 8,
+      "actual_transactions_per_dflash_request": 4,
+      "proposal_counts_per_dflash_request": [15, 15, 15, 8],
+      "stable_generated_token_count": 58,
+      "stable_first_token": 11,
+      "stable_last_token": 68,
+      "stable_stop_reason": "length",
+      "token_id_mismatches": 0,
+      "eos_mismatches": 0,
+      "paired_dflash_requests": 13,
+      "target_verify_commit_executions": 52,
+      "speculative_sync_windows": 13,
+      "speculative_synchronizations_elided": 39,
+      "speculative_d2h_operations_elided": 39,
+      "speculative_d2h_padding_bytes": 2340,
+      "speculative_window_staging_operations": 52,
+      "speculative_window_staging_bytes": 23504,
+      "speculative_window_staging_device_bytes": 4096,
+      "speculative_window_staging_pinned_host_bytes": 4096,
+      "proposal_count_staging_pinned_host_bytes": 32,
+      "five_artifact_status": "PASS",
+      "unified_target_step_status": "PASS",
+      "claim_boundary": "both physical topologies preserve strict token/EOS parity and close four transactions into one barrier under Fake ACL; real Ascend310P 1/2/4/8 forward-and-reverse 3+10 evidence is still required and window 1 remains default"
     }
   },
   "activation_gate": {
@@ -573,10 +603,12 @@
       "Draft AIR/ATC success for every N=1..16 verify gear and every 64-row prompt gear",
       "ordinary and DFlash zero token/EOS mismatch",
       "fixed-16 versus committed-prefix zero token/EOS mismatch with visible Draft KV equality below logical_draft_cursor",
+      "DFlash sync windows 1,2,4,8 zero token/EOS mismatch on representative full-accept, rejection and early-EOS cases",
       "fixed-T16 causal scratch-suffix tests for logical K=1/3/5/7/15",
       "state rejection tests across positions 62/63/64/65",
       "full candidate-set memory/load report",
       "same-device unprofiled 3+10 fixed-16 versus committed-prefix performance comparison plus msprof physical-row attribution",
+      "same-device forward/reverse DFlash sync-window 1,2,4,8 comparison with D2D/D2H/barrier closure and unprofiled median/p90 evidence",
       "same-device forward/reverse normal-only versus huge-first build comparison with policy identity, memory headroom, zero mismatch and unprofiled median/p90 evidence before changing the allocation default"
     ]
   },

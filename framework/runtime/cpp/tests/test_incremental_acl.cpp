@@ -42,7 +42,7 @@ void RunPolicy(
   Require(executor.proposal_width() == 15, "fake proposal width differs");
   Require(executor.eos_table_width() == 4, "fake EOS width differs");
   Require(
-      executor.max_speculative_sync_window() == 2,
+      executor.max_speculative_sync_window() == 8,
       "fake executor sync-window capability differs");
   Require(executor.state_reset_policy() == reset_policy, "reset policy differs");
   Require(
@@ -140,7 +140,7 @@ void RunPolicy(
           stats.prefill_proposal_control_bytes_per_slot == 708 &&
           stats.prefill_persistent_control_tail_bytes_per_slot == 188 &&
           stats.prefill_staging_pinned_host_bytes == 1792 &&
-          stats.proposal_count_staging_pinned_host_bytes == 8,
+          stats.proposal_count_staging_pinned_host_bytes == 32,
       "prefill pinned-host staging ring differs");
   Require(
       stats.prefill_draft_propose_executions == 3 &&
@@ -244,7 +244,15 @@ void RunPolicy(
           stats.compact_slot_bytes == 512 &&
           stats.compact_ordinary_result_bytes == 257 &&
           stats.compact_verify_result_bytes == 452 &&
-          stats.carrier_device_bytes > stats.compact_ping_pong_device_bytes,
+          stats.speculative_window_staging_device_bytes ==
+              8 * stats.compact_slot_bytes &&
+          stats.speculative_window_staging_pinned_host_bytes ==
+              stats.speculative_window_staging_device_bytes &&
+          stats.speculative_window_staging_operations == 0 &&
+          stats.speculative_window_staging_bytes == 0 &&
+          stats.carrier_device_bytes >
+              stats.compact_ping_pong_device_bytes +
+                  stats.speculative_window_staging_device_bytes,
       "compact result ping-pong allocation was not reported");
   Require(stats.state_reset_bytes_per_request > 0, "reset byte set is empty");
   Require(
@@ -471,16 +479,19 @@ void TestCommittedDraftFeaturePrefix(
       "committed-prefix Draft feature policy was not selected");
 
   qwen35::dflash::GenerationOptions options;
-  options.max_new_tokens = 10;
-  options.max_draft_tokens = 3;
+  options.max_new_tokens = sync_window > 2 ? 30 : 10;
+  options.max_draft_tokens = sync_window > 2 ? 7 : 3;
   options.dflash_sync_window = sync_window;
   const auto generated = qwen35::dflash::GenerateStatefulOnce(
       executor,
       {10},
       qwen35::dflash::GenerationMode::kDFlash,
       options);
-  const std::vector<std::int64_t> expected{
-      11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
+  std::vector<std::int64_t> expected;
+  expected.reserve(options.max_new_tokens);
+  for (std::size_t index = 0; index < options.max_new_tokens; ++index) {
+    expected.push_back(11 + static_cast<std::int64_t>(index));
+  }
   Require(
       generated.generated_token_ids == expected,
       "committed-prefix Draft route changed exact generated tokens");
@@ -518,7 +529,15 @@ void TestCommittedDraftFeaturePrefix(
   } else {
     Require(
         stats.draft_verify_pending_upper_bound_executions > 0,
-        "window-two Draft did not use its causal pending upper bound");
+        "multi-transaction Draft did not use its causal pending upper bound");
+  }
+  if (sync_window > 2) {
+    Require(
+        stats.speculative_window_staging_operations > 0 &&
+            stats.speculative_window_staging_bytes ==
+                stats.speculative_window_staging_operations *
+                    stats.compact_verify_result_bytes,
+        "extended committed-prefix window did not stage compact results");
   }
 }
 
@@ -587,6 +606,41 @@ void TestPrefillVerifyCoalescing(
       "prefill/verify D2H accounting does not close");
 }
 
+void TestExtendedSpeculativeWindow(
+    const std::array<std::filesystem::path, 5>& model_paths) {
+  qwen35::dflash::IncrementalOmPaths paths{
+      model_paths[0], model_paths[1], model_paths[2], model_paths[3],
+      model_paths[4]};
+  qwen35::dflash::AclIncrementalExecutor executor(std::move(paths));
+  qwen35::dflash::GenerationOptions options;
+  options.max_new_tokens = 58;
+  options.max_draft_tokens = 15;
+  options.dflash_sync_window = 8;
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kOrdinary,
+      options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kDFlash,
+      options);
+  Require(
+      ordinary.generated_token_ids == dflash.generated_token_ids &&
+          dflash.generated_token_ids.size() == options.max_new_tokens,
+      "extended speculative window changed exact generated tokens");
+  const auto& stats = executor.execution_stats();
+  Require(
+      stats.speculative_sync_windows == 1 &&
+          stats.speculative_synchronizations_elided == 3 &&
+          stats.speculative_d2h_operations_elided == 3 &&
+          stats.speculative_window_staging_operations == 4 &&
+          stats.speculative_window_staging_bytes ==
+              4 * stats.compact_verify_result_bytes,
+      "extended speculative window did not close four transactions in one barrier");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -624,7 +678,9 @@ int main(int argc, char** argv) {
     TestExplicitDecodeOverride(paths);
     TestCommittedDraftFeaturePrefix(paths, 1);
     TestCommittedDraftFeaturePrefix(paths, 2);
+    TestCommittedDraftFeaturePrefix(paths, 8);
     TestPrefillVerifyCoalescing(paths);
+    TestExtendedSpeculativeWindow(paths);
     TestUnifiedTargetStep(
         {paths[0], paths[1], paths[3], std::filesystem::path(argv[6])});
     std::cout << "PASS: reset, decode carrier and committed-prefix Draft "

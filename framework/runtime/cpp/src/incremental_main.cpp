@@ -97,7 +97,7 @@ void Usage(std::ostream& stream) {
       << "  --pad-token-id ID                        default 0\n"
       << "  --max-new-tokens N                       default 32\n"
       << "  --max-draft-tokens N                     default 15\n"
-      << "  --dflash-sync-window N                   1 (default) or exact two-round window\n"
+      << "  --dflash-sync-window N                   exact window in 1..8 (default 1)\n"
       << "  --prefill-completion-policy POLICY       separate (default) or coalesce-first-verify\n"
       << "  --warmup N                               evidence=3, profile=1\n"
       << "  --repetitions N                          evidence=10, profile=1\n"
@@ -293,8 +293,8 @@ Arguments ParseArguments(int argc, char** argv) {
   result.dflash_sync_window = ParseSize(
       TakeOptional(&values, "dflash-sync-window", "1"),
       "dflash-sync-window");
-  if (result.dflash_sync_window > 2) {
-    throw std::invalid_argument("dflash-sync-window must be 1 or 2");
+  if (result.dflash_sync_window == 0 || result.dflash_sync_window > 8) {
+    throw std::invalid_argument("dflash-sync-window must be in 1..8");
   }
   const std::string prefill_completion_policy = TakeOptional(
       &values, "prefill-completion-policy", "separate");
@@ -568,6 +568,18 @@ void WriteReport(
           execution.target_verify_commit_executions ||
       execution.speculative_d2h_operations_elided !=
           execution.speculative_synchronizations_elided ||
+      execution.speculative_window_staging_bytes !=
+          execution.speculative_window_staging_operations *
+              execution.compact_verify_result_bytes ||
+      execution.speculative_window_staging_operations >
+          execution.target_verify_commit_executions ||
+      (arguments.dflash_sync_window <= 2 &&
+       execution.speculative_window_staging_operations != 0) ||
+      execution.speculative_window_staging_device_bytes !=
+          executor.max_speculative_sync_window() *
+              execution.compact_slot_bytes ||
+      execution.speculative_window_staging_pinned_host_bytes !=
+          execution.speculative_window_staging_device_bytes ||
       execution.prefill_verify_synchronizations_elided !=
           execution.prefill_verify_coalesced_windows ||
       execution.prefill_verify_d2h_operations_elided !=
@@ -659,7 +671,7 @@ void WriteReport(
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":8,\"status\":\"PASS\","
+         << "{\"schema_version\":9,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
          << (executor.unified_target_step() ? "four" : "five")
          << "-resident-OM paired model loop\","
@@ -708,6 +720,10 @@ void WriteReport(
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
          << ",\"compact_ping_pong_device_bytes\":"
          << execution.compact_ping_pong_device_bytes
+         << ",\"speculative_window_staging_device_bytes\":"
+         << execution.speculative_window_staging_device_bytes
+         << ",\"speculative_window_staging_pinned_host_bytes\":"
+         << execution.speculative_window_staging_pinned_host_bytes
          << ",\"compact_slot_bytes\":" << execution.compact_slot_bytes
          << ",\"compact_ordinary_result_bytes\":"
          << execution.compact_ordinary_result_bytes
@@ -762,8 +778,8 @@ void WriteReport(
          << ",\"maximum_supported_dflash_sync_window\":"
          << executor.max_speculative_sync_window()
          << ",\"decode_iteration_scope\":\"one host-visible "
-            "synchronization window; a DFlash window may contain one or two "
-            "complete speculative transactions\""
+            "synchronization window; a DFlash window may contain one to "
+            "eight complete speculative transactions\""
          << ",\"order\":\"alternating ordinary/DFlash in one "
          << (executor.unified_target_step() ? "four" : "five")
          << "-model process\","
@@ -820,8 +836,9 @@ void WriteReport(
          << (executor.draft_feature_policy() ==
                      IncrementalDraftFeaturePolicy::kCommittedPrefix
                  ? "after a synchronized verify, Draft binds exactly accepted+1 "
-                   "leading Target feature rows; an unsynchronized second "
-                   "transaction binds the causal K+1 upper bound; masked "
+                   "leading Target feature rows; each later unsynchronized "
+                   "transaction binds its predecessor's causal K+1 upper "
+                   "bound; masked "
                    "suffix cache writes are scratch and overwritten before "
                    "becoming visible"
                  : "verify-source Draft binds the original physical N=16; "
@@ -859,8 +876,10 @@ void WriteReport(
          << "\"scope\":\"paired warmups and measurements\","
          << "\"proposal_policy\":\"Draft-to-verify device carrier; no proposal D2H/H2D\","
          << "\"result_policy\":\"one logical compact result per complete "
-            "transaction; an exact two-transaction DFlash window coalesces "
-            "adjacent compact slots into one D2H; an eligible final prefill "
+            "transaction; a two-transaction DFlash window coalesces adjacent "
+            "ping-pong slots, while windows of three to eight stage each "
+            "452-byte result D2D into a 4 KiB arena before one D2H; an "
+            "eligible final prefill "
             "and first verify may independently share one contiguous D2H; "
             "one barrier per completed prompt/decode window; no host-visible "
             "result for intermediate prefill chunks\","
@@ -897,6 +916,14 @@ void WriteReport(
          << execution.speculative_d2h_operations_elided
          << ",\"speculative_d2h_padding_bytes\":"
          << execution.speculative_d2h_padding_bytes
+         << ",\"speculative_window_staging_operations\":"
+         << execution.speculative_window_staging_operations
+         << ",\"speculative_window_staging_bytes\":"
+         << execution.speculative_window_staging_bytes
+         << ",\"speculative_window_staging_device_bytes\":"
+         << execution.speculative_window_staging_device_bytes
+         << ",\"speculative_window_staging_pinned_host_bytes\":"
+         << execution.speculative_window_staging_pinned_host_bytes
          << ",\"prefill_verify_coalesced_windows\":"
          << execution.prefill_verify_coalesced_windows
          << ",\"prefill_verify_synchronizations_elided\":"

@@ -25,6 +25,7 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     INCREMENTAL_CPP_RUNNER_ID,
     INCREMENTAL_STATE_POLICY,
     LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+    MAX_DFLASH_SYNC_WINDOW,
     ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
     SEPARATE_PREFILL_COMPLETION_POLICY,
     _INCREMENTAL_GRAPH_ABI,
@@ -103,7 +104,7 @@ def _report(
     )
     draft_verify_pending_executions = (
         verify_draft_executions
-        if committed_prefix and dflash_sync_window == 2
+        if committed_prefix and dflash_sync_window > 1
         else 0
     )
     prefill_draft_elided = dflash_request_count * (prompt_chunks - 1)
@@ -144,12 +145,19 @@ def _report(
     )
     remaining_verify_transactions = 26 - prefill_verify_windows
     speculative_windows = (
-        remaining_verify_transactions
-        if dflash_sync_window == 1
-        else (remaining_verify_transactions + 1) // 2
-    )
+        remaining_verify_transactions + dflash_sync_window - 1
+    ) // dflash_sync_window
     speculative_syncs_elided = (
         remaining_verify_transactions - speculative_windows
+    )
+    complete_windows, final_window = divmod(
+        remaining_verify_transactions, dflash_sync_window
+    )
+    speculative_staging_operations = (
+        complete_windows * dflash_sync_window
+        + (final_window if final_window > 2 else 0)
+        if dflash_sync_window > 2
+        else 0
     )
     last_token_d2d = (
         decode_carrier_policy == LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
@@ -178,7 +186,7 @@ def _report(
         for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
-        "schema_version": 8,
+        "schema_version": 9,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -195,10 +203,10 @@ def _report(
             "profile_model_execution_trace_enabled": False,
             "device_memory_allocation_policy": "normal-only",
             "dflash_sync_window": dflash_sync_window,
-            "maximum_supported_dflash_sync_window": 2,
+            "maximum_supported_dflash_sync_window": MAX_DFLASH_SYNC_WINDOW,
             "decode_iteration_scope": (
                 "one host-visible synchronization window; a DFlash window "
-                "may contain one or two complete speculative transactions"
+                "may contain one to eight complete speculative transactions"
             ),
             "prefill_completion_policy": prefill_completion_policy,
             "prefill_completion_policy_description": (
@@ -251,8 +259,9 @@ def _report(
             "draft_feature_policy": draft_feature_policy,
             "draft_feature_policy_description": (
                 "after a synchronized verify, Draft binds exactly accepted+1 "
-                "leading Target feature rows; an unsynchronized second "
-                "transaction binds the causal K+1 upper bound; masked suffix "
+                "leading Target feature rows; each later unsynchronized "
+                "transaction binds its predecessor's causal K+1 upper bound; "
+                "masked suffix "
                 "cache writes are scratch and overwritten before becoming "
                 "visible"
                 if committed_prefix
@@ -286,8 +295,10 @@ def _report(
             "working_state_device_bytes": working_state_bytes,
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
-            "carrier_device_bytes": 4096,
+            "carrier_device_bytes": 8192,
             "compact_ping_pong_device_bytes": 1024,
+            "speculative_window_staging_device_bytes": 4096,
+            "speculative_window_staging_pinned_host_bytes": 4096,
             "compact_slot_bytes": 512,
             "compact_ordinary_result_bytes": 257,
             "compact_verify_result_bytes": 452,
@@ -305,7 +316,7 @@ def _report(
                 prefill_persistent_control_tail_bytes
             ),
             "prefill_staging_pinned_host_bytes": 1792,
-            "proposal_count_staging_pinned_host_bytes": 8,
+            "proposal_count_staging_pinned_host_bytes": 32,
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
             "draft_dynamic_gear_count": 18,
@@ -313,7 +324,7 @@ def _report(
             "draft_prefill_dynamic_gear_count": 2,
             "target_step_zero_count_device_bytes": 0,
             "explicit_allocated_device_bytes_excluding_runtime": (
-                64 + 1088 + state_bytes + 4096
+                64 + 1088 + state_bytes + 8192
             ),
             "load_policy": (
                 "five aclmdlLoadFromFileWithMem sessions; one max-sized serial "
@@ -348,6 +359,14 @@ def _report(
             "speculative_d2h_padding_bytes": (
                 speculative_syncs_elided * 60
             ),
+            "speculative_window_staging_operations": (
+                speculative_staging_operations
+            ),
+            "speculative_window_staging_bytes": (
+                speculative_staging_operations * 452
+            ),
+            "speculative_window_staging_device_bytes": 4096,
+            "speculative_window_staging_pinned_host_bytes": 4096,
             "prefill_verify_coalesced_windows": prefill_verify_windows,
             "prefill_verify_synchronizations_elided": prefill_verify_windows,
             "prefill_verify_d2h_operations_elided": prefill_verify_windows,
@@ -410,7 +429,7 @@ def _report(
             ),
             "proposal_count_upload_operations": proposal_upload_operations,
             "proposal_count_upload_bytes": proposal_upload_operations * 4,
-            "proposal_count_staging_pinned_host_bytes": 8,
+            "proposal_count_staging_pinned_host_bytes": 32,
             "state_resets": 26,
             "state_memset_operations": 0 if immutable_zero else 52,
             "state_memset_bytes": 0 if immutable_zero else 26 * reset_bytes,
@@ -439,7 +458,7 @@ def _report(
             "working_state_device_bytes": working_state_bytes,
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
-            "carrier_device_bytes": 4096,
+            "carrier_device_bytes": 8192,
             "compact_ping_pong_device_bytes": 1024,
             "compact_slot_bytes": 512,
             "compact_ordinary_result_bytes": 257,
@@ -459,7 +478,7 @@ def _report(
                 prefill_persistent_control_tail_bytes
             ),
             "prefill_staging_pinned_host_bytes": 1792,
-            "proposal_count_staging_pinned_host_bytes": 8,
+            "proposal_count_staging_pinned_host_bytes": 32,
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
             "draft_dynamic_gear_count": 18,
@@ -717,7 +736,7 @@ def test_incremental_runner_rejects_decode_carrier_policy_mismatch() -> None:
         _validate(report)
 
 
-@pytest.mark.parametrize("dflash_sync_window", [1, 2])
+@pytest.mark.parametrize("dflash_sync_window", [1, 2, 8])
 def test_incremental_runner_accepts_committed_prefix_draft_features(
     dflash_sync_window: int,
 ) -> None:
@@ -932,7 +951,7 @@ def test_incremental_runner_rejects_unknown_dflash_sync_window() -> None:
                 "firmware": "test-firmware",
                 "runtime": "AscendCL",
                 "state_policy": INCREMENTAL_STATE_POLICY,
-                "dflash_sync_window": 3,
+                "dflash_sync_window": 9,
             },
             0,
         )
@@ -961,6 +980,10 @@ def test_incremental_runner_rejects_dflash_sync_window_report_mismatch() -> None
 
 def test_incremental_runner_accepts_closed_two_transaction_window() -> None:
     _validate(_report(dflash_sync_window=2), dflash_sync_window=2)
+
+
+def test_incremental_runner_accepts_closed_eight_transaction_window() -> None:
+    _validate(_report(dflash_sync_window=8), dflash_sync_window=8)
 
 
 def test_resolve_incremental_oms_locks_all_five_abis_and_hashes(
