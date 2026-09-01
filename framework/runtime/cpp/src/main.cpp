@@ -27,6 +27,8 @@ using qwen35::dflash::BenchmarkResult;
 using qwen35::dflash::Distribution;
 using qwen35::dflash::GenerationMeasurement;
 using qwen35::dflash::PairedBenchmarkResult;
+using qwen35::dflash::ProgressCallback;
+using qwen35::dflash::ProgressEvent;
 
 struct Arguments {
   std::filesystem::path model;
@@ -40,6 +42,7 @@ struct Arguments {
   std::size_t warmup = 3;
   std::size_t repetitions = 10;
   int device_id = 0;
+  bool progress = true;
 };
 
 void Usage(std::ostream& stream) {
@@ -55,7 +58,8 @@ void Usage(std::ostream& stream) {
       << "  --max-draft-tokens N         default 15\n"
       << "  --warmup N                   target evidence requires 3\n"
       << "  --repetitions N              target evidence requires 10\n"
-      << "  --device-id N                default 0\n";
+      << "  --device-id N                default 0\n"
+      << "  --progress true|false        live stderr progress, default true\n";
 }
 
 std::string Trim(std::string value) {
@@ -91,6 +95,16 @@ std::size_t ParseSize(const std::string& text, const char* name) {
     throw std::invalid_argument(std::string(name) + " must be positive");
   }
   return static_cast<std::size_t>(value);
+}
+
+bool ParseBool(const std::string& text, const char* name) {
+  if (text == "true" || text == "1") {
+    return true;
+  }
+  if (text == "false" || text == "0") {
+    return false;
+  }
+  throw std::invalid_argument(std::string(name) + " must be true or false");
 }
 
 std::vector<std::int64_t> ParseTokenIds(
@@ -202,6 +216,8 @@ Arguments ParseArguments(int argc, char** argv) {
       ParseSize(TakeOptional(&values, "warmup", "3"), "warmup");
   result.repetitions = ParseSize(
       TakeOptional(&values, "repetitions", "10"), "repetitions");
+  result.progress = ParseBool(
+      TakeOptional(&values, "progress", "true"), "progress");
   const std::int64_t device_id = ParseInt64(
       TakeOptional(&values, "device-id", "0"), "device-id");
   if (device_id < 0) {
@@ -231,6 +247,36 @@ Arguments ParseArguments(int argc, char** argv) {
     throw std::invalid_argument("model-sha256 must be 64 hexadecimal characters");
   }
   return result;
+}
+
+void PrintProgress(bool enabled, const std::string& message) {
+  if (enabled) {
+    std::cerr << "[qwen35-dflash] " << message << std::endl;
+  }
+}
+
+ProgressCallback MakeProgressCallback(bool enabled) {
+  if (!enabled) {
+    return {};
+  }
+  return [](const ProgressEvent& event) {
+    std::cerr << "[qwen35-dflash] phase=" << event.phase
+              << " run=" << event.run_index << '/' << event.run_total
+              << " mode=" << qwen35::dflash::ModeName(event.mode)
+              << " stage=" << event.stage
+              << " generated=" << event.generated_tokens << '/'
+              << event.max_new_tokens
+              << " prefix=" << event.prefix_tokens
+              << " graph_calls=" << event.graph_calls;
+    if (event.decode_iteration != 0) {
+      std::cerr << " decode_iteration=" << event.decode_iteration;
+    }
+    if (event.elapsed_ms > 0.0) {
+      std::cerr << " elapsed_ms=" << std::fixed << std::setprecision(3)
+                << event.elapsed_ms;
+    }
+    std::cerr << std::endl;
+  };
 }
 
 std::string JsonEscape(const std::string& value) {
@@ -388,7 +434,10 @@ void WriteReport(
          << arguments.repetitions
          << ",\"order\":\"alternating ordinary/DFlash in one loaded process\","
          << "\"synchronization\":\"one aclrtSynchronizeStream after queued H2D, execute, D2H\","
-         << "\"model_load_excluded_from_latency\":true},"
+         << "\"model_load_excluded_from_latency\":true,"
+         << "\"live_progress_enabled\":"
+         << (arguments.progress ? "true" : "false") << ','
+         << "\"progress_emission_excluded_from_model_timers\":true},"
          << "\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
   output << ",\"eos_token_ids\":";
@@ -440,6 +489,7 @@ void AtomicWrite(
 int main(int argc, char** argv) {
   try {
     const Arguments arguments = ParseArguments(argc, argv);
+    PrintProgress(arguments.progress, "stage=validate-om-start");
     if (!std::filesystem::is_regular_file(arguments.model)) {
       throw std::runtime_error("OM file does not exist: " + arguments.model.string());
     }
@@ -447,32 +497,54 @@ int main(int argc, char** argv) {
     if (actual_hash != arguments.model_sha256) {
       throw std::runtime_error("OM SHA-256 differs from --model-sha256");
     }
+    PrintProgress(arguments.progress, "stage=validate-om-done");
 
+    PrintProgress(arguments.progress, "stage=load-om-start");
     const auto load_start = std::chrono::steady_clock::now();
     qwen35::dflash::AclExecutor executor(arguments.model, arguments.device_id);
     const auto load_end = std::chrono::steady_clock::now();
+    const double load_ms =
+        std::chrono::duration<double, std::milli>(load_end - load_start).count();
+    {
+      std::ostringstream message;
+      message << "stage=load-om-done sequence_length="
+              << executor.sequence_length() << " draft_width="
+              << executor.draft_width() << " elapsed_ms=" << std::fixed
+              << std::setprecision(3) << load_ms;
+      PrintProgress(arguments.progress, message.str());
+    }
     qwen35::dflash::GenerationOptions options;
     options.pad_token_id = arguments.pad_token_id;
     options.max_new_tokens = arguments.max_new_tokens;
     options.max_draft_tokens = arguments.max_draft_tokens;
     options.eos_token_ids = arguments.eos_token_ids;
+    PrintProgress(
+        arguments.progress,
+        "stage=benchmark-start protocol=paired-3-warmup-plus-10-measurements");
     const auto benchmark_start = std::chrono::steady_clock::now();
     const PairedBenchmarkResult result = qwen35::dflash::BenchmarkPair(
         executor,
         arguments.prompt_token_ids,
         options,
         arguments.warmup,
-        arguments.repetitions);
+        arguments.repetitions,
+        MakeProgressCallback(arguments.progress));
     const auto benchmark_end = std::chrono::steady_clock::now();
-    const double load_ms =
-        std::chrono::duration<double, std::milli>(load_end - load_start).count();
     const double benchmark_ms =
         std::chrono::duration<double, std::milli>(
             benchmark_end - benchmark_start)
             .count();
+    {
+      std::ostringstream message;
+      message << "stage=benchmark-done elapsed_ms=" << std::fixed
+              << std::setprecision(3) << benchmark_ms;
+      PrintProgress(arguments.progress, message.str());
+    }
+    PrintProgress(arguments.progress, "stage=write-report-start");
     std::ostringstream report;
     WriteReport(report, arguments, executor, load_ms, benchmark_ms, result);
     AtomicWrite(arguments.output, report.str());
+    PrintProgress(arguments.progress, "stage=write-report-done status=PASS");
     std::cout << report.str() << '\n';
     return 0;
   } catch (const std::exception& error) {

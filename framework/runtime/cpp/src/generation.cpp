@@ -168,6 +168,37 @@ BenchmarkResult FinalizeBenchmark(
   return result;
 }
 
+void EmitProgress(
+    const ProgressCallback& progress,
+    const char* phase,
+    GenerationMode mode,
+    std::size_t run_index,
+    std::size_t run_total,
+    const char* stage,
+    std::size_t generated_tokens,
+    std::size_t max_new_tokens,
+    std::size_t prefix_tokens,
+    std::size_t graph_calls,
+    std::size_t decode_iteration,
+    double elapsed_ms) {
+  if (!progress) {
+    return;
+  }
+  progress(ProgressEvent{
+      phase,
+      mode,
+      run_index,
+      run_total,
+      stage,
+      generated_tokens,
+      max_new_tokens,
+      prefix_tokens,
+      graph_calls,
+      decode_iteration,
+      elapsed_ms,
+  });
+}
+
 }  // namespace
 
 const char* ModeName(GenerationMode mode) noexcept {
@@ -175,11 +206,17 @@ const char* ModeName(GenerationMode mode) noexcept {
                                             : "dflash-strict-greedy";
 }
 
-GenerationMeasurement GenerateOnce(
+namespace {
+
+GenerationMeasurement GenerateOnceWithContext(
     GraphExecutor& executor,
     const std::vector<std::int64_t>& prompt_token_ids,
     GenerationMode mode,
-    const GenerationOptions& options) {
+    const GenerationOptions& options,
+    const ProgressCallback& progress,
+    const char* phase,
+    std::size_t run_index,
+    std::size_t run_total) {
   ValidateInputs(executor, prompt_token_ids, options);
   const std::unordered_set<std::int64_t> eos(
       options.eos_token_ids.begin(), options.eos_token_ids.end());
@@ -193,6 +230,32 @@ GenerationMeasurement GenerateOnce(
   GenerationMeasurement result;
   result.counters.graph_calls = 1;
 
+  EmitProgress(
+      progress,
+      phase,
+      mode,
+      run_index,
+      run_total,
+      "run-start",
+      0,
+      options.max_new_tokens,
+      prefix.size(),
+      0,
+      0,
+      0.0);
+  EmitProgress(
+      progress,
+      phase,
+      mode,
+      run_index,
+      run_total,
+      "prefill-start",
+      0,
+      options.max_new_tokens,
+      prefix.size(),
+      0,
+      0,
+      0.0);
   const auto prefill_start = Clock::now();
   const GraphOutputs& prefill_outputs =
       executor.Execute(prefix, options.pad_token_id);
@@ -208,9 +271,37 @@ GenerationMeasurement GenerateOnce(
       &finished);
   const auto prefill_end = Clock::now();
   result.prefill_ms = Milliseconds(prefill_start, prefill_end);
+  EmitProgress(
+      progress,
+      phase,
+      mode,
+      run_index,
+      run_total,
+      "prefill-done",
+      generated.size(),
+      options.max_new_tokens,
+      prefix.size(),
+      result.counters.graph_calls,
+      0,
+      result.prefill_ms);
 
   while (!finished && generated.size() < options.max_new_tokens) {
     const std::size_t remaining = options.max_new_tokens - generated.size();
+    const std::size_t decode_iteration =
+        result.counters.decode_iterations + 1;
+    EmitProgress(
+        progress,
+        phase,
+        mode,
+        run_index,
+        run_total,
+        "decode-start",
+        generated.size(),
+        options.max_new_tokens,
+        prefix.size(),
+        result.counters.graph_calls,
+        decode_iteration,
+        0.0);
     const auto decode_start = Clock::now();
     const GraphOutputs& proposal_outputs =
         executor.Execute(prefix, options.pad_token_id);
@@ -282,6 +373,19 @@ GenerationMeasurement GenerateOnce(
     result.decode_iteration_ms.push_back(iteration_ms);
     result.decode_ms += iteration_ms;
     ++result.counters.decode_iterations;
+    EmitProgress(
+        progress,
+        phase,
+        mode,
+        run_index,
+        run_total,
+        "decode-done",
+        generated.size(),
+        options.max_new_tokens,
+        prefix.size(),
+        result.counters.graph_calls,
+        decode_iteration,
+        iteration_ms);
   }
 
   result.generated_token_ids = std::move(generated);
@@ -291,7 +395,39 @@ GenerationMeasurement GenerateOnce(
           ? "eos"
           : "length";
   result.model_total_ms = result.prefill_ms + result.decode_ms;
+  EmitProgress(
+      progress,
+      phase,
+      mode,
+      run_index,
+      run_total,
+      "run-done",
+      result.generated_token_ids.size(),
+      options.max_new_tokens,
+      prefix.size(),
+      result.counters.graph_calls,
+      result.counters.decode_iterations,
+      result.model_total_ms);
   return result;
+}
+
+}  // namespace
+
+GenerationMeasurement GenerateOnce(
+    GraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    GenerationMode mode,
+    const GenerationOptions& options,
+    const ProgressCallback& progress) {
+  return GenerateOnceWithContext(
+      executor,
+      prompt_token_ids,
+      mode,
+      options,
+      progress,
+      "single",
+      1,
+      1);
 }
 
 BenchmarkResult Benchmark(
@@ -300,18 +436,34 @@ BenchmarkResult Benchmark(
     GenerationMode mode,
     const GenerationOptions& options,
     std::size_t warmup,
-    std::size_t repetitions) {
+    std::size_t repetitions,
+    const ProgressCallback& progress) {
   if (repetitions == 0) {
     throw std::invalid_argument("benchmark repetitions must be positive");
   }
   for (std::size_t index = 0; index < warmup; ++index) {
-    static_cast<void>(GenerateOnce(executor, prompt_token_ids, mode, options));
+    static_cast<void>(GenerateOnceWithContext(
+        executor,
+        prompt_token_ids,
+        mode,
+        options,
+        progress,
+        "warmup",
+        index + 1,
+        warmup));
   }
   std::vector<GenerationMeasurement> measurements;
   measurements.reserve(repetitions);
   for (std::size_t index = 0; index < repetitions; ++index) {
-    measurements.push_back(
-        GenerateOnce(executor, prompt_token_ids, mode, options));
+    measurements.push_back(GenerateOnceWithContext(
+        executor,
+        prompt_token_ids,
+        mode,
+        options,
+        progress,
+        "measurement",
+        index + 1,
+        repetitions));
   }
   return FinalizeBenchmark(mode, warmup, std::move(measurements));
 }
@@ -321,21 +473,26 @@ PairedBenchmarkResult BenchmarkPair(
     const std::vector<std::int64_t>& prompt_token_ids,
     const GenerationOptions& options,
     std::size_t warmup,
-    std::size_t repetitions) {
+    std::size_t repetitions,
+    const ProgressCallback& progress) {
   if (repetitions == 0) {
     throw std::invalid_argument("benchmark repetitions must be positive");
   }
   for (std::size_t index = 0; index < warmup; ++index) {
     if (index % 2 == 0) {
-      static_cast<void>(GenerateOnce(
-          executor, prompt_token_ids, GenerationMode::kOrdinary, options));
-      static_cast<void>(GenerateOnce(
-          executor, prompt_token_ids, GenerationMode::kDFlash, options));
+      static_cast<void>(GenerateOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
+          progress, "warmup", index + 1, warmup));
+      static_cast<void>(GenerateOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options,
+          progress, "warmup", index + 1, warmup));
     } else {
-      static_cast<void>(GenerateOnce(
-          executor, prompt_token_ids, GenerationMode::kDFlash, options));
-      static_cast<void>(GenerateOnce(
-          executor, prompt_token_ids, GenerationMode::kOrdinary, options));
+      static_cast<void>(GenerateOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options,
+          progress, "warmup", index + 1, warmup));
+      static_cast<void>(GenerateOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
+          progress, "warmup", index + 1, warmup));
     }
   }
 
@@ -345,15 +502,19 @@ PairedBenchmarkResult BenchmarkPair(
   dflash.reserve(repetitions);
   for (std::size_t index = 0; index < repetitions; ++index) {
     if (index % 2 == 0) {
-      ordinary.push_back(GenerateOnce(
-          executor, prompt_token_ids, GenerationMode::kOrdinary, options));
-      dflash.push_back(GenerateOnce(
-          executor, prompt_token_ids, GenerationMode::kDFlash, options));
+      ordinary.push_back(GenerateOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
+          progress, "measurement", index + 1, repetitions));
+      dflash.push_back(GenerateOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options,
+          progress, "measurement", index + 1, repetitions));
     } else {
-      dflash.push_back(GenerateOnce(
-          executor, prompt_token_ids, GenerationMode::kDFlash, options));
-      ordinary.push_back(GenerateOnce(
-          executor, prompt_token_ids, GenerationMode::kOrdinary, options));
+      dflash.push_back(GenerateOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options,
+          progress, "measurement", index + 1, repetitions));
+      ordinary.push_back(GenerateOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
+          progress, "measurement", index + 1, repetitions));
     }
   }
 

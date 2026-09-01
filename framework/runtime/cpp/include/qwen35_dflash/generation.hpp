@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,22 @@ enum class GenerationMode {
   kOrdinary,
   kDFlash,
 };
+
+struct ProgressEvent {
+  const char* phase = "single";
+  GenerationMode mode = GenerationMode::kOrdinary;
+  std::size_t run_index = 1;
+  std::size_t run_total = 1;
+  const char* stage = "run-start";
+  std::size_t generated_tokens = 0;
+  std::size_t max_new_tokens = 0;
+  std::size_t prefix_tokens = 0;
+  std::size_t graph_calls = 0;
+  std::size_t decode_iteration = 0;
+  double elapsed_ms = 0.0;
+};
+
+using ProgressCallback = std::function<void(const ProgressEvent&)>;
 
 struct GraphOutputs {
   std::vector<std::int64_t> target_top1;
@@ -94,7 +111,8 @@ GenerationMeasurement GenerateOnce(
     GraphExecutor& executor,
     const std::vector<std::int64_t>& prompt_token_ids,
     GenerationMode mode,
-    const GenerationOptions& options);
+    const GenerationOptions& options,
+    const ProgressCallback& progress = {});
 
 BenchmarkResult Benchmark(
     GraphExecutor& executor,
@@ -102,7 +120,8 @@ BenchmarkResult Benchmark(
     GenerationMode mode,
     const GenerationOptions& options,
     std::size_t warmup,
-    std::size_t repetitions);
+    std::size_t repetitions,
+    const ProgressCallback& progress = {});
 
 // Runs both modes through the same loaded executor. Warmups and measurements
 // alternate order to reduce thermal/order bias while preserving raw samples.
@@ -111,7 +130,8 @@ PairedBenchmarkResult BenchmarkPair(
     const std::vector<std::int64_t>& prompt_token_ids,
     const GenerationOptions& options,
     std::size_t warmup,
-    std::size_t repetitions);
+    std::size_t repetitions,
+    const ProgressCallback& progress = {});
 
 Distribution Summarize(const std::vector<double>& values);
 const char* ModeName(GenerationMode mode) noexcept;

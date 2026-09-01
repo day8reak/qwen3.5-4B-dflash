@@ -651,6 +651,20 @@ cp config/quant_air_om_runner.example.json "$AI_RUN_DIR/runner.json"
 所以它不是“Python 算完 token、C++ 只读结果”，而是 C++ 的 token 循环实际调用 OM 完成
 Target/Draft 推理。
 
+该命令默认把控制面和 C++ runner 进度实时输出到终端，同时逐行刷新到
+`$AI_RUN_DIR/log/<报告名>-cpp-runner.log`。典型输出如下：
+
+```text
+[infer-cpp] stage=runner-start live child output follows
+[qwen35-dflash] stage=load-om-start
+[qwen35-dflash] phase=warmup run=1/3 mode=ordinary-greedy stage=prefill-start generated=0/32 ...
+[qwen35-dflash] phase=measurement run=1/10 mode=dflash-strict-greedy stage=decode-done generated=16/32 ...
+```
+
+每个 prefill/decode 计时区间的日志都在计时开始前或结束后输出，不计入
+`prefill_ms`、`decode_ms` 和 `model_total_ms`。正式无人值守采样如需静默，可加
+`--no-progress`；日志文件仍会完整保留子进程输出。
+
 ## 10. 一键端到端
 
 先构建 C++ runner，然后执行：

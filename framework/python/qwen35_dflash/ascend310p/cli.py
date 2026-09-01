@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
@@ -44,6 +45,11 @@ def _config(path: Path | None) -> dict[str, Any]:
 
 def _print(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _progress(enabled: bool, message: str) -> None:
+    if enabled:
+        print(f"[infer-cpp] {message}", file=sys.stderr, flush=True)
 
 
 def command_export(args: argparse.Namespace) -> int:
@@ -209,14 +215,24 @@ def command_infer_cpp(args: argparse.Namespace) -> int:
     output = require_run_output(args.output)
     if output.exists():
         raise FileExistsError(f"C++ prompt report already exists: {output}")
+    _progress(args.progress, "stage=target-preflight-start")
     preflight_log = run_declared_target_preflight()
+    _progress(args.progress, "stage=target-preflight-done")
+    _progress(args.progress, "stage=load-tokenizer-start")
     tokenizer, tokenizer_source = load_tokenizer(
         model_dir=args.model_dir,
         model_asset_id=args.model_asset_id,
     )
+    _progress(args.progress, "stage=load-tokenizer-done")
+    _progress(args.progress, "stage=tokenize-start")
     tokenize_start = time.perf_counter_ns()
     prompt_ids = tokenize_prompt(tokenizer, args.prompt, chat=args.chat)
     tokenize_end = time.perf_counter_ns()
+    _progress(
+        args.progress,
+        f"stage=tokenize-done prompt_tokens={len(prompt_ids)} "
+        f"elapsed_ms={(tokenize_end - tokenize_start) / 1_000_000.0:.3f}",
+    )
     raw_output = output.with_name(f"{output.stem}-runner-raw.json")
     run_root = Path(os.environ["AI_RUN_DIR"]).expanduser().resolve()
     log_output = run_root / "log" / f"{output.stem}-cpp-runner.log"
@@ -231,14 +247,21 @@ def command_infer_cpp(args: argparse.Namespace) -> int:
         max_draft_tokens=args.max_draft_tokens,
         raw_output=raw_output,
         log_output=log_output,
+        progress=args.progress,
     )
     payload["control_plane"]["target_preflight"] = file_record(
         preflight_log, relative_to=run_root
     )
     generated = [int(item) for item in payload["dflash"]["stable_generated_token_ids"]]
+    _progress(args.progress, "stage=detokenize-start")
     detokenize_start = time.perf_counter_ns()
     text_output = tokenizer.decode(generated, skip_special_tokens=True)
     detokenize_end = time.perf_counter_ns()
+    _progress(
+        args.progress,
+        f"stage=detokenize-done generated_tokens={len(generated)} "
+        f"elapsed_ms={(detokenize_end - detokenize_start) / 1_000_000.0:.3f}",
+    )
     report = write_cpp_prompt_report(
         payload=payload,
         output=output,
@@ -249,6 +272,7 @@ def command_infer_cpp(args: argparse.Namespace) -> int:
         detokenize_ms=(detokenize_end - detokenize_start) / 1_000_000.0,
         generated_text=text_output,
     )
+    _progress(args.progress, f"stage=final-report-done status=PASS output={output}")
     _print(report)
     return 0
 
@@ -295,6 +319,7 @@ def command_run_e2e_cpp(args: argparse.Namespace) -> int:
         max_draft_tokens=args.max_draft_tokens,
         model_dir=args.model_dir,
         model_asset_id=args.model_asset_id,
+        progress=args.progress,
     )
     _print(payload)
     return 0
@@ -417,7 +442,15 @@ def build_parser() -> argparse.ArgumentParser:
     infer_cpp.add_argument("--max-new-tokens", type=int, default=32)
     infer_cpp.add_argument("--max-draft-tokens", type=int, default=15)
     infer_cpp.add_argument("--output", type=Path, required=True)
-    infer_cpp.set_defaults(handler=command_infer_cpp, model_asset_id=None)
+    infer_cpp.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="disable live control-plane and C++ per-iteration progress",
+    )
+    infer_cpp.set_defaults(
+        handler=command_infer_cpp, model_asset_id=None, progress=True
+    )
 
     run_e2e = subparsers.add_parser(
         "run-e2e",
@@ -468,7 +501,15 @@ def build_parser() -> argparse.ArgumentParser:
     run_e2e_cpp.add_argument("--max-new-tokens", type=int, default=32)
     run_e2e_cpp.add_argument("--max-draft-tokens", type=int, default=15)
     run_e2e_cpp.add_argument("--report-dir", type=Path, required=True)
-    run_e2e_cpp.set_defaults(handler=command_run_e2e_cpp, model_asset_id=None)
+    run_e2e_cpp.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="disable live C++ per-iteration progress",
+    )
+    run_e2e_cpp.set_defaults(
+        handler=command_run_e2e_cpp, model_asset_id=None, progress=True
+    )
     return parser
 
 

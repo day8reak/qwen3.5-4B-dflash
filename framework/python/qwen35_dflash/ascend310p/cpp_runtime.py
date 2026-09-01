@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -23,6 +24,45 @@ from .utils import (
 
 CPP_RUNNER_ID = "qwen35-dflash-ascendcl-cpp-v1"
 _GENERIC_DEVICE_NAMES = {"310p", "ascend310p", "atlas310p"}
+
+
+def _progress(enabled: bool, message: str) -> None:
+    if enabled:
+        print(f"[infer-cpp] {message}", file=sys.stderr, flush=True)
+
+
+def _execute_streaming(
+    command: Sequence[str],
+    *,
+    log_path: Path,
+    echo: bool,
+) -> subprocess.CompletedProcess[str]:
+    """Tee combined child output to its durable log while it is running."""
+
+    chunks: list[str] = []
+    with log_path.open("x", encoding="utf-8") as log_stream:
+        process = subprocess.Popen(
+            list(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        if process.stdout is None:
+            process.kill()
+            process.wait()
+            raise RuntimeError("C++ ACL runner stdout pipe was not created")
+        for line in process.stdout:
+            chunks.append(line)
+            log_stream.write(line)
+            log_stream.flush()
+            if echo:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+        return_code = process.wait()
+    return subprocess.CompletedProcess(
+        list(command), return_code, stdout="".join(chunks)
+    )
 
 
 def resolve_cpp_runner(path: str | Path) -> Path:
@@ -43,9 +83,14 @@ def preflight_cpp_runner(path: str | Path) -> Path:
         stderr=subprocess.STDOUT,
         text=True,
     )
-    if result.returncode != 0 or "qwen35_dflash_acl_runner" not in result.stdout:
+    if (
+        result.returncode != 0
+        or "qwen35_dflash_acl_runner" not in result.stdout
+        or "--progress true|false" not in result.stdout
+    ):
         raise RuntimeError(
-            "C++ ACL runner cannot start in the activated target environment: "
+            "C++ ACL runner cannot start or does not support live progress; "
+            "rebuild it from the current framework source: "
             f"exit={result.returncode}, output={result.stdout!r}"
         )
     return executable
@@ -362,7 +407,8 @@ def run_cpp_pair(
     max_draft_tokens: int,
     raw_output: str | Path,
     log_output: str | Path,
-    execute: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    progress: bool = True,
+    execute: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> dict[str, Any]:
     """Run paired ordinary/DFlash generation entirely inside one C++ process."""
 
@@ -371,13 +417,16 @@ def run_cpp_pair(
     tokens = [int(item) for item in prompt_token_ids]
     if not tokens:
         raise ValueError("C++ runner prompt tokens must not be empty")
+    _progress(progress, "stage=validate-config-start")
     identity = _runtime_identity(runner_options, device_id)
+    _progress(progress, "stage=validate-manifest-and-om-start")
     om_path, deployment, graph = _resolve_integrated_om(
         deployment_manifest,
         graph_name=identity["graph_name"],
     )
+    _progress(progress, "stage=validate-manifest-and-om-done")
     om_record = dict(graph["om"])
-    executable = resolve_cpp_runner(runner)
+    executable = preflight_cpp_runner(runner)
     raw_path = require_run_output(raw_output)
     log_path = require_run_output(log_output)
     if raw_path.exists() or log_path.exists():
@@ -408,23 +457,42 @@ def run_cpp_pair(
         "10",
         "--device-id",
         str(int(device_id)),
+        "--progress",
+        "true" if progress else "false",
     ]
-    start_ns = time.perf_counter_ns()
-    result = execute(
-        command,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    _progress(
+        progress,
+        "stage=runner-start live child output follows; "
+        f"durable_log={log_path}",
     )
+    start_ns = time.perf_counter_ns()
+    if execute is None:
+        result = _execute_streaming(command, log_path=log_path, echo=progress)
+    else:
+        result = execute(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        log_path.write_text(result.stdout or "", encoding="utf-8")
+        if progress and result.stdout:
+            sys.stderr.write(result.stdout)
+            sys.stderr.flush()
     end_ns = time.perf_counter_ns()
-    log_path.write_text(result.stdout or "", encoding="utf-8")
+    _progress(
+        progress,
+        f"stage=runner-exit code={result.returncode} "
+        f"wall_ms={(end_ns - start_ns) / 1_000_000.0:.3f}",
+    )
     if result.returncode != 0:
         raise RuntimeError(
             f"C++ ACL runner failed with exit {result.returncode}; log={log_path}"
         )
     if not raw_path.is_file():
         raise RuntimeError("C++ ACL runner returned success without a JSON report")
+    _progress(progress, "stage=validate-runner-report-start")
     report = load_json_object(raw_path)
     validate_cpp_runner_report(
         report,
@@ -434,6 +502,7 @@ def run_cpp_pair(
         max_new_tokens=max_new_tokens,
         max_draft_tokens=max_draft_tokens,
     )
+    _progress(progress, "stage=validate-runner-report-done")
     run_root = Path(os.environ["AI_RUN_DIR"]).expanduser().resolve()
     air_record = deployment.get("air_manifest")
     if not isinstance(air_record, Mapping):
@@ -469,6 +538,7 @@ def run_cpp_pair(
         "compiler": dict(deployment.get("compiler", {})),
         "target": dict(deployment.get("target", {})),
     }
+    _progress(progress, "stage=cpp-pair-done status=PASS")
     return report
 
 

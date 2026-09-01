@@ -23,6 +23,12 @@ execute_process(
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "fake ACL runner failed: ${result}\n${stdout}\n${stderr}")
 endif()
+if(NOT stderr MATCHES "stage=validate-om-start" OR
+   NOT stderr MATCHES "phase=warmup" OR
+   NOT stderr MATCHES "stage=decode-done" OR
+   NOT stderr MATCHES "stage=write-report-done status=PASS")
+  message(FATAL_ERROR "fake ACL runner omitted live progress:\n${stderr}")
+endif()
 
 file(READ "${OUTPUT}" report)
 string(JSON status GET "${report}" status)

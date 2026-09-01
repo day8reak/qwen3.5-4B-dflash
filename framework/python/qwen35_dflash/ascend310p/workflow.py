@@ -502,6 +502,7 @@ def run_cpp_target_pipeline(
     max_draft_tokens: int = 15,
     model_dir: str | Path | None = None,
     model_asset_id: str | None = None,
+    progress: bool = True,
 ) -> dict[str, Any]:
     """Build one OM, then run paired 3+10 entirely in the C++ ACL hot path."""
 
@@ -558,6 +559,7 @@ def run_cpp_target_pipeline(
         max_draft_tokens=max_draft_tokens,
         raw_output=report_root / "runner-raw.json",
         log_output=run_root / "log" / "dflash-cpp-runner.log",
+        progress=progress,
     )
     payload["control_plane"]["target_preflight"] = file_record(
         preflight_log, relative_to=run_root

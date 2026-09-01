@@ -146,6 +146,36 @@ void TestPairedBenchmarkIsStableAndExact() {
       "paired stable tokens differ");
 }
 
+void TestProgressReportsPhaseAndTokenMovement() {
+  FakeExecutor executor;
+  std::vector<std::string> stages;
+  bool saw_warmup = false;
+  bool saw_measurement = false;
+  bool saw_generated_token = false;
+  const auto progress = [&](const qwen35::dflash::ProgressEvent& event) {
+    stages.emplace_back(event.stage);
+    saw_warmup = saw_warmup || std::string(event.phase) == "warmup";
+    saw_measurement =
+        saw_measurement || std::string(event.phase) == "measurement";
+    saw_generated_token =
+        saw_generated_token || event.generated_tokens > 0;
+  };
+  static_cast<void>(qwen35::dflash::BenchmarkPair(
+      executor, {10}, Options(), 1, 2, progress));
+  Require(saw_warmup, "progress omitted the warmup phase");
+  Require(saw_measurement, "progress omitted the measurement phase");
+  Require(saw_generated_token, "progress never reported generated tokens");
+  Require(
+      std::find(stages.begin(), stages.end(), "prefill-start") != stages.end(),
+      "progress omitted prefill start");
+  Require(
+      std::find(stages.begin(), stages.end(), "decode-done") != stages.end(),
+      "progress omitted decode completion");
+  Require(
+      std::find(stages.begin(), stages.end(), "run-done") != stages.end(),
+      "progress omitted run completion");
+}
+
 void TestSha256KnownVector() {
   Require(
       qwen35::dflash::Sha256("abc") ==
@@ -162,6 +192,7 @@ int main() {
     TestEosStopsBothModesAtSameToken();
     TestCapacityGate();
     TestPairedBenchmarkIsStableAndExact();
+    TestProgressReportsPhaseAndTokenMovement();
     TestSha256KnownVector();
     std::cout << "PASS: C++ scheduler, parity, EOS, capacity and SHA-256\n";
     return 0;
