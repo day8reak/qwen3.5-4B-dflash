@@ -335,12 +335,12 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 23
+    assert framework_lock["schema_version"] == 24
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v23"
+        "qwen3.5-4b-quant-air-om-ascendcl-v24"
     )
     assert deployment["schema_version"] == 2
-    assert performance["schema_version"] == 5
+    assert performance["schema_version"] == 6
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -361,6 +361,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
         "incremental_profile_attribution"
     ]
     assert "N=1..16" in runtime["incremental_draft_feature_prefix"]
+    assert "draft_to_verify_model_launches_elided" in runtime[
+        "incremental_fused_speculative_step"
+    ]
     assert "coalesce-first-verify" in runtime[
         "incremental_prefill_completion"
     ]
@@ -383,6 +386,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
         "incremental_five_om_io"
     ]
     assert "D2D" in runner["incremental_five_om_io"]
+    assert "one fused-speculative-step physical execution" in runner[
+        "incremental_fused_speculative_io"
+    ]
     assert "same-binary" in runner["required_decode_carrier_policy"]
     assert any(
         "full/base/count/proposal" in item
@@ -392,6 +398,10 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert "draft_verify_feature_input_rows" in runner[
         "required_io_counters"
     ]
+    assert any(
+        "draft_to_verify_model_launches_elided" in item
+        for item in runner["required_io_counters"]
+    )
     assert "coalesce-first-verify" in runner[
         "required_prefill_completion_policy"
     ]

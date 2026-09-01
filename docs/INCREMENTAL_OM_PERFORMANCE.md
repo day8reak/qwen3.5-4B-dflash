@@ -86,6 +86,34 @@ control H2D 中一并初始化一个进程常驻、64-byte 对齐的 INT32 零�
 产生独立的 4-byte `K=0` H2D，也不会迫使下一次 DFlash prefill 把正 K 恢复回来。这个改动只改变
 C++ 内部 buffer/view 路由；统一 Target-step 的输入名、shape、动态 gear、AIR/OM 和算子 ABI 都不变。
 
+已批准范围内还实现了一个默认不激活的精确 `fused-speculative-step` 候选。它不是把 Draft 算法改成
+近似算法，而是把现有 `draft-propose` 的四个输出直接接到现有固定 T=16
+`target-verify-commit`，使 `verify_input_ids` 不再跨 OM 边界。当前物理文件仍是四个：
+`target-prefill`、`target-prefill-head`、`target-decode1` 和
+`fused-speculative-step`。每个 speculative transaction 的逻辑 Draft/verify 计数均保留，但物理
+`aclmdlExecuteAsync` 从两次降为一次；ordinary 继续只调用静态 `target-decode1`。
+
+```mermaid
+flowchart LR
+  Z[Reset Target and Draft state] --> P[Target prefill body<br/>64-row chunks]
+  P --> H[Target prefill head<br/>final chunk only]
+  H --> M{ordinary or DFlash?}
+  M -->|ordinary| D1[Target decode1]
+  M -->|DFlash| F[Fused speculative step<br/>Draft propose + fixed-T16 Target verify]
+  F --> A[Exact accept/commit<br/>Target and Draft state ping-pong]
+  A --> C[Compact result D2H<br/>one sync per window]
+  C --> E{EOS or budget reached?}
+  E -->|continue DFlash| F
+  E -->|one-token / fallback| D1
+  D1 --> E
+  E -->|stop| X[Return exact token IDs]
+```
+
+首个 fused 调用直接消费所有常驻 prompt feature slab；后续调用按 `fixed-16` 或
+`committed-prefix` 绑定 N=1..16。Target verify 在当前候选里仍固定物理 T=16，因此这个候选只删除
+Draft→verify 的模型启动/载体边界，不宣称减少 Target kernel 工作。是否真正更快必须由同一台 310P
+上的五图基线与 fused 四图正反顺序 3+10 A/B 决定；msprof 只能解释差异。
+
 ## 2. 为什么不能按 OM 数量认定更快
 
 不同 Target OM 可能各自携带一份 Target 权重。CANN 文档允许串行模型共享一块最大 workspace，
@@ -140,7 +168,14 @@ cmake --build "$CPP_BUILD" -j
 ```
 
 四物理 OM 统一 Target-step 候选删除 `target-decode1` 行，并把输出名改为
-`four-graph-unified-target-step-memory.json`。重点查看：
+`four-graph-unified-target-step-memory.json`。fused 候选保留 prefill/head/decode 三行，删除
+`draft-propose`/`target-verify-commit` 两行并增加：
+
+```bash
+--model fused-speculative-step="$FUSED_BUNDLE/om/fused-speculative-step.om"
+```
+
+其输出应使用 `four-graph-fused-speculative-step-memory.json`。重点查看：
 
 ```bash
 jq '{models, budget, assumptions, claim_boundary}' \
@@ -531,6 +566,69 @@ jq -e '
 `target_step_padded_rows_elided` 是相对“每次固定 T=16”的源码行数差，不是时延节省；真实收益只能
 由关闭 profiler 后的配对 3+10 报告确认。
 
+#### 5.2.2 生成四物理 OM 的 fused speculative-step 候选
+
+仍使用同一份 checkpoint、量化文件、receiver、自定义算子注册和 factory 配置，只替换 factory
+入口。`fused-speculative-step` 的第 0 个输入是 Draft 消费的 Target feature，因此 AIR 必须携带
+N=1..16 以及 N=64,128,...,`max_sequence_length` 的完整离散 gear；内部 Target verify 始终是
+固定 T=16。
+
+```bash
+export FUSED_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-fused-speculative-step"
+
+"$MODEL_PYTHON" -m qwen35_dflash.ascend310p build-om \
+  --factory \
+    qwen35_dflash.ascend310p.quant_factory:create_quant_fused_speculative_step_graphs \
+  --factory-config "$AI_RUN_DIR/factory-incremental.json" \
+  --bundle-dir "$FUSED_BUNDLE" \
+  --atc /ABSOLUTE/PATH/atc \
+  --soc-version Ascend310P3
+```
+
+生成后必须恰好是下面四个 role；不能同时混入独立 `draft-propose` 或
+`target-verify-commit`。所有 Target verify 自定义节点仍必须保留，且动态 gear 不能缺失：
+
+```bash
+jq -e --argjson max_sequence_length 2048 '
+  ([.graphs[].name] == [
+    "target-prefill", "target-prefill-head", "target-decode1",
+    "fused-speculative-step"
+  ]) and
+  ((.graphs[] | select(.name == "fused-speculative-step") | .dynamic) == true) and
+  ((.graphs[] | select(.name == "fused-speculative-step") |
+    .input_dim_gears["0"]["1"][0:16]) ==
+    [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]) and
+  ((.graphs[] | select(.name == "fused-speculative-step") |
+    .input_dim_gears["0"]["1"][16:]) ==
+    [range(64; $max_sequence_length + 1; 64)]) and
+  ((.graphs[] | select(.name == "fused-speculative-step") |
+    .metadata.verify_input_ids_externalized) == false) and
+  ((.graphs[] | select(.name == "fused-speculative-step") |
+    .metadata.target_verify_rows) == 16) and
+  ((.graphs[] | select(.name == "fused-speculative-step") |
+    .custom_op_audit | length) == 7) and
+  ([.graphs[] | select(.name == "fused-speculative-step") |
+    .custom_op_audit[] | .status] | all(. == "PASS")) and
+  (([.graphs[] | select(.name == "fused-speculative-step") |
+    .custom_op_audit[] |
+    select(.torch_target == "npu.npu_gated_delta_rule_mtp.default")] |
+    length) == 1) and
+  ((.graphs[] | select(.name == "fused-speculative-step") |
+    .custom_op_audit[] |
+    select(.torch_target == "qwen35_dflash.npu_cache_update.default") |
+    .ge_node_occurrences) == 256)
+' "$FUSED_BUNDLE/deployment-manifest.json"
+
+PYTHONPATH="$PWD/framework/python:$PWD" "$MODEL_PYTHON" -m pytest -q \
+  tests/test_incremental_om_graphs.py \
+  tests/test_incremental_cpp_runtime.py
+```
+
+`jq` 中的 `2048` 必须与本次 factory 配置一致。C++ 控制面还会重新核对四个 role 的完整输入/输出
+顺序、SHA-256 和每一档动态 N；OM description 缺任一项都会在执行前失败。这个候选可能把 Target
+verify 与 Draft 权重共同装入 fused OM，同时还存在 Target prefill/decode artifact，因此必须重新跑
+第 2.1 节的完整集合 `aclmdlQuerySize`/load 门禁，不能从“四个文件”推断显存更少。
+
 ### 5.3 构建并通过控制面运行
 
 ```bash
@@ -556,12 +654,26 @@ cp config/quant_air_om_incremental_runner.example.json \
   --max-draft-tokens 15 \
   --device-id 0 \
   --output "$AI_RUN_DIR/reports/cpp-incremental.json"
+
+# 跑 fused 候选时只替换 manifest 和输出文件；控制面会自动选择四模型 CLI。
+"$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
+  --deployment-manifest "$FUSED_BUNDLE/deployment-manifest.json" \
+  --runner \
+    "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+  --runner-config "$AI_RUN_DIR/runner-incremental.json" \
+  --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
+  --prompt '请用一句话解释为什么天空是蓝色的。' \
+  --chat \
+  --max-new-tokens 32 \
+  --max-draft-tokens 15 \
+  --device-id 0 \
+  --output "$AI_RUN_DIR/reports/cpp-fused-speculative-step.json"
 ```
 
-控制面会在启动前校验五个 role 的输入/输出顺序和 OM SHA-256；runner 自身会再次校验 hash，
-加载后再从真实 OM description 校验 dtype、shape、state 对齐、完整 `N=1..16` verify gear 和
-从 `N=64` 开始的 prompt gear。任何一层不符
-都会停止，不能进入时延比较。
+控制面会在启动前按 manifest 自动选择五图、统一 Target-step 四图或 fused 四图，并校验所选 role
+集合的输入/输出顺序和 OM SHA-256；runner 自身会再次校验 hash。加载后再从真实 OM description
+校验 dtype、shape、state 对齐、完整 N=1..16 动态档和从 N=64 开始的 prompt 档。任何一层不符
+都会停止，不能进入时延比较。fused manifest 不会向 runner 传独立 Draft/verify 参数。
 
 直接检查关键门禁：
 
@@ -592,8 +704,10 @@ jq -e '
 ' "$AI_RUN_DIR/reports/cpp-incremental.json"
 ```
 
-正确的多 OM report 中，`model_executions` 等于五个物理 role execution 之和。设 prompt token 数为
-`P`、`C=ceil(P/64)`，paired 3+10 的请求数 `R=2*(3+10)=26`，则必须满足：
+正确的多 OM report 中，`model_executions` 等于实际加载的物理 role execution 之和。五图和统一
+Target-step 中 Draft 与 verify 是两个物理调用；fused 候选中它们仍各有逻辑计数，但共同对应一个
+物理调用。设 prompt token 数为 `P`、`C=ceil(P/64)`，paired 3+10 的请求数
+`R=2*(3+10)=26`，则必须满足：
 
 ```text
 target_prefill_executions          = R * C
@@ -651,6 +765,16 @@ prefill_verify_d2h_padding_bytes     = slot0_windows
 host_to_device_operations           = prefill_control_upload_operations
                                     + decode_id_upload_operations
                                     + proposal_count_upload_operations
+
+# 仅 fused-speculative-step 拓扑
+fused_speculative_step_executions   = draft_propose_executions
+                                    = target_verify_commit_executions
+draft_to_verify_model_launches_elided
+                                    = fused_speculative_step_executions
+model_executions                    = prefill + prefill-head + decode1 + fused
+model_executions + draft_to_verify_model_launches_elided
+                                    = prefill + prefill-head + decode1
+                                    + logical-draft + logical-verify
 ```
 
 上述 `prefill_draft_*` 的 `(R/2)` 前提是 `max_new_tokens>2`。Prefill 自身先提交 1 token，第一次
@@ -1705,7 +1829,106 @@ export UNIFIED_TARGET_STEP_OM="$UNIFIED_BUNDLE/om/target-verify-commit.om"
 如果误把静态五图的 verify OM 放到这里，runner 会因缺少动态控制输入或 T=1..16 gear 而拒绝
 启动；不会静默退回固定 T=16。
 
-### 5.7 用 msprof 分角色确认五 OM 或统一 Target-step 耗时
+fused speculative-step 同样使用这个 runner，但保留独立 `target-decode1`，并用一个 fused OM
+替换两项独立 Draft/verify。下面是可直接复制的未 profiling 3+10 命令：
+
+```bash
+export FUSED_PREFILL_OM="$FUSED_BUNDLE/om/target-prefill.om"
+export FUSED_PREFILL_HEAD_OM="$FUSED_BUNDLE/om/target-prefill-head.om"
+export FUSED_DECODE_OM="$FUSED_BUNDLE/om/target-decode1.om"
+export FUSED_STEP_OM="$FUSED_BUNDLE/om/fused-speculative-step.om"
+
+"$INCREMENTAL_RUNNER" \
+  --target-prefill "$FUSED_PREFILL_OM" \
+  --target-prefill-sha256 \
+    "$(sha256sum "$FUSED_PREFILL_OM" | awk '{print $1}')" \
+  --target-prefill-head "$FUSED_PREFILL_HEAD_OM" \
+  --target-prefill-head-sha256 \
+    "$(sha256sum "$FUSED_PREFILL_HEAD_OM" | awk '{print $1}')" \
+  --target-decode1 "$FUSED_DECODE_OM" \
+  --target-decode1-sha256 \
+    "$(sha256sum "$FUSED_DECODE_OM" | awk '{print $1}')" \
+  --fused-speculative-step "$FUSED_STEP_OM" \
+  --fused-speculative-step-sha256 \
+    "$(sha256sum "$FUSED_STEP_OM" | awk '{print $1}')" \
+  --output "$AI_RUN_DIR/reports/cpp-fused-speculative-step.json" \
+  --prompt-token-ids 'REAL,TOKEN,IDS' \
+  --eos-token-ids 'REAL,EOS,IDS' \
+  --pad-token-id 0 \
+  --max-new-tokens 32 \
+  --max-draft-tokens 15 \
+  --measurement-protocol evidence \
+  --warmup 3 \
+  --repetitions 10 \
+  --device-id 0 \
+  --state-reset-policy async-memset \
+  --decode-carrier-policy last-token-d2d \
+  --dflash-sync-window 1 \
+  --prefill-completion-policy separate \
+  --zero-accept-fallback-policy disabled \
+  --draft-feature-policy fixed-16 \
+  --progress true
+
+jq -e '
+  .execution_io_counters as $io |
+  (.schema_version == 12) and
+  (.abi.physical_topology ==
+    "split-prefill-head-four-resident-fused-speculative-step-v1") and
+  ([.models[].role] == [
+    "target-prefill", "target-prefill-head", "target-decode1",
+    "fused-speculative-step"
+  ]) and
+  ($io.fused_speculative_step_executions ==
+   $io.draft_propose_executions) and
+  ($io.fused_speculative_step_executions ==
+   $io.target_verify_commit_executions) and
+  ($io.draft_to_verify_model_launches_elided ==
+   $io.fused_speculative_step_executions) and
+  ($io.model_executions ==
+   ($io.target_prefill_executions +
+    $io.target_prefill_head_executions +
+    $io.target_decode1_executions +
+    $io.fused_speculative_step_executions)) and
+  (.ordinary_parity.token_id_mismatches == 0) and
+  (.ordinary_parity.eos_mismatches == 0)
+' "$AI_RUN_DIR/reports/cpp-fused-speculative-step.json"
+```
+
+启动输出会分别显示 OM hash 校验、每个 model query/load、ABI 校验、buffer 分配、immutable-zero
+初始化（若选择）、dataset plan 构建、warmup、measurement 和写报告阶段。因此长时间停顿时先看最后一
+条 `stage=`，不要只凭“还没生成 token”判断是模型执行卡住。
+
+先按“五图→fused”运行一对，再用新的输出路径按“fused→五图”反向运行一对。四份报告必须使用
+相同 prompt token IDs、生成上限、runner 二进制、设备身份和除 topology 外的策略。关闭 msprof 后
+可用下面命令汇总，不能拿 Fake ACL 或 profile 模式的耗时做选择：
+
+```bash
+jq -s '
+  map({
+    topology: .abi.physical_topology,
+    om_sha256: (.models | map({role,sha256})),
+    token_mismatch: .ordinary_parity.token_id_mismatches,
+    eos_mismatch: .ordinary_parity.eos_mismatches,
+    physical_model_executions: .execution_io_counters.model_executions,
+    fused_launches_elided:
+      .execution_io_counters.draft_to_verify_model_launches_elided,
+    ordinary_median_ms: .ordinary.latency_ms.model_total.median,
+    ordinary_p90_ms: .ordinary.latency_ms.model_total.p90,
+    dflash_median_ms: .dflash.latency_ms.model_total.median,
+    dflash_p90_ms: .dflash.latency_ms.model_total.p90,
+    acceptance_rate: .dflash.acceptance_rate
+  })
+' \
+  "$AI_RUN_DIR/reports/forward-five.json" \
+  "$AI_RUN_DIR/reports/forward-fused.json" \
+  "$AI_RUN_DIR/reports/reverse-fused.json" \
+  "$AI_RUN_DIR/reports/reverse-five.json"
+```
+
+只有四份报告都为零 token/EOS mismatch，且 fused 在正反顺序的 DFlash median/p90 都超过预先声明
+的测量噪声门槛时，才能继续考虑激活；ordinary 变慢、内存不够或只有单向改善都不能晋级。
+
+### 5.7 用 msprof 分角色确认五 OM、统一 Target-step 或 fused 耗时
 
 五个 OM 是独立 model ID，因此最可靠的 profile 是运行完整状态机，再在 msprof 导出的
 model/task/op 表中按 model ID 和 role 文件名分组。不要分别喂随机 state 跑五个 OM 后把数字相加；
@@ -1770,11 +1993,11 @@ done
 `DRAFT_FEATURE_POLICY=committed-prefix`；分析 prefill 合并候选时设
 `PREFILL_COMPLETION_POLICY=coalesce-first-verify`；分析零接受 fallback 时设
 `ZERO_ACCEPT_FALLBACK_POLICY=request-target-only`。每个候选都要换一个新的
-`PROFILE_ROOT`/`UNIFIED_PROFILE_ROOT` 后完整重跑，不能把两个窗口的 CSV 合并到同一 analysis
+`PROFILE_ROOT`/`UNIFIED_PROFILE_ROOT`/`FUSED_PROFILE_ROOT` 后完整重跑，不能把两个窗口的 CSV 合并到同一 analysis
 目录。分析器会要求 `aclmdlExecuteAsync` 按 transaction 闭合、实际 D2H 加
 `speculative_d2h_operations_elided` 和 `prefill_verify_d2h_operations_elided` 后按 transaction
 闭合，而 `aclrtSynchronizeStream` 按
-`speculative_sync_windows` 闭合。schema 11 的 window 3..8 必须报告
+`speculative_sync_windows` 闭合。schema 12 的 window 3..8 必须报告
 `speculative_window_staging_operations=0`，所以 `aclrtMemcpyAsync` 期望值不再加 compact staging；
 `speculative_window_direct_output_bindings/bytes` 则必须与 Verify 直接输出闭合，但不会作为 memcpy
 事件出现。任何候选都不应伪装成少执行了 verify。
@@ -1809,6 +2032,57 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
       --target-verify-commit "$UNIFIED_TARGET_STEP_OM" \
       --target-verify-commit-sha256 \
         "$(sha256sum "$UNIFIED_TARGET_STEP_OM" | awk '{print $1}')" \
+      --output "$CASE_ROOT/runner-report.json" \
+      --prompt-token-ids "$TOKEN_IDS" \
+      --eos-token-ids 'REAL,EOS,IDS' \
+      --pad-token-id 0 \
+      --max-new-tokens 32 \
+      --max-draft-tokens 15 \
+      --measurement-protocol profile \
+      --warmup 1 \
+      --repetitions 1 \
+      --device-id 0 \
+      --state-reset-policy "$RESET_POLICY" \
+      --decode-carrier-policy "$DECODE_CARRIER_POLICY" \
+      --dflash-sync-window "$DFLASH_SYNC_WINDOW" \
+      --prefill-completion-policy "$PREFILL_COMPLETION_POLICY" \
+      --zero-accept-fallback-policy "$ZERO_ACCEPT_FALLBACK_POLICY" \
+      --draft-feature-policy "$DRAFT_FEATURE_POLICY" \
+      --progress false
+done
+```
+
+fused 候选必须再采一组独立 profile。它有四个物理 model ID；`fused-speculative-step` 的一次
+`aclmdlExecuteAsync` 同时代表一个逻辑 Draft 和一个逻辑 Target verify，不能在 msprof 里伪拆成
+两个 OM 时延：
+
+```bash
+export FUSED_PROFILE_ROOT=/ABSOLUTE/PATH/qwen35-fused-speculative-msprof
+mkdir -p "$FUSED_PROFILE_ROOT"
+
+for AIC_METRIC in PipeUtilization Memory MemoryUB; do
+  LABEL="fused-speculative-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${PREFILL_COMPLETION_POLICY}-${ZERO_ACCEPT_FALLBACK_POLICY}-${AIC_METRIC}"
+  CASE_ROOT="$FUSED_PROFILE_ROOT/$LABEL"
+  "$DFLASH_SOURCE/tools/run_msprof.sh" \
+    --label "$LABEL" \
+    --output-dir "$CASE_ROOT" \
+    --python "$MODEL_PYTHON" \
+    --aic-metrics "$AIC_METRIC" \
+    --no-msproftx \
+    -- \
+    "$INCREMENTAL_RUNNER" \
+      --target-prefill "$FUSED_PREFILL_OM" \
+      --target-prefill-sha256 \
+        "$(sha256sum "$FUSED_PREFILL_OM" | awk '{print $1}')" \
+      --target-prefill-head "$FUSED_PREFILL_HEAD_OM" \
+      --target-prefill-head-sha256 \
+        "$(sha256sum "$FUSED_PREFILL_HEAD_OM" | awk '{print $1}')" \
+      --target-decode1 "$FUSED_DECODE_OM" \
+      --target-decode1-sha256 \
+        "$(sha256sum "$FUSED_DECODE_OM" | awk '{print $1}')" \
+      --fused-speculative-step "$FUSED_STEP_OM" \
+      --fused-speculative-step-sha256 \
+        "$(sha256sum "$FUSED_STEP_OM" | awk '{print $1}')" \
       --output "$CASE_ROOT/runner-report.json" \
       --prompt-token-ids "$TOKEN_IDS" \
       --eos-token-ids 'REAL,EOS,IDS' \
@@ -1866,6 +2140,7 @@ jq -e '
 
 jq '{
   topology,
+  fused_speculative_step,
   device_task_summary,
   by_role,
   by_role_and_physical_rows,
@@ -1885,8 +2160,9 @@ analysis-input 目录后再运行上述命令。旧版
 `op_summary_<device>_<model>_<iteration>.csv` 和新版带 `Model ID/Infer ID` 列的汇总 CSV 都支持；
 同一 `(model_id,infer_id)` 出现在两个文件时会被视为重复导出并拒绝，避免耗时翻倍。
 
-分析器用 runner 自报信息建立 `model_id -> target-prefill/target-prefill-head/target-decode1/
-draft-propose/target-verify-commit` 映射；统一候选只有四个 model ID，ordinary 的
+分析器用 runner 自报信息建立 `model_id -> physical role` 映射。五图使用
+`target-prefill/target-prefill-head/target-decode1/draft-propose/target-verify-commit`；统一候选只有
+四个 model ID，ordinary 的
 `target_decode1_executions` 是逻辑计数，物理执行归入动态 `target-verify-commit`。再按 model ID 汇总
 `Task Duration(us)`，并用 trace 的物理 T 拆分 T=1 与 T>1。它还要求 `aclmdlExecuteAsync`、
 `aclrtMemcpyAsync`、`aclrtMemsetAsync`、`aclrtSynchronizeStream` 的 API count 与 runner 计数严格
@@ -1895,6 +2171,12 @@ draft-propose/target-verify-commit` 映射；统一候选只有四个 model ID�
 msprof 仅用于定位 kernel、Memcpy、launch、同步和空洞；最终 median/p90
 必须重新关闭 profiling，以 `--measurement-protocol evidence --warmup 3 --repetitions 10` 跑上面
 的正式命令。profile report 会明确写入 `formal_latency_evidence=false`，不能混入候选提升依据。
+
+fused 候选的第四个 model ID 是 `fused-speculative-step`。分析器用 trace 中 N>16 的调用归因首次
+prompt feature batch，用 N<=16 的调用归因后续 verify-source Draft feature 输入，并要求这些行数与
+runner 的 `prefill_feature_rows_batched`/`draft_verify_feature_input_rows` 严格闭合。该 model 的
+`Task Duration(us)` 是整个 Draft+Target verify supergraph 的 device task 总和；要判断内部热点只能看
+同一 model/infer 下的 operator 行，不能把它虚构成两个可独立测量的 OM 时延。
 
 另外必须把 `api_statistic`/timeline 中的 memcpy 与 report 对齐：每个 prefill chunk 必须恰好
 出现一次 control H2D，其长度只能是 report 声明的 base/count/proposal/full 四档；连续请求中
@@ -1955,6 +2237,29 @@ jq -e '
     ($io.compact_slot_bytes -
      $io.compact_verify_result_bytes))) and
   (if .abi.physical_topology ==
+      "split-prefill-head-four-resident-fused-speculative-step-v1" then
+     ($io.fused_speculative_step_executions ==
+      $io.draft_propose_executions) and
+     ($io.fused_speculative_step_executions ==
+      $io.target_verify_commit_executions) and
+     ($io.draft_to_verify_model_launches_elided ==
+      $io.fused_speculative_step_executions) and
+     ($io.model_executions ==
+      ($io.target_prefill_executions +
+       $io.target_prefill_head_executions +
+       $io.target_decode1_executions +
+       $io.fused_speculative_step_executions))
+   else
+     ($io.fused_speculative_step_executions == 0) and
+     ($io.draft_to_verify_model_launches_elided == 0) and
+     ($io.model_executions ==
+      ($io.target_prefill_executions +
+       $io.target_prefill_head_executions +
+       $io.target_decode1_executions +
+       $io.draft_propose_executions +
+       $io.target_verify_commit_executions))
+   end) and
+  (if .abi.physical_topology ==
       "split-prefill-head-four-resident-unified-target-step-v1" then
      (.model_memory_query.target_step_zero_count_device_bytes == 4) and
      ($io.target_step_zero_count_device_bytes == 4) and
@@ -1987,20 +2292,23 @@ jq -e '
 6. 先要求 ordinary/DFlash token ID、EOS、stop reason 全部零差异，再比较 median、p90、TTFT、
    TPOT、每轮同步数、实际 transaction/物理 T 和接受率；同步窗口 1/2/4/8 也必须正反顺序
    单独 A/B。
-7. 只提升通过上述门禁且端到端最快的拓扑。
+7. 对 fused 候选额外确认
+   `physical model_executions + draft_to_verify_model_launches_elided` 与原逻辑 Draft/verify 总数闭合；
+   msprof 只把 fused 作为一个物理 model ID 统计。
+8. 只提升通过上述门禁且端到端最快的拓扑。
 
 单 OM 的 msprof 命令已经写在 `docs/QUANT_AIR_OM_FRAMEWORK.md` 的“单独 profile 每个 OM”章节。
 五图基线包含 `target-prefill`、`target-prefill-head`、`target-decode1`、`draft-propose` 和
 `target-verify-commit`；统一候选删除独立 decode，动态 verify 同时承担 T=1 ordinary 与 T>1
-verify。使用第 5.7 节的一次进程级采集，再按 model ID/role/gear 汇总；不要分别构造不真实的
-随机状态运行这些 OM。
+verify；fused 候选保留独立 decode，并把 Draft+固定 T16 verify 合成一个物理 model ID。使用第 5.7
+节的一次进程级采集，再按 model ID/role/gear 汇总；不要分别构造不真实的随机状态运行这些 OM。
 
 ## 7. 当前证据边界
 
 本地环境是 simulation profile，没有物理 Ascend310P、匹配的 TorchAir/ATC 和真实 OM。因此当前
 可以冻结 ABI、实现 host/Fake-ACL 测试和生成真机命令，但不能宣称：
 
-- 2/3/4/当前 5 图候选中哪个一定更快；
+- 2/3/4/当前 5 图及 fused 四图候选中哪个一定更快；
 - 不同 Target OM 会共享权重；
 - 792 MiB bank 会被编译器复用为理想 workspace；
 - receiver 自定义算子能通过动态 gear；
@@ -2008,7 +2316,8 @@ verify。使用第 5.7 节的一次进程级采集，再按 model ID/role/gear �
 
 因此当前实现结论是“可导出、可由 C++ 选择、非目标动态图和完整 Fake ACL 状态机通过”，不是
 “四个真实 OM 已生成”或“性能已经更快”。真机首先比较完整集合的 `sum(weightSize)`：统一候选
-理论上删除一份独立 Target decode artifact，但实际节省只能以 `aclmdlQuerySize` 和完整 load 为准。
+理论上删除一份独立 Target decode artifact；fused 候选则用一个 Draft+verify artifact 替换两个文件，
+但可能改变权重封装和 workspace。实际节省只能以 `aclmdlQuerySize` 和完整 load 为准。
 
 这些结论必须由同一台 310P 上的组合 load、零差异验证、未 profile 的 10 次分布和 msprof
 诊断共同给出。

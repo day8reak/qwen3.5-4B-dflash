@@ -708,6 +708,88 @@ class DraftProposeStateGraph(nn.Module):
         return verify_input_ids, next_key, next_value, next_cursor
 
 
+class FusedSpeculativeStepStateGraph(nn.Module):
+    """Run the exact Draft proposal and fixed-T16 Target transaction in one graph.
+
+    This is the approved ``fused-speculative-step`` topology candidate.  It
+    preserves the two existing modules and their state contracts verbatim; the
+    only removed boundary is the device-resident ``verify_input_ids`` carrier
+    between two separately launched OMs.
+    """
+
+    def __init__(
+        self,
+        target: nn.Module,
+        draft: nn.Module,
+        input_embedding: nn.Module,
+        output_embedding: nn.Module,
+        *,
+        kv_cache_max_len: int,
+    ) -> None:
+        super().__init__()
+        self.draft_propose = DraftProposeStateGraph(
+            draft,
+            input_embedding,
+            output_embedding,
+            kv_cache_max_len=kv_cache_max_len,
+        )
+        self.target_verify = TargetVerifyCommitStateGraph(
+            target,
+            kv_cache_max_len=kv_cache_max_len,
+        )
+
+    def forward(
+        self,
+        target_feature_tail: Tensor,
+        committed_input_count: Tensor,
+        previous_committed_token_ids: Tensor,
+        previous_commit_count: Tensor,
+        logical_proposal_count: Tensor,
+        eos_token_ids: Tensor,
+        eos_token_count: Tensor,
+        target_conv_state: Tensor,
+        target_recurrent_state: Tensor,
+        target_key_cache: Tensor,
+        target_value_cache: Tensor,
+        logical_target_cursor: Tensor,
+        draft_key_cache: Tensor,
+        draft_value_cache: Tensor,
+        logical_draft_cursor: Tensor,
+    ) -> tuple[Tensor, ...]:
+        (
+            verify_input_ids,
+            next_draft_key,
+            next_draft_value,
+            next_draft_cursor,
+        ) = self.draft_propose(
+            target_feature_tail,
+            committed_input_count,
+            previous_committed_token_ids,
+            previous_commit_count,
+            logical_proposal_count,
+            draft_key_cache,
+            draft_value_cache,
+            logical_draft_cursor,
+        )
+        target_outputs = self.target_verify(
+            verify_input_ids,
+            logical_proposal_count,
+            eos_token_ids,
+            eos_token_count,
+            target_conv_state,
+            target_recurrent_state,
+            target_key_cache,
+            target_value_cache,
+            logical_target_cursor,
+        )
+        return (
+            *target_outputs,
+            next_draft_key,
+            next_draft_value,
+            next_draft_cursor,
+        )
+
+
 def incremental_state_graph_specs(
     target: nn.Module,
     draft: nn.Module,
@@ -720,9 +802,10 @@ def incremental_state_graph_specs(
     head_custom_ops: tuple[CustomOpExportSpec, ...],
     verify_custom_ops: tuple[CustomOpExportSpec, ...],
     unified_target_step: bool = False,
+    fused_speculative_step: bool = False,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[AirGraphSpec, ...]:
-    """Create the five-OM baseline or four-OM unified Target-step candidate."""
+    """Create one approved exact incremental physical-topology candidate."""
 
     if dtype is not torch.float16:
         raise ValueError("incremental state graphs currently require float16")
@@ -730,6 +813,14 @@ def incremental_state_graph_specs(
         raise TypeError("eos_table_width must be an integer")
     if eos_table_width <= 0:
         raise ValueError("eos_table_width must be positive")
+    if not isinstance(unified_target_step, bool) or not isinstance(
+        fused_speculative_step, bool
+    ):
+        raise TypeError("incremental topology selectors must be booleans")
+    if unified_target_step and fused_speculative_step:
+        raise ValueError(
+            "unified_target_step and fused_speculative_step are mutually exclusive"
+        )
     target_device = torch.device(device)
     config = getattr(target, "config", None)
     layer_types = tuple(getattr(config, "layer_types", ()))
@@ -857,6 +948,17 @@ def incremental_state_graph_specs(
         output_embedding,
         kv_cache_max_len=kv_cache_max_len,
     ).eval()
+    fused = (
+        FusedSpeculativeStepStateGraph(
+            target,
+            draft,
+            input_embedding,
+            output_embedding,
+            kv_cache_max_len=kv_cache_max_len,
+        ).eval()
+        if fused_speculative_step
+        else None
+    )
     draft_feature_gears = tuple(range(1, VERIFY_ROWS + 1)) + tuple(
         range(PREFILL_ROWS, kv_cache_max_len + 1, PREFILL_ROWS)
     )
@@ -1040,6 +1142,103 @@ def incremental_state_graph_specs(
         metadata=verify_metadata,
         custom_ops=verify_custom_ops,
     )
+    if fused_speculative_step:
+        assert fused is not None
+        fused_metadata = graph_metadata(
+            "fused-speculative-step",
+            verify_custom_ops,
+            [
+                "target_conv_state",
+                "target_recurrent_state",
+                "target_key_cache",
+                "target_value_cache",
+                "logical_target_cursor",
+                "draft_key_cache",
+                "draft_value_cache",
+                "logical_draft_cursor",
+            ],
+        )
+        fused_metadata = {
+            **fused_metadata,
+            "physical_topology": (
+                "split-prefill-head-four-resident-fused-speculative-step-v1"
+            ),
+            "fused_logical_roles": [
+                "draft-propose",
+                "target-verify-commit",
+            ],
+            "verify_input_ids_externalized": False,
+            "target_verify_rows": VERIFY_ROWS,
+        }
+        fused_spec = AirGraphSpec(
+            name="fused-speculative-step",
+            role="fused-speculative-step",
+            model=fused,
+            example_args=(
+                torch.zeros(
+                    (1, VERIFY_ROWS, feature_width),
+                    dtype=dtype,
+                    device=target_device,
+                ),
+                torch.ones((1,), dtype=torch.int32, device=target_device),
+                torch.zeros(
+                    (1, VERIFY_ROWS), dtype=torch.long, device=target_device
+                ),
+                torch.ones((1,), dtype=torch.int32, device=target_device),
+                torch.full(
+                    (1,),
+                    PROPOSAL_ROWS,
+                    dtype=torch.int32,
+                    device=target_device,
+                ),
+                eos_ids,
+                eos_count,
+                *state_inputs,
+                draft_key,
+                draft_value,
+                draft_cursor,
+            ),
+            input_names=(
+                "target_feature_tail",
+                "committed_input_count",
+                "previous_committed_token_ids",
+                "previous_commit_count",
+                "logical_proposal_count",
+                "eos_token_ids",
+                "eos_token_count",
+                "target_conv_state",
+                "target_recurrent_state",
+                "target_key_cache",
+                "target_value_cache",
+                "logical_target_cursor",
+                "draft_key_cache",
+                "draft_value_cache",
+                "logical_draft_cursor",
+            ),
+            output_names=(
+                "committed_token_ids",
+                "commit_count",
+                "drafted_count",
+                "accepted_count",
+                "rejected_count",
+                "target_conv_state",
+                "target_recurrent_state",
+                "target_feature_tail",
+                "committed_input_count",
+                "logical_target_cursor",
+                "finished",
+                "target_key_cache",
+                "target_value_cache",
+                "draft_key_cache",
+                "draft_value_cache",
+                "logical_draft_cursor",
+            ),
+            dynamic=True,
+            input_dim_gears={0: {1: draft_feature_gears}},
+            metadata=fused_metadata,
+            custom_ops=verify_custom_ops,
+        )
+        return prefill_spec, prefill_head_spec, decode_spec, fused_spec
     if unified_target_step:
         return prefill_spec, prefill_head_spec, draft_spec, verify_spec
     return prefill_spec, prefill_head_spec, decode_spec, draft_spec, verify_spec
@@ -1047,6 +1246,7 @@ def incremental_state_graph_specs(
 
 __all__ = [
     "DraftProposeStateGraph",
+    "FusedSpeculativeStepStateGraph",
     "incremental_state_graph_specs",
     "PREFILL_ROWS",
     "PROPOSAL_ROWS",

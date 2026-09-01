@@ -12,6 +12,7 @@ from .incremental import ExactAcceptCommitStateGraph
 from .msprof_analysis import analyze_incremental_msprof
 from .incremental_graphs import (
     DraftProposeStateGraph,
+    FusedSpeculativeStepStateGraph,
     TargetDecodeOneStateGraph,
     TargetPrefillHeadGraph,
     TargetPrefillStateGraph,
@@ -19,6 +20,7 @@ from .incremental_graphs import (
     TargetVerifyCommitStateGraph,
 )
 from .quant_factory import (
+    create_quant_fused_speculative_step_graphs,
     create_quant_incremental_state_graphs,
     create_quant_recompute_graph,
     create_quant_unified_target_step_graphs,
@@ -33,6 +35,7 @@ __all__ = [
     "GenerationStep",
     "ExactAcceptCommitStateGraph",
     "DraftProposeStateGraph",
+    "FusedSpeculativeStepStateGraph",
     "IntegratedDFlashRecomputeGraph",
     "RecomputeDFlashOmBackend",
     "TargetDecodeOneStateGraph",
@@ -46,6 +49,7 @@ __all__ = [
     "build_quant_input_manifest",
     "compile_air_bundle",
     "create_quant_recompute_graph",
+    "create_quant_fused_speculative_step_graphs",
     "create_quant_incremental_state_graphs",
     "create_quant_unified_target_step_graphs",
     "export_air_bundle",

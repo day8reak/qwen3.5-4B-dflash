@@ -30,6 +30,7 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
     REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY,
     SEPARATE_PREFILL_COMPLETION_POLICY,
+    _FUSED_SPECULATIVE_STEP_GRAPH_ABI,
     _INCREMENTAL_GRAPH_ABI,
     _UNIFIED_TARGET_STEP_GRAPH_ABI,
     _resolve_incremental_oms,
@@ -210,7 +211,7 @@ def _report(
         for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
-        "schema_version": 11,
+        "schema_version": 12,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -380,6 +381,8 @@ def _report(
             "target_decode1_executions": decode_executions,
             "draft_propose_executions": draft_propose_executions,
             "target_verify_commit_executions": 26,
+            "fused_speculative_step_executions": 0,
+            "draft_to_verify_model_launches_elided": 0,
             "stream_synchronizations": (
                 request_count + decode_executions + speculative_windows
             ),
@@ -616,6 +619,72 @@ def _unified_report(
     return report
 
 
+def _fused_report() -> dict[str, object]:
+    report = _report()
+    hashes = {
+        role: hashlib.sha256(role.encode("utf-8")).hexdigest()
+        for role in _FUSED_SPECULATIVE_STEP_GRAPH_ABI
+    }
+    report["models"] = [
+        {
+            "role": role,
+            "model_id": model_id,
+            "sha256": hashes[role],
+            "work_bytes": 64,
+            "weight_bytes": 64 if role == "target-prefill-head" else 256,
+        }
+        for model_id, role in enumerate(
+            _FUSED_SPECULATIVE_STEP_GRAPH_ABI, start=1
+        )
+    ]
+    report["abi"]["physical_topology"] = (
+        "split-prefill-head-four-resident-fused-speculative-step-v1"
+    )
+    report["protocol"]["prefill_draft_policy"] = (
+        "Target feature slabs stay device-resident; no prompt chunk launches "
+        "Draft separately; the first prebound dynamic-gear fused transaction "
+        "consumes the complete prompt feature batch"
+    )
+    memory = report["model_memory_query"]
+    memory["sum_work_bytes"] = 256
+    memory["sum_weight_bytes"] = 832
+    memory["load_policy"] = (
+        "four aclmdlLoadFromFileWithMem sessions; one max-sized serial "
+        "workspace; separate per-artifact weights; no cross-OM weight "
+        "sharing assumed"
+    )
+    memory["explicit_allocated_device_bytes_excluding_runtime"] = (
+        int(memory["max_work_bytes"])
+        + int(memory["sum_weight_bytes"])
+        + int(memory["state_device_bytes"])
+        + int(memory["carrier_device_bytes"])
+    )
+    execution = report["execution_io_counters"]
+    verify = int(execution["target_verify_commit_executions"])
+    prefill_draft = int(execution["prefill_draft_propose_executions"])
+    verify_source_draft = verify - prefill_draft
+    execution["draft_propose_executions"] = verify
+    execution["fused_speculative_step_executions"] = verify
+    execution["draft_to_verify_model_launches_elided"] = verify
+    execution["model_executions"] = (
+        int(execution["target_prefill_executions"])
+        + int(execution["target_prefill_head_executions"])
+        + int(execution["target_decode1_executions"])
+        + verify
+    )
+    execution["draft_verify_feature_input_rows"] = 16 * verify_source_draft
+    execution["draft_verify_full_width_equivalent_rows"] = (
+        16 * verify_source_draft
+    )
+    execution["draft_verify_feature_rows_elided"] = 0
+    execution["draft_verify_fixed_width_executions"] = verify_source_draft
+    execution["draft_verify_committed_prefix_executions"] = 0
+    execution["draft_verify_pending_upper_bound_executions"] = 0
+    execution["target_step_input_rows"] = 16 * verify
+    execution["target_step_padded_rows_elided"] = 0
+    return report
+
+
 def _validate(
     report: dict[str, object],
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
@@ -628,6 +697,7 @@ def _validate(
         DISABLED_ZERO_ACCEPT_FALLBACK_POLICY
     ),
     unified_target_step: bool = False,
+    fused_speculative_step: bool = False,
 ) -> None:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
     hashes = _hashes()
@@ -635,6 +705,11 @@ def _validate(
         hashes = {
             role: hashes[role]
             for role in _UNIFIED_TARGET_STEP_GRAPH_ABI
+        }
+    elif fused_speculative_step:
+        hashes = {
+            role: hashlib.sha256(role.encode("utf-8")).hexdigest()
+            for role in _FUSED_SPECULATIVE_STEP_GRAPH_ABI
         }
     validate_incremental_cpp_runner_report(
         report,
@@ -759,6 +834,19 @@ def test_build_cpp_runner_keeps_policy_specific_logs_with_build(
 
 def test_unified_incremental_runner_report_closes_resident_zero_count() -> None:
     _validate(_unified_report(), unified_target_step=True)
+
+
+def test_fused_incremental_runner_report_closes_one_physical_launch() -> None:
+    _validate(_fused_report(), fused_speculative_step=True)
+
+
+def test_fused_incremental_runner_rejects_launch_elision_drift() -> None:
+    report = _fused_report()
+    report["execution_io_counters"][
+        "draft_to_verify_model_launches_elided"
+    ] -= 1
+    with pytest.raises(RuntimeError, match="fused Draft-to-verify"):
+        _validate(report, fused_speculative_step=True)
 
 
 def test_unified_incremental_runner_rejects_missing_zero_count_binding() -> None:
@@ -1206,6 +1294,50 @@ def test_resolve_incremental_oms_accepts_only_complete_t1_to_t16_target_step(
     graphs[-1]["input_dim_gears"] = {"0": {"1": list(range(2, 17))}}
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="T=1..16"):
+        _resolve_incremental_oms(manifest_path)
+
+
+def test_resolve_incremental_oms_locks_fused_speculative_step_abi_and_gears(
+    tmp_path: Path,
+) -> None:
+    graphs = []
+    for role, (inputs, outputs) in _FUSED_SPECULATIVE_STEP_GRAPH_ABI.items():
+        om = tmp_path / f"{role}.om"
+        om.write_bytes(role.encode("utf-8"))
+        graph = {
+            "name": role,
+            "role": role,
+            "input_names": inputs,
+            "output_names": outputs,
+            "om": {
+                "path": om.name,
+                "sha256": hashlib.sha256(om.read_bytes()).hexdigest(),
+            },
+        }
+        if role == "fused-speculative-step":
+            graph["dynamic"] = True
+            graph["input_dim_gears"] = {
+                "0": {"1": list(range(1, 17)) + [64, 128]}
+            }
+        graphs.append(graph)
+    manifest_path = tmp_path / "deployment.json"
+    manifest = {
+        "artifact_kind": "qwen35-dflash-ascend310p-om-bundle",
+        "status": "PASS",
+        "graphs": graphs,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    resolved, _ = _resolve_incremental_oms(manifest_path)
+    assert list(resolved) == list(_FUSED_SPECULATIVE_STEP_GRAPH_ABI)
+    assert "draft-propose" not in resolved
+    assert "target-verify-commit" not in resolved
+
+    graphs[-1]["input_dim_gears"] = {
+        "0": {"1": list(range(2, 17)) + [64, 128]}
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="N=1..16"):
         _resolve_incremental_oms(manifest_path)
 
 

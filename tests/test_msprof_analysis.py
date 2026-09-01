@@ -132,6 +132,102 @@ def _schema_ten_runner_report() -> dict[str, object]:
     return report
 
 
+def _fused_runner_report() -> dict[str, object]:
+    return {
+        "schema_version": 12,
+        "status": "PASS",
+        "runner_id": "qwen35-dflash-ascendcl-cpp-incremental-v3",
+        "runner_version": "1.20.0",
+        "cpu_fallback": False,
+        "device_id": 0,
+        "models": [
+            {"role": "target-prefill", "model_id": 1},
+            {"role": "target-prefill-head", "model_id": 2},
+            {"role": "target-decode1", "model_id": 3},
+            {"role": "fused-speculative-step", "model_id": 4},
+        ],
+        "abi": {
+            "physical_topology": (
+                "split-prefill-head-four-resident-"
+                "fused-speculative-step-v1"
+            ),
+            "prefill_width": 64,
+            "verify_width": 16,
+        },
+        "protocol": {
+            "kind": "profile",
+            "formal_latency_evidence": False,
+            "profile_model_execution_trace_enabled": True,
+            "device_memory_allocation_policy": "normal-only",
+            "dflash_sync_window": 1,
+            "maximum_supported_dflash_sync_window": 8,
+            "draft_feature_policy": "committed-prefix",
+            "prefill_completion_policy": "separate",
+            "zero_accept_fallback_policy": "disabled",
+        },
+        "execution_io_counters": {
+            "model_executions": 7,
+            "target_prefill_executions": 2,
+            "target_prefill_head_executions": 1,
+            "target_decode1_executions": 2,
+            "draft_propose_executions": 2,
+            "target_verify_commit_executions": 2,
+            "fused_speculative_step_executions": 2,
+            "draft_to_verify_model_launches_elided": 2,
+            "prefill_draft_propose_executions": 1,
+            "prefill_feature_rows_batched": 128,
+            "draft_verify_feature_input_rows": 4,
+            "draft_verify_full_width_equivalent_rows": 16,
+            "draft_verify_feature_rows_elided": 12,
+            "draft_verify_fixed_width_executions": 0,
+            "draft_verify_committed_prefix_executions": 1,
+            "draft_verify_pending_upper_bound_executions": 0,
+            "draft_dynamic_gear_count": 18,
+            "draft_verify_dynamic_gear_count": 16,
+            "draft_prefill_dynamic_gear_count": 2,
+            "host_to_device_operations": 3,
+            "host_to_device_bytes": 1024,
+            "device_to_host_operations": 5,
+            "device_to_host_bytes": 1480,
+            "decode_id_device_compaction_operations": 1,
+            "decode_id_device_compaction_bytes": 8,
+            "state_memset_operations": 2,
+            "state_initialization_memset_operations": 0,
+            "stream_synchronizations": 5,
+            "speculative_sync_windows": 2,
+            "speculative_synchronizations_elided": 0,
+            "speculative_d2h_operations_elided": 0,
+            "speculative_d2h_padding_bytes": 0,
+            "speculative_window_staging_operations": 0,
+            "speculative_window_staging_bytes": 0,
+            "speculative_window_staging_device_bytes": 4096,
+            "speculative_window_staging_pinned_host_bytes": 4096,
+            "speculative_window_direct_output_bindings": 0,
+            "speculative_window_direct_output_bytes": 0,
+            "compact_slot_bytes": 512,
+            "compact_ordinary_result_bytes": 257,
+            "compact_verify_result_bytes": 452,
+            "prefill_verify_coalesced_windows": 0,
+            "prefill_verify_synchronizations_elided": 0,
+            "prefill_verify_d2h_operations_elided": 0,
+            "prefill_verify_d2h_padding_bytes": 0,
+            "prefill_verify_prefill_slot0_windows": 0,
+            "prefill_verify_prefill_slot1_windows": 0,
+            "prefill_completion_synchronizations": 1,
+            "state_initialization_stream_synchronizations": 0,
+        },
+        "profile_model_execution_trace": [
+            {"ordinal": 0, "model_id": 1, "physical_rows": 64},
+            {"ordinal": 1, "model_id": 1, "physical_rows": 64},
+            {"ordinal": 2, "model_id": 2, "physical_rows": 1},
+            {"ordinal": 3, "model_id": 3, "physical_rows": 1},
+            {"ordinal": 4, "model_id": 4, "physical_rows": 128},
+            {"ordinal": 5, "model_id": 4, "physical_rows": 4},
+            {"ordinal": 6, "model_id": 3, "physical_rows": 1},
+        ],
+    }
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -317,6 +413,51 @@ def test_msprof_analysis_attributes_every_role_and_dynamic_gear(
             "prefill_completion_synchronizations + "
             "target_decode1_executions + speculative_transactions"
         ),
+    }
+
+
+def test_msprof_analysis_attributes_fused_physical_launches(
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "fused-runner-report.json"
+    _write_json(report_path, _fused_runner_report())
+    profile = tmp_path / "PROF_fused" / "mindstudio_profiler_output"
+    profile.mkdir(parents=True)
+    _write_csv(
+        profile / "op_summary_fused.csv",
+        _op_rows_for_invocations(
+            [(1, 1), (1, 2), (2, 1), (3, 1), (4, 1), (4, 2), (3, 2)]
+        ),
+    )
+    _write_api_csv(
+        profile / "api_statistic_fused.csv",
+        execute_count=7,
+        memcpy_count=9,
+        synchronize_count=5,
+    )
+
+    payload = analyze_incremental_msprof(
+        profile_dir=profile.parent,
+        runner_report=report_path,
+    )
+    assert payload["fused_speculative_step"] is True
+    assert payload["coverage"]["observed_by_role"] == {
+        "target-prefill": 2,
+        "target-prefill-head": 1,
+        "target-decode1": 2,
+        "fused-speculative-step": 2,
+    }
+    assert payload["by_role_and_physical_rows"][
+        "fused-speculative-step:T=4"
+    ]["invocation_task_duration"]["count"] == 1
+    assert payload["expected_draft_feature_signature"]["trace_gate"] == (
+        "sum fused-speculative-step T<=16 physical_rows equals "
+        "draft_verify_feature_input_rows"
+    )
+    assert payload["api_count_gates"]["aclmdlExecuteAsync"] == {
+        "status": "PASS",
+        "expected": 7,
+        "observed": 7,
     }
 
 

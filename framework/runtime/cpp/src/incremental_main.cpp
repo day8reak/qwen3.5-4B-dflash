@@ -51,12 +51,13 @@ struct ModelArgument {
 };
 
 struct Arguments {
-  std::array<ModelArgument, 5> models{{
+  std::array<ModelArgument, 6> models{{
       {"target-prefill", {}, {}},
       {"target-prefill-head", {}, {}},
       {"target-decode1", {}, {}},
       {"draft-propose", {}, {}},
       {"target-verify-commit", {}, {}},
+      {"fused-speculative-step", {}, {}},
   }};
   std::filesystem::path output;
   std::vector<std::int64_t> prompt_token_ids;
@@ -94,6 +95,8 @@ void Usage(std::ostream& stream) {
       << "  --draft-propose-sha256 HEX               expected Draft SHA-256\n"
       << "  --target-verify-commit PATH              hash-locked verify OM\n"
       << "  --target-verify-commit-sha256 HEX        expected verify SHA-256\n"
+      << "  --fused-speculative-step PATH            exact Draft+verify supergraph; replaces separate pair\n"
+      << "  --fused-speculative-step-sha256 HEX      expected fused OM SHA-256\n"
       << "  --output PATH                            paired JSON report\n"
       << "  --prompt-token-ids CSV                   non-empty prompt\n"
       << "  --eos-token-ids CSV                      optional EOS token IDs\n"
@@ -263,18 +266,21 @@ std::string NormalizeHash(std::string value, const std::string& name) {
 Arguments ParseArguments(int argc, char** argv) {
   auto values = ParseOptions(argc, argv);
   Arguments result;
-  for (auto& model : result.models) {
-    if (std::string(model.role) == "target-decode1") {
+  for (std::size_t index = 0; index < result.models.size(); ++index) {
+    auto& model = result.models[index];
+    if (index >= 2) {
       const std::string path = TakeOptional(&values, model.role, "");
       const std::string hash = TakeOptional(
           &values, std::string(model.role) + "-sha256", "");
       if (path.empty() != hash.empty()) {
         throw std::invalid_argument(
-            "--target-decode1 and --target-decode1-sha256 must be supplied together");
+            std::string("--") + model.role + " and --" + model.role +
+            "-sha256 must be supplied together");
       }
       if (!path.empty()) {
         model.path = path;
-        model.sha256 = NormalizeHash(hash, "target-decode1-sha256");
+        model.sha256 = NormalizeHash(
+            hash, std::string(model.role) + "-sha256");
       }
     } else {
       model.path = TakeRequired(&values, model.role);
@@ -282,6 +288,20 @@ Arguments ParseArguments(int argc, char** argv) {
           TakeRequired(&values, std::string(model.role) + "-sha256"),
           std::string(model.role) + "-sha256");
     }
+  }
+  const bool fused = !result.models[5].path.empty();
+  const bool has_decode = !result.models[2].path.empty();
+  const bool has_draft = !result.models[3].path.empty();
+  const bool has_verify = !result.models[4].path.empty();
+  if (fused) {
+    if (!has_decode || has_draft || has_verify) {
+      throw std::invalid_argument(
+          "fused topology requires target-decode1 and forbids separate "
+          "draft-propose/target-verify-commit");
+    }
+  } else if (!has_draft || !has_verify) {
+    throw std::invalid_argument(
+        "non-fused topology requires draft-propose and target-verify-commit");
   }
   result.output = TakeRequired(&values, "output");
   result.prompt_token_ids = ParseTokenIds(
@@ -572,6 +592,16 @@ void WriteReport(
         return left.work_bytes < right.work_bytes;
       })->work_bytes;
   const auto& execution = executor.execution_stats();
+  const bool fused_speculative_step = executor.fused_speculative_step();
+  const char* resident_model_count =
+      (executor.unified_target_step() || fused_speculative_step)
+      ? "four"
+      : "five";
+  const char* physical_topology = fused_speculative_step
+      ? "split-prefill-head-four-resident-fused-speculative-step-v1"
+      : (executor.unified_target_step()
+             ? "split-prefill-head-four-resident-unified-target-step-v1"
+             : "split-prefill-head-five-resident-v1");
   const bool formal_latency_evidence =
       arguments.measurement_protocol == MeasurementProtocol::kEvidence;
   if (result.ordinary.total_zero_accept_transactions != 0 ||
@@ -593,8 +623,22 @@ void WriteReport(
       execution.target_prefill_executions +
       execution.target_prefill_head_executions +
       execution.target_decode1_executions +
-      execution.draft_propose_executions +
-      execution.target_verify_commit_executions;
+      (fused_speculative_step
+           ? execution.fused_speculative_step_executions
+           : execution.draft_propose_executions +
+                 execution.target_verify_commit_executions);
+  if (fused_speculative_step
+          ? (execution.fused_speculative_step_executions !=
+                 execution.draft_propose_executions ||
+             execution.fused_speculative_step_executions !=
+                 execution.target_verify_commit_executions ||
+             execution.draft_to_verify_model_launches_elided !=
+                 execution.fused_speculative_step_executions)
+          : (execution.fused_speculative_step_executions != 0 ||
+             execution.draft_to_verify_model_launches_elided != 0)) {
+    throw std::runtime_error(
+        "fused Draft-to-verify physical execution counters do not close");
+  }
   const auto& model_execution_trace = executor.model_execution_trace();
   if (formal_latency_evidence && !model_execution_trace.empty()) {
     throw std::runtime_error(
@@ -718,9 +762,9 @@ void WriteReport(
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":11,\"status\":\"PASS\","
+         << "{\"schema_version\":12,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
-         << (executor.unified_target_step() ? "four" : "five")
+         << resident_model_count
          << "-resident-OM paired model loop\","
          << "\"runner_id\":\"qwen35-dflash-ascendcl-cpp-incremental-v3\","
          << "\"runner_version\":\"" << JsonEscape(QWEN35_DFLASH_RUNNER_VERSION)
@@ -743,9 +787,7 @@ void WriteReport(
   output << "],\"abi\":{"
          << "\"id\":\"qwen35-4b-dflash-ascend310p-incremental-performance-v2\","
          << "\"physical_topology\":\""
-         << (executor.unified_target_step()
-                 ? "split-prefill-head-four-resident-unified-target-step-v1"
-                 : "split-prefill-head-five-resident-v1")
+         << physical_topology
          << "\","
          << "\"state_policy\":\"explicit device-resident ping-pong\","
          << "\"sequence_capacity\":" << executor.sequence_length()
@@ -808,7 +850,7 @@ void WriteReport(
          << max_work + sum_weight + execution.state_device_bytes +
                 execution.carrier_device_bytes
          << ",\"load_policy\":\""
-         << (executor.unified_target_step() ? "four" : "five")
+         << resident_model_count
          << " aclmdlLoadFromFileWithMem sessions; "
             "one max-sized serial workspace; separate per-artifact weights; "
             "no cross-OM weight sharing assumed\"},"
@@ -839,7 +881,7 @@ void WriteReport(
             "synchronization window; a DFlash window may contain one to "
             "eight complete speculative transactions\""
          << ",\"order\":\"alternating ordinary/DFlash in one "
-         << (executor.unified_target_step() ? "four" : "five")
+         << resident_model_count
          << "-model process\","
          << "\"model_load_excluded_from_latency\":true,"
          << "\"device_memory_allocation_policy\":\""
@@ -863,9 +905,16 @@ void WriteReport(
             "changed proposal count, or a changed process-resident EOS "
             "table/count; all device subsegments start at 64-byte "
             "boundaries\","
-         << "\"prefill_draft_policy\":\"Target feature slabs stay device-resident; "
-            "non-final prompt chunks execute no Draft OM; final prompt "
-            "completion executes one prebound dynamic-gear Draft OM\","
+         << "\"prefill_draft_policy\":\""
+         << (fused_speculative_step
+                 ? "Target feature slabs stay device-resident; no prompt "
+                   "chunk launches Draft separately; the first prebound "
+                   "dynamic-gear fused transaction consumes the complete "
+                   "prompt feature batch"
+                 : "Target feature slabs stay device-resident; non-final "
+                   "prompt chunks execute no Draft OM; final prompt "
+                   "completion executes one prebound dynamic-gear Draft OM")
+         << "\","
          << "\"prefill_feature_arena_policy\":\"contiguous 64-row FP16 slabs "
             "with 64-byte-aligned starts and one terminal guard; no D2D "
             "compaction\","
@@ -932,7 +981,12 @@ void WriteReport(
          << (arguments.progress ? "true" : "false") << "},"
          << "\"execution_io_counters\":{"
          << "\"scope\":\"paired warmups and measurements\","
-         << "\"proposal_policy\":\"Draft-to-verify device carrier; no proposal D2H/H2D\","
+         << "\"proposal_policy\":\""
+         << (fused_speculative_step
+                 ? "verify IDs remain internal to fused Draft-to-Target; no "
+                   "proposal tensor crosses an OM or host boundary"
+                 : "Draft-to-verify device carrier; no proposal D2H/H2D")
+         << "\","
          << "\"result_policy\":\"one logical compact result per complete "
             "transaction; a two-transaction DFlash window coalesces adjacent "
             "ping-pong slots, while windows of three to eight bind each "
@@ -955,6 +1009,10 @@ void WriteReport(
          << execution.draft_propose_executions
          << ",\"target_verify_commit_executions\":"
          << execution.target_verify_commit_executions
+         << ",\"fused_speculative_step_executions\":"
+         << execution.fused_speculative_step_executions
+         << ",\"draft_to_verify_model_launches_elided\":"
+         << execution.draft_to_verify_model_launches_elided
          << ",\"target_step_dynamic_gear_count\":"
          << execution.target_step_dynamic_gear_count
          << ",\"target_step_input_rows\":"
@@ -1139,7 +1197,7 @@ void WriteReport(
          << arguments.max_draft_tokens << "},\"startup_ms\":{"
          << "\"acl_and_resident_model_load\":" << load_ms
          << ",\""
-         << (executor.unified_target_step()
+         << ((executor.unified_target_step() || fused_speculative_step)
                  ? "acl_and_four_model_load"
                  : "acl_and_five_model_load")
          << "\":" << load_ms
@@ -1191,8 +1249,12 @@ void AtomicWrite(const std::filesystem::path& path, const std::string& payload) 
 int main(int argc, char** argv) {
   try {
     const Arguments arguments = ParseArguments(argc, argv);
-    const bool unified_target_step = arguments.models[2].path.empty();
-    const char* topology_count = unified_target_step ? "four" : "five";
+    const bool fused_speculative_step = !arguments.models[5].path.empty();
+    const bool unified_target_step =
+        !fused_speculative_step && arguments.models[2].path.empty();
+    const char* topology_count =
+        fused_speculative_step ? "four-fused"
+                               : (unified_target_step ? "four" : "five");
     PrintProgress(
         arguments.progress,
         std::string("stage=validate-") + topology_count + "-om-start");
@@ -1223,6 +1285,7 @@ int main(int argc, char** argv) {
         arguments.models[2].path,
         arguments.models[3].path,
         arguments.models[4].path,
+        arguments.models[5].path,
     };
     qwen35::dflash::AclIncrementalExecutor executor(
         std::move(paths),

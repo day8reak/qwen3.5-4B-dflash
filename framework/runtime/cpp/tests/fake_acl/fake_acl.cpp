@@ -30,6 +30,7 @@ enum class Role {
   kDraftPropose,
   kTargetVerify,
   kTargetStep,
+  kFusedSpeculativeStep,
 };
 
 struct Spec {
@@ -81,6 +82,9 @@ Role RoleFromPath(const char* path) {
   }
   if (value.find("target-decode1") != std::string::npos) {
     return Role::kTargetDecode;
+  }
+  if (value.find("fused-speculative-step") != std::string::npos) {
+    return Role::kFusedSpeculativeStep;
   }
   if (value.find("draft-propose") != std::string::npos) {
     return Role::kDraftPropose;
@@ -193,6 +197,24 @@ const std::vector<Spec>& Inputs(Role role) {
       kTargetCursor,
       {ACL_UINT64, {64}, "ascend_mbatch_shape_data"},
   };
+  static const std::vector<Spec> fused{
+      {ACL_FLOAT16, {1, -1, 8}, "target_feature_tail"},
+      {ACL_INT32, {1}, "committed_input_count"},
+      {ACL_INT64, {1, 16}, "previous_committed_token_ids"},
+      {ACL_INT32, {1}, "previous_commit_count"},
+      {ACL_INT32, {1}, "logical_proposal_count"},
+      {ACL_INT64, {4}, "eos_token_ids"},
+      {ACL_INT32, {1}, "eos_token_count"},
+      kTargetConv,
+      kTargetRecurrent,
+      kTargetKey,
+      kTargetValue,
+      kTargetCursor,
+      kDraftKey,
+      kDraftValue,
+      kDraftCursor,
+      {ACL_UINT64, {64}, "ascend_mbatch_shape_data"},
+  };
   switch (role) {
     case Role::kTargetPrefill:
       return prefill;
@@ -206,6 +228,8 @@ const std::vector<Spec>& Inputs(Role role) {
       return verify;
     case Role::kTargetStep:
       return target_step;
+    case Role::kFusedSpeculativeStep:
+      return fused;
     case Role::kIntegrated:
       return integrated;
   }
@@ -263,6 +287,24 @@ const std::vector<Spec>& Outputs(Role role) {
       kTargetKey,
       kTargetValue,
   };
+  static const std::vector<Spec> fused{
+      {ACL_INT64, {1, 16}, "committed_token_ids"},
+      {ACL_INT32, {1}, "commit_count"},
+      {ACL_INT32, {1}, "drafted_count"},
+      {ACL_INT32, {1}, "accepted_count"},
+      {ACL_INT32, {1}, "rejected_count"},
+      kTargetConv,
+      kTargetRecurrent,
+      {ACL_FLOAT16, {1, 16, 8}, "target_feature_tail"},
+      {ACL_INT32, {1}, "committed_input_count"},
+      kTargetCursor,
+      {ACL_BOOL, {1}, "finished"},
+      kTargetKey,
+      kTargetValue,
+      kDraftKey,
+      kDraftValue,
+      kDraftCursor,
+  };
   switch (role) {
     case Role::kTargetPrefill:
       return prefill;
@@ -275,6 +317,8 @@ const std::vector<Spec>& Outputs(Role role) {
     case Role::kTargetVerify:
     case Role::kTargetStep:
       return verify;
+    case Role::kFusedSpeculativeStep:
+      return fused;
     case Role::kIntegrated:
       return integrated;
   }
@@ -498,6 +542,47 @@ aclError ExecuteVerify(const aclmdlDataset* input, aclmdlDataset* output) {
   Copy(output->buffers[11], input->buffers[6]);
   Copy(output->buffers[12], input->buffers[7]);
   return ACL_SUCCESS;
+}
+
+aclError ExecuteFused(
+    const aclmdlDataset* input,
+    aclmdlDataset* output) {
+  if (input->buffers.size() != 16 || output->buffers.size() != 16) {
+    return 1;
+  }
+  alignas(64) std::array<std::int64_t, kVerifyRows> verify_ids{};
+  aclDataBuffer verify_ids_buffer{
+      verify_ids.data(), verify_ids.size() * sizeof(std::int64_t)};
+  aclmdlDataset draft_input;
+  draft_input.dynamic_dims = input->dynamic_dims;
+  for (const std::size_t index : {0U, 1U, 2U, 3U, 4U, 12U, 13U, 14U}) {
+    draft_input.buffers.push_back(input->buffers[index]);
+  }
+  aclmdlDataset draft_output;
+  draft_output.buffers = {
+      &verify_ids_buffer,
+      output->buffers[13],
+      output->buffers[14],
+      output->buffers[15]};
+  const aclError draft_status = ExecuteDraft(&draft_input, &draft_output);
+  if (draft_status != ACL_SUCCESS) {
+    return draft_status;
+  }
+  aclmdlDataset verify_input;
+  verify_input.buffers = {
+      &verify_ids_buffer,
+      input->buffers[4],
+      input->buffers[5],
+      input->buffers[6],
+      input->buffers[7],
+      input->buffers[8],
+      input->buffers[9],
+      input->buffers[10],
+      input->buffers[11]};
+  aclmdlDataset verify_output;
+  verify_output.buffers.assign(
+      output->buffers.begin(), output->buffers.begin() + 13);
+  return ExecuteVerify(&verify_input, &verify_output);
 }
 
 }  // namespace
@@ -769,10 +854,15 @@ aclError aclmdlGetInputDynamicGearCount(
     std::size_t* gear_count) {
   if (description == nullptr || gear_count == nullptr ||
       (description->role != Role::kDraftPropose &&
+       description->role != Role::kFusedSpeculativeStep &&
        description->role != Role::kTargetStep)) {
     return 1;
   }
-  *gear_count = description->role == Role::kDraftPropose ? 18 : 16;
+  *gear_count =
+      (description->role == Role::kDraftPropose ||
+       description->role == Role::kFusedSpeculativeStep)
+      ? 18
+      : 16;
   return ACL_SUCCESS;
 }
 
@@ -783,16 +873,22 @@ aclError aclmdlGetInputDynamicDims(
     std::size_t gear_count) {
   if (description == nullptr || dimensions == nullptr ||
       (description->role != Role::kDraftPropose &&
+       description->role != Role::kFusedSpeculativeStep &&
        description->role != Role::kTargetStep)) {
     return 1;
   }
   const std::size_t expected_gears =
-      description->role == Role::kDraftPropose ? 18 : 16;
+      (description->role == Role::kDraftPropose ||
+       description->role == Role::kFusedSpeculativeStep)
+      ? 18
+      : 16;
   if (gear_count != expected_gears) {
     return 1;
   }
   for (std::size_t gear = 0; gear < expected_gears; ++gear) {
-    const std::int64_t rows = description->role == Role::kDraftPropose
+    const std::int64_t rows =
+        (description->role == Role::kDraftPropose ||
+         description->role == Role::kFusedSpeculativeStep)
         ? (gear < 16
                ? static_cast<std::int64_t>(gear + 1)
                : static_cast<std::int64_t>((gear - 15) * 64))
@@ -853,7 +949,9 @@ aclError aclmdlSetInputDynamicDims(
   const std::size_t expected_index =
       iterator->second == Role::kDraftPropose
       ? 8
-      : (iterator->second == Role::kTargetStep ? 9 : 999);
+      : (iterator->second == Role::kTargetStep
+             ? 9
+             : (iterator->second == Role::kFusedSpeculativeStep ? 15 : 999));
   if (index != expected_index) {
     return 1;
   }
@@ -892,6 +990,8 @@ aclError aclmdlExecuteAsync(
     case Role::kTargetVerify:
     case Role::kTargetStep:
       return ExecuteVerify(input, output);
+    case Role::kFusedSpeculativeStep:
+      return ExecuteFused(input, output);
   }
   return 1;
 }

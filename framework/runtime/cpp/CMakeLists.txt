@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(qwen35_dflash_acl_runner VERSION 1.19.0 LANGUAGES CXX)
+project(qwen35_dflash_acl_runner VERSION 1.20.0 LANGUAGES CXX)
 
 option(QWEN35_DFLASH_BUILD_ACL_RUNNER "Build the AscendCL executable" ON)
 option(QWEN35_DFLASH_BUILD_TESTS "Build host-only scheduler tests" ON)
@@ -204,6 +204,7 @@ if(QWEN35_DFLASH_BUILD_TESTS)
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om" "fake-draft")
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om" "fake-verify")
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om" "fake-dynamic-verify")
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om" "fake-fused-speculative-step")
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/fake.om" _fake_om_sha256)
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om" _prefill_om_sha256)
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om" _prefill_head_om_sha256)
@@ -211,6 +212,7 @@ if(QWEN35_DFLASH_BUILD_TESTS)
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om" _draft_om_sha256)
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om" _verify_om_sha256)
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om" _dynamic_verify_om_sha256)
+  file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om" _fused_speculative_om_sha256)
   add_test(
     NAME qwen35_dflash_incremental_acl_tests
     COMMAND qwen35_dflash_incremental_acl_tests
@@ -220,6 +222,7 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       ${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
       ${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om
       ${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om
+      ${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om
   )
   add_test(
     NAME qwen35_dflash_fake_acl_runner
@@ -435,6 +438,21 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-incremental-profile-report.json
       -DMEASUREMENT_PROTOCOL=profile
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_fused_speculative_step_runner
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
+      -DDECODE_SHA=${_decode_om_sha256}
+      -DFUSED=${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om
+      -DFUSED_SHA=${_fused_speculative_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-fused-speculative-step-report.json
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_fused_speculative_runner.cmake
   )
   add_test(
     NAME qwen35_dflash_fake_unified_target_step_runner

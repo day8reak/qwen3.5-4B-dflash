@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
+from qwen35_dflash.ascend310p.contracts import CustomOpExportSpec
 from qwen35_dflash.ascend310p.incremental_graphs import (
     DraftProposeStateGraph,
+    FusedSpeculativeStepStateGraph,
     TargetDecodeOneStateGraph,
     TargetPrefillHeadGraph,
     TargetPrefillStateGraph,
@@ -462,6 +465,64 @@ def test_draft_graph_keeps_kv_fixed_and_returns_device_verify_carrier() -> None:
         torch.testing.assert_close(actual, expected)
 
 
+def test_fused_speculative_step_matches_two_exact_resident_graphs() -> None:
+    target = _FakeTarget().eval()
+    draft = _FakeDraft().eval()
+    input_embedding = nn.Embedding(128, 2, dtype=torch.float16)
+    output_embedding = nn.Linear(2, 128, bias=False, dtype=torch.float16)
+    with torch.no_grad():
+        input_embedding.weight[:, 0] = torch.arange(128)
+        input_embedding.weight[:, 1] = 0
+
+    propose = DraftProposeStateGraph(
+        draft,
+        input_embedding,
+        output_embedding,
+        kv_cache_max_len=64,
+    ).eval()
+    verify = TargetVerifyCommitStateGraph(
+        target,
+        kv_cache_max_len=64,
+    ).eval()
+    fused = FusedSpeculativeStepStateGraph(
+        target,
+        draft,
+        input_embedding,
+        output_embedding,
+        kv_cache_max_len=64,
+    ).eval()
+    eos_ids, eos_count = _eos()
+    target_state = _target_state()
+    draft_key = torch.zeros(2, 1, 1, 64, 2, dtype=torch.float16)
+    draft_value = torch.zeros_like(draft_key)
+    args = (
+        torch.arange(16, dtype=torch.float16).reshape(1, 4, 4),
+        torch.tensor([4], dtype=torch.int32),
+        torch.tensor([[40, 41] + [0] * 14], dtype=torch.long),
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([5], dtype=torch.int32),
+        eos_ids,
+        eos_count,
+        *target_state,
+        draft_key,
+        draft_value,
+        torch.tensor([3], dtype=torch.long),
+    )
+
+    proposed = propose(*args[:5], *args[12:])
+    verified = verify(proposed[0], args[4], *args[5:12])
+    expected = (*verified, *proposed[1:])
+    eager = fused(*args)
+    assert len(eager) == len(expected) == 16
+    for actual, reference in zip(eager, expected):
+        torch.testing.assert_close(actual, reference)
+
+    exported = torch.export.export(fused, args, strict=True)
+    captured = exported.module()(*args)
+    for actual, reference in zip(captured, expected):
+        torch.testing.assert_close(actual, reference)
+
+
 def test_draft_committed_prefix_preserves_all_logically_visible_state() -> None:
     draft = _FakeDraft().eval()
     input_embedding = nn.Embedding(128, 2, dtype=torch.float16)
@@ -670,3 +731,85 @@ def test_four_physical_specs_use_dynamic_unified_target_step() -> None:
         0: {1: tuple(range(1, 17))}
     }
     assert target_step.metadata["target_step_fixed_output_rows"] == 16
+
+
+def test_four_physical_specs_fuse_draft_and_verify_without_external_carrier() -> None:
+    verify_custom_ops = (
+        CustomOpExportSpec(
+            torch_op="npu::test_verify",
+            ge_op_type="TestVerify",
+        ),
+    )
+    specs = incremental_state_graph_specs(
+        _FakeTarget().eval(),
+        _FakeDraft().eval(),
+        kv_cache_max_len=64,
+        device="cpu",
+        dtype=torch.float16,
+        eos_table_width=4,
+        ordinary_custom_ops=(),
+        head_custom_ops=(),
+        verify_custom_ops=verify_custom_ops,
+        fused_speculative_step=True,
+    )
+    assert [item.name for item in specs] == [
+        "target-prefill",
+        "target-prefill-head",
+        "target-decode1",
+        "fused-speculative-step",
+    ]
+    fused = specs[-1]
+    assert isinstance(fused.model, FusedSpeculativeStepStateGraph)
+    assert fused.dynamic is True
+    assert fused.input_dim_gears == {
+        0: {1: tuple(range(1, 17)) + (64,)}
+    }
+    assert len(fused.input_names) == 15
+    assert len(fused.output_names) == 16
+    assert fused.input_names[0:5] == (
+        "target_feature_tail",
+        "committed_input_count",
+        "previous_committed_token_ids",
+        "previous_commit_count",
+        "logical_proposal_count",
+    )
+    assert fused.output_names[0:5] == (
+        "committed_token_ids",
+        "commit_count",
+        "drafted_count",
+        "accepted_count",
+        "rejected_count",
+    )
+    assert fused.metadata["fused_logical_roles"] == [
+        "draft-propose",
+        "target-verify-commit",
+    ]
+    assert fused.metadata["verify_input_ids_externalized"] is False
+    assert fused.custom_ops == verify_custom_ops
+    assert fused.metadata["custom_op_export_contracts"] == [
+        {
+            "torch_target": "npu.test_verify.default",
+            "ge_op_type": "TestVerify",
+            "minimum_occurrences": 1,
+            "preservation": (
+                "one registered GE operator; no Tensor decomposition"
+            ),
+        }
+    ]
+
+
+def test_incremental_topology_selectors_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        incremental_state_graph_specs(
+            _FakeTarget().eval(),
+            _FakeDraft().eval(),
+            kv_cache_max_len=64,
+            device="cpu",
+            dtype=torch.float16,
+            eos_table_width=4,
+            ordinary_custom_ops=(),
+            head_custom_ops=(),
+            verify_custom_ops=(),
+            unified_target_step=True,
+            fused_speculative_step=True,
+        )

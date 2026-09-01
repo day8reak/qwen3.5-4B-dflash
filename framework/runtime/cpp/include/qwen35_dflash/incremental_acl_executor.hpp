@@ -17,8 +17,10 @@ struct IncrementalOmPaths {
   std::filesystem::path target_prefill_head;
   // Empty selects the unified dynamic target-verify-commit T=1..16 artifact.
   std::filesystem::path target_decode1;
+  // The separate pair is empty when this approved exact supergraph is used.
   std::filesystem::path draft_propose;
   std::filesystem::path target_verify_commit;
+  std::filesystem::path fused_speculative_step;
 };
 
 struct IncrementalModelMemory {
@@ -77,6 +79,8 @@ struct IncrementalAclExecutionStats {
   std::size_t target_decode1_executions = 0;
   std::size_t draft_propose_executions = 0;
   std::size_t target_verify_commit_executions = 0;
+  std::size_t fused_speculative_step_executions = 0;
+  std::size_t draft_to_verify_model_launches_elided = 0;
   std::size_t stream_synchronizations = 0;
   std::size_t speculative_sync_windows = 0;
   std::size_t speculative_synchronizations_elided = 0;
@@ -247,6 +251,7 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
   IncrementalDecodeCarrierPolicy decode_carrier_policy() const noexcept;
   IncrementalDraftFeaturePolicy draft_feature_policy() const noexcept;
   bool unified_target_step() const noexcept;
+  bool fused_speculative_step() const noexcept;
 
  private:
   class Impl;

@@ -63,6 +63,9 @@ QUANT_INCREMENTAL_GRAPH_FACTORY_ID = (
 QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY_ID = (
     "qwen3.5-4b-quant-w8a8-dflash-unified-target-step-v1"
 )
+QUANT_FUSED_SPECULATIVE_STEP_GRAPH_FACTORY_ID = (
+    "qwen3.5-4b-quant-w8a8-dflash-fused-speculative-step-v1"
+)
 _TARGET_GDN_CHUNK = 64
 _GDR_EFFECTIVE_LENGTH_MAX = torch.iinfo(torch.int16).max
 _DTYPES = {"float16": torch.float16}
@@ -713,6 +716,13 @@ def create_quant_incremental_state_graphs(
     unified_target_step = config.get("unified_target_step", False)
     if not isinstance(unified_target_step, bool):
         raise TypeError("unified_target_step must be a boolean")
+    fused_speculative_step = config.get("fused_speculative_step", False)
+    if not isinstance(fused_speculative_step, bool):
+        raise TypeError("fused_speculative_step must be a boolean")
+    if unified_target_step and fused_speculative_step:
+        raise ValueError(
+            "unified_target_step and fused_speculative_step are mutually exclusive"
+        )
     max_sequence_length = int(config.get("max_sequence_length", 0))
     if max_sequence_length <= 0 or max_sequence_length % _TARGET_GDN_CHUNK:
         raise ValueError(
@@ -758,7 +768,11 @@ def create_quant_incremental_state_graphs(
         "factory_id": (
             QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY_ID
             if unified_target_step
-            else QUANT_INCREMENTAL_GRAPH_FACTORY_ID
+            else (
+                QUANT_FUSED_SPECULATIVE_STEP_GRAPH_FACTORY_ID
+                if fused_speculative_step
+                else QUANT_INCREMENTAL_GRAPH_FACTORY_ID
+            )
         ),
         "quant_branch_base_revision": QUANT_BASE_REVISION,
         "quant_source_lock": identity["quant_source_lock"],
@@ -797,7 +811,11 @@ def create_quant_incremental_state_graphs(
         "physical_topology": (
             "split-prefill-head-four-resident-unified-target-step-v1"
             if unified_target_step
-            else "split-prefill-head-five-resident-v1"
+            else (
+                "split-prefill-head-four-resident-fused-speculative-step-v1"
+                if fused_speculative_step
+                else "split-prefill-head-five-resident-v1"
+            )
         ),
     }
     ordinary_custom_ops = _target_custom_op_exports(config, mtp=False)
@@ -823,6 +841,7 @@ def create_quant_incremental_state_graphs(
         head_custom_ops=head_custom_ops,
         verify_custom_ops=_target_custom_op_exports(config, mtp=True),
         unified_target_step=unified_target_step,
+        fused_speculative_step=fused_speculative_step,
         metadata=metadata,
     )
 
@@ -837,14 +856,26 @@ def create_quant_unified_target_step_graphs(
     return create_quant_incremental_state_graphs(selected)
 
 
+def create_quant_fused_speculative_step_graphs(
+    config: Mapping[str, Any],
+) -> tuple[AirGraphSpec, ...]:
+    """Build the exact four-OM candidate with one Draft-to-verify graph."""
+
+    selected = dict(config)
+    selected["fused_speculative_step"] = True
+    return create_quant_incremental_state_graphs(selected)
+
+
 __all__ = [
     "AirDFlashOps",
     "QUANT_BASE_REVISION",
     "QUANT_GRAPH_FACTORY_ID",
     "QUANT_INCREMENTAL_GRAPH_FACTORY_ID",
+    "QUANT_FUSED_SPECULATIVE_STEP_GRAPH_FACTORY_ID",
     "QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY_ID",
     "QuantFullPrefixExportTarget",
     "create_quant_recompute_graph",
     "create_quant_incremental_state_graphs",
+    "create_quant_fused_speculative_step_graphs",
     "create_quant_unified_target_step_graphs",
 ]

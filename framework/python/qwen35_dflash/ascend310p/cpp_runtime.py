@@ -133,9 +133,35 @@ _UNIFIED_TARGET_STEP_GRAPH_ABI: dict[str, tuple[list[str], list[str]]] = {
     for role, binding in _INCREMENTAL_GRAPH_ABI.items()
     if role != "target-decode1"
 }
+_FUSED_SPECULATIVE_STEP_GRAPH_ABI: dict[str, tuple[list[str], list[str]]] = {
+    role: binding
+    for role, binding in _INCREMENTAL_GRAPH_ABI.items()
+    if role not in {"draft-propose", "target-verify-commit"}
+}
+_FUSED_SPECULATIVE_STEP_GRAPH_ABI["fused-speculative-step"] = (
+    [
+        "target_feature_tail", "committed_input_count",
+        "previous_committed_token_ids", "previous_commit_count",
+        "logical_proposal_count", "eos_token_ids", "eos_token_count",
+        "target_conv_state", "target_recurrent_state", "target_key_cache",
+        "target_value_cache", "logical_target_cursor", "draft_key_cache",
+        "draft_value_cache", "logical_draft_cursor",
+    ],
+    [
+        "committed_token_ids", "commit_count", "drafted_count",
+        "accepted_count", "rejected_count", "target_conv_state",
+        "target_recurrent_state", "target_feature_tail",
+        "committed_input_count", "logical_target_cursor", "finished",
+        "target_key_cache", "target_value_cache", "draft_key_cache",
+        "draft_value_cache", "logical_draft_cursor",
+    ],
+)
 _BASELINE_INCREMENTAL_TOPOLOGY = "split-prefill-head-five-resident-v1"
 _UNIFIED_TARGET_STEP_TOPOLOGY = (
     "split-prefill-head-four-resident-unified-target-step-v1"
+)
+_FUSED_SPECULATIVE_STEP_TOPOLOGY = (
+    "split-prefill-head-four-resident-fused-speculative-step-v1"
 )
 _GENERIC_DEVICE_NAMES = {"310p", "ascend310p", "atlas310p"}
 
@@ -551,14 +577,16 @@ def _resolve_incremental_oms(
         if isinstance(graph, Mapping)
         and str(graph.get("name")) == str(graph.get("role"))
     }
-    if set(_INCREMENTAL_GRAPH_ABI).issubset(graph_roles):
+    if set(_FUSED_SPECULATIVE_STEP_GRAPH_ABI).issubset(graph_roles):
+        selected_abi = _FUSED_SPECULATIVE_STEP_GRAPH_ABI
+    elif set(_INCREMENTAL_GRAPH_ABI).issubset(graph_roles):
         selected_abi = _INCREMENTAL_GRAPH_ABI
     elif set(_UNIFIED_TARGET_STEP_GRAPH_ABI).issubset(graph_roles):
         selected_abi = _UNIFIED_TARGET_STEP_GRAPH_ABI
     else:
         raise ValueError(
-            "deployment manifest matches neither the five-OM baseline nor "
-            "the four-OM unified Target-step ABI"
+            "deployment manifest matches none of the baseline, unified "
+            "Target-step or fused-speculative-step ABIs"
         )
     resolved: dict[str, tuple[Path, dict[str, Any], dict[str, Any]]] = {}
     for role, (input_names, output_names) in selected_abi.items():
@@ -587,7 +615,12 @@ def _resolve_incremental_oms(
         if not om_path.is_file() or sha256_file(om_path) != expected_hash:
             raise ValueError(f"{role} OM artifact integrity check failed")
         resolved[role] = (om_path, graph, record)
-    draft_graph = resolved["draft-propose"][1]
+    draft_role = (
+        "fused-speculative-step"
+        if selected_abi is _FUSED_SPECULATIVE_STEP_GRAPH_ABI
+        else "draft-propose"
+    )
+    draft_graph = resolved[draft_role][1]
     draft_gears = draft_graph.get("input_dim_gears")
     draft_rows = (
         draft_gears.get("0", {}).get("1", [])
@@ -606,7 +639,7 @@ def _resolve_incremental_oms(
         ]
     ):
         raise ValueError(
-            "draft-propose must lock input-0 axis-1 to N=1..16 followed by "
+            f"{draft_role} must lock input-0 axis-1 to N=1..16 followed by "
             "every 64-row prompt gear through sequence capacity"
         )
     if selected_abi is _UNIFIED_TARGET_STEP_GRAPH_ABI:
@@ -802,7 +835,7 @@ def validate_incremental_cpp_runner_report(
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
-    if report.get("schema_version") != 11:
+    if report.get("schema_version") != 12:
         raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
@@ -819,9 +852,15 @@ def validate_incremental_cpp_runner_report(
     if supplied_roles == list(_INCREMENTAL_GRAPH_ABI):
         expected_roles = list(_INCREMENTAL_GRAPH_ABI)
         unified_target_step = False
+        fused_speculative_step = False
     elif supplied_roles == list(_UNIFIED_TARGET_STEP_GRAPH_ABI):
         expected_roles = list(_UNIFIED_TARGET_STEP_GRAPH_ABI)
         unified_target_step = True
+        fused_speculative_step = False
+    elif supplied_roles == list(_FUSED_SPECULATIVE_STEP_GRAPH_ABI):
+        expected_roles = list(_FUSED_SPECULATIVE_STEP_GRAPH_ABI)
+        unified_target_step = False
+        fused_speculative_step = True
     else:
         raise RuntimeError("incremental expected OM role set differs")
     models = report.get("models")
@@ -986,11 +1025,16 @@ def validate_incremental_cpp_runner_report(
         "64-byte boundaries"
     ):
         raise RuntimeError("incremental prefill control policy differs")
-    if protocol.get("prefill_draft_policy") != (
-        "Target feature slabs stay device-resident; non-final prompt chunks "
-        "execute no Draft OM; final prompt completion executes one prebound "
-        "dynamic-gear Draft OM"
-    ):
+    expected_prefill_draft_policy = (
+        "Target feature slabs stay device-resident; no prompt chunk launches "
+        "Draft separately; the first prebound dynamic-gear fused transaction "
+        "consumes the complete prompt feature batch"
+        if fused_speculative_step
+        else "Target feature slabs stay device-resident; non-final prompt "
+        "chunks execute no Draft OM; final prompt completion executes one "
+        "prebound dynamic-gear Draft OM"
+    )
+    if protocol.get("prefill_draft_policy") != expected_prefill_draft_policy:
         raise RuntimeError("incremental prefill Draft policy differs")
     if protocol.get("prefill_feature_arena_policy") != (
         "contiguous 64-row FP16 slabs with 64-byte-aligned starts and one "
@@ -1030,9 +1074,13 @@ def validate_incremental_cpp_runner_report(
     if abi.get("id") != _INCREMENTAL_ABI_ID:
         raise RuntimeError("incremental runner ABI identity differs")
     expected_topology = (
-        _UNIFIED_TARGET_STEP_TOPOLOGY
-        if unified_target_step
-        else _BASELINE_INCREMENTAL_TOPOLOGY
+        _FUSED_SPECULATIVE_STEP_TOPOLOGY
+        if fused_speculative_step
+        else (
+            _UNIFIED_TARGET_STEP_TOPOLOGY
+            if unified_target_step
+            else _BASELINE_INCREMENTAL_TOPOLOGY
+        )
     )
     if abi.get("physical_topology") != expected_topology:
         raise RuntimeError("incremental runner physical topology differs")
@@ -1068,7 +1116,7 @@ def validate_incremental_cpp_runner_report(
     if memory.get("source") != "aclmdlQuerySize":
         raise RuntimeError("incremental runner omitted model memory queries")
     if memory.get("load_policy") != (
-        f"{'four' if unified_target_step else 'five'} "
+        f"{'four' if unified_target_step or fused_speculative_step else 'five'} "
         "aclmdlLoadFromFileWithMem sessions; one max-sized serial "
         "workspace; separate per-artifact weights; no cross-OM weight sharing "
         "assumed"
@@ -1228,8 +1276,37 @@ def validate_incremental_cpp_runner_report(
     prefill, prefill_head, decode, draft, verify = (
         int(value) for value in role_counts
     )
-    if execution.get("model_executions") != sum(role_counts):
+    fused_execution = execution.get("fused_speculative_step_executions")
+    fused_launches_elided = execution.get(
+        "draft_to_verify_model_launches_elided"
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (fused_execution, fused_launches_elided)
+    ):
+        raise RuntimeError("incremental fused execution counters are invalid")
+    fused_execution = int(fused_execution)
+    fused_launches_elided = int(fused_launches_elided)
+    expected_model_executions = (
+        prefill + prefill_head + decode + fused_execution
+        if fused_speculative_step
+        else sum(int(value) for value in role_counts)
+    )
+    if execution.get("model_executions") != expected_model_executions:
         raise RuntimeError("incremental model execution counters do not close")
+    if fused_speculative_step:
+        if (
+            fused_execution != draft
+            or fused_execution != verify
+            or fused_launches_elided != fused_execution
+            or expected_model_executions + fused_launches_elided
+            != sum(int(value) for value in role_counts)
+        ):
+            raise RuntimeError(
+                "incremental fused Draft-to-verify launch accounting differs"
+            )
+    elif fused_execution != 0 or fused_launches_elided != 0:
+        raise RuntimeError("non-fused report contains fused executions")
     if execution.get("target_step_dynamic_gear_count", 0) != (
         16 if unified_target_step else 0
     ):
@@ -1256,6 +1333,12 @@ def validate_incremental_cpp_runner_report(
             or target_step_rows + elided_rows != 16 * (decode + verify)
         ):
             raise RuntimeError("incremental unified Target-step row counters differ")
+    elif fused_speculative_step:
+        if (
+            execution.get("target_step_input_rows") != 16 * fused_execution
+            or execution.get("target_step_padded_rows_elided") != 0
+        ):
+            raise RuntimeError("incremental fused fixed verify rows differ")
     request_count = 2 * (3 + 10)
     prompt_chunks = (len(prompt_token_ids) + prefill_width - 1) // prefill_width
     expected_prefill = request_count * prompt_chunks

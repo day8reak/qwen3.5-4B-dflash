@@ -637,9 +637,10 @@ $AI_RUN_DIR/build/cpp-release/qwen35_dflash_acl_runner
 $AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner
 ```
 
-第一个二进制运行单一重计算 OM 基线；第二个二进制运行已批准、尚待真机提升的五图常驻 OM
-候选。`build-cpp` 会同时构建并 host-test 两者。五图的导出 factory、runner 配置、直接运行、
-report 门禁、同二进制 `one-token-h2d`/`last-token-d2d` A/B 和 msprof 命令见
+第一个二进制运行单一重计算 OM 基线；第二个二进制运行已批准、尚待真机提升的五图、统一
+Target-step 四图或 fused speculative-step 四图常驻 OM 候选。`build-cpp` 会同时构建并 host-test
+两者。各拓扑的导出 factory、runner 配置、直接运行、report 门禁、同二进制
+`one-token-h2d`/`last-token-d2d` A/B 和 msprof 命令见
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5 节。runner 配置中的 `decode_carrier_policy` 只改变
 C++ buffer/copy 路由，不要求重新生成 AIR 或 OM；`dflash_sync_window=1..8` 同样不改 AIR/OM
 ABI。候选 2 直接合并两槽 compact result，候选 3..8 通过 4 KiB staging arena 把多个完整
@@ -845,11 +846,14 @@ msprof 只能回答重计算基线 OM 中每个算子、device task 和 AscendCL
 集成图强行拆出 prefill/decode/verify/draft 的模型级时延。
 
 分支同时提供五图基线 `create_quant_incremental_state_graphs`、四物理 OM 动态候选
-`create_quant_unified_target_step_graphs` 和同一个常驻 OM C++ runner。生成后，应使用
+`create_quant_unified_target_step_graphs`、四物理 OM Draft+verify 精确融合候选
+`create_quant_fused_speculative_step_graphs` 和同一个常驻 OM C++ runner。生成后，应使用
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节对应拓扑的完整状态机 msprof 命令，并按
-model ID/role/gear 分组；两类 profile 不得混成同一份时延基线。统一候选省略独立
+model ID/role/gear 分组；不同拓扑的 profile 不得混成同一份时延基线。统一候选省略独立
 `target-decode1`，由 `target-verify-commit` 的 T=1 gear 执行 ordinary decode；T=K+1 只执行
-本轮有效 verify 行。该 runner 会把长 prompt 的中间
+本轮有效 verify 行。fused 候选保留静态 `target-decode1`，由一个
+`fused-speculative-step` model ID 同时运行逻辑 Draft 和固定 T16 Target verify；msprof 只能报告
+该 supergraph 的物理总耗时，再按 operator 行分析内部热点，不能伪造两个 OM 时延。该 runner 会把长 prompt 的中间
 64-row chunk 留在同一 stream，仅最后一个 chunk 下载 compact 结果并同步；报告中的 elided
 prefill 计数必须与 `ceil(prompt_tokens/64)-1` 按请求数闭合。每个 chunk 的 ID、有效长度、累计
 token 数、proposal count 和 EOS 表仍合并为一次 H2D，但复制长度按消费活性收窄为
@@ -870,7 +874,7 @@ runner/OM/input 做未 profile 的 3+10 A/B，msprof API timeline 仅用于解�
 闭合，stream synchronization 按
 `speculative_sync_windows` 闭合，完整命令见增量性能文档第 5.5.1 节。
 
-多 OM profile 必须使用报告 schema 8 中的运行时 model ID、逐次执行 trace、Draft feature
+多 OM profile 必须使用报告 schema 12 中的运行时 model ID、逐次执行 trace、Draft feature
 策略、编译期设备内存分配策略与逐次物理行数做严格归因，
 不能靠文件顺序猜测 OM 角色。采集完成后运行
 `python -m qwen35_dflash.ascend310p analyze-msprof`；完整命令、输入约束和判定规则见
@@ -1082,10 +1086,12 @@ NPU，后续调用只处理新增 token：
 | `target_decode_1.om` | 处理 1 个新 token，读写常驻 Target state | ordinary/correction 路径的 query 长度从 `S` 降为 1 |
 | `draft_16.om` | 复用 Draft KV/feature state 生成一块 proposals | 不再为每轮 proposal 重算 Draft 全前缀 |
 | `target_verify_16.om` | 一次验证 anchor + 最多 15 个 proposals | 接受多个 token 时，一次 Target 调用被多个输出 token 分摊 |
+| `fused-speculative-step.om`（独立候选） | 在一张精确 supergraph 内顺序执行上述 Draft 与固定 T16 verify | 每个 speculative transaction 删除一次 Draft→verify 物理 OM launch；不减少 Target 数学工作 |
 
 拆分后 ATC 还可以针对 `S=1`、`S=16` 和 `S=64` 分别选择内核、tiling 和工作区，避免用一个
 大的静态 shape 覆盖所有阶段。但物理文件不一定正好是四个：若 verify 能证明 `T=1` gear，decode
-可与 verify 合并成 3 OM；若多 gear、自定义算子和分支均通过，可测试 2 个动态 OM。要得到端到端
+可与 verify 合并；若多 gear、自定义算子和分支均通过，可测试 2 个动态 OM；若 launch 边界占主导，
+可比较保留静态 decode 的 fused speculative-step 四图候选。要得到端到端
 收益，必须同时满足：
 
 - 五个当前物理 OM 只加载一次，device buffer 复用；

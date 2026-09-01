@@ -28,6 +28,12 @@ UNIFIED_ROLES = (
     "draft-propose",
     "target-verify-commit",
 )
+FUSED_ROLES = (
+    "target-prefill",
+    "target-prefill-head",
+    "target-decode1",
+    "fused-speculative-step",
+)
 
 
 class MsprofAnalysisError(RuntimeError):
@@ -147,6 +153,7 @@ def _validate_runner_report(
     dict[str, int],
     list[dict[str, int]],
     bool,
+    bool,
 ]:
     if (
         report.get("status") != "PASS"
@@ -194,8 +201,13 @@ def _validate_runner_report(
     roles = tuple(item.get("role") for item in models if isinstance(item, Mapping))
     if roles == BASELINE_ROLES:
         unified = False
+        fused = False
     elif roles == UNIFIED_ROLES:
         unified = True
+        fused = False
+    elif roles == FUSED_ROLES:
+        unified = False
+        fused = True
     else:
         raise MsprofAnalysisError("runner report has an unknown model role order")
     model_to_role: dict[int, str] = {}
@@ -404,6 +416,7 @@ def _validate_runner_report(
         "target-decode1": "target_decode1_executions",
         "draft-propose": "draft_propose_executions",
         "target-verify-commit": "target_verify_commit_executions",
+        "fused-speculative-step": "fused_speculative_step_executions",
     }
     expected_by_role: dict[str, int] = {}
     for role in roles:
@@ -415,6 +428,17 @@ def _validate_runner_report(
         expected_by_role["target-verify-commit"] += int(
             counters["target_decode1_executions"]
         )
+    if fused:
+        fused_count = expected_by_role["fused-speculative-step"]
+        if (
+            counters.get("draft_propose_executions") != fused_count
+            or counters.get("target_verify_commit_executions") != fused_count
+            or counters.get("draft_to_verify_model_launches_elided")
+            != fused_count
+        ):
+            raise MsprofAnalysisError(
+                "runner fused Draft-to-verify counters do not close"
+            )
 
     trace = report.get("profile_model_execution_trace")
     if not isinstance(trace, list):
@@ -482,7 +506,7 @@ def _validate_runner_report(
             or sum(row > 1 for row in target_rows) != verify_count
         ):
             raise MsprofAnalysisError("unified Target-step gear trace does not close")
-    elif any(row != verify_width for row in target_rows):
+    elif not fused and any(row != verify_width for row in target_rows):
         raise MsprofAnalysisError("baseline verify trace is not fixed-width")
     if int(report.get("schema_version", 0)) >= 6:
         draft_policy = protocol.get("draft_feature_policy")
@@ -524,7 +548,10 @@ def _validate_runner_report(
         ) = (int(value) for value in draft_values)
         total_draft_count = int(counters["draft_propose_executions"])
         verify_draft_count = total_draft_count - prefill_draft_count
-        draft_rows = rows_by_role["draft-propose"]
+        draft_trace_role = (
+            "fused-speculative-step" if fused else "draft-propose"
+        )
+        draft_rows = rows_by_role[draft_trace_role]
         prefill_trace_rows = [row for row in draft_rows if row > verify_width]
         verify_trace_rows = [row for row in draft_rows if row <= verify_width]
         if (
@@ -557,7 +584,7 @@ def _validate_runner_report(
             or prefix_count + pending_count != verify_draft_count
         ):
             raise MsprofAnalysisError("committed-prefix Draft trace differs")
-    return model_to_role, expected_by_role, normalized_trace, unified
+    return model_to_role, expected_by_role, normalized_trace, unified, fused
 
 
 def _read_op_summaries(
@@ -763,9 +790,13 @@ def analyze_incremental_msprof(
     if not runner_path.is_file():
         raise MsprofAnalysisError(f"runner report does not exist: {runner_path}")
     report = _load_runner_report(runner_path)
-    model_to_role, expected_by_role, trace, unified = _validate_runner_report(
-        report
-    )
+    (
+        model_to_role,
+        expected_by_role,
+        trace,
+        unified,
+        fused,
+    ) = _validate_runner_report(report)
 
     op_files = sorted(profile_root.rglob("op_summary_*.csv"))
     if not op_files:
@@ -1006,6 +1037,7 @@ def analyze_incremental_msprof(
         "formal_latency_evidence": False,
         "topology": report["abi"]["physical_topology"],
         "unified_target_step": unified,
+        "fused_speculative_step": fused,
         "runner_report": {
             "path": str(runner_path),
             "sha256": _sha256(runner_path),
@@ -1096,7 +1128,13 @@ def analyze_incremental_msprof(
                     "draft_verify_pending_upper_bound_executions"
                 ],
                 "trace_gate": (
-                    "sum draft-propose T<=16 physical_rows equals "
+                    "sum "
+                    + (
+                        "fused-speculative-step"
+                        if fused
+                        else "draft-propose"
+                    )
+                    + " T<=16 physical_rows equals "
                     "draft_verify_feature_input_rows"
                 ),
             }

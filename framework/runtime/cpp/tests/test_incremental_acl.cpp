@@ -24,7 +24,7 @@ void RunPolicy(
     qwen35::dflash::IncrementalDecodeCarrierPolicy decode_carrier_policy) {
   qwen35::dflash::IncrementalOmPaths paths{
       model_paths[0], model_paths[1], model_paths[2], model_paths[3],
-      model_paths[4]};
+      model_paths[4], {}};
   std::vector<std::string> loaded_roles;
   qwen35::dflash::AclIncrementalExecutor executor(
       std::move(paths),
@@ -328,7 +328,7 @@ void TestExplicitDecodeOverride(
     const std::array<std::filesystem::path, 5>& model_paths) {
   qwen35::dflash::IncrementalOmPaths paths{
       model_paths[0], model_paths[1], model_paths[2], model_paths[3],
-      model_paths[4]};
+      model_paths[4], {}};
   qwen35::dflash::AclIncrementalExecutor executor(
       std::move(paths),
       0,
@@ -372,7 +372,7 @@ void TestExplicitDecodeOverride(
 void TestUnifiedTargetStep(
     const std::array<std::filesystem::path, 4>& model_paths) {
   qwen35::dflash::IncrementalOmPaths paths{
-      model_paths[0], model_paths[1], {}, model_paths[2], model_paths[3]};
+      model_paths[0], model_paths[1], {}, model_paths[2], model_paths[3], {}};
   std::vector<std::string> loaded_roles;
   qwen35::dflash::AclIncrementalExecutor executor(
       std::move(paths),
@@ -461,12 +461,105 @@ void TestUnifiedTargetStep(
       "unified profile trace T1 count differs");
 }
 
+void TestFusedSpeculativeStep(
+    const std::array<std::filesystem::path, 4>& model_paths) {
+  qwen35::dflash::IncrementalOmPaths paths{
+      model_paths[0], model_paths[1], model_paths[2], {}, {}, model_paths[3]};
+  std::vector<std::string> loaded_roles;
+  qwen35::dflash::AclIncrementalExecutor executor(
+      std::move(paths),
+      0,
+      [&](const char* role, const char* stage, std::size_t, std::size_t) {
+        if (std::string(stage) == "load-done") {
+          loaded_roles.emplace_back(role);
+        }
+      },
+      qwen35::dflash::IncrementalStateResetPolicy::kImmutableZero,
+      qwen35::dflash::IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact,
+      true,
+      qwen35::dflash::IncrementalDraftFeaturePolicy::kCommittedPrefix);
+  Require(
+      executor.fused_speculative_step(),
+      "fused speculative topology was not selected");
+  Require(
+      !executor.unified_target_step(),
+      "fused topology unexpectedly selected unified Target step");
+  Require(loaded_roles.size() == 4, "fused route did not load four OMs");
+  Require(
+      loaded_roles.back() == "fused-speculative-step",
+      "fused model role differs");
+  Require(executor.model_memory().size() == 4, "fused memory set differs");
+
+  qwen35::dflash::GenerationOptions options;
+  options.max_new_tokens = 70;
+  options.max_draft_tokens = 7;
+  options.dflash_sync_window = 8;
+  options.coalesce_prefill_with_first_verify = true;
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kOrdinary,
+      options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kDFlash,
+      options);
+  Require(
+      ordinary.generated_token_ids == dflash.generated_token_ids &&
+          dflash.generated_token_ids.size() == options.max_new_tokens,
+      "fused speculative step changed exact generated tokens");
+
+  const auto& stats = executor.execution_stats();
+  Require(
+      stats.fused_speculative_step_executions > 0 &&
+          stats.fused_speculative_step_executions ==
+              stats.draft_propose_executions &&
+          stats.fused_speculative_step_executions ==
+              stats.target_verify_commit_executions &&
+          stats.draft_to_verify_model_launches_elided ==
+              stats.fused_speculative_step_executions,
+      "fused logical/physical execution counters differ");
+  Require(
+      stats.draft_dynamic_gear_count == 18 &&
+          stats.draft_verify_dynamic_gear_count == 16 &&
+          stats.draft_prefill_dynamic_gear_count == 2,
+      "fused dynamic feature gears differ");
+  Require(
+      stats.prefill_draft_propose_executions == 1 &&
+          stats.prefill_feature_rows_batched == 64 &&
+          stats.draft_verify_feature_rows_elided > 0 &&
+          stats.draft_verify_pending_upper_bound_executions > 0,
+      "fused Draft feature-source counters differ");
+  Require(
+      stats.prefill_verify_coalesced_windows == 1 &&
+          stats.speculative_window_direct_output_bindings > 0,
+      "fused coalesced/staged scheduler routes were not exercised");
+  const std::size_t physical_model_executions =
+      stats.target_prefill_executions +
+      stats.target_prefill_head_executions +
+      stats.target_decode1_executions +
+      stats.fused_speculative_step_executions;
+  Require(
+      executor.model_execution_trace().size() == physical_model_executions,
+      "fused physical model execution trace does not close");
+  Require(
+      physical_model_executions +
+              stats.draft_to_verify_model_launches_elided ==
+          stats.target_prefill_executions +
+              stats.target_prefill_head_executions +
+              stats.target_decode1_executions +
+              stats.draft_propose_executions +
+              stats.target_verify_commit_executions,
+      "fused launch-elision identity does not close");
+}
+
 void TestCommittedDraftFeaturePrefix(
     const std::array<std::filesystem::path, 5>& model_paths,
     std::size_t sync_window) {
   qwen35::dflash::IncrementalOmPaths paths{
       model_paths[0], model_paths[1], model_paths[2], model_paths[3],
-      model_paths[4]};
+      model_paths[4], {}};
   qwen35::dflash::AclIncrementalExecutor executor(
       std::move(paths),
       0,
@@ -549,7 +642,7 @@ void TestPrefillVerifyCoalescing(
     const std::array<std::filesystem::path, 5>& model_paths) {
   qwen35::dflash::IncrementalOmPaths paths{
       model_paths[0], model_paths[1], model_paths[2], model_paths[3],
-      model_paths[4]};
+      model_paths[4], {}};
   qwen35::dflash::AclIncrementalExecutor executor(std::move(paths));
   Require(
       executor.supports_prefill_verify_coalescing(),
@@ -615,7 +708,7 @@ void TestExtendedSpeculativeWindow(
   {
     qwen35::dflash::IncrementalOmPaths paths{
         model_paths[0], model_paths[1], model_paths[2], model_paths[3],
-        model_paths[4]};
+        model_paths[4], {}};
     qwen35::dflash::AclIncrementalExecutor executor(std::move(paths));
     qwen35::dflash::GenerationOptions options;
     options.max_new_tokens = 66;
@@ -655,7 +748,7 @@ void TestExtendedSpeculativeWindow(
 
   qwen35::dflash::IncrementalOmPaths cross_paths{
       model_paths[0], model_paths[1], model_paths[2], model_paths[3],
-      model_paths[4]};
+      model_paths[4], {}};
   qwen35::dflash::AclIncrementalExecutor cross_executor(
       std::move(cross_paths));
   qwen35::dflash::GenerationOptions cross_options;
@@ -691,8 +784,9 @@ void TestExtendedSpeculativeWindow(
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 7) {
-      throw std::invalid_argument("expected five baseline and one dynamic fake OM paths");
+    if (argc != 8) {
+      throw std::invalid_argument(
+          "expected five baseline, one dynamic and one fused fake OM paths");
     }
     const std::array<std::filesystem::path, 5> paths{
         std::filesystem::path(argv[1]),
@@ -729,6 +823,8 @@ int main(int argc, char** argv) {
     TestExtendedSpeculativeWindow(paths);
     TestUnifiedTargetStep(
         {paths[0], paths[1], paths[3], std::filesystem::path(argv[6])});
+    TestFusedSpeculativeStep(
+        {paths[0], paths[1], paths[2], std::filesystem::path(argv[7])});
     std::cout << "PASS: reset, decode carrier and committed-prefix Draft "
                  "feature policies preserve exact tokens, device state "
                  "routing, compact synchronization and override fallback\n";

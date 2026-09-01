@@ -476,7 +476,7 @@ if(ADAPTIVE_PROPOSAL_COUNTS AND
    NOT proposal_uploads EQUAL expected_dflash_requests)
   message(FATAL_ERROR "adaptive-K proposal uploads differ: ${report}")
 endif()
-if(NOT schema_version EQUAL 11 OR
+if(NOT schema_version EQUAL 12 OR
    NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR

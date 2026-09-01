@@ -24,6 +24,53 @@ constexpr const char* kDynamicTensorName = "ascend_mbatch_shape_data";
 constexpr std::size_t kBufferAlignment = 64;
 constexpr std::size_t kCompactSlotCount = 2;
 constexpr std::size_t kMaxSpeculativeSyncWindow = 8;
+constexpr std::size_t kResidentCompactRoute = kMaxSpeculativeSyncWindow;
+constexpr std::size_t kFusedCompactRouteCount =
+    2 * (kMaxSpeculativeSyncWindow + 1) +
+    (kMaxSpeculativeSyncWindow - 1);
+
+struct FusedCompactRoute {
+  std::size_t input_staging_index = kResidentCompactRoute;
+  std::size_t output_staging_index = kResidentCompactRoute;
+};
+
+FusedCompactRoute FusedRoute(std::size_t route_index) {
+  if (route_index <= kMaxSpeculativeSyncWindow) {
+    return {route_index, kResidentCompactRoute};
+  }
+  if (route_index < 2 * (kMaxSpeculativeSyncWindow + 1)) {
+    return {
+        route_index - (kMaxSpeculativeSyncWindow + 1),
+        0};
+  }
+  if (route_index < kFusedCompactRouteCount) {
+    const std::size_t output =
+        route_index - 2 * (kMaxSpeculativeSyncWindow + 1) + 1;
+    return {output - 1, output};
+  }
+  throw std::out_of_range("fused compact route index is invalid");
+}
+
+std::size_t FusedRouteIndex(
+    std::size_t input_staging_index,
+    std::size_t output_staging_index) {
+  if (input_staging_index > kResidentCompactRoute ||
+      output_staging_index > kResidentCompactRoute) {
+    throw std::out_of_range("fused compact route index is invalid");
+  }
+  if (output_staging_index == kResidentCompactRoute) {
+    return input_staging_index;
+  }
+  if (output_staging_index == 0) {
+    return kMaxSpeculativeSyncWindow + 1 + input_staging_index;
+  }
+  if (input_staging_index + 1 == output_staging_index) {
+    return 2 * (kMaxSpeculativeSyncWindow + 1) +
+        output_staging_index - 1;
+  }
+  throw std::logic_error(
+      "fused compact route is not used by the exact scheduler");
+}
 
 void Check(aclError code, const std::string& operation) {
   if (code != ACL_SUCCESS) {
@@ -515,13 +562,27 @@ class AclIncrementalExecutor::Impl {
       bool profile_model_executions,
       IncrementalDraftFeaturePolicy draft_feature_policy)
       : device_id_(device_id),
-        unified_target_step_(paths.target_decode1.empty()),
+        fused_speculative_step_(!paths.fused_speculative_step.empty()),
+        unified_target_step_(
+            paths.fused_speculative_step.empty() &&
+            paths.target_decode1.empty()),
         state_reset_policy_(state_reset_policy),
         decode_carrier_policy_(decode_carrier_policy),
         draft_feature_policy_(draft_feature_policy),
         profile_model_executions_(profile_model_executions) {
     if (device_id < 0) {
       throw std::invalid_argument("device ID must be non-negative");
+    }
+    const bool separate_speculative_pair =
+        !paths.draft_propose.empty() && !paths.target_verify_commit.empty();
+    const bool partial_speculative_pair =
+        paths.draft_propose.empty() != paths.target_verify_commit.empty();
+    if (partial_speculative_pair ||
+        (fused_speculative_step_ == separate_speculative_pair) ||
+        (fused_speculative_step_ && paths.target_decode1.empty())) {
+      throw std::invalid_argument(
+          "incremental topology requires either Draft+verify, or fused "
+          "speculative step plus static decode");
     }
     if (state_reset_policy_ != IncrementalStateResetPolicy::kAsyncMemset &&
         state_reset_policy_ != IncrementalStateResetPolicy::kImmutableZero) {
@@ -557,9 +618,16 @@ class AclIncrementalExecutor::Impl {
       if (!unified_target_step_) {
         decode_.Query(paths.target_decode1, "target-decode1", progress);
       }
-      draft_.Query(paths.draft_propose, "draft-propose", progress);
-      verify_.Query(
-          paths.target_verify_commit, "target-verify-commit", progress);
+      if (fused_speculative_step_) {
+        fused_.Query(
+            paths.fused_speculative_step,
+            "fused-speculative-step",
+            progress);
+      } else {
+        draft_.Query(paths.draft_propose, "draft-propose", progress);
+        verify_.Query(
+            paths.target_verify_commit, "target-verify-commit", progress);
+      }
       if (prefill_head_.weight_bytes >= prefill_.weight_bytes) {
         throw std::runtime_error(
             "target-prefill-head weightSize must be smaller than the "
@@ -569,17 +637,19 @@ class AclIncrementalExecutor::Impl {
           {prefill_.work_bytes,
            prefill_head_.work_bytes,
            unified_target_step_ ? 0 : decode_.work_bytes,
-           draft_.work_bytes,
-           verify_.work_bytes});
+           fused_speculative_step_ ? 0 : draft_.work_bytes,
+           fused_speculative_step_ ? 0 : verify_.work_bytes,
+           fused_.work_bytes});
       if (shared_work_bytes != 0) {
         shared_model_work_.Allocate(shared_work_bytes);
       }
-      const std::array<std::size_t, 5> weight_bytes{
+      const std::array<std::size_t, 6> weight_bytes{
           prefill_.weight_bytes,
           prefill_head_.weight_bytes,
           decode_.weight_bytes,
           draft_.weight_bytes,
           verify_.weight_bytes,
+          fused_.weight_bytes,
       };
       for (std::size_t index = 0; index < model_weights_.size(); ++index) {
         if (weight_bytes[index] != 0) {
@@ -603,8 +673,12 @@ class AclIncrementalExecutor::Impl {
       if (!unified_target_step_) {
         load(decode_, model_weights_[2], false);
       }
-      load(draft_, model_weights_[3], true);
-      load(verify_, model_weights_[4], unified_target_step_);
+      if (fused_speculative_step_) {
+        load(fused_, model_weights_[5], true);
+      } else {
+        load(draft_, model_weights_[3], true);
+        load(verify_, model_weights_[4], unified_target_step_);
+      }
       memory_.push_back(
           {prefill_.role,
            prefill_.id,
@@ -622,17 +696,45 @@ class AclIncrementalExecutor::Impl {
              decode_.work_bytes,
              decode_.weight_bytes});
       }
-      memory_.push_back(
-          {draft_.role, draft_.id, draft_.work_bytes, draft_.weight_bytes});
-      memory_.push_back(
-          {verify_.role,
-           verify_.id,
-           verify_.work_bytes,
-           verify_.weight_bytes});
+      if (fused_speculative_step_) {
+        memory_.push_back(
+            {fused_.role,
+             fused_.id,
+             fused_.work_bytes,
+             fused_.weight_bytes});
+      } else {
+        memory_.push_back(
+            {draft_.role, draft_.id, draft_.work_bytes, draft_.weight_bytes});
+        memory_.push_back(
+            {verify_.role,
+             verify_.id,
+             verify_.work_bytes,
+             verify_.weight_bytes});
+      }
+      if (progress) {
+        progress("incremental-runtime", "abi-validation-start", 0, 0);
+      }
       ValidateAbi();
+      if (progress) {
+        progress("incremental-runtime", "abi-validation-done", 0, 0);
+        progress("incremental-runtime", "buffer-allocation-start", 0, 0);
+      }
       AllocateBuffers();
+      if (progress) {
+        progress("incremental-runtime", "buffer-allocation-done", 0, 0);
+        progress(
+            "incremental-runtime", "zero-state-initialization-start", 0, 0);
+      }
       InitializeImmutableZeroState();
+      if (progress) {
+        progress(
+            "incremental-runtime", "zero-state-initialization-done", 0, 0);
+        progress("incremental-runtime", "dataset-plan-build-start", 0, 0);
+      }
       BuildPlans();
+      if (progress) {
+        progress("incremental-runtime", "dataset-plan-build-done", 0, 0);
+      }
     } catch (...) {
       Cleanup();
       throw;
@@ -665,6 +767,9 @@ class AclIncrementalExecutor::Impl {
     return draft_feature_policy_;
   }
   bool unified_target_step() const noexcept { return unified_target_step_; }
+  bool fused_speculative_step() const noexcept {
+    return fused_speculative_step_;
+  }
 
   void Reset(
       std::int64_t pad_token_id,
@@ -699,6 +804,7 @@ class AclIncrementalExecutor::Impl {
     feature_source_ = FeatureSource::kNone;
     prefill_staging_index_ = 0;
     prefill_total_token_count_ = 0;
+    fused_prefill_feature_rows_ = 0;
     draft_reset_pending_ = true;
 
     configured_eos_token_ids_ = eos_token_ids;
@@ -792,15 +898,23 @@ class AclIncrementalExecutor::Impl {
     if (prepare_draft && complete) {
       const std::size_t feature_rows =
           (staging_index + 1) * prefill_width_;
-      ExecuteDraft(
-          FeatureSource::kPrefill,
-          feature_rows,
-          DraftFeatureRoute::kPrefill);
-      proposal_ready_ = true;
-      prepared_proposal_count_ = logical_proposal_count;
-      ++executions;
+      if (fused_speculative_step_) {
+        // The exact fused OM consumes these resident Target features and runs
+        // Draft+verify together in the first speculative transaction.
+        fused_prefill_feature_rows_ = feature_rows;
+        proposal_ready_ = false;
+      } else {
+        ExecuteDraft(
+            FeatureSource::kPrefill,
+            feature_rows,
+            DraftFeatureRoute::kPrefill);
+        proposal_ready_ = true;
+        prepared_proposal_count_ = logical_proposal_count;
+        ++executions;
+      }
     } else {
       proposal_ready_ = false;
+      fused_prefill_feature_rows_ = 0;
       if (prepare_draft) {
         ++stats_.prefill_draft_propose_executions_elided;
       }
@@ -1001,6 +1115,13 @@ class AclIncrementalExecutor::Impl {
   }
 
  private:
+  using FusedRoutePlans =
+      std::array<DatasetPlan, kFusedCompactRouteCount>;
+  using FusedStatePlans =
+      std::array<std::array<FusedRoutePlans, 2>, 2>;
+  using InitialFusedPlans =
+      std::array<std::array<DatasetPlan, 2>, 2>;
+
   struct PendingSpeculative {
     std::size_t model_executions = 0;
     std::size_t compact_state_index = 0;
@@ -1028,6 +1149,14 @@ class AclIncrementalExecutor::Impl {
         pending_compact_staging_index != kMaxSpeculativeSyncWindow) {
       throw std::logic_error(
           "host-visible speculative step cannot name a pending carrier");
+    }
+    if (fused_speculative_step_) {
+      return EnqueueFusedSpeculative(
+          logical_proposal_count,
+          allow_pending_stream_work,
+          pending_feature_upper_bound,
+          pending_compact_staging_index,
+          output_compact_staging_index);
     }
     std::size_t executions = 1;
     if (proposal_ready_) {
@@ -1113,6 +1242,81 @@ class AclIncrementalExecutor::Impl {
         staged_output ? output_compact_staging_index : 0};
   }
 
+  PendingSpeculative EnqueueFusedSpeculative(
+      std::size_t logical_proposal_count,
+      bool allow_pending_stream_work,
+      std::size_t pending_feature_upper_bound,
+      std::size_t pending_compact_staging_index,
+      std::size_t output_compact_staging_index) {
+    if (!fused_speculative_step_) {
+      throw std::logic_error("fused speculative route is not active");
+    }
+    if (feature_source_ == FeatureSource::kNone) {
+      throw std::runtime_error(
+          "no committed Target feature carrier is available for fused step");
+    }
+    SetProposalCount(logical_proposal_count);
+    const bool prefill_source = feature_source_ == FeatureSource::kPrefill;
+    std::size_t feature_rows = verify_width_;
+    DraftFeatureRoute feature_route = DraftFeatureRoute::kFixedVerifyWidth;
+    if (prefill_source) {
+      if (fused_prefill_feature_rows_ == 0 ||
+          fused_prefill_feature_rows_ % prefill_width_ != 0 ||
+          fused_prefill_feature_rows_ > sequence_length_) {
+        throw std::logic_error(
+            "fused prefill feature batch is unavailable");
+      }
+      if (pending_compact_staging_index != kResidentCompactRoute) {
+        throw std::logic_error(
+            "first fused transaction requires the resident prefill carrier");
+      }
+      feature_rows = fused_prefill_feature_rows_;
+      feature_route = DraftFeatureRoute::kPrefill;
+    } else if (draft_feature_policy_ ==
+               IncrementalDraftFeaturePolicy::kCommittedPrefix) {
+      if (allow_pending_stream_work) {
+        if (pending_feature_upper_bound == 0 ||
+            pending_feature_upper_bound > verify_width_) {
+          throw std::logic_error(
+              "pending fused Draft feature upper bound is invalid");
+        }
+        feature_rows = pending_feature_upper_bound;
+        feature_route = DraftFeatureRoute::kPendingUpperBound;
+      } else {
+        if (!committed_feature_rows_valid_ ||
+            committed_feature_rows_ == 0 ||
+            committed_feature_rows_ > verify_width_) {
+          throw std::logic_error(
+              "host-visible fused Draft feature prefix is unavailable");
+        }
+        feature_rows = committed_feature_rows_;
+        feature_route = DraftFeatureRoute::kCommittedPrefix;
+      }
+    }
+    const std::size_t input_staging_index = allow_pending_stream_work
+        ? pending_compact_staging_index
+        : (compact_carrier_is_staged_
+               ? compact_carrier_staging_index_
+               : kResidentCompactRoute);
+    ExecuteFused(
+        prefill_source ? FeatureSource::kPrefill : FeatureSource::kVerify,
+        feature_rows,
+        feature_route,
+        input_staging_index,
+        output_compact_staging_index);
+    const bool staged_output =
+        output_compact_staging_index < kMaxSpeculativeSyncWindow;
+    target_state_index_ = 1 - target_state_index_;
+    proposal_ready_ = false;
+    fused_prefill_feature_rows_ = 0;
+    feature_source_ = FeatureSource::kVerify;
+    return PendingSpeculative{
+        1,
+        target_state_index_,
+        staged_output,
+        staged_output ? output_compact_staging_index : 0};
+  }
+
   enum class FeatureSource : std::size_t {
     kPrefill = 0,
     kVerify = 1,
@@ -1157,12 +1361,18 @@ class AclIncrementalExecutor::Impl {
         (!unified_target_step_ &&
          (decode_.public_input_indices.size() != 8 ||
           decode_.outputs.size() != 8)) ||
-        draft_.public_input_indices.size() != 8 ||
-        draft_.outputs.size() != 4 ||
-        verify_.public_input_indices.size() != 9 ||
-        verify_.outputs.size() != 13) {
-      throw std::runtime_error("incremental OM binding counts differ from v2 ABI");
+        (fused_speculative_step_
+             ? (fused_.public_input_indices.size() != 15 ||
+                fused_.outputs.size() != 16)
+             : (draft_.public_input_indices.size() != 8 ||
+                draft_.outputs.size() != 4 ||
+                verify_.public_input_indices.size() != 9 ||
+                verify_.outputs.size() != 13))) {
+      throw std::runtime_error(
+          "incremental OM binding counts differ from the exact state ABI");
     }
+    const ModelSession& transaction =
+        fused_speculative_step_ ? fused_ : verify_;
     const auto& prefill_ids = prefill_.PublicInput(0);
     if (prefill_ids.dtype != ACL_INT64 || prefill_ids.shape.size() != 2 ||
         prefill_ids.shape[0] != 1 || prefill_ids.shape[1] != 64) {
@@ -1204,26 +1414,34 @@ class AclIncrementalExecutor::Impl {
           "decode EOS count");
     }
 
-    const auto& verify_ids = verify_.PublicInput(0);
-    const std::int64_t expected_verify_rows = unified_target_step_ ? -1 : 16;
-    if (verify_ids.dtype != ACL_INT64 || verify_ids.shape.size() != 2 ||
-        verify_ids.shape[0] != 1 ||
-        verify_ids.shape[1] != expected_verify_rows) {
-      throw std::runtime_error(
-          unified_target_step_
-              ? "unified Target input IDs must be dynamic INT64[1,-1]"
-              : "verify input IDs must be INT64[1,16]");
+    if (!fused_speculative_step_) {
+      const auto& verify_ids = verify_.PublicInput(0);
+      const std::int64_t expected_verify_rows =
+          unified_target_step_ ? -1 : 16;
+      if (verify_ids.dtype != ACL_INT64 || verify_ids.shape.size() != 2 ||
+          verify_ids.shape[0] != 1 ||
+          verify_ids.shape[1] != expected_verify_rows) {
+        throw std::runtime_error(
+            unified_target_step_
+                ? "unified Target input IDs must be dynamic INT64[1,-1]"
+                : "verify input IDs must be INT64[1,16]");
+      }
     }
     verify_width_ = 16;
     proposal_width_ = verify_width_ - 1;
     RequireTensor(
-        verify_.PublicInput(1), ACL_INT32, {1}, "verify proposal count");
+        transaction.PublicInput(fused_speculative_step_ ? 4 : 1),
+        ACL_INT32,
+        {1},
+        "speculative proposal count");
     RequireSameTensor(
-        prefill_head_.PublicInput(1), verify_.PublicInput(2),
-        "verify EOS table");
+        prefill_head_.PublicInput(1),
+        transaction.PublicInput(fused_speculative_step_ ? 5 : 2),
+        "speculative EOS table");
     RequireSameTensor(
-        prefill_head_.PublicInput(2), verify_.PublicInput(3),
-        "verify EOS count");
+        prefill_head_.PublicInput(2),
+        transaction.PublicInput(fused_speculative_step_ ? 6 : 3),
+        "speculative EOS count");
 
     target_state_specs_ = SelectSpecs(
         prefill_.inputs,
@@ -1243,11 +1461,21 @@ class AclIncrementalExecutor::Impl {
     RequireStateSet(
         target_state_specs_,
         SelectSpecs(
-            verify_.inputs,
-            {verify_.public_input_indices[4], verify_.public_input_indices[5],
-             verify_.public_input_indices[6], verify_.public_input_indices[7],
-             verify_.public_input_indices[8]}),
-        "verify Target");
+            transaction.inputs,
+            fused_speculative_step_
+                ? std::vector<std::size_t>{
+                      transaction.public_input_indices[7],
+                      transaction.public_input_indices[8],
+                      transaction.public_input_indices[9],
+                      transaction.public_input_indices[10],
+                      transaction.public_input_indices[11]}
+                : std::vector<std::size_t>{
+                      transaction.public_input_indices[4],
+                      transaction.public_input_indices[5],
+                      transaction.public_input_indices[6],
+                      transaction.public_input_indices[7],
+                      transaction.public_input_indices[8]}),
+        "speculative Target");
     RequireStateSet(
         target_state_specs_,
         SelectSpecs(prefill_.outputs, {3, 4, 5, 6, 7}),
@@ -1260,17 +1488,25 @@ class AclIncrementalExecutor::Impl {
     }
     RequireStateSet(
         target_state_specs_,
-        SelectSpecs(verify_.outputs, {5, 6, 11, 12, 9}),
-        "verify Target outputs");
+        SelectSpecs(transaction.outputs, {5, 6, 11, 12, 9}),
+        "speculative Target outputs");
 
-    draft_state_specs_ = SelectSpecs(
-        draft_.inputs,
-        {draft_.public_input_indices[5], draft_.public_input_indices[6],
-         draft_.public_input_indices[7]});
+    draft_state_specs_ = fused_speculative_step_
+        ? SelectSpecs(
+              fused_.inputs,
+              {fused_.public_input_indices[12],
+               fused_.public_input_indices[13],
+               fused_.public_input_indices[14]})
+        : SelectSpecs(
+              draft_.inputs,
+              {draft_.public_input_indices[5], draft_.public_input_indices[6],
+               draft_.public_input_indices[7]});
     RequireStateSet(
         draft_state_specs_,
-        SelectSpecs(draft_.outputs, {1, 2, 3}),
-        "Draft outputs");
+        fused_speculative_step_
+            ? SelectSpecs(fused_.outputs, {13, 14, 15})
+            : SelectSpecs(draft_.outputs, {1, 2, 3}),
+        "speculative Draft outputs");
     const auto& draft_key = draft_state_specs_[0];
     if (draft_key.dtype != ACL_FLOAT16 || draft_key.shape.size() != 5 ||
         draft_key.shape[0] != 6 || draft_key.shape[1] != 1 ||
@@ -1320,44 +1556,59 @@ class AclIncrementalExecutor::Impl {
     }
 
     RequireSameTensor(
-        prefill_head_.outputs[0], verify_.outputs[0],
-        "verify committed IDs");
+        prefill_head_.outputs[0], transaction.outputs[0],
+        "speculative committed IDs");
     for (std::size_t index = 1; index <= 4; ++index) {
       RequireTensor(
-          verify_.outputs[index], ACL_INT32, {1}, "verify compact counter");
+          transaction.outputs[index], ACL_INT32, {1},
+          "speculative compact counter");
     }
-    RequireTensor(verify_.outputs[10], ACL_BOOL, {1}, "verify finished");
-    if (verify_.outputs[7].dtype != ACL_FLOAT16 ||
-        verify_.outputs[7].shape !=
+    RequireTensor(
+        transaction.outputs[10], ACL_BOOL, {1}, "speculative finished");
+    if (transaction.outputs[7].dtype != ACL_FLOAT16 ||
+        transaction.outputs[7].shape !=
             std::vector<std::int64_t>{1, 16, static_cast<std::int64_t>(feature_width_)}) {
-      throw std::runtime_error("verify Target feature carrier ABI differs");
+      throw std::runtime_error(
+          "speculative Target feature carrier ABI differs");
     }
-    RequireSameTensor(prefill_.outputs[2], verify_.outputs[8], "feature count");
+    RequireSameTensor(
+        prefill_.outputs[2], transaction.outputs[8], "feature count");
 
-    const auto& draft_feature = draft_.PublicInput(0);
+    const auto& draft_feature = fused_speculative_step_
+        ? fused_.PublicInput(0)
+        : draft_.PublicInput(0);
     if (draft_feature.dtype != ACL_FLOAT16 || draft_feature.shape.size() != 3 ||
         draft_feature.shape[0] != 1 || draft_feature.shape[1] != -1 ||
         draft_feature.shape[2] != static_cast<std::int64_t>(feature_width_)) {
       throw std::runtime_error(
           "Draft feature input must be FP16[1,-1,feature_width]");
     }
-    RequireSameTensor(prefill_.outputs[2], draft_.PublicInput(1), "Draft feature count");
+    const ModelSession& draft_contract =
+        fused_speculative_step_ ? fused_ : draft_;
     RequireSameTensor(
-        prefill_head_.outputs[0], draft_.PublicInput(2),
+        prefill_.outputs[2], draft_contract.PublicInput(1),
+        "Draft feature count");
+    RequireSameTensor(
+        prefill_head_.outputs[0], draft_contract.PublicInput(2),
         "Draft previous IDs");
     RequireSameTensor(
-        prefill_head_.outputs[1], draft_.PublicInput(3),
+        prefill_head_.outputs[1], draft_contract.PublicInput(3),
         "Draft previous count");
-    RequireSameTensor(verify_.PublicInput(1), draft_.PublicInput(4), "Draft proposal count");
-    if (unified_target_step_) {
-      if (verify_.PublicInput(0).dtype != draft_.outputs[0].dtype ||
-          verify_.PublicInput(0).bytes != draft_.outputs[0].bytes) {
-        throw std::runtime_error(
-            "dynamic Target-step maximum input differs from Draft verify IDs");
+    RequireSameTensor(
+        transaction.PublicInput(fused_speculative_step_ ? 4 : 1),
+        draft_contract.PublicInput(4),
+        "Draft proposal count");
+    if (!fused_speculative_step_) {
+      if (unified_target_step_) {
+        if (verify_.PublicInput(0).dtype != draft_.outputs[0].dtype ||
+            verify_.PublicInput(0).bytes != draft_.outputs[0].bytes) {
+          throw std::runtime_error(
+              "dynamic Target-step maximum input differs from Draft verify IDs");
+        }
+      } else {
+        RequireSameTensor(
+            verify_.PublicInput(0), draft_.outputs[0], "Draft verify IDs");
       }
-    } else {
-      RequireSameTensor(
-          verify_.PublicInput(0), draft_.outputs[0], "Draft verify IDs");
     }
     ResolveDraftGears();
     if (unified_target_step_) {
@@ -1367,10 +1618,12 @@ class AclIncrementalExecutor::Impl {
 
   std::vector<std::int64_t> FlattenDraftShape(std::size_t feature_rows) const {
     std::vector<std::int64_t> result;
+    const ModelSession& session =
+        fused_speculative_step_ ? fused_ : draft_;
     for (std::size_t public_index = 0;
-         public_index < draft_.public_input_indices.size();
+         public_index < session.public_input_indices.size();
          ++public_index) {
-      const auto& spec = draft_.PublicInput(public_index);
+      const auto& spec = session.PublicInput(public_index);
       for (std::size_t dimension = 0; dimension < spec.shape.size(); ++dimension) {
         std::int64_t value = spec.shape[dimension];
         if (value == -1) {
@@ -1387,9 +1640,11 @@ class AclIncrementalExecutor::Impl {
   }
 
   void ResolveDraftGears() {
-    const auto find = [this](std::size_t rows) -> aclmdlIODims {
+    const ModelSession& session =
+        fused_speculative_step_ ? fused_ : draft_;
+    const auto find = [this, &session](std::size_t rows) -> aclmdlIODims {
       const auto expected = FlattenDraftShape(rows);
-      for (const auto& gear : draft_.dynamic_gears) {
+      for (const auto& gear : session.dynamic_gears) {
         if (gear.dimCount != expected.size()) {
           continue;
         }
@@ -1411,16 +1666,16 @@ class AclIncrementalExecutor::Impl {
     }
     const std::size_t prefill_gears =
         (sequence_length_ - 1) / prefill_width_ + 1;
-    if (draft_.dynamic_gears.size() != prefill_gears + verify_width_) {
+    if (session.dynamic_gears.size() != prefill_gears + verify_width_) {
       throw std::runtime_error(
-          "Draft OM dynamic gear count differs from N=1..16 plus every "
-          "64-row prompt batch");
+          "Draft-bearing OM dynamic gear count differs from N=1..16 plus "
+          "every 64-row prompt batch");
     }
     draft_gear_prefill_.reserve(prefill_gears);
     for (std::size_t index = 0; index < prefill_gears; ++index) {
       draft_gear_prefill_.push_back(find((index + 1) * prefill_width_));
     }
-    stats_.draft_dynamic_gear_count = draft_.dynamic_gears.size();
+    stats_.draft_dynamic_gear_count = session.dynamic_gears.size();
     stats_.draft_verify_dynamic_gear_count = draft_gear_verify_.size();
     stats_.draft_prefill_dynamic_gear_count = draft_gear_prefill_.size();
   }
@@ -1481,6 +1736,10 @@ class AclIncrementalExecutor::Impl {
   }
 
   void AllocateBuffers() {
+    const ModelSession& transaction =
+        fused_speculative_step_ ? fused_ : verify_;
+    const ModelSession& draft_contract =
+        fused_speculative_step_ ? fused_ : draft_;
     target_states_[0].Allocate(target_state_specs_);
     target_states_[1].Allocate(target_state_specs_);
     draft_states_[0].Allocate(draft_state_specs_);
@@ -1521,9 +1780,11 @@ class AclIncrementalExecutor::Impl {
     prefill_count_control_bytes_ =
         prefill_total_count_offset_ + prefill_.outputs[2].bytes;
     proposal_count_offset_ = ReserveDeviceSegment(
-        &control_cursor, verify_.PublicInput(1).bytes);
+        &control_cursor,
+        transaction.PublicInput(fused_speculative_step_ ? 4 : 1).bytes);
     prefill_proposal_control_bytes_ =
-        proposal_count_offset_ + verify_.PublicInput(1).bytes;
+        proposal_count_offset_ +
+        transaction.PublicInput(fused_speculative_step_ ? 4 : 1).bytes;
     eos_ids_offset_ = ReserveDeviceSegment(
         &control_cursor, prefill_head_.PublicInput(1).bytes);
     eos_count_offset_ = ReserveDeviceSegment(
@@ -1579,7 +1840,8 @@ class AclIncrementalExecutor::Impl {
       extra_prefill_control_host_[index].Allocate(prefill_control_.bytes);
     }
     for (auto& host : proposal_count_upload_host_) {
-      host.Allocate(verify_.PublicInput(1).bytes);
+      host.Allocate(
+          transaction.PublicInput(fused_speculative_step_ ? 4 : 1).bytes);
       stats_.proposal_count_staging_pinned_host_bytes += host.bytes;
     }
 
@@ -1591,15 +1853,15 @@ class AclIncrementalExecutor::Impl {
     compact_finished_offset_ = ReserveDeviceSegment(
         &compact_cursor, prefill_head_.outputs[2].bytes);
     compact_drafted_offset_ = ReserveDeviceSegment(
-        &compact_cursor, verify_.outputs[2].bytes);
+        &compact_cursor, transaction.outputs[2].bytes);
     compact_accepted_offset_ = ReserveDeviceSegment(
-        &compact_cursor, verify_.outputs[3].bytes);
+        &compact_cursor, transaction.outputs[3].bytes);
     compact_rejected_offset_ = ReserveDeviceSegment(
-        &compact_cursor, verify_.outputs[4].bytes);
+        &compact_cursor, transaction.outputs[4].bytes);
     compact_ordinary_bytes_ =
         compact_finished_offset_ + prefill_head_.outputs[2].bytes;
     compact_verify_bytes_ =
-        compact_rejected_offset_ + verify_.outputs[4].bytes;
+        compact_rejected_offset_ + transaction.outputs[4].bytes;
     stats_.compact_ordinary_result_bytes = compact_ordinary_bytes_;
     stats_.compact_verify_result_bytes = compact_verify_bytes_;
     compact_slot_bytes_ = Align(compact_cursor, kBufferAlignment);
@@ -1634,12 +1896,12 @@ class AclIncrementalExecutor::Impl {
     }
     const std::size_t packed_feature_bytes =
         stats_.prefill_staging_slots * prefill_feature_payload;
-    if (draft_.PublicInput(0).bytes < packed_feature_bytes) {
+    if (draft_contract.PublicInput(0).bytes < packed_feature_bytes) {
       throw std::runtime_error(
           "Draft feature input buffer is smaller than the maximum prompt batch");
     }
     const std::size_t feature_payload =
-        std::max(draft_.PublicInput(0).bytes, packed_feature_bytes);
+        std::max(draft_contract.PublicInput(0).bytes, packed_feature_bytes);
     if (feature_payload > std::numeric_limits<std::size_t>::max() - 32) {
       throw std::overflow_error("prefill feature terminal guard overflow");
     }
@@ -1649,13 +1911,16 @@ class AclIncrementalExecutor::Impl {
     stats_.prefill_feature_arena_bytes = prefill_features_.bytes;
     prefill_last_hidden_.Allocate(prefill_.outputs[0].bytes);
     committed_input_count_.Allocate(prefill_.outputs[2].bytes);
-    verify_ids_.Allocate(verify_.PublicInput(0).bytes);
+    if (!fused_speculative_step_) {
+      verify_ids_.Allocate(verify_.PublicInput(0).bytes);
+    }
     prefill_dynamic_controls_.resize(stats_.prefill_staging_slots);
     for (auto& control : prefill_dynamic_controls_) {
-      control.Allocate(draft_.inputs.at(draft_.dynamic_input_index).bytes);
+      control.Allocate(
+          draft_contract.inputs.at(draft_contract.dynamic_input_index).bytes);
     }
     verify_dynamic_control_.Allocate(
-        draft_.inputs.at(draft_.dynamic_input_index).bytes);
+        draft_contract.inputs.at(draft_contract.dynamic_input_index).bytes);
     if (unified_target_step_) {
       target_step_dynamic_control_.Allocate(
           verify_.inputs.at(verify_.dynamic_input_index).bytes);
@@ -1664,11 +1929,19 @@ class AclIncrementalExecutor::Impl {
     }
 
     prefill_plans_.resize(stats_.prefill_staging_slots);
-    prefill_draft_plans_.resize(stats_.prefill_staging_slots);
-    verify_draft_plans_.resize(verify_width_);
-    staged_verify_draft_plans_.resize(verify_width_);
-    if (state_reset_policy_ == IncrementalStateResetPolicy::kImmutableZero) {
-      initial_draft_plans_.resize(stats_.prefill_staging_slots);
+    if (fused_speculative_step_) {
+      fused_prefill_plans_.resize(stats_.prefill_staging_slots);
+      fused_verify_plans_.resize(verify_width_);
+      if (state_reset_policy_ == IncrementalStateResetPolicy::kImmutableZero) {
+        initial_fused_prefill_plans_.resize(stats_.prefill_staging_slots);
+      }
+    } else {
+      prefill_draft_plans_.resize(stats_.prefill_staging_slots);
+      verify_draft_plans_.resize(verify_width_);
+      staged_verify_draft_plans_.resize(verify_width_);
+      if (state_reset_policy_ == IncrementalStateResetPolicy::kImmutableZero) {
+        initial_draft_plans_.resize(stats_.prefill_staging_slots);
+      }
     }
 
     stats_.carrier_device_bytes =
@@ -1773,8 +2046,11 @@ class AclIncrementalExecutor::Impl {
   }
 
   BufferView ProposalCountView() const {
+    const ModelSession& transaction =
+        fused_speculative_step_ ? fused_ : verify_;
     return PrefillControlView(
-        proposal_count_offset_, verify_.PublicInput(1).bytes);
+        proposal_count_offset_,
+        transaction.PublicInput(fused_speculative_step_ ? 4 : 1).bytes);
   }
 
   BufferView TargetStepZeroCountView() const {
@@ -1809,7 +2085,8 @@ class AclIncrementalExecutor::Impl {
   }
 
   BufferView PrefillFeatureBatchView() const {
-    return prefill_features_.View(draft_.PublicInput(0).bytes);
+    return prefill_features_.View(
+        (fused_speculative_step_ ? fused_ : draft_).PublicInput(0).bytes);
   }
 
   std::size_t PreparePrefillControl(
@@ -2206,22 +2483,24 @@ class AclIncrementalExecutor::Impl {
                   current),
               decode_outputs());
         }
-        verify_plans_[current].Build(
-            verify_,
-            TargetInputs(
-                {verify_ids_.View(), ProposalCountView(), EosIdsView(),
-                 EosCountView()},
-                current),
-            verify_outputs());
-        for (std::size_t staging = 0;
-             staging < kMaxSpeculativeSyncWindow; ++staging) {
-          staged_verify_plans_[current][staging].Build(
+        if (!fused_speculative_step_) {
+          verify_plans_[current].Build(
               verify_,
               TargetInputs(
                   {verify_ids_.View(), ProposalCountView(), EosIdsView(),
                    EosCountView()},
                   current),
-              verify_outputs(staging));
+              verify_outputs());
+          for (std::size_t staging = 0;
+               staging < kMaxSpeculativeSyncWindow; ++staging) {
+            staged_verify_plans_[current][staging].Build(
+                verify_,
+                TargetInputs(
+                    {verify_ids_.View(), ProposalCountView(), EosIdsView(),
+                     EosCountView()},
+                    current),
+                verify_outputs(staging));
+          }
         }
       }
       prefill_head_plans_[current].Build(
@@ -2241,53 +2520,56 @@ class AclIncrementalExecutor::Impl {
                prefill_head_.outputs[2].bytes)});
     }
 
-    for (std::size_t target = 0; target < 2; ++target) {
-      for (std::size_t current = 0; current < 2; ++current) {
-        const std::size_t next = 1 - current;
-        for (std::size_t rows = 1; rows <= verify_width_; ++rows) {
-          build_draft(
-              verify_draft_plans_.at(rows - 1)[target][current],
-              target,
-              kMaxSpeculativeSyncWindow,
-              PrefillFeatureBatchView(),
-              committed_input_count_.View(),
-              draft_states_[current].tensors,
-              draft_states_[next].tensors,
-              verify_dynamic_control_.View(),
-              draft_gear_verify_.at(rows - 1),
-              "verify committed-prefix prebind");
-          if (draft_feature_policy_ ==
-                  IncrementalDraftFeaturePolicy::kCommittedPrefix ||
-              rows == verify_width_) {
-            for (std::size_t staging = 0;
-                 staging < kMaxSpeculativeSyncWindow; ++staging) {
-              build_draft(
-                  staged_verify_draft_plans_.at(rows - 1)
-                      [target][current][staging],
-                  target,
-                  staging,
-                  PrefillFeatureBatchView(),
-                  committed_input_count_.View(),
-                  draft_states_[current].tensors,
-                  draft_states_[next].tensors,
-                  verify_dynamic_control_.View(),
-                  draft_gear_verify_.at(rows - 1),
-                  "verify direct-staging carrier prebind");
+    if (!fused_speculative_step_) {
+      for (std::size_t target = 0; target < 2; ++target) {
+        for (std::size_t current = 0; current < 2; ++current) {
+          const std::size_t next = 1 - current;
+          for (std::size_t rows = 1; rows <= verify_width_; ++rows) {
+            build_draft(
+                verify_draft_plans_.at(rows - 1)[target][current],
+                target,
+                kMaxSpeculativeSyncWindow,
+                PrefillFeatureBatchView(),
+                committed_input_count_.View(),
+                draft_states_[current].tensors,
+                draft_states_[next].tensors,
+                verify_dynamic_control_.View(),
+                draft_gear_verify_.at(rows - 1),
+                "verify committed-prefix prebind");
+            if (draft_feature_policy_ ==
+                    IncrementalDraftFeaturePolicy::kCommittedPrefix ||
+                rows == verify_width_) {
+              for (std::size_t staging = 0;
+                   staging < kMaxSpeculativeSyncWindow; ++staging) {
+                build_draft(
+                    staged_verify_draft_plans_.at(rows - 1)
+                        [target][current][staging],
+                    target,
+                    staging,
+                    PrefillFeatureBatchView(),
+                    committed_input_count_.View(),
+                    draft_states_[current].tensors,
+                    draft_states_[next].tensors,
+                    verify_dynamic_control_.View(),
+                    draft_gear_verify_.at(rows - 1),
+                    "verify direct-staging carrier prebind");
+              }
             }
           }
-        }
-        for (std::size_t slot = 0; slot < prefill_draft_plans_.size(); ++slot) {
-          build_draft(
-              prefill_draft_plans_[slot][target][current],
-              target,
-              kMaxSpeculativeSyncWindow,
-              PrefillFeatureBatchView(),
-              PrefillTotalCountView(),
-              draft_states_[current].tensors,
-              draft_states_[next].tensors,
-              prefill_dynamic_controls_[slot].View(),
-              draft_gear_prefill_[slot],
-              "prefill batch prebind");
+          for (std::size_t slot = 0; slot < prefill_draft_plans_.size();
+               ++slot) {
+            build_draft(
+                prefill_draft_plans_[slot][target][current],
+                target,
+                kMaxSpeculativeSyncWindow,
+                PrefillFeatureBatchView(),
+                PrefillTotalCountView(),
+                draft_states_[current].tensors,
+                draft_states_[next].tensors,
+                prefill_dynamic_controls_[slot].View(),
+                draft_gear_prefill_[slot],
+                "prefill batch prebind");
+          }
         }
       }
     }
@@ -2312,19 +2594,178 @@ class AclIncrementalExecutor::Impl {
            target_states_[0].tensors[2],
            target_states_[0].tensors[3],
            target_states_[0].tensors[4]});
-      for (std::size_t slot = 0; slot < initial_draft_plans_.size(); ++slot) {
+      if (!fused_speculative_step_) {
+        for (std::size_t slot = 0; slot < initial_draft_plans_.size(); ++slot) {
+          for (std::size_t target = 0; target < 2; ++target) {
+            build_draft(
+                initial_draft_plans_[slot][target],
+                target,
+                kMaxSpeculativeSyncWindow,
+                PrefillFeatureBatchView(),
+                PrefillTotalCountView(),
+                draft_zero_state_.tensors,
+                draft_states_[0].tensors,
+                prefill_dynamic_controls_[slot].View(),
+                draft_gear_prefill_[slot],
+                "immutable zero prefill batch prebind");
+          }
+        }
+      }
+    }
+    if (fused_speculative_step_) {
+      BuildFusedPlans();
+    }
+  }
+
+  void BuildFusedPlan(
+      DatasetPlan& plan,
+      std::size_t target_state_index,
+      std::size_t input_staging_index,
+      std::size_t output_staging_index,
+      const BufferView& features,
+      const BufferView& committed_count,
+      const std::vector<BufferView>& draft_input_state,
+      const std::vector<BufferView>& draft_output_state,
+      const BufferView& dynamic_control,
+      const aclmdlIODims& gear,
+      std::size_t feature_rows) {
+    if (!fused_speculative_step_ || target_state_index >= 2 ||
+        draft_input_state.size() != 3 || draft_output_state.size() != 3) {
+      throw std::logic_error("invalid fused speculative plan state");
+    }
+    const std::size_t next_target = 1 - target_state_index;
+    const auto compact_input = [this, target_state_index, input_staging_index](
+                                   std::size_t offset,
+                                   std::size_t bytes) {
+      return CarrierCompactView(
+          target_state_index, input_staging_index, offset, bytes);
+    };
+    const auto compact_output = [this, next_target, output_staging_index](
+                                    std::size_t offset,
+                                    std::size_t bytes) {
+      return CarrierCompactView(
+          next_target, output_staging_index, offset, bytes);
+    };
+    std::vector<BufferView> inputs{
+        features,
+        committed_count,
+        compact_input(
+            compact_token_offset_, fused_.PublicInput(2).bytes),
+        compact_input(
+            compact_commit_offset_, fused_.PublicInput(3).bytes),
+        ProposalCountView(),
+        EosIdsView(),
+        EosCountView()};
+    inputs.insert(
+        inputs.end(),
+        target_states_[target_state_index].tensors.begin(),
+        target_states_[target_state_index].tensors.end());
+    inputs.insert(
+        inputs.end(), draft_input_state.begin(), draft_input_state.end());
+    plan.Build(
+        fused_,
+        inputs,
+        {compact_output(compact_token_offset_, fused_.outputs[0].bytes),
+         compact_output(compact_commit_offset_, fused_.outputs[1].bytes),
+         compact_output(compact_drafted_offset_, fused_.outputs[2].bytes),
+         compact_output(compact_accepted_offset_, fused_.outputs[3].bytes),
+         compact_output(compact_rejected_offset_, fused_.outputs[4].bytes),
+         target_states_[next_target].tensors[0],
+         target_states_[next_target].tensors[1],
+         prefill_features_.View(fused_.outputs[7].bytes),
+         committed_input_count_.View(),
+         target_states_[next_target].tensors[4],
+         compact_output(compact_finished_offset_, fused_.outputs[10].bytes),
+         target_states_[next_target].tensors[2],
+         target_states_[next_target].tensors[3],
+         draft_output_state[0],
+         draft_output_state[1],
+         draft_output_state[2]},
+        dynamic_control);
+    Check(
+        aclmdlSetInputDynamicDims(
+            fused_.id,
+            plan.input,
+            fused_.dynamic_input_index,
+            &gear),
+        "fused-speculative-step: aclmdlSetInputDynamicDims(N=" +
+            std::to_string(feature_rows) + ")");
+  }
+
+  void BuildFusedPlans() {
+    if (!fused_speculative_step_) {
+      throw std::logic_error("fused plan builder used by another topology");
+    }
+    const auto build_gears = [this](
+                                 std::vector<FusedStatePlans>& plans,
+                                 const std::vector<aclmdlIODims>& gears,
+                                 bool prefill_source) {
+      for (std::size_t gear_index = 0; gear_index < plans.size(); ++gear_index) {
+        const std::size_t feature_rows = prefill_source
+            ? (gear_index + 1) * prefill_width_
+            : gear_index + 1;
+        const BufferView committed_count = prefill_source
+            ? PrefillTotalCountView()
+            : committed_input_count_.View();
+        const BufferView dynamic_control = prefill_source
+            ? prefill_dynamic_controls_.at(gear_index).View()
+            : verify_dynamic_control_.View();
         for (std::size_t target = 0; target < 2; ++target) {
-          build_draft(
-              initial_draft_plans_[slot][target],
-              target,
-              kMaxSpeculativeSyncWindow,
-              PrefillFeatureBatchView(),
-              PrefillTotalCountView(),
-              draft_zero_state_.tensors,
-              draft_states_[0].tensors,
-              prefill_dynamic_controls_[slot].View(),
-              draft_gear_prefill_[slot],
-              "immutable zero prefill batch prebind");
+          for (std::size_t draft = 0; draft < 2; ++draft) {
+            const std::size_t next_draft = 1 - draft;
+            for (std::size_t route_index = 0;
+                 route_index < kFusedCompactRouteCount;
+                 ++route_index) {
+              const FusedCompactRoute route = FusedRoute(route_index);
+              if (prefill_source &&
+                  (route.input_staging_index != kResidentCompactRoute ||
+                   (route.output_staging_index != kResidentCompactRoute &&
+                    route.output_staging_index != 0))) {
+                continue;
+              }
+              BuildFusedPlan(
+                  plans[gear_index][target][draft][route_index],
+                  target,
+                  route.input_staging_index,
+                  route.output_staging_index,
+                  PrefillFeatureBatchView(),
+                  committed_count,
+                  draft_states_[draft].tensors,
+                  draft_states_[next_draft].tensors,
+                  dynamic_control,
+                  gears.at(gear_index),
+                  feature_rows);
+            }
+          }
+        }
+      }
+    };
+    build_gears(fused_verify_plans_, draft_gear_verify_, false);
+    build_gears(fused_prefill_plans_, draft_gear_prefill_, true);
+
+    if (state_reset_policy_ == IncrementalStateResetPolicy::kImmutableZero) {
+      for (std::size_t gear_index = 0;
+           gear_index < initial_fused_prefill_plans_.size();
+           ++gear_index) {
+        const std::size_t feature_rows = (gear_index + 1) * prefill_width_;
+        for (std::size_t target = 0; target < 2; ++target) {
+          for (std::size_t output_route = 0; output_route < 2; ++output_route) {
+            const std::size_t output_staging_index = output_route == 0
+                ? kResidentCompactRoute
+                : 0;
+            BuildFusedPlan(
+                initial_fused_prefill_plans_[gear_index][target][output_route],
+                target,
+                kResidentCompactRoute,
+                output_staging_index,
+                PrefillFeatureBatchView(),
+                PrefillTotalCountView(),
+                draft_zero_state_.tensors,
+                draft_states_[0].tensors,
+                prefill_dynamic_controls_.at(gear_index).View(),
+                draft_gear_prefill_.at(gear_index),
+                feature_rows);
+          }
         }
       }
     }
@@ -2406,7 +2847,7 @@ class AclIncrementalExecutor::Impl {
     void* host = staging.data;
     *static_cast<std::int32_t*>(host) =
         static_cast<std::int32_t>(value);
-    const std::size_t bytes = verify_.PublicInput(1).bytes;
+    const std::size_t bytes = ProposalCountView().bytes;
     UploadFromHost(ProposalCountView(), host, bytes);
     ++stats_.proposal_count_upload_operations;
     stats_.proposal_count_upload_bytes += bytes;
@@ -2487,6 +2928,99 @@ class AclIncrementalExecutor::Impl {
           break;
         case DraftFeatureRoute::kPrefill:
           throw std::logic_error("prefill Draft route reached verify stats");
+      }
+    }
+    draft_state_index_ = use_immutable_zero ? 0 : 1 - draft_state_index_;
+    draft_reset_pending_ = false;
+  }
+
+  void ExecuteFused(
+      FeatureSource source,
+      std::size_t feature_rows,
+      DraftFeatureRoute feature_route,
+      std::size_t input_staging_index,
+      std::size_t output_staging_index) {
+    if (!fused_speculative_step_ || source == FeatureSource::kNone ||
+        input_staging_index > kResidentCompactRoute ||
+        output_staging_index > kResidentCompactRoute) {
+      throw std::logic_error("invalid fused speculative execution route");
+    }
+    const bool prefill_source = source == FeatureSource::kPrefill;
+    if ((!prefill_source &&
+         (feature_rows == 0 || feature_rows > verify_width_)) ||
+        (prefill_source &&
+         (feature_rows == 0 || feature_rows % prefill_width_ != 0 ||
+          feature_rows > sequence_length_)) ||
+        (prefill_source && feature_route != DraftFeatureRoute::kPrefill) ||
+        (!prefill_source && feature_route == DraftFeatureRoute::kPrefill)) {
+      throw std::logic_error("fused feature route does not match its gear");
+    }
+    const bool use_immutable_zero =
+        draft_reset_pending_ &&
+        state_reset_policy_ == IncrementalStateResetPolicy::kImmutableZero;
+    if (draft_reset_pending_ && !use_immutable_zero) {
+      throw std::logic_error("fused Draft reset was not consumed by prefill");
+    }
+    if (use_immutable_zero && !prefill_source) {
+      throw std::logic_error(
+          "immutable fused Draft zero state is valid only after prefill");
+    }
+    DatasetPlan* plan = nullptr;
+    if (use_immutable_zero) {
+      if (input_staging_index != kResidentCompactRoute ||
+          (output_staging_index != kResidentCompactRoute &&
+           output_staging_index != 0)) {
+        throw std::logic_error("immutable fused compact route is invalid");
+      }
+      const std::size_t gear_index = feature_rows / prefill_width_ - 1;
+      const std::size_t output_route =
+          output_staging_index == kResidentCompactRoute ? 0 : 1;
+      plan = &initial_fused_prefill_plans_.at(gear_index)
+                  [target_state_index_][output_route];
+    } else {
+      const std::size_t route_index =
+          FusedRouteIndex(input_staging_index, output_staging_index);
+      if (prefill_source) {
+        const std::size_t gear_index = feature_rows / prefill_width_ - 1;
+        plan = &fused_prefill_plans_.at(gear_index)
+                    [target_state_index_][draft_state_index_][route_index];
+      } else {
+        plan = &fused_verify_plans_.at(feature_rows - 1)
+                    [target_state_index_][draft_state_index_][route_index];
+      }
+    }
+    if (plan == nullptr || plan->input == nullptr || plan->output == nullptr) {
+      throw std::logic_error("fused speculative plan was not prebuilt");
+    }
+    Execute(fused_, *plan, feature_rows);
+    ++stats_.fused_speculative_step_executions;
+    ++stats_.draft_to_verify_model_launches_elided;
+    ++stats_.draft_propose_executions;
+    ++stats_.target_verify_commit_executions;
+    stats_.target_step_input_rows += verify_width_;
+    if (output_staging_index < kMaxSpeculativeSyncWindow) {
+      ++stats_.speculative_window_direct_output_bindings;
+      stats_.speculative_window_direct_output_bytes += compact_verify_bytes_;
+    }
+    if (prefill_source) {
+      ++stats_.prefill_draft_propose_executions;
+      stats_.prefill_feature_rows_batched += feature_rows;
+    } else {
+      stats_.draft_verify_feature_input_rows += feature_rows;
+      stats_.draft_verify_full_width_equivalent_rows += verify_width_;
+      stats_.draft_verify_feature_rows_elided += verify_width_ - feature_rows;
+      switch (feature_route) {
+        case DraftFeatureRoute::kFixedVerifyWidth:
+          ++stats_.draft_verify_fixed_width_executions;
+          break;
+        case DraftFeatureRoute::kCommittedPrefix:
+          ++stats_.draft_verify_committed_prefix_executions;
+          break;
+        case DraftFeatureRoute::kPendingUpperBound:
+          ++stats_.draft_verify_pending_upper_bound_executions;
+          break;
+        case DraftFeatureRoute::kPrefill:
+          throw std::logic_error("prefill fused route reached verify stats");
       }
     }
     draft_state_index_ = use_immutable_zero ? 0 : 1 - draft_state_index_;
@@ -2817,6 +3351,28 @@ class AclIncrementalExecutor::Impl {
       static_cast<void>(aclrtSynchronizeStream(stream_));
       stream_work_pending_ = false;
     }
+    for (auto& by_gear : initial_fused_prefill_plans_) {
+      for (auto& by_target : by_gear) {
+        for (auto& plan : by_target) {
+          plan.Release();
+        }
+      }
+    }
+    initial_fused_prefill_plans_.clear();
+    const auto release_fused = [](std::vector<FusedStatePlans>& plans) {
+      for (auto& by_gear : plans) {
+        for (auto& by_target : by_gear) {
+          for (auto& by_draft : by_target) {
+            for (auto& plan : by_draft) {
+              plan.Release();
+            }
+          }
+        }
+      }
+      plans.clear();
+    };
+    release_fused(fused_prefill_plans_);
+    release_fused(fused_verify_plans_);
     for (auto& by_target : initial_draft_plans_) {
       for (auto& plan : by_target) {
         plan.Release();
@@ -2923,6 +3479,7 @@ class AclIncrementalExecutor::Impl {
     draft_zero_state_.Release();
     target_zero_state_.Release();
 
+    fused_.Release();
     verify_.Release();
     draft_.Release();
     decode_.Release();
@@ -2951,6 +3508,7 @@ class AclIncrementalExecutor::Impl {
   }
 
   int device_id_ = 0;
+  bool fused_speculative_step_ = false;
   bool unified_target_step_ = false;
   IncrementalStateResetPolicy state_reset_policy_ =
       IncrementalStateResetPolicy::kAsyncMemset;
@@ -2970,10 +3528,11 @@ class AclIncrementalExecutor::Impl {
   ModelSession decode_;
   ModelSession draft_;
   ModelSession verify_;
+  ModelSession fused_;
   std::vector<IncrementalModelMemory> memory_;
   std::vector<IncrementalModelExecutionTrace> model_execution_trace_;
   DeviceAllocation shared_model_work_;
-  std::array<DeviceAllocation, 5> model_weights_;
+  std::array<DeviceAllocation, 6> model_weights_;
 
   std::size_t sequence_length_ = 0;
   std::size_t prefill_width_ = 0;
@@ -3055,11 +3614,15 @@ class AclIncrementalExecutor::Impl {
   DatasetPlan initial_prefill_plan_;
   std::array<DatasetPlan, 2> prefill_head_plans_;
   std::vector<std::array<DatasetPlan, 2>> initial_draft_plans_;
+  std::vector<FusedStatePlans> fused_prefill_plans_;
+  std::vector<FusedStatePlans> fused_verify_plans_;
+  std::vector<InitialFusedPlans> initial_fused_prefill_plans_;
 
   std::size_t target_state_index_ = 0;
   std::size_t draft_state_index_ = 0;
   std::size_t prefill_staging_index_ = 0;
   std::size_t prefill_total_token_count_ = 0;
+  std::size_t fused_prefill_feature_rows_ = 0;
   bool deferred_prefill_pending_ = false;
   bool stream_work_pending_ = false;
   bool proposal_ready_ = false;
@@ -3212,6 +3775,10 @@ AclIncrementalExecutor::draft_feature_policy() const noexcept {
 
 bool AclIncrementalExecutor::unified_target_step() const noexcept {
   return impl_->unified_target_step();
+}
+
+bool AclIncrementalExecutor::fused_speculative_step() const noexcept {
+  return impl_->fused_speculative_step();
 }
 
 }  // namespace qwen35::dflash
