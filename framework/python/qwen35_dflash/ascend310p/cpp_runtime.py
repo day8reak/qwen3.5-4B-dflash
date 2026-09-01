@@ -384,6 +384,58 @@ def validate_cpp_runner_report(
         or weight_bytes <= 0
     ):
         raise RuntimeError("C++ runner returned invalid OM work/weight bytes")
+    execution_io = report.get("execution_io_counters", {})
+    if execution_io.get("input_policy") != (
+        "persistent device mirror plus changed contiguous ranges"
+    ):
+        raise RuntimeError("C++ runner did not use the locked incremental input policy")
+    if execution_io.get("target_output_policy") != (
+        "download only the last draft_width_plus_one rows needed by proposal or verify"
+    ):
+        raise RuntimeError("C++ runner did not use the locked target output slice")
+    executions = execution_io.get("model_executions")
+    synchronizations = execution_io.get("stream_synchronizations")
+    if (
+        isinstance(executions, bool)
+        or not isinstance(executions, int)
+        or executions <= 0
+        or synchronizations != executions
+    ):
+        raise RuntimeError("C++ runner execution/synchronization counters differ")
+    for actual_name, full_name, avoided_name in (
+        (
+            "host_to_device_bytes",
+            "full_host_to_device_bytes",
+            "host_to_device_bytes_avoided",
+        ),
+        (
+            "device_to_host_bytes",
+            "full_device_to_host_bytes",
+            "device_to_host_bytes_avoided",
+        ),
+    ):
+        actual = execution_io.get(actual_name)
+        full = execution_io.get(full_name)
+        avoided = execution_io.get(avoided_name)
+        if (
+            isinstance(actual, bool)
+            or not isinstance(actual, int)
+            or actual < 0
+            or isinstance(full, bool)
+            or not isinstance(full, int)
+            or full <= 0
+            or actual > full
+            or avoided != full - actual
+        ):
+            raise RuntimeError(f"C++ runner returned invalid {actual_name}")
+    maximum_target = execution_io.get("maximum_target_elements_per_call")
+    if (
+        isinstance(maximum_target, bool)
+        or not isinstance(maximum_target, int)
+        or maximum_target <= 0
+        or maximum_target > int(abi.get("draft_width", -1)) + 1
+    ):
+        raise RuntimeError("C++ runner target output slice exceeds K+1")
     ordinary = report.get("ordinary")
     dflash = report.get("dflash")
     if not isinstance(ordinary, Mapping) or not isinstance(dflash, Mapping):

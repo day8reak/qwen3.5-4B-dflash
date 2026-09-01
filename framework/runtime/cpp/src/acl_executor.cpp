@@ -3,6 +3,7 @@
 #include <acl/acl.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -27,6 +28,48 @@ struct Buffer {
   std::size_t bytes = 0;
   aclDataBuffer* data = nullptr;
 };
+
+struct ElementRange {
+  std::size_t begin = 0;
+  std::size_t end = 0;
+
+  bool empty() const noexcept { return begin == end; }
+  std::size_t size() const noexcept { return end - begin; }
+};
+
+ElementRange ChangedTokenRange(
+    std::int64_t* values,
+    std::size_t count,
+    const std::vector<std::int64_t>& prefix,
+    std::int64_t pad_token_id) {
+  ElementRange changed{count, count};
+  for (std::size_t index = 0; index < count; ++index) {
+    const std::int64_t desired =
+        index < prefix.size() ? prefix[index] : pad_token_id;
+    if (values[index] != desired) {
+      values[index] = desired;
+      changed.begin = std::min(changed.begin, index);
+      changed.end = index + 1;
+    }
+  }
+  return changed;
+}
+
+ElementRange ChangedMaskRange(
+    std::int64_t* values,
+    std::size_t count,
+    std::size_t prefix_length) {
+  ElementRange changed{count, count};
+  for (std::size_t index = 0; index < count; ++index) {
+    const std::int64_t desired = index < prefix_length ? 1 : 0;
+    if (values[index] != desired) {
+      values[index] = desired;
+      changed.begin = std::min(changed.begin, index);
+      changed.end = index + 1;
+    }
+  }
+  return changed;
+}
 
 std::vector<std::int64_t> Shape(
     const aclmdlDesc* description,
@@ -170,6 +213,7 @@ class AclExecutor::Impl {
   std::size_t draft_width() const noexcept { return draft_width_; }
   std::size_t model_work_bytes() const noexcept { return model_work_bytes_; }
   std::size_t model_weight_bytes() const noexcept { return model_weight_bytes_; }
+  const AclExecutionStats& execution_stats() const noexcept { return stats_; }
 
   const GraphOutputs& Execute(
       const std::vector<std::int64_t>& prefix,
@@ -184,41 +228,63 @@ class AclExecutor::Impl {
     }
     auto* input_ids = static_cast<std::int64_t*>(inputs_[0].host);
     auto* attention_mask = static_cast<std::int64_t*>(inputs_[1].host);
-    std::fill_n(input_ids, sequence_length_, pad_token_id);
-    std::fill_n(attention_mask, sequence_length_, 0);
-    std::copy(prefix.begin(), prefix.end(), input_ids);
-    std::fill_n(attention_mask, prefix.size(), 1);
-
-    for (const Buffer& input : inputs_) {
-      Check(
-          aclrtMemcpyAsync(
-              input.device,
-              input.bytes,
-              input.host,
-              input.bytes,
-              ACL_MEMCPY_HOST_TO_DEVICE,
-              stream_),
-          "aclrtMemcpyAsync(host_to_device)");
+    ElementRange ids_changed;
+    ElementRange mask_changed;
+    if (!inputs_initialized_) {
+      std::fill_n(input_ids, sequence_length_, pad_token_id);
+      std::fill_n(attention_mask, sequence_length_, 0);
+      std::copy(prefix.begin(), prefix.end(), input_ids);
+      std::fill_n(attention_mask, prefix.size(), 1);
+      ids_changed = ElementRange{0, sequence_length_};
+      mask_changed = ElementRange{0, sequence_length_};
+      inputs_initialized_ = true;
+    } else {
+      ids_changed = ChangedTokenRange(
+          input_ids,
+          sequence_length_,
+          prefix,
+          pad_token_id);
+      mask_changed = ChangedMaskRange(
+          attention_mask,
+          sequence_length_,
+          prefix.size());
     }
+    stats_.full_host_to_device_bytes += inputs_[0].bytes + inputs_[1].bytes;
+    QueueHostToDevice(inputs_[0], ids_changed);
+    QueueHostToDevice(inputs_[1], mask_changed);
+
     Check(
         aclmdlExecuteAsync(model_id_, input_dataset_, output_dataset_, stream_),
         "aclmdlExecuteAsync");
-    for (const Buffer& output : outputs_) {
-      Check(
-          aclrtMemcpyAsync(
-              output.host,
-              output.bytes,
-              output.device,
-              output.bytes,
-              ACL_MEMCPY_DEVICE_TO_HOST,
-              stream_),
-          "aclrtMemcpyAsync(device_to_host)");
-    }
+    ++stats_.model_executions;
+
+    // Every current scheduler read is in this suffix: prefill/proposal reads
+    // only prefix[-1], while verify reads anchor plus at most draft_width_
+    // proposal rows.  Keep the full logical vector ABI, but transfer only the
+    // suffix that can be observed by the caller.
+    const std::size_t maximum_target_rows = draft_width_ + 1;
+    const std::size_t target_begin =
+        prefix.size() > maximum_target_rows
+            ? prefix.size() - maximum_target_rows
+            : 0;
+    const ElementRange target_range{target_begin, prefix.size()};
+    stats_.full_device_to_host_bytes += outputs_[0].bytes + outputs_[1].bytes;
+    QueueDeviceToHost(outputs_[0], target_range);
+    QueueDeviceToHost(
+        outputs_[1], ElementRange{0, draft_width_});
+    stats_.target_elements_downloaded += target_range.size();
+    stats_.maximum_target_elements_per_call = std::max(
+        stats_.maximum_target_elements_per_call,
+        target_range.size());
+
     Check(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
+    ++stats_.stream_synchronizations;
+    const std::size_t target_bytes =
+        target_range.size() * sizeof(std::int64_t);
     std::memcpy(
-        graph_outputs_.target_top1.data(),
-        outputs_[0].host,
-        outputs_[0].bytes);
+        graph_outputs_.target_top1.data() + target_range.begin,
+        static_cast<const std::int64_t*>(outputs_[0].host) + target_range.begin,
+        target_bytes);
     std::memcpy(
         graph_outputs_.draft_top1.data(),
         outputs_[1].host,
@@ -227,6 +293,57 @@ class AclExecutor::Impl {
   }
 
  private:
+  void QueueHostToDevice(const Buffer& buffer, const ElementRange& range) {
+    if (range.begin > range.end ||
+        range.end > buffer.bytes / sizeof(std::int64_t)) {
+      throw std::runtime_error("host-to-device range exceeds its INT64 buffer");
+    }
+    if (range.empty()) {
+      ++stats_.host_to_device_copies_skipped;
+      return;
+    }
+    const std::size_t offset = range.begin * sizeof(std::int64_t);
+    const std::size_t bytes = range.size() * sizeof(std::int64_t);
+    auto* destination = static_cast<std::byte*>(buffer.device) + offset;
+    const auto* source = static_cast<const std::byte*>(buffer.host) + offset;
+    Check(
+        aclrtMemcpyAsync(
+            destination,
+            buffer.bytes - offset,
+            source,
+            bytes,
+            ACL_MEMCPY_HOST_TO_DEVICE,
+            stream_),
+        "aclrtMemcpyAsync(host_to_device_range)");
+    ++stats_.host_to_device_operations;
+    stats_.host_to_device_bytes += bytes;
+  }
+
+  void QueueDeviceToHost(const Buffer& buffer, const ElementRange& range) {
+    if (range.begin > range.end ||
+        range.end > buffer.bytes / sizeof(std::int64_t)) {
+      throw std::runtime_error("device-to-host range exceeds its INT64 buffer");
+    }
+    if (range.empty()) {
+      throw std::runtime_error("device-to-host output range must not be empty");
+    }
+    const std::size_t offset = range.begin * sizeof(std::int64_t);
+    const std::size_t bytes = range.size() * sizeof(std::int64_t);
+    auto* destination = static_cast<std::byte*>(buffer.host) + offset;
+    const auto* source = static_cast<const std::byte*>(buffer.device) + offset;
+    Check(
+        aclrtMemcpyAsync(
+            destination,
+            buffer.bytes - offset,
+            source,
+            bytes,
+            ACL_MEMCPY_DEVICE_TO_HOST,
+            stream_),
+        "aclrtMemcpyAsync(device_to_host_range)");
+    ++stats_.device_to_host_operations;
+    stats_.device_to_host_bytes += bytes;
+  }
+
   void ValidateAndAllocate() {
     if (aclmdlGetNumInputs(description_) != 2 ||
         aclmdlGetNumOutputs(description_) != 2) {
@@ -341,6 +458,8 @@ class AclExecutor::Impl {
   std::size_t draft_width_ = 0;
   std::size_t model_work_bytes_ = 0;
   std::size_t model_weight_bytes_ = 0;
+  bool inputs_initialized_ = false;
+  AclExecutionStats stats_;
   GraphOutputs graph_outputs_;
 };
 
@@ -367,6 +486,10 @@ std::size_t AclExecutor::model_work_bytes() const noexcept {
 
 std::size_t AclExecutor::model_weight_bytes() const noexcept {
   return impl_->model_weight_bytes();
+}
+
+const AclExecutionStats& AclExecutor::execution_stats() const noexcept {
+  return impl_->execution_stats();
 }
 
 const GraphOutputs& AclExecutor::Execute(

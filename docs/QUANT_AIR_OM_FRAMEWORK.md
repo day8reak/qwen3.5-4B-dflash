@@ -598,9 +598,15 @@ $AI_RUN_DIR/artifacts/quant-dflash/
 - `aclmdlLoadFromFile`，进程内只加载一次 OM；
 - `aclrtMallocHost` pinned host buffer；
 - 持久化 device buffer 和 dataset；
-- 每轮排队 H2D、`aclmdlExecuteAsync`、D2H；
+- 第一次调用完整上传两个输入；之后保留 device mirror，只上传相对上次调用变化的连续区间；
+- Target `[1,S]` 只下载当前 prefix 尾部最多 `K+1` 行，覆盖 prefill/proposal 的最后一行和
+  verify 的 anchor 到最后 proposal；Draft 的 K 个 ID 仍完整下载；
+- 每轮排队 ranged H2D、`aclmdlExecuteAsync`、sliced D2H；
 - 每次 OM 调用只做一次 `aclrtSynchronizeStream`；
 - token 调度、DFlash 接受/correction/bonus、EOS 都在 C++17 中完成。
+
+这不改变两输入/两输出 OM ABI，也不改变 Target/Draft 数学。它只减少当前重算基线的
+host/device 传输；OM 内部仍计算完整静态输出，完整前缀重算也仍是结构性主瓶颈。
 
 生产二进制通常位于：
 
@@ -707,6 +713,12 @@ assert report["dflash"]["warmup"] == 3
 assert report["dflash"]["repetitions"] == 10
 assert report["ordinary"]["stable_generated_token_ids"] == \
        report["dflash"]["stable_generated_token_ids"]
+io = report["execution_io_counters"]
+assert io["model_executions"] == io["stream_synchronizations"]
+assert io["host_to_device_bytes"] <= io["full_host_to_device_bytes"]
+assert io["device_to_host_bytes"] <= io["full_device_to_host_bytes"]
+assert io["maximum_target_elements_per_call"] <= \
+       report["abi"]["draft_width"] + 1
 ```
 
 此外检查：
@@ -716,6 +728,24 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 - 10 次输出 token 和 stop reason 完全稳定；
 - prompt token 数加最大输出数不超过静态 gear；
 - 没有 CPU fallback、mock、fake ACL 或 simulation 标记。
+- `execution_io_counters` 的 avoided 字节严格等于 full-equivalent 减 actual；如果真机 msprof
+  的 Memcpy API 仍显示每轮完整 `S` 传输，说明实际 runner/source 与报告身份不一致。
+
+直接查看本次传输缩减量：
+
+```bash
+jq '.execution_io_counters | {
+  model_executions,
+  stream_synchronizations,
+  host_to_device_bytes,
+  full_host_to_device_bytes,
+  host_to_device_bytes_avoided,
+  device_to_host_bytes,
+  full_device_to_host_bytes,
+  device_to_host_bytes_avoided,
+  maximum_target_elements_per_call
+}' "$AI_RUN_DIR/reports/cpp-infer.json"
+```
 
 ### 11.2 多 workload 正确性
 

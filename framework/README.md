@@ -38,6 +38,10 @@ ordinary greedy 与 strict-greedy DFlash 逐 token 生成
 C++ 调用 OM 完成 token 推理，但尚未把 `quant` 分支已有的 persistent rollback cache/state
 转成显式 OM I/O。因此它是功能基线，不应在真实测量前声称已达到闭源框架时延。
 
+当前 C++ 基线在第一次完整输入上传后只发送变化区间，并只从 Target 输出下载 scheduler 需要的
+尾部 `K+1` 行；JSON 保留实际与“每次完整传输”等价字节计数。这个 exact I/O 优化不改变 OM
+数学，也不能替代后续 incremental state OM。
+
 当前 `quant` 基线要求原 GDR 算子接收 `INT16[B] effective_length`。框架不会为此增加第三个
 OM 输入，而是在 AIR 图内从 `attention_mask` 计算有效前缀长度；静态物理 gear 与逻辑有效
 行数因此可以分别为 64 和 37。

@@ -7,6 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "framework" / "abi" / "incremental-performance-v2.json"
 DOCUMENT_PATH = ROOT / "docs" / "INCREMENTAL_OM_PERFORMANCE.md"
+FRAMEWORK_LOCK_PATH = ROOT / "framework" / "FRAMEWORK_LOCK.json"
+DEPLOYMENT_PATH = ROOT / "framework" / "abi" / "dflash-deployment-v1.json"
+PERFORMANCE_PATH = ROOT / "framework" / "abi" / "performance-v1.json"
 
 
 def _contract() -> dict[str, object]:
@@ -123,3 +126,30 @@ def test_document_contains_memory_inspector_and_claim_boundary() -> None:
     assert "--state-bytes" in document
     assert "PROPOSED_NOT_ACTIVE" in document
     assert "不能宣称" in document
+
+
+def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
+    framework_lock = json.loads(FRAMEWORK_LOCK_PATH.read_text(encoding="utf-8"))
+    deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
+    performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
+
+    assert framework_lock["schema_version"] == 10
+    runtime = framework_lock["runtime"]
+    assert "input device mirrors" in runtime["memory"]
+    assert "last K+1 rows" in runtime["memory"]
+    assert "actual/full-equivalent H2D and D2H bytes" in (
+        runtime["execution_io_evidence"]
+    )
+
+    cpp_runtime = deployment["cpp_runtime"]
+    assert "changed contiguous range" in cpp_runtime["memory"]
+    assert "last K+1 Target rows" in cpp_runtime["execution"]
+    assert "actual versus full-equivalent transfer bytes" in (
+        cpp_runtime["execution_io_report"]
+    )
+
+    runner = performance["runner_contract"]
+    assert runner["current_integrated_om_io"].startswith(
+        "persistent input device mirror"
+    )
+    assert "maximum_target_elements_per_call" in runner["required_io_counters"]

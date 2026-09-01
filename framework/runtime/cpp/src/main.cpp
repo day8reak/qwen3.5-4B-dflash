@@ -415,6 +415,7 @@ void WriteReport(
                              ? result.ordinary.model_total_ms.median /
                                    result.dflash.model_total_ms.median
                              : 0.0;
+  const auto& execution = executor.execution_stats();
   output << std::setprecision(17)
          << "{\"schema_version\":1,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ paired OM model loop\","
@@ -441,6 +442,37 @@ void WriteReport(
          << "\"live_progress_enabled\":"
          << (arguments.progress ? "true" : "false") << ','
          << "\"progress_emission_excluded_from_model_timers\":true},"
+         << "\"execution_io_counters\":{"
+         << "\"scope\":\"paired warmups and measurements\","
+         << "\"input_policy\":\"persistent device mirror plus changed contiguous ranges\","
+         << "\"target_output_policy\":\"download only the last draft_width_plus_one rows needed by proposal or verify\","
+         << "\"model_executions\":" << execution.model_executions
+         << ",\"stream_synchronizations\":"
+         << execution.stream_synchronizations
+         << ",\"host_to_device_operations\":"
+         << execution.host_to_device_operations
+         << ",\"host_to_device_bytes\":"
+         << execution.host_to_device_bytes
+         << ",\"full_host_to_device_bytes\":"
+         << execution.full_host_to_device_bytes
+         << ",\"host_to_device_bytes_avoided\":"
+         << (execution.full_host_to_device_bytes -
+             execution.host_to_device_bytes)
+         << ",\"host_to_device_copies_skipped\":"
+         << execution.host_to_device_copies_skipped
+         << ",\"device_to_host_operations\":"
+         << execution.device_to_host_operations
+         << ",\"device_to_host_bytes\":"
+         << execution.device_to_host_bytes
+         << ",\"full_device_to_host_bytes\":"
+         << execution.full_device_to_host_bytes
+         << ",\"device_to_host_bytes_avoided\":"
+         << (execution.full_device_to_host_bytes -
+             execution.device_to_host_bytes)
+         << ",\"target_elements_downloaded\":"
+         << execution.target_elements_downloaded
+         << ",\"maximum_target_elements_per_call\":"
+         << execution.maximum_target_elements_per_call << "},"
          << "\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
   output << ",\"eos_token_ids\":";

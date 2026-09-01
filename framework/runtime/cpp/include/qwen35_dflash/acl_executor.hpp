@@ -9,6 +9,20 @@
 
 namespace qwen35::dflash {
 
+struct AclExecutionStats {
+  std::size_t model_executions = 0;
+  std::size_t stream_synchronizations = 0;
+  std::size_t host_to_device_operations = 0;
+  std::size_t host_to_device_bytes = 0;
+  std::size_t full_host_to_device_bytes = 0;
+  std::size_t host_to_device_copies_skipped = 0;
+  std::size_t device_to_host_operations = 0;
+  std::size_t device_to_host_bytes = 0;
+  std::size_t full_device_to_host_bytes = 0;
+  std::size_t target_elements_downloaded = 0;
+  std::size_t maximum_target_elements_per_call = 0;
+};
+
 // Direct AscendCL executor for the ordered deployment ABI:
 //   inputs:  input_ids [1,S], attention_mask [1,S]
 //   outputs: target_top1 [1,S], draft_top1 [1,K]
@@ -30,6 +44,7 @@ class AclExecutor final : public GraphExecutor {
   std::size_t draft_width() const noexcept override;
   std::size_t model_work_bytes() const noexcept;
   std::size_t model_weight_bytes() const noexcept;
+  const AclExecutionStats& execution_stats() const noexcept;
   const GraphOutputs& Execute(
       const std::vector<std::int64_t>& committed_prefix,
       std::int64_t pad_token_id) override;

@@ -1,6 +1,6 @@
 {
-  "schema_version": 9,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v9",
+  "schema_version": 10,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v10",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -168,9 +168,10 @@
     "model_load": "aclmdlLoadFromFile",
     "model_memory_query": "aclmdlQuerySize is recorded for the active integrated OM; qwen35_dflash_om_inspect sums weights and uses the maximum serial workspace across a proposed multi-OM set",
     "execute": "aclmdlExecuteAsync",
-    "memory": "persistent pinned host and device buffers",
+    "memory": "persistent pinned host/device buffers; input device mirrors upload only changed contiguous ranges after the first call; target D2H is limited to the last K+1 rows required by every current scheduler read",
     "synchronization": "one stream synchronization per OM invocation",
     "generation": "ordinary greedy and strict-greedy DFlash",
+    "execution_io_evidence": "runner JSON records actual/full-equivalent H2D and D2H bytes, copy counts, model executions, and one synchronization per model execution",
     "incremental_performance_proposal": "framework/abi/incremental-performance-v2.json is PROPOSED_NOT_ACTIVE; physical OM count is selected by exactness, complete-set memory/load, and same-device latency gates"
   },
   "correctness_gate": {

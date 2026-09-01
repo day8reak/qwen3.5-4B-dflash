@@ -28,7 +28,15 @@
       "reset_state()",
       "clear_cache()"
     ],
-    "stable_token_ids_across_repetitions": true
+    "stable_token_ids_across_repetitions": true,
+    "current_integrated_om_io": "persistent input device mirror with changed-range H2D; Target D2H tail is bounded by K+1; full Draft ID D2H; one stream synchronization per model execution",
+    "required_io_counters": [
+      "model_executions",
+      "stream_synchronizations",
+      "host_to_device_bytes and full_host_to_device_bytes",
+      "device_to_host_bytes and full_device_to_host_bytes",
+      "maximum_target_elements_per_call"
+    ]
   },
   "unprofiled_baseline": {
     "warmup_iterations": 3,

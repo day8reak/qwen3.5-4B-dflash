@@ -170,9 +170,16 @@ host 只处理 EOS/长度/输出文本
 model_memory_query.work_bytes
 model_memory_query.weight_bytes
 model_memory_query.source = aclmdlQuerySize
+execution_io_counters.host_to_device_bytes
+execution_io_counters.full_host_to_device_bytes
+execution_io_counters.device_to_host_bytes
+execution_io_counters.full_device_to_host_bytes
+execution_io_counters.maximum_target_elements_per_call
 ```
 
-它可以立即确认当前 integrated OM 的查询值，但只有上述多模型 inspector 才会按
+当前 runner 已在不改变 OM ABI 的前提下使用 changed-range H2D，并把 Target D2H 限制为尾部
+`K+1` 行；上述计数用于让 msprof API timeline 与 runner 自报字节互相校验。这只能减少传输和
+host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多模型 inspector 才会按
 `sum(weights) + max(serial workspace) + state + margin` 计算候选集合。
 
 ## 6. 真机选择顺序
