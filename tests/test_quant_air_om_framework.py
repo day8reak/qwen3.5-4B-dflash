@@ -597,6 +597,11 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         for session in sessions
         if session.spec.torch_op == NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP
     )
+    cache_session = next(
+        session
+        for session in sessions
+        if session.spec.torch_op == FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP
+    )
     torchair.converters[operations["npu_chunk_gated_delta_rule"]](
         query,
         key,
@@ -656,6 +661,22 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         },
     }
     assert gdr_session.converter_mode == "named-gdr-effective-length-v2"
+    cache_call = next(
+        call
+        for call in torchair.ge.calls
+        if call[0] == NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE
+    )
+    assert cache_call[1] == ()
+    assert cache_call[2] == {
+        "inputs": {
+            "x": placeholder,
+            "updates": placeholder,
+            "targetBlock": placeholder,
+            "offsetInBlock": placeholder,
+        },
+        "outputs": ["x"],
+    }
+    assert cache_session.converter_mode == "named-cache-update-x-v1"
 
 
 def test_gdr_fake_keeps_frontend_operator_in_strict_export() -> None:

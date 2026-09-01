@@ -96,8 +96,13 @@
           "input shape/dtype/device as a non-aliased Tensor"
         ],
         "constraints": "AIR uses a functional no-alias frontend because AOTAutograd cannot functionalize a non-ATen output alias; eager modeling still invokes the original mutable source op",
+        "ge_prototype": {
+          "inputs": ["x", "updates", "targetBlock", "offsetInBlock"],
+          "outputs": ["x"],
+          "attrs": []
+        },
         "default_ge_op_type": "CacheUpdate",
-        "converter": "framework registered GE IR",
+        "converter": "framework named-input GE IR; frontend input/target_block/offset_in_block map to GE x/targetBlock/offsetInBlock",
         "minimum_occurrences": 1
       },
       {

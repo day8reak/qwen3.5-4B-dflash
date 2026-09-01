@@ -1039,6 +1039,11 @@ def _register_framework_converter(
         NPU_CACHE_UPDATE_TORCH_OP,
         FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
     }:
+        if spec.ge_op_type != NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE:
+            raise RuntimeError(
+                "npu_cache_update currently has an exact named lowering only to "
+                f"{NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE}"
+            )
 
         def converter(
             input: Any,
@@ -1048,9 +1053,27 @@ def _register_framework_converter(
             meta_outputs: Any = None,
         ) -> Any:
             del meta_outputs
-            return emit_positional(input, updates, target_block, offset_in_block)
+            session.converter_calls += 1
+            result = custom_op(
+                spec.ge_op_type,
+                inputs={
+                    "x": input,
+                    "updates": updates,
+                    "targetBlock": target_block,
+                    "offsetInBlock": offset_in_block,
+                },
+                outputs=["x"],
+            )
+            if isinstance(result, (tuple, list)):
+                if len(result) != 1:
+                    raise RuntimeError(
+                        "CacheUpdate GE IR must return exactly one x output"
+                    )
+                return result[0]
+            return result
 
         converter.__name__ = "convert_npu_cache_update_default"
+        session.converter_mode = "named-cache-update-x-v1"
     elif adapter.torch_op == ADN_FUSED_INFER_ATTENTION_TORCH_OP:
         if spec.ge_op_type != ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE:
             raise RuntimeError(

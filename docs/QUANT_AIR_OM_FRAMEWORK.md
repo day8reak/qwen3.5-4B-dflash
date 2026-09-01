@@ -139,6 +139,17 @@ AOTAutograd 不能 functionalize 带返回 alias 的非 ATen 算子，所以 AIR
 clone 或额外 NPU launch；rollback 多行写在 AIR 路径中显式串接每一行的更新输出。设置
 `keep_inference_input_mutations=True` 不能解除非 ATen 算子“返回值带 alias”的限制。
 
+`CacheUpdate` 的 GE 原型不是按前端 Python 参数名解析，而是固定为：
+
+```text
+inputs: x, updates, targetBlock, offsetInBlock
+outputs: x
+attrs: none
+```
+
+因此 converter 使用 named inputs/output，并显式完成 `input -> x`、`target_block -> targetBlock`、
+`offset_in_block -> offsetInBlock` 映射；不能再把四个前端参数交给 positional 自动解析。
+
 七个预期 GE type 都在 `factory.json` 中显式锁定。builtin converter 和当前 fused-attention 精确
 映射必须使用表中的 type；GDR 当前只允许上述 `ChunkGatedDeltaRule` v2 named ABI。该值不会
 自动回退：指定 IR 未注册、converter 没有命中，或 `dynamo.pbtxt` 中 required type 数为 0，
@@ -694,6 +705,7 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
 | `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
 | `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 旧版 AIR 路径把 `Tensor(a!) -> Tensor(a!)` 直接交给 AOTAutograd；Fake 正确也无法 functionalize | 更新本分支；确认 FX target 为 `qwen35_dflash.npu_cache_update.default`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
+| `ERR03005 GRAPH internal error`，`Original traceback` 指向 `qwen35_dflash.npu_cache_update.default`，Meta 单测通过 | 旧 converter 把前端 snake_case 参数按 positional 传入，但 GE `CacheUpdate` 原型要求 `x/updates/targetBlock/offsetInBlock -> x` | 更新本分支；确认 AIR manifest 中该算子的 `converter_mode` 为 `named-cache-update-x-v1` |
 | `pse_shift` 期望 `Optional[Tensor]` 但收到 `[64]` / `immutable_list` | 旧版 modeling 在 export 路径把 `allQLen` 长度列表误接到了 PSE 输入，尚未进入 Fake/converter | 更新本分支；确认两个 modeling 文件均传 `all_seq_lengths_q=allQLen` 且不构造伪 PSE Tensor |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |
