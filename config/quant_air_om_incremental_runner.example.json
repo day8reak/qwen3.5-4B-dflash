@@ -3,8 +3,7 @@
   "cann": "REPLACE_WITH_CANN_VERSION",
   "driver": "REPLACE_WITH_DRIVER_VERSION",
   "firmware": "REPLACE_WITH_FIRMWARE_VERSION",
-  "runtime": "AscendCL C++",
-  "state_policy": "recompute-committed-prefixes",
-  "graph_name": "quant_dflash_recompute",
+  "runtime": "AscendCL C++ four-resident-OM",
+  "state_policy": "incremental-explicit-state-v2",
   "pad_token_id": 0
 }

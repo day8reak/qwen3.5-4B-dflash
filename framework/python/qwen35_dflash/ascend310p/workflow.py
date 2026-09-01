@@ -504,7 +504,7 @@ def run_cpp_target_pipeline(
     model_asset_id: str | None = None,
     progress: bool = True,
 ) -> dict[str, Any]:
-    """Build one OM, then run paired 3+10 entirely in the C++ ACL hot path."""
+    """Build the selected OM topology and run paired 3+10 in the C++ ACL path."""
 
     validate_cpp_runner_options(runner_options, device_id)
     runner_path = preflight_cpp_runner(runner)

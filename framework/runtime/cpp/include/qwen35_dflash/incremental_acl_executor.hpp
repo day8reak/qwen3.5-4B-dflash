@@ -31,6 +31,9 @@ struct IncrementalAclExecutionStats {
   std::size_t draft_propose_executions = 0;
   std::size_t target_verify_commit_executions = 0;
   std::size_t stream_synchronizations = 0;
+  std::size_t state_resets = 0;
+  std::size_t state_memset_operations = 0;
+  std::size_t state_memset_bytes = 0;
   std::size_t host_to_device_operations = 0;
   std::size_t host_to_device_bytes = 0;
   std::size_t device_to_host_operations = 0;
@@ -49,7 +52,9 @@ using IncrementalModelProgress = std::function<void(
 // Target and Draft states are ping-ponged in device arenas.  Proposal IDs,
 // Target features and cursors never cross the host boundary.  A speculative
 // method enqueues Draft -> Target verify/commit and performs one stream sync
-// only after a compact transaction result has been queued for D2H.
+// only after a compact transaction result has been queued for D2H. The first
+// prefill after Reset enqueues state clears on the same stream, so their device
+// work is inside prefill timing without adding a second synchronization.
 class AclIncrementalExecutor final : public StatefulGraphExecutor {
  public:
   explicit AclIncrementalExecutor(

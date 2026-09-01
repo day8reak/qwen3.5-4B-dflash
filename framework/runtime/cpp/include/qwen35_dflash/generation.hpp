@@ -62,7 +62,9 @@ class GraphExecutor {
 };
 
 // Exact explicit-state graph suite used by the approved multi-OM route.
-// Reset, state initialization and EOS-table upload are outside model latency.
+// Reset stages request metadata before model timing. The production ACL
+// executor defers state initialization and EOS upload to the first
+// PrefillChunk so their device work remains inside prefill latency.
 // PrefillChunk and DecodeOne each expose one Target completion barrier.
 // SpeculativeStep enqueues Draft -> Target verify/commit and exposes exactly
 // one completion barrier for the whole transaction.

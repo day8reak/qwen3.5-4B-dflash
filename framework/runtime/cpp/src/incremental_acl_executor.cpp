@@ -115,10 +115,9 @@ struct ModelSession {
   std::vector<std::size_t> public_input_indices;
   std::vector<aclmdlIODims> dynamic_gears;
 
-  void Load(
+  void Query(
       const std::filesystem::path& model_path,
       std::string model_role,
-      bool require_dynamic_gears,
       const IncrementalModelProgress& progress) {
     role = std::move(model_role);
     path = model_path;
@@ -133,11 +132,34 @@ struct ModelSession {
         role + ": aclmdlQuerySize");
     if (progress) {
       progress(role.c_str(), "query-done", work_bytes, weight_bytes);
+    }
+  }
+
+  void LoadWithMemory(
+      void* shared_work,
+      std::size_t shared_work_bytes,
+      void* weight,
+      std::size_t allocated_weight_bytes,
+      bool require_dynamic_gears,
+      const IncrementalModelProgress& progress) {
+    if ((work_bytes != 0 && shared_work == nullptr) ||
+        shared_work_bytes < work_bytes ||
+        (weight_bytes != 0 && weight == nullptr) ||
+        allocated_weight_bytes < weight_bytes) {
+      throw std::runtime_error(role + ": explicit model memory is too small");
+    }
+    if (progress) {
       progress(role.c_str(), "load-start", work_bytes, weight_bytes);
     }
     Check(
-        aclmdlLoadFromFile(path.c_str(), &id),
-        role + ": aclmdlLoadFromFile");
+        aclmdlLoadFromFileWithMem(
+            path.c_str(),
+            &id,
+            shared_work,
+            shared_work_bytes,
+            weight,
+            allocated_weight_bytes),
+        role + ": aclmdlLoadFromFileWithMem");
     loaded = true;
     description = aclmdlCreateDesc();
     if (description == nullptr) {
@@ -428,20 +450,52 @@ class AclIncrementalExecutor::Impl {
       Check(aclrtSetCurrentContext(context_), "aclrtSetCurrentContext");
       Check(aclrtCreateStream(&stream_), "aclrtCreateStream");
 
-      prefill_.Load(paths.target_prefill, "target-prefill", false, progress);
-      decode_.Load(paths.target_decode1, "target-decode1", false, progress);
-      draft_.Load(paths.draft_propose, "draft-propose", true, progress);
-      verify_.Load(
-          paths.target_verify_commit,
-          "target-verify-commit",
-          false,
-          progress);
+      prefill_.Query(paths.target_prefill, "target-prefill", progress);
+      decode_.Query(paths.target_decode1, "target-decode1", progress);
+      draft_.Query(paths.draft_propose, "draft-propose", progress);
+      verify_.Query(
+          paths.target_verify_commit, "target-verify-commit", progress);
       memory_ = {
           {prefill_.role, prefill_.work_bytes, prefill_.weight_bytes},
           {decode_.role, decode_.work_bytes, decode_.weight_bytes},
           {draft_.role, draft_.work_bytes, draft_.weight_bytes},
           {verify_.role, verify_.work_bytes, verify_.weight_bytes},
       };
+      const std::size_t shared_work_bytes = std::max(
+          {prefill_.work_bytes,
+           decode_.work_bytes,
+           draft_.work_bytes,
+           verify_.work_bytes});
+      if (shared_work_bytes != 0) {
+        shared_model_work_.Allocate(shared_work_bytes);
+      }
+      const std::array<std::size_t, 4> weight_bytes{
+          prefill_.weight_bytes,
+          decode_.weight_bytes,
+          draft_.weight_bytes,
+          verify_.weight_bytes,
+      };
+      for (std::size_t index = 0; index < model_weights_.size(); ++index) {
+        if (weight_bytes[index] != 0) {
+          model_weights_[index].Allocate(weight_bytes[index]);
+        }
+      }
+      const auto load = [this, &progress](
+                            ModelSession& session,
+                            DeviceAllocation& weight,
+                            bool dynamic) {
+        session.LoadWithMemory(
+            shared_model_work_.data,
+            shared_model_work_.bytes,
+            weight.data,
+            weight.bytes,
+            dynamic,
+            progress);
+      };
+      load(prefill_, model_weights_[0], false);
+      load(decode_, model_weights_[1], false);
+      load(draft_, model_weights_[2], true);
+      load(verify_, model_weights_[3], false);
       ValidateAbi();
       AllocateBuffers();
       BuildPlans();
@@ -484,34 +538,20 @@ class AclIncrementalExecutor::Impl {
     proposal_ready_ = false;
     prepared_proposal_count_ = 0;
     feature_source_ = FeatureSource::kNone;
-    proposal_value_valid_ = false;
 
-    Check(
-        aclrtMemsetAsync(
-            target_states_[0].allocation.data,
-            target_states_[0].allocation.bytes,
-            0,
-            target_states_[0].allocation.bytes,
-            stream_),
-        "aclrtMemsetAsync(target state)");
-    Check(
-        aclrtMemsetAsync(
-            draft_states_[0].allocation.data,
-            draft_states_[0].allocation.bytes,
-            0,
-            draft_states_[0].allocation.bytes,
-            stream_),
-        "aclrtMemsetAsync(draft state)");
-
-    auto* eos_values = static_cast<std::int64_t*>(eos_ids_.host);
-    std::fill_n(eos_values, eos_table_width_, 0);
-    std::copy(eos_token_ids.begin(), eos_token_ids.end(), eos_values);
-    *static_cast<std::int32_t*>(eos_count_.host) =
-        static_cast<std::int32_t>(eos_token_ids.size());
-    Upload(eos_ids_, eos_ids_.bytes);
-    Upload(eos_count_, eos_count_.bytes);
-    Synchronize();
-    ++state_reset_synchronizations_;
+    if (!eos_uploaded_ || eos_token_ids != uploaded_eos_ids_) {
+      auto* eos_values = static_cast<std::int64_t*>(eos_ids_.host);
+      std::fill_n(eos_values, eos_table_width_, 0);
+      std::copy(eos_token_ids.begin(), eos_token_ids.end(), eos_values);
+      *static_cast<std::int32_t*>(eos_count_.host) =
+          static_cast<std::int32_t>(eos_token_ids.size());
+      pending_eos_ids_ = eos_token_ids;
+      eos_upload_pending_ = true;
+    } else {
+      eos_upload_pending_ = false;
+    }
+    ++stats_.state_resets;
+    reset_pending_ = true;
     reset_ = true;
   }
 
@@ -530,9 +570,12 @@ class AclIncrementalExecutor::Impl {
     }
     if (prepare_draft) {
       RequireProposalCount(logical_proposal_count);
-      SetProposalCount(logical_proposal_count);
     } else if (logical_proposal_count != 0) {
       throw std::invalid_argument("proposal count supplied without Draft execution");
+    }
+    ApplyPendingReset();
+    if (prepare_draft) {
+      SetProposalCount(logical_proposal_count);
     }
 
     auto* values = static_cast<std::int64_t*>(prefill_ids_.host);
@@ -563,6 +606,7 @@ class AclIncrementalExecutor::Impl {
 
   StatefulStep DecodeOne(std::int64_t input_token_id) {
     RequireReset();
+    RequirePrefilled();
     if (input_token_id < 0) {
       throw std::invalid_argument("decode input token ID must be non-negative");
     }
@@ -580,6 +624,7 @@ class AclIncrementalExecutor::Impl {
 
   StatefulStep SpeculativeStep(std::size_t logical_proposal_count) {
     RequireReset();
+    RequirePrefilled();
     RequireProposalCount(logical_proposal_count);
     std::size_t executions = 1;
     if (proposal_ready_) {
@@ -876,8 +921,9 @@ class AclIncrementalExecutor::Impl {
     verify_features_.Allocate(feature_allocation);
     committed_input_count_.Allocate(prefill_.outputs[4].bytes);
     verify_ids_.Allocate(verify_.PublicInput(0).bytes);
-    dynamic_control_.Allocate(
-        draft_.inputs.at(draft_.dynamic_input_index).bytes);
+    for (auto& control : dynamic_controls_) {
+      control.Allocate(draft_.inputs.at(draft_.dynamic_input_index).bytes);
+    }
 
     stats_.carrier_device_bytes =
         prefill_ids_.device.bytes + effective_length_.device.bytes +
@@ -885,7 +931,8 @@ class AclIncrementalExecutor::Impl {
         decode_id_.device.bytes + proposal_count_.device.bytes +
         compact_.device.bytes + prefill_features_.bytes +
         verify_features_.bytes + committed_input_count_.bytes +
-        verify_ids_.bytes + dynamic_control_.bytes;
+        verify_ids_.bytes + dynamic_controls_[0].bytes +
+        dynamic_controls_[1].bytes;
   }
 
   BufferView CompactView(std::size_t offset, std::size_t bytes) const {
@@ -980,7 +1027,17 @@ class AclIncrementalExecutor::Impl {
              draft_states_[next].tensors[0],
              draft_states_[next].tensors[1],
              draft_states_[next].tensors[2]},
-            dynamic_control_.View());
+            dynamic_controls_[source].View());
+        const aclmdlIODims& gear = source == 0
+            ? draft_gear_prefill_
+            : draft_gear_verify_;
+        Check(
+            aclmdlSetInputDynamicDims(
+                draft_.id,
+                draft_plans_[source][current].input,
+                draft_.dynamic_input_index,
+                &gear),
+            "draft-propose: aclmdlSetInputDynamicDims(prebind)");
       }
     }
   }
@@ -989,6 +1046,47 @@ class AclIncrementalExecutor::Impl {
     if (!reset_) {
       throw std::logic_error("incremental executor must be reset before use");
     }
+  }
+
+  void RequirePrefilled() const {
+    if (reset_pending_) {
+      throw std::logic_error(
+          "incremental executor requires prefill after reset");
+    }
+  }
+
+  void ApplyPendingReset() {
+    if (!reset_pending_) {
+      return;
+    }
+    Check(
+        aclrtMemsetAsync(
+            target_states_[0].allocation.data,
+            target_states_[0].allocation.bytes,
+            0,
+            target_states_[0].allocation.bytes,
+            stream_),
+        "aclrtMemsetAsync(target state)");
+    ++stats_.state_memset_operations;
+    stats_.state_memset_bytes += target_states_[0].allocation.bytes;
+    Check(
+        aclrtMemsetAsync(
+            draft_states_[0].allocation.data,
+            draft_states_[0].allocation.bytes,
+            0,
+            draft_states_[0].allocation.bytes,
+            stream_),
+        "aclrtMemsetAsync(draft state)");
+    ++stats_.state_memset_operations;
+    stats_.state_memset_bytes += draft_states_[0].allocation.bytes;
+    if (eos_upload_pending_) {
+      Upload(eos_ids_, eos_ids_.bytes);
+      Upload(eos_count_, eos_count_.bytes);
+      uploaded_eos_ids_ = pending_eos_ids_;
+      eos_uploaded_ = true;
+      eos_upload_pending_ = false;
+    }
+    reset_pending_ = false;
   }
 
   void RequireProposalCount(std::size_t value) const {
@@ -1016,16 +1114,6 @@ class AclIncrementalExecutor::Impl {
     }
     DatasetPlan& plan =
         draft_plans_[static_cast<std::size_t>(source)][draft_state_index_];
-    const aclmdlIODims& gear = feature_rows == prefill_width_
-        ? draft_gear_prefill_
-        : draft_gear_verify_;
-    Check(
-        aclmdlSetInputDynamicDims(
-            draft_.id,
-            plan.input,
-            draft_.dynamic_input_index,
-            &gear),
-        "draft-propose: aclmdlSetInputDynamicDims");
     Execute(draft_, plan);
     ++stats_.draft_propose_executions;
     draft_state_index_ = 1 - draft_state_index_;
@@ -1127,7 +1215,9 @@ class AclIncrementalExecutor::Impl {
       plan.Release();
     }
 
-    dynamic_control_.Release();
+    for (auto& control : dynamic_controls_) {
+      control.Release();
+    }
     verify_ids_.Release();
     committed_input_count_.Release();
     verify_features_.Release();
@@ -1150,6 +1240,10 @@ class AclIncrementalExecutor::Impl {
     draft_.Release();
     decode_.Release();
     prefill_.Release();
+    for (auto& weight : model_weights_) {
+      weight.Release();
+    }
+    shared_model_work_.Release();
     if (stream_ != nullptr) {
       static_cast<void>(aclrtDestroyStream(stream_));
       stream_ = nullptr;
@@ -1180,6 +1274,8 @@ class AclIncrementalExecutor::Impl {
   ModelSession draft_;
   ModelSession verify_;
   std::vector<IncrementalModelMemory> memory_;
+  DeviceAllocation shared_model_work_;
+  std::array<DeviceAllocation, 4> model_weights_;
 
   std::size_t sequence_length_ = 0;
   std::size_t prefill_width_ = 0;
@@ -1205,7 +1301,7 @@ class AclIncrementalExecutor::Impl {
   DeviceAllocation verify_features_;
   DeviceAllocation committed_input_count_;
   DeviceAllocation verify_ids_;
-  DeviceAllocation dynamic_control_;
+  std::array<DeviceAllocation, 2> dynamic_controls_;
 
   std::size_t compact_token_offset_ = 0;
   std::size_t compact_commit_offset_ = 0;
@@ -1229,7 +1325,11 @@ class AclIncrementalExecutor::Impl {
   bool proposal_value_valid_ = false;
   std::size_t proposal_value_ = 0;
   std::int64_t pad_token_id_ = 0;
-  std::size_t state_reset_synchronizations_ = 0;
+  bool eos_uploaded_ = false;
+  bool eos_upload_pending_ = false;
+  bool reset_pending_ = false;
+  std::vector<std::int64_t> uploaded_eos_ids_;
+  std::vector<std::int64_t> pending_eos_ids_;
   IncrementalAclExecutionStats stats_;
 };
 

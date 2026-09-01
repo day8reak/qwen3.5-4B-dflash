@@ -619,7 +619,12 @@ host/device 传输；OM 内部仍计算完整静态输出，完整前缀重算�
 
 ```text
 $AI_RUN_DIR/build/cpp-release/qwen35_dflash_acl_runner
+$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner
 ```
+
+第一个二进制运行单一重计算 OM 基线；第二个二进制运行已批准、尚待真机提升的四常驻 OM
+候选。`build-cpp` 会同时构建并 host-test 两者。四 OM 的导出 factory、runner 配置、直接运行、
+report 门禁和 msprof 命令见 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5 节。
 
 不要把 build 目录或二进制提交进源码仓库。
 
@@ -802,11 +807,15 @@ jq '.execution_io_counters | {
 
 ### 11.4 用 msprof 单独分析当前 OM
 
-先明确采样边界：当前分支每个静态 gear 只生成一个
-`quant_dflash_recompute.om`，Target 全前缀和 Draft proposal 在同一张图里。因此
-msprof 可以回答这个 OM 中每个算子、device task 和 AscendCL API 的耗时，但现在
-没有四个独立 OM 可供比较，也不能从这张集成图直接声称得到了独立
-prefill/decode/verify/draft 的模型级时延。
+先明确采样边界：本小节使用默认
+`create_quant_recompute_graph` factory，所以每个静态 gear 只生成一个
+`quant_dflash_recompute.om`，Target 全前缀和 Draft proposal 在同一张图里。因此这里的
+msprof 只能回答重计算基线 OM 中每个算子、device task 和 AscendCL API 的耗时，不能从这张
+集成图强行拆出 prefill/decode/verify/draft 的模型级时延。
+
+分支同时提供 `create_quant_incremental_state_graphs` 和四常驻 OM C++ runner。生成四个独立 OM
+后，应使用 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.5 节的完整状态机 msprof 命令，并按
+model ID/role 分组；两类 profile 不得混成同一份时延基线。
 
 正式时延基线仍然使用 11.3 中未开 profiling 的 3 次 warmup + 10 次
 measurement 报告。下面的 msprof 命令只做瓶颈定位，采集器引入的开销不能算入

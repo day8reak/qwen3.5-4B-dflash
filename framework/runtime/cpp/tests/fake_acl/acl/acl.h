@@ -85,6 +85,13 @@ aclError aclrtMemsetAsync(
     aclrtStream stream);
 
 aclError aclmdlLoadFromFile(const char* model_path, std::uint32_t* model_id);
+aclError aclmdlLoadFromFileWithMem(
+    const char* model_path,
+    std::uint32_t* model_id,
+    void* work_ptr,
+    std::size_t work_size,
+    void* weight_ptr,
+    std::size_t weight_size);
 aclError aclmdlQuerySize(
     const char* model_path,
     std::size_t* work_size,

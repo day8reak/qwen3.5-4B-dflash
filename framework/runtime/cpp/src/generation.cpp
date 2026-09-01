@@ -507,7 +507,7 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
       options.max_new_tokens, prompt_token_ids.size(), 0, 0, 0.0);
   executor.Reset(options.pad_token_id, options.eos_token_ids);
   EmitProgress(
-      progress, phase, mode, run_index, run_total, "state-reset-done", 0,
+      progress, phase, mode, run_index, run_total, "state-reset-staged", 0,
       options.max_new_tokens, prompt_token_ids.size(), 0, 0, 0.0);
 
   std::vector<std::int64_t> prefix = prompt_token_ids;

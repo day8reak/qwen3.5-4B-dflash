@@ -350,7 +350,7 @@ void TestStatefulPairedBenchmarkAndProgress() {
   bool saw_reset = false;
   bool saw_decode = false;
   const auto progress = [&](const qwen35::dflash::ProgressEvent& event) {
-    saw_reset = saw_reset || std::string(event.stage) == "state-reset-done";
+    saw_reset = saw_reset || std::string(event.stage) == "state-reset-staged";
     saw_decode = saw_decode || std::string(event.stage) == "decode-done";
   };
   const auto result = qwen35::dflash::BenchmarkPairStateful(

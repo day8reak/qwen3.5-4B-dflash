@@ -80,6 +80,19 @@ int main(int argc, char** argv) {
     Require(
         stats.target_verify_commit_executions > 0,
         "verify OM was not executed");
+    Require(stats.state_resets == 3, "state reset count differs");
+    Require(
+        stats.state_memset_operations == 2 * stats.state_resets,
+        "state reset did not clear exactly the current Target/Draft arenas");
+    Require(
+        stats.stream_synchronizations ==
+            stats.target_prefill_executions +
+                stats.target_decode1_executions +
+                stats.target_verify_commit_executions,
+        "reset or Draft introduced an extra stream barrier");
+    Require(
+        stats.device_to_host_operations == stats.stream_synchronizations,
+        "each transaction must return exactly one compact host result");
     Require(stats.state_device_bytes > 0, "state arenas were not reported");
     Require(stats.device_to_host_operations <
                 stats.target_prefill_executions +

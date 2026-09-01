@@ -58,6 +58,8 @@ const Spec kDraftCursor{ACL_INT64, {1}, "logical_draft_cursor"};
 
 std::map<std::uint32_t, Role> g_models;
 std::uint32_t g_next_model_id = 1;
+void* g_incremental_shared_work = nullptr;
+std::vector<void*> g_incremental_weights;
 
 Role RoleFromPath(const char* path) {
   const std::string value = path == nullptr ? "" : path;
@@ -511,6 +513,37 @@ aclError aclrtMemsetAsync(
 }
 
 aclError aclmdlLoadFromFile(const char* path, std::uint32_t* model_id) {
+  if (model_id == nullptr || RoleFromPath(path) != Role::kIntegrated) {
+    return 1;
+  }
+  *model_id = g_next_model_id++;
+  g_models[*model_id] = RoleFromPath(path);
+  return ACL_SUCCESS;
+}
+
+aclError aclmdlLoadFromFileWithMem(
+    const char* path,
+    std::uint32_t* model_id,
+    void* work_ptr,
+    std::size_t work_size,
+    void* weight_ptr,
+    std::size_t weight_size) {
+  if (work_ptr == nullptr || work_size < kModelWorkBytes ||
+      weight_ptr == nullptr || weight_size < kModelWeightBytes) {
+    return 1;
+  }
+  if (g_incremental_shared_work == nullptr) {
+    g_incremental_shared_work = work_ptr;
+  } else if (g_incremental_shared_work != work_ptr) {
+    return 1;
+  }
+  if (std::find(
+          g_incremental_weights.begin(),
+          g_incremental_weights.end(),
+          weight_ptr) != g_incremental_weights.end()) {
+    return 1;
+  }
+  g_incremental_weights.push_back(weight_ptr);
   if (model_id == nullptr) {
     return 1;
   }
@@ -531,6 +564,10 @@ aclError aclmdlQuerySize(
 
 aclError aclmdlUnload(std::uint32_t model_id) {
   g_models.erase(model_id);
+  if (g_models.empty()) {
+    g_incremental_shared_work = nullptr;
+    g_incremental_weights.clear();
+  }
   return ACL_SUCCESS;
 }
 

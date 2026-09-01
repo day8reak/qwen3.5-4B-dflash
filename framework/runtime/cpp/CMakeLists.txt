@@ -48,11 +48,18 @@ if(QWEN35_DFLASH_BUILD_ACL_RUNNER)
     src/acl_executor.cpp
     src/main.cpp
   )
+  add_executable(qwen35_dflash_incremental_acl_runner
+    src/incremental_acl_executor.cpp
+    src/incremental_main.cpp
+  )
   add_executable(qwen35_dflash_om_inspect src/om_inspect.cpp)
   target_include_directories(qwen35_dflash_acl_runner PRIVATE
     "${ASCENDCL_INCLUDE_DIR}"
   )
   target_include_directories(qwen35_dflash_om_inspect PRIVATE
+    "${ASCENDCL_INCLUDE_DIR}"
+  )
+  target_include_directories(qwen35_dflash_incremental_acl_runner PRIVATE
     "${ASCENDCL_INCLUDE_DIR}"
   )
   target_link_libraries(qwen35_dflash_acl_runner PRIVATE
@@ -63,13 +70,23 @@ if(QWEN35_DFLASH_BUILD_ACL_RUNNER)
     qwen35_dflash_core
     "${ASCENDCL_LIBRARY}"
   )
+  target_link_libraries(qwen35_dflash_incremental_acl_runner PRIVATE
+    qwen35_dflash_core
+    "${ASCENDCL_LIBRARY}"
+  )
   target_compile_definitions(qwen35_dflash_acl_runner PRIVATE
+    QWEN35_DFLASH_RUNNER_VERSION="${PROJECT_VERSION}"
+  )
+  target_compile_definitions(qwen35_dflash_incremental_acl_runner PRIVATE
     QWEN35_DFLASH_RUNNER_VERSION="${PROJECT_VERSION}"
   )
   target_compile_options(qwen35_dflash_acl_runner PRIVATE
     -Wall -Wextra -Wpedantic
   )
   target_compile_options(qwen35_dflash_om_inspect PRIVATE
+    -Wall -Wextra -Wpedantic
+  )
+  target_compile_options(qwen35_dflash_incremental_acl_runner PRIVATE
     -Wall -Wextra -Wpedantic
   )
 endif()
@@ -106,10 +123,21 @@ if(QWEN35_DFLASH_BUILD_TESTS)
     src/acl_executor.cpp
     src/main.cpp
   )
+  add_executable(qwen35_dflash_incremental_acl_runner_fake
+    src/incremental_acl_executor.cpp
+    src/incremental_main.cpp
+  )
   add_executable(qwen35_dflash_om_inspect_fake src/om_inspect.cpp)
   target_include_directories(qwen35_dflash_acl_runner_fake PRIVATE tests/fake_acl)
+  target_include_directories(qwen35_dflash_incremental_acl_runner_fake PRIVATE
+    tests/fake_acl
+  )
   target_include_directories(qwen35_dflash_om_inspect_fake PRIVATE tests/fake_acl)
   target_link_libraries(qwen35_dflash_acl_runner_fake PRIVATE
+    qwen35_dflash_core
+    qwen35_dflash_fake_acl
+  )
+  target_link_libraries(qwen35_dflash_incremental_acl_runner_fake PRIVATE
     qwen35_dflash_core
     qwen35_dflash_fake_acl
   )
@@ -120,7 +148,13 @@ if(QWEN35_DFLASH_BUILD_TESTS)
   target_compile_definitions(qwen35_dflash_acl_runner_fake PRIVATE
     QWEN35_DFLASH_RUNNER_VERSION="${PROJECT_VERSION}-fake-acl"
   )
+  target_compile_definitions(qwen35_dflash_incremental_acl_runner_fake PRIVATE
+    QWEN35_DFLASH_RUNNER_VERSION="${PROJECT_VERSION}-fake-acl"
+  )
   target_compile_options(qwen35_dflash_acl_runner_fake PRIVATE
+    -Wall -Wextra -Wpedantic
+  )
+  target_compile_options(qwen35_dflash_incremental_acl_runner_fake PRIVATE
     -Wall -Wextra -Wpedantic
   )
   target_compile_options(qwen35_dflash_om_inspect_fake PRIVATE
@@ -133,6 +167,10 @@ if(QWEN35_DFLASH_BUILD_TESTS)
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om" "fake-draft")
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om" "fake-verify")
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/fake.om" _fake_om_sha256)
+  file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om" _prefill_om_sha256)
+  file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om" _decode_om_sha256)
+  file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om" _draft_om_sha256)
+  file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om" _verify_om_sha256)
   add_test(
     NAME qwen35_dflash_incremental_acl_tests
     COMMAND qwen35_dflash_incremental_acl_tests
@@ -149,6 +187,21 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DMODEL_SHA=${_fake_om_sha256}
       -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-runner-report.json
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_incremental_acl_runner
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
+      -DDECODE_SHA=${_decode_om_sha256}
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DDRAFT_SHA=${_draft_om_sha256}
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om
+      -DVERIFY_SHA=${_verify_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-incremental-runner-report.json
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
   )
   add_test(
     NAME qwen35_dflash_fake_om_inspect

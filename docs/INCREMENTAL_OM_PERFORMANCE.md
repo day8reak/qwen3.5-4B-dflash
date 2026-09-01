@@ -204,6 +204,210 @@ execution_io_counters.maximum_target_elements_per_call
 host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多模型 inspector 才会按
 `sum(weights) + max(serial workspace) + state + margin` 计算候选集合。
 
+### 5.1 已接入的四 OM 生产候选 runner
+
+`qwen35_dflash_incremental_acl_runner` 现在是独立的生产可执行文件，不再只存在于 Fake-ACL
+测试里。它与单重计算 OM 的 `qwen35_dflash_acl_runner` 并存，方便在同一份源码、同一设备和
+同一 workload 下做 A/B。四 OM runner 已实现：
+
+- 四个 model ID、description、dataset 和 device buffer 一次加载、整个进程复用；
+- 四个串行模型通过 `aclmdlLoadFromFileWithMem` 共用一块 `max(workSize)` workspace；每个 OM
+  仍分配自己的 `weightSize`，不假设跨文件共享权重；
+- Target/Draft state 双缓冲留在 device，proposal 与 feature carrier 不回 host；
+- `draft-propose -> target-verify-commit -> compact D2H -> synchronize` 每轮一个 barrier；
+- reset 的 state memset 在第一次 prefill 计时区间内排入同一 stream，不再增加 reset-only
+  barrier，也不会把清零设备时间藏到模型时延之外；
+- EOS 表和 `logical_proposal_count` 仅在值变化时 H2D；
+- Draft 的 `N=64/N=16` 动态 gear 在 dataset 建立时预绑定，不在 decode 热循环反复配置；
+- ordinary 路径只执行 `target-prefill`/`target-decode1`，不执行 Draft。
+
+这些是源代码和 Fake-ACL 可验证的执行属性，仍不是物理 310P 的性能结论。
+
+当前四角色 ABI 中，长 prompt 的每个 64-row chunk 都要把 Target feature 送入
+`draft-propose` 来推进 Draft KV；非末 chunk 产生的 proposal 会被丢弃。它避免了历史前缀重算，
+但还没有独立的“只 ingest context、不跑 proposal head”Draft prefill 图。是否值得增加该物理
+角色必须由长 prompt 的 msprof 证明，并需要单独审批 ABI/拓扑变更，不能在本候选中暗改语义。
+
+### 5.2 生成四个 AIR/OM
+
+沿用量化 factory 配置，但生产 context 容量应按真实 workload 设置，例如 2048；必须是 64 的
+倍数。`eos_table_width` 必须能容纳 tokenizer 的全部 EOS ID：
+
+```json
+{
+  "max_sequence_length": 2048,
+  "eos_table_width": 4,
+  "dtype": "float16",
+  "device": "npu:0"
+}
+```
+
+其余权重、量化、自定义算子和 receiver 路径与重计算 factory 配置相同。执行：
+
+```bash
+export MODEL_PYTHON=/ABSOLUTE/PATH/TO/MODEL/PYTHON
+export FOUR_OM_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-incremental"
+
+"$MODEL_PYTHON" -m qwen35_dflash.ascend310p build-om \
+  --factory \
+    qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_state_graphs \
+  --factory-config "$AI_RUN_DIR/factory-incremental.json" \
+  --bundle-dir "$FOUR_OM_BUNDLE" \
+  --atc /ABSOLUTE/PATH/atc \
+  --soc-version Ascend310P3
+
+jq -r '.graphs[] | [.name,.role,.om.path,.om.sha256] | @tsv' \
+  "$FOUR_OM_BUNDLE/deployment-manifest.json"
+```
+
+输出必须恰好包含 `target-prefill`、`target-decode1`、`draft-propose`、
+`target-verify-commit` 四个 role。导出/ATC 仍会按每个 graph 的合同检查自定义节点，不能把它们
+静默分解成普通 Tensor 子图。
+
+### 5.3 构建并通过控制面运行
+
+```bash
+"$MODEL_PYTHON" -m qwen35_dflash.ascend310p build-cpp \
+  --build-dir "$AI_RUN_DIR/build/cpp-release" \
+  --output "$AI_RUN_DIR/reports/cpp-build.json" \
+  --ascendcl-root /ABSOLUTE/PATH/CANN
+
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-incremental.json"
+# 将 device_model/cann/driver/firmware 改成当前真机身份。
+
+"$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
+  --deployment-manifest "$FOUR_OM_BUNDLE/deployment-manifest.json" \
+  --runner \
+    "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+  --runner-config "$AI_RUN_DIR/runner-incremental.json" \
+  --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
+  --prompt '请用一句话解释为什么天空是蓝色的。' \
+  --chat \
+  --max-new-tokens 32 \
+  --max-draft-tokens 15 \
+  --device-id 0 \
+  --output "$AI_RUN_DIR/reports/cpp-incremental.json"
+```
+
+控制面会在启动前校验四个 role 的输入/输出顺序和 OM SHA-256；runner 自身会再次校验 hash，
+加载后再从真实 OM description 校验 dtype、shape、state 对齐、`N=16/N=64` gear。任何一层不符
+都会停止，不能进入时延比较。
+
+直接检查关键门禁：
+
+```bash
+jq '{
+  status,
+  runner_id,
+  candidate_status,
+  models,
+  abi,
+  model_memory_query,
+  execution_io_counters,
+  ordinary_parity,
+  ordinary_median_ms: .ordinary.latency_ms.model_total.median,
+  dflash_median_ms: .dflash.latency_ms.model_total.median,
+  speedup: .dflash_speedup_over_ordinary_model_total_median
+}' "$AI_RUN_DIR/reports/cpp-incremental.json"
+```
+
+正确的多 OM report 中：`model_executions` 等于四个 role execution 之和；
+`stream_synchronizations` 等于 prefill + decode1 + verify-commit 的事务数，不包含 Draft 的额外
+barrier；`device_to_host_operations` 与该事务数相同；paired 3+10 的 `state_resets` 固定为 26。
+
+### 5.4 直接运行二进制
+
+控制面是推荐路径。需要排除 Python 控制面时，可直接执行同一个 runner：
+
+```bash
+export PREFILL_OM="$FOUR_OM_BUNDLE/om/target-prefill.om"
+export DECODE_OM="$FOUR_OM_BUNDLE/om/target-decode1.om"
+export DRAFT_OM="$FOUR_OM_BUNDLE/om/draft-propose.om"
+export VERIFY_OM="$FOUR_OM_BUNDLE/om/target-verify-commit.om"
+export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner"
+
+"$INCREMENTAL_RUNNER" \
+  --target-prefill "$PREFILL_OM" \
+  --target-prefill-sha256 "$(sha256sum "$PREFILL_OM" | awk '{print $1}')" \
+  --target-decode1 "$DECODE_OM" \
+  --target-decode1-sha256 "$(sha256sum "$DECODE_OM" | awk '{print $1}')" \
+  --draft-propose "$DRAFT_OM" \
+  --draft-propose-sha256 "$(sha256sum "$DRAFT_OM" | awk '{print $1}')" \
+  --target-verify-commit "$VERIFY_OM" \
+  --target-verify-commit-sha256 "$(sha256sum "$VERIFY_OM" | awk '{print $1}')" \
+  --output "$AI_RUN_DIR/reports/cpp-incremental-raw.json" \
+  --prompt-token-ids 'REAL,TOKEN,IDS' \
+  --eos-token-ids 'REAL,EOS,IDS' \
+  --pad-token-id 0 \
+  --max-new-tokens 32 \
+  --max-draft-tokens 15 \
+  --warmup 3 \
+  --repetitions 10 \
+  --device-id 0 \
+  --progress true
+```
+
+`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，不能保留文字占位符。
+
+### 5.5 用 msprof 分角色确认四 OM 耗时
+
+四个 OM 是独立 model ID，因此最可靠的 profile 是运行完整状态机，再在 msprof 导出的
+model/task/op 表中按 model ID 和 role 文件名分组。不要分别喂随机 state 跑四个 OM 后把数字相加；
+那样缺少真实依赖、cache cursor 和接受路径。
+
+```bash
+export DFLASH_SOURCE=/ABSOLUTE/PATH/qwen3.5-4B-dflash
+export PROFILE_ROOT=/ABSOLUTE/PATH/qwen35-four-om-msprof
+export TOKEN_IDS='REAL,COMMA,SEPARATED,TOKEN,IDS'
+mkdir -p "$PROFILE_ROOT"
+
+for AIC_METRIC in PipeUtilization Memory MemoryUB; do
+  LABEL="four-om-stateful-${AIC_METRIC}"
+  CASE_ROOT="$PROFILE_ROOT/$LABEL"
+  "$DFLASH_SOURCE/tools/run_msprof.sh" \
+    --label "$LABEL" \
+    --output-dir "$CASE_ROOT" \
+    --python "$MODEL_PYTHON" \
+    --aic-metrics "$AIC_METRIC" \
+    --no-msproftx \
+    -- \
+    "$INCREMENTAL_RUNNER" \
+      --target-prefill "$PREFILL_OM" \
+      --target-prefill-sha256 "$(sha256sum "$PREFILL_OM" | awk '{print $1}')" \
+      --target-decode1 "$DECODE_OM" \
+      --target-decode1-sha256 "$(sha256sum "$DECODE_OM" | awk '{print $1}')" \
+      --draft-propose "$DRAFT_OM" \
+      --draft-propose-sha256 "$(sha256sum "$DRAFT_OM" | awk '{print $1}')" \
+      --target-verify-commit "$VERIFY_OM" \
+      --target-verify-commit-sha256 "$(sha256sum "$VERIFY_OM" | awk '{print $1}')" \
+      --output "$CASE_ROOT/runner-report.json" \
+      --prompt-token-ids "$TOKEN_IDS" \
+      --eos-token-ids 'REAL,EOS,IDS' \
+      --pad-token-id 0 \
+      --max-new-tokens 32 \
+      --max-draft-tokens 15 \
+      --warmup 3 \
+      --repetitions 10 \
+      --device-id 0 \
+      --progress false
+done
+```
+
+采集后对每个 `PROF_*` 目录执行：
+
+```bash
+msprof --query=on --output="$PROF_DIR"
+msprof --export=on --output="$PROF_DIR" --summary-format=csv
+rg --files "$PROF_DIR" | \
+  rg '/(model|op_summary|op_statistic|api_statistic|task_time)_[^/]*\.csv$'
+```
+
+用 model/task 表建立 `model_id -> target-prefill/target-decode1/draft-propose/
+target-verify-commit` 映射，再按 model ID 汇总 duration。`runner-report.json` 的各 role execution
+次数是交叉校验依据。msprof 仅用于定位 kernel、Memcpy、launch、同步和空洞；最终 median/p90
+必须重新关闭 profiling 跑上面的 paired 3+10。
+
 ## 6. 真机选择顺序
 
 1. 对每个候选 OM 记录 `aclmdlQuerySize` 的 `workSize/weightSize` 和 SHA-256。
