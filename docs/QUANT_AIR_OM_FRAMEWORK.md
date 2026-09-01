@@ -467,7 +467,7 @@ PY
 还可以直接检查 TorchAir 的可读 GE 图：
 
 ```bash
-rg -n 'type: "(SoftplusV2|DynamicQuant|QuantBatchMatmulV3|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|FusedInferAttentionScore|ScatterNdUpdate)"' \
+rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV3|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|FusedInferAttentionScore|ScatterNdUpdate)"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
 ```
 
@@ -475,6 +475,8 @@ rg -n 'type: "(SoftplusV2|DynamicQuant|QuantBatchMatmulV3|RmsNorm|ChunkGatedDelt
 不出现。这里检查的是 AIR 内部 GE type，`npu.*.default` 前端 FX 名称不会原样作为 GE type
 出现。`air-manifest.json` 对框架 converter 同时记录调用数和 GE 节点数；TorchAir builtin 没有被
 框架包装，所以其 `converter_calls` 为 `null`，只以 schema/Meta 探针和最终 GE 节点作为门禁。
+不同 TorchAir 版本会把 `dynamo.pbtxt` 的节点类型写成 `type: "..."` 或 `op: "..."`。审计器
+同时识别两种字段；同一文件、同一 GE type 取两者较大的计数，不能相加后把一个物理节点算两次。
 
 如果 `dynamo_export` 报 graph break，应保留完整 TorchAir 日志并定位首个不支持节点；不能用空
 AIR、伪文件或 CPU export 替代。若仍出现 `does not support running with fake tensors`，先看错误中
@@ -706,6 +708,7 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
 | `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 旧版 AIR 路径把 `Tensor(a!) -> Tensor(a!)` 直接交给 AOTAutograd；Fake 正确也无法 functionalize | 更新本分支；确认 FX target 为 `qwen35_dflash.npu_cache_update.default`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
 | `ERR03005 GRAPH internal error`，`Original traceback` 指向 `qwen35_dflash.npu_cache_update.default`，Meta 单测通过 | 旧 converter 把前端 snake_case 参数按 positional 传入，但 GE `CacheUpdate` 原型要求 `x/updates/targetBlock/offsetInBlock -> x` | 更新本分支；确认 AIR manifest 中该算子的 `converter_mode` 为 `named-cache-update-x-v1` |
+| `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |
 | `pse_shift` 期望 `Optional[Tensor]` 但收到 `[64]` / `immutable_list` | 旧版 modeling 在 export 路径把 `allQLen` 长度列表误接到了 PSE 输入，尚未进入 Fake/converter | 更新本分支；确认两个 modeling 文件均传 `all_seq_lengths_q=allQLen` 且不构造伪 PSE Tensor |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |

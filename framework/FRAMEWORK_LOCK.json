@@ -144,6 +144,7 @@
   "compiler": {
     "exporter": "TorchAir dynamo_export",
     "custom_op_gate": "validate and propagate AIR custom_op_audit before ATC",
+    "ge_ir_node_audit": "count both TorchAir dynamo.pbtxt op and type node fields; use the per-file maximum per GE type to avoid duplicate counting",
     "gdr_prototype_gate": "reject duplicate or legacy ChunkGatedDeltaRule prototypes from ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH before checkpoint load",
     "atc_mode": 0,
     "atc_framework": 1,

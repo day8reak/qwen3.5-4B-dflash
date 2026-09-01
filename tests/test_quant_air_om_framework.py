@@ -395,6 +395,32 @@ def test_aten_softplus_audit_rejects_missing_ge_node(tmp_path: Path) -> None:
         )
 
 
+def test_aten_softplus_audit_accepts_op_field_without_double_counting(
+    tmp_path: Path,
+) -> None:
+    torchair = _FakeTorchAir()
+    session = prepare_aten_softplus_export(torchair)
+    converter = torchair.converters[torch.ops.aten.softplus.default]
+    converter(object())
+    converter(object())
+    graph_dir = tmp_path / "air" / "op-field"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "dynamo.pbtxt").write_text(
+        'op {\n  name: "softplus_0"\n  op: "SoftplusV2"\n}\n'
+        'op {\n  name: "softplus_1"\n  op: "SoftplusV2"\n'
+        '  type: "SoftplusV2"\n}\n',
+        encoding="utf-8",
+    )
+
+    audit = audit_aten_softplus_export(
+        session,
+        graph_dir,
+        calls_before=0,
+        relative_to=tmp_path,
+    )
+    assert audit["ge_node_occurrences"] == 2
+
+
 class _FakeExecutionModel(nn.Module):
     def __init__(self, embedding: nn.Module, lm_head: nn.Module) -> None:
         super().__init__()
@@ -1062,6 +1088,31 @@ def test_custom_op_audit_rejects_missing_ge_node(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeError, match="TorchAir IR contains"):
         audit_custom_op_export((session,), graph_dir, relative_to=tmp_path)
+
+
+def test_custom_op_audit_accepts_builtin_op_field_without_double_counting(
+    tmp_path: Path,
+) -> None:
+    _ensure_target_test_schema("npu_dynamic_quant")
+    session = prepare_custom_op_export(
+        CustomOpExportSpec(
+            torch_op=NPU_DYNAMIC_QUANT_TORCH_OP,
+            ge_op_type=NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
+        ),
+        _FakeTorchAir(),
+    )
+    graph_dir = tmp_path / "air" / "op-field"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "dynamo.pbtxt").write_text(
+        'op {\n  name: "dynamic_quant"\n  op: "DynamicQuant"\n}\n',
+        encoding="utf-8",
+    )
+
+    audit = audit_custom_op_export(
+        (session,), graph_dir, relative_to=tmp_path
+    )
+    assert audit[0]["ge_node_occurrences"] == 1
+    assert audit[0]["observed_in_graph"] is True
 
 
 def test_compiler_rejects_incomplete_declared_custom_op_audit() -> None:

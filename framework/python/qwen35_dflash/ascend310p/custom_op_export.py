@@ -21,6 +21,7 @@ from typing import Any, Callable, Literal, Sequence
 import torch
 
 from .contracts import CustomOpExportSpec
+from .utils import count_ge_ir_nodes
 
 
 ADN_FUSED_INFER_ATTENTION_TORCH_OP = "npu::adn_fused_infer_attention"
@@ -40,7 +41,6 @@ NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE = "DynamicQuant"
 NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE = "QuantBatchMatmulV3"
 NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE = "ScatterNdUpdate"
 
-_GE_TYPE_FIELD = re.compile(r'\btype:\s*"([A-Za-z_][A-Za-z0-9_]*)"')
 _GDR_GE_PROTO_BLOCK = re.compile(
     r"REG_OP\s*\(\s*ChunkGatedDeltaRule\s*\)"
     r"(?P<body>.*?)"
@@ -1230,13 +1230,7 @@ def audit_custom_op_export(
         raise RuntimeError(
             "TorchAir produced no dynamo.pbtxt; custom-op preservation cannot be audited"
         )
-    ge_type_counts: dict[str, int] = {}
-    for path in pbtxt_paths:
-        with path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                for match in _GE_TYPE_FIELD.finditer(line):
-                    op_type = match.group(1)
-                    ge_type_counts[op_type] = ge_type_counts.get(op_type, 0) + 1
+    ge_type_counts = count_ge_ir_nodes(pbtxt_paths)
 
     records: list[dict[str, Any]] = []
     for session in sessions:

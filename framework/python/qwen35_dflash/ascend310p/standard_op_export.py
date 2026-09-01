@@ -6,15 +6,15 @@ from dataclasses import dataclass
 import math
 from numbers import Real
 from pathlib import Path
-import re
 from typing import Any
 
 import torch
 
+from .utils import count_ge_ir_nodes
+
 
 ATEN_SOFTPLUS_TORCH_TARGET = "aten.softplus.default"
 ATEN_SOFTPLUS_GE_OP_TYPE = "SoftplusV2"
-_GE_TYPE_FIELD = re.compile(r'\btype:\s*"([A-Za-z_][A-Za-z0-9_]*)"')
 
 
 @dataclass
@@ -108,14 +108,7 @@ def audit_aten_softplus_export(
         raise RuntimeError(
             "TorchAir produced no dynamo.pbtxt; SoftplusV2 lowering cannot be audited"
         )
-    ge_occurrences = 0
-    for path in pbtxt_paths:
-        with path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                ge_occurrences += sum(
-                    match.group(1) == session.ge_op_type
-                    for match in _GE_TYPE_FIELD.finditer(line)
-                )
+    ge_occurrences = count_ge_ir_nodes(pbtxt_paths).get(session.ge_op_type, 0)
     if ge_occurrences < converter_calls:
         raise RuntimeError(
             f"TorchAir IR contains {ge_occurrences} {session.ge_op_type} nodes for "
