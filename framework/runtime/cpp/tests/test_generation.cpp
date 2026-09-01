@@ -55,9 +55,9 @@ class FakeStatefulExecutor final
   explicit FakeStatefulExecutor(bool corrupt_second_proposal = false)
       : corrupt_second_proposal_(corrupt_second_proposal) {}
 
-  std::size_t sequence_length() const noexcept override { return 32; }
+  std::size_t sequence_length() const noexcept override { return 64; }
   std::size_t prefill_width() const noexcept override { return 4; }
-  std::size_t proposal_width() const noexcept override { return 3; }
+  std::size_t proposal_width() const noexcept override { return 15; }
   std::size_t eos_table_width() const noexcept override { return 4; }
 
   void Reset(
@@ -70,6 +70,7 @@ class FakeStatefulExecutor final
     anchor_ = 0;
     prepared_ = false;
     prepared_count_ = 0;
+    speculative_windows_.clear();
   }
 
   qwen35::dflash::StatefulStep PrefillChunk(
@@ -147,6 +148,30 @@ class FakeStatefulExecutor final
     };
   }
 
+  std::size_t max_speculative_sync_window() const noexcept override {
+    return 2;
+  }
+
+  std::vector<qwen35::dflash::StatefulStep> SpeculativeWindow(
+      const std::vector<std::size_t>& logical_proposal_counts) override {
+    if (logical_proposal_counts.empty() ||
+        logical_proposal_counts.size() > max_speculative_sync_window()) {
+      throw std::invalid_argument("invalid fake speculative window");
+    }
+    speculative_windows_.push_back(logical_proposal_counts);
+    std::vector<qwen35::dflash::StatefulStep> result;
+    result.reserve(logical_proposal_counts.size());
+    for (const std::size_t count : logical_proposal_counts) {
+      result.push_back(SpeculativeStep(count));
+    }
+    return result;
+  }
+
+  const std::vector<std::vector<std::size_t>>& speculative_windows()
+      const noexcept {
+    return speculative_windows_;
+  }
+
  private:
   bool IsEos(std::int64_t token) const {
     return std::find(eos_.begin(), eos_.end(), token) != eos_.end();
@@ -179,6 +204,7 @@ class FakeStatefulExecutor final
   bool prepared_ = false;
   std::size_t prepared_count_ = 0;
   std::vector<std::int64_t> prepared_proposals_;
+  std::vector<std::vector<std::size_t>> speculative_windows_;
 };
 
 void Require(bool condition, const std::string& message) {
@@ -361,6 +387,60 @@ void TestStatefulPairedBenchmarkAndProgress() {
   Require(saw_decode, "stateful progress omitted decode");
 }
 
+void TestTwoTransactionWindowUsesBudgetSafeSecondProposalCount() {
+  FakeStatefulExecutor executor;
+  auto options = Options();
+  options.max_new_tokens = 32;
+  options.max_draft_tokens = 15;
+  options.dflash_sync_window = 2;
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kOrdinary, options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(
+      ordinary.generated_token_ids == dflash.generated_token_ids,
+      "two-transaction window changed authoritative tokens");
+  Require(
+      executor.speculative_windows().size() == 1 &&
+          executor.speculative_windows().front() ==
+              std::vector<std::size_t>({15, 14}),
+      "two-transaction window did not use the budget-safe K=15/K=14 pair");
+  Require(
+      dflash.counters.speculative_transactions == 2 &&
+          dflash.counters.decode_iterations == 1,
+      "two-transaction window counters differ");
+}
+
+void TestTwoTransactionWindowStopsAtFirstTransactionEos() {
+  FakeStatefulExecutor executor;
+  auto options = Options();
+  options.max_new_tokens = 8;
+  options.max_draft_tokens = 3;
+  options.dflash_sync_window = 2;
+  options.eos_token_ids = {13};
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kOrdinary, options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  const std::vector<std::int64_t> expected{11, 12, 13};
+  Require(
+      ordinary.generated_token_ids == expected &&
+          dflash.generated_token_ids == expected,
+      "two-transaction window committed output after first-transaction EOS");
+  Require(
+      ordinary.stop_reason == "eos" && dflash.stop_reason == "eos",
+      "two-transaction window changed EOS stop reason");
+  Require(
+      executor.speculative_windows().size() == 1 &&
+          executor.speculative_windows().front() ==
+              std::vector<std::size_t>({3, 2}),
+      "EOS case did not exercise a queued two-transaction window");
+  Require(
+      dflash.counters.speculative_transactions == 2 &&
+          dflash.counters.decode_iterations == 1,
+      "EOS case did not account for the queued second transaction");
+}
+
 void TestSha256KnownVector() {
   Require(
       qwen35::dflash::Sha256("abc") ==
@@ -381,6 +461,8 @@ int main() {
     TestStatefulOrdinaryAndDFlashMatchAcrossPromptChunks();
     TestStatefulCorrectionAndEosRemainExact();
     TestStatefulPairedBenchmarkAndProgress();
+    TestTwoTransactionWindowUsesBudgetSafeSecondProposalCount();
+    TestTwoTransactionWindowStopsAtFirstTransactionEos();
     TestSha256KnownVector();
     std::cout << "PASS: recompute/stateful C++ schedulers, parity, EOS, "
                  "capacity and SHA-256\n";

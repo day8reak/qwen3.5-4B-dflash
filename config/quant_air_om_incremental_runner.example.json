@@ -7,5 +7,6 @@
   "state_policy": "incremental-explicit-state-v2",
   "state_reset_policy": "async-memset",
   "decode_carrier_policy": "last-token-d2d",
+  "dflash_sync_window": 1,
   "pad_token_id": 0
 }

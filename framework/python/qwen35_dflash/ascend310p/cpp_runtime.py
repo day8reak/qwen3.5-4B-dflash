@@ -232,6 +232,9 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
             f"{LAST_TOKEN_D2D_DECODE_CARRIER_POLICY!r} or "
             f"{ONE_TOKEN_H2D_DECODE_CARRIER_POLICY!r}"
         )
+    dflash_sync_window = int(options.get("dflash_sync_window", 1))
+    if dflash_sync_window not in {1, 2}:
+        raise ValueError("C++ runner dflash_sync_window must be 1 or 2")
     return {
         "cpu_fallback": False,
         "device": {
@@ -247,6 +250,7 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
         "state_policy": state_policy,
         "state_reset_policy": state_reset_policy,
         "decode_carrier_policy": decode_carrier_policy,
+        "dflash_sync_window": dflash_sync_window,
         "pad_token_id": pad_token_id,
     }
 
@@ -682,10 +686,11 @@ def validate_incremental_cpp_runner_report(
     max_draft_tokens: int,
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+    dflash_sync_window: int = 1,
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
-    if report.get("schema_version") != 4:
+    if report.get("schema_version") != 5:
         raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
@@ -772,6 +777,18 @@ def validate_incremental_cpp_runner_report(
         raise ValueError("expected incremental decode carrier policy is invalid")
     if protocol.get("decode_carrier_policy") != decode_carrier_policy:
         raise RuntimeError("incremental runner decode carrier policy differs")
+    if dflash_sync_window not in {1, 2}:
+        raise ValueError("expected DFlash sync window is invalid")
+    if (
+        protocol.get("dflash_sync_window") != dflash_sync_window
+        or protocol.get("maximum_supported_dflash_sync_window") != 2
+    ):
+        raise RuntimeError("incremental DFlash sync window differs")
+    if protocol.get("decode_iteration_scope") != (
+        "one host-visible synchronization window; a DFlash window may "
+        "contain one or two complete speculative transactions"
+    ):
+        raise RuntimeError("incremental decode iteration scope differs")
     if protocol.get("state_reset_only_barriers") != 0:
         raise RuntimeError("incremental runner added a reset-only barrier")
     immutable_zero = state_reset_policy == IMMUTABLE_ZERO_STATE_RESET_POLICY
@@ -898,12 +915,16 @@ def validate_incremental_cpp_runner_report(
         "state_reset_bytes_per_request",
         "carrier_device_bytes",
         "compact_ping_pong_device_bytes",
+        "compact_slot_bytes",
+        "compact_ordinary_result_bytes",
+        "compact_verify_result_bytes",
         "prefill_control_bytes_per_slot",
         "prefill_base_control_bytes_per_slot",
         "prefill_count_control_bytes_per_slot",
         "prefill_proposal_control_bytes_per_slot",
         "prefill_persistent_control_tail_bytes_per_slot",
         "prefill_staging_pinned_host_bytes",
+        "proposal_count_staging_pinned_host_bytes",
         "prefill_feature_slab_bytes",
         "prefill_feature_arena_bytes",
         "draft_dynamic_gear_count",
@@ -977,6 +998,7 @@ def validate_incremental_cpp_runner_report(
         != expected_persistent_control_tail_bytes
         or memory["prefill_staging_pinned_host_bytes"]
         != expected_staging_host_bytes
+        or memory["proposal_count_staging_pinned_host_bytes"] != 8
     ):
         raise RuntimeError("incremental prefill pinned-host staging differs")
     minimum_feature_arena_bytes = (
@@ -1084,9 +1106,42 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental prefill chunk counters differ")
     transactions = int(prefill_completions) + decode + verify
+    speculative_windows = execution.get("speculative_sync_windows")
+    speculative_syncs_elided = execution.get(
+        "speculative_synchronizations_elided"
+    )
+    speculative_d2h_elided = execution.get(
+        "speculative_d2h_operations_elided"
+    )
+    speculative_d2h_padding = execution.get(
+        "speculative_d2h_padding_bytes"
+    )
     if (
-        execution.get("stream_synchronizations") != transactions
-        or execution.get("device_to_host_operations") != transactions
+        isinstance(speculative_windows, bool)
+        or not isinstance(speculative_windows, int)
+        or speculative_windows < 0
+        or isinstance(speculative_syncs_elided, bool)
+        or not isinstance(speculative_syncs_elided, int)
+        or speculative_syncs_elided < 0
+        or isinstance(speculative_d2h_elided, bool)
+        or not isinstance(speculative_d2h_elided, int)
+        or speculative_d2h_elided < 0
+        or isinstance(speculative_d2h_padding, bool)
+        or not isinstance(speculative_d2h_padding, int)
+        or speculative_d2h_padding < 0
+        or speculative_windows + speculative_syncs_elided != verify
+        or speculative_d2h_elided != speculative_syncs_elided
+        or speculative_d2h_padding
+        != speculative_d2h_elided
+        * (
+            memory["compact_slot_bytes"]
+            - memory["compact_verify_result_bytes"]
+        )
+        or execution.get("stream_synchronizations")
+        != int(prefill_completions) + decode + speculative_windows
+        or execution.get("device_to_host_operations")
+        + speculative_d2h_elided
+        != transactions
     ):
         raise RuntimeError("incremental transaction synchronization policy differs")
     if execution.get("state_resets") != request_count:
@@ -1129,6 +1184,21 @@ def validate_incremental_cpp_runner_report(
     if memory["compact_ping_pong_device_bytes"] > memory["carrier_device_bytes"]:
         raise RuntimeError("incremental compact ping-pong exceeds carrier bytes")
     if (
+        memory["compact_ping_pong_device_bytes"]
+        != 2 * memory["compact_slot_bytes"]
+        or memory["compact_slot_bytes"] != 512
+        or memory["compact_ordinary_result_bytes"] != 257
+        or memory["compact_verify_result_bytes"] != 452
+    ):
+        raise RuntimeError("incremental compact slot layout differs")
+    for field in (
+        "compact_slot_bytes",
+        "compact_ordinary_result_bytes",
+        "compact_verify_result_bytes",
+    ):
+        if execution.get(field) != memory.get(field):
+            raise RuntimeError(f"incremental {field} reports differ")
+    if (
         execution.get("prefill_staging_slots") != expected_staging_slots
         or execution.get("prefill_control_bytes_per_slot")
         != expected_control_bytes
@@ -1142,6 +1212,8 @@ def validate_incremental_cpp_runner_report(
         != expected_persistent_control_tail_bytes
         or execution.get("prefill_staging_pinned_host_bytes")
         != expected_staging_host_bytes
+        or execution.get("proposal_count_staging_pinned_host_bytes")
+        != memory["proposal_count_staging_pinned_host_bytes"]
         or execution.get("prefill_feature_slab_bytes")
         != memory["prefill_feature_slab_bytes"]
         or execution.get("prefill_feature_arena_bytes")
@@ -1435,6 +1507,8 @@ def run_cpp_pair(
                 identity["state_reset_policy"],
                 "--decode-carrier-policy",
                 identity["decode_carrier_policy"],
+                "--dflash-sync-window",
+                str(identity["dflash_sync_window"]),
             ]
         )
     command.extend(["--progress", "true" if progress else "false"])
@@ -1482,6 +1556,7 @@ def run_cpp_pair(
             max_draft_tokens=max_draft_tokens,
             state_reset_policy=identity["state_reset_policy"],
             decode_carrier_policy=identity["decode_carrier_policy"],
+            dflash_sync_window=identity["dflash_sync_window"],
         )
     else:
         assert om_record is not None

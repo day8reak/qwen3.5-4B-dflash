@@ -30,6 +30,15 @@ endif()
 if(NOT DEFINED DECODE_CARRIER_POLICY)
   set(DECODE_CARRIER_POLICY "last-token-d2d")
 endif()
+if(NOT DEFINED DFLASH_SYNC_WINDOW)
+  set(DFLASH_SYNC_WINDOW 1)
+endif()
+if(NOT DEFINED MAX_NEW_TOKENS)
+  set(MAX_NEW_TOKENS 6)
+endif()
+if(NOT DEFINED MAX_DRAFT_TOKENS)
+  set(MAX_DRAFT_TOKENS 3)
+endif()
 if(NOT DEFINED MEASUREMENT_PROTOCOL)
   set(MEASUREMENT_PROTOCOL "evidence")
 endif()
@@ -64,8 +73,9 @@ execute_process(
     --prompt-token-ids "${PROMPT_IDS}"
     --eos-token-ids 999
     --pad-token-id 0
-    --max-new-tokens 6
-    --max-draft-tokens 3
+    --max-new-tokens "${MAX_NEW_TOKENS}"
+    --max-draft-tokens "${MAX_DRAFT_TOKENS}"
+    --dflash-sync-window "${DFLASH_SYNC_WINDOW}"
     --warmup "${WARMUP}"
     --repetitions "${REPETITIONS}"
     --device-id 0
@@ -112,7 +122,13 @@ string(JSON physical_topology GET "${report}" abi physical_topology)
 string(JSON resident_model_load GET "${report}" startup_ms acl_and_resident_model_load)
 string(JSON model_executions GET "${report}" execution_io_counters model_executions)
 string(JSON synchronizations GET "${report}" execution_io_counters stream_synchronizations)
+string(JSON speculative_windows GET "${report}" execution_io_counters speculative_sync_windows)
+string(JSON speculative_syncs_elided GET "${report}" execution_io_counters speculative_synchronizations_elided)
+string(JSON speculative_d2h_elided GET "${report}" execution_io_counters speculative_d2h_operations_elided)
+string(JSON speculative_d2h_padding GET "${report}" execution_io_counters speculative_d2h_padding_bytes)
 string(JSON resets GET "${report}" execution_io_counters state_resets)
+string(JSON report_dflash_sync_window GET "${report}" protocol dflash_sync_window)
+string(JSON maximum_dflash_sync_window GET "${report}" protocol maximum_supported_dflash_sync_window)
 string(JSON report_reset_policy GET "${report}" protocol state_reset_policy)
 string(JSON report_decode_carrier_policy GET "${report}" protocol decode_carrier_policy)
 string(JSON report_zero_count_policy GET "${report}" protocol target_step_zero_count_policy)
@@ -169,14 +185,26 @@ string(JSON decode_h2d_elided GET "${report}" execution_io_counters decode_id_h2
 string(JSON decode_device_compactions GET "${report}" execution_io_counters decode_id_device_compaction_operations)
 string(JSON decode_device_compaction_bytes GET "${report}" execution_io_counters decode_id_device_compaction_bytes)
 string(JSON compact_ping_pong_bytes GET "${report}" execution_io_counters compact_ping_pong_device_bytes)
+string(JSON compact_slot_bytes GET "${report}" execution_io_counters compact_slot_bytes)
+string(JSON compact_ordinary_bytes GET "${report}" execution_io_counters compact_ordinary_result_bytes)
+string(JSON compact_verify_bytes GET "${report}" execution_io_counters compact_verify_result_bytes)
+string(JSON memory_compact_slot_bytes GET "${report}" model_memory_query compact_slot_bytes)
+string(JSON memory_compact_ordinary_bytes GET "${report}" model_memory_query compact_ordinary_result_bytes)
+string(JSON memory_compact_verify_bytes GET "${report}" model_memory_query compact_verify_result_bytes)
 string(JSON proposal_uploads GET "${report}" execution_io_counters proposal_count_upload_operations)
 string(JSON proposal_upload_bytes GET "${report}" execution_io_counters proposal_count_upload_bytes)
+string(JSON proposal_staging_bytes GET "${report}" execution_io_counters proposal_count_staging_pinned_host_bytes)
+string(JSON memory_proposal_staging_bytes GET "${report}" model_memory_query proposal_count_staging_pinned_host_bytes)
 string(JSON h2d_operations GET "${report}" execution_io_counters host_to_device_operations)
 string(JSON h2d_bytes GET "${report}" execution_io_counters host_to_device_bytes)
 string(JSON decode_executions GET "${report}" execution_io_counters target_decode1_executions)
 string(JSON draft_executions GET "${report}" execution_io_counters draft_propose_executions)
 string(JSON verify_executions GET "${report}" execution_io_counters target_verify_commit_executions)
 math(EXPR transactions "${prefill_completions} + ${decode_executions} + ${verify_executions}")
+math(EXPR expected_synchronizations "${prefill_completions} + ${decode_executions} + ${speculative_windows}")
+math(EXPR closed_speculative_transactions "${speculative_windows} + ${speculative_syncs_elided}")
+math(EXPR closed_d2h_transactions "${d2h_operations} + ${speculative_d2h_elided}")
+math(EXPR expected_speculative_d2h_padding "${speculative_d2h_elided} * (${compact_slot_bytes} - ${compact_verify_bytes})")
 math(EXPR role_total
   "${prefill_executions} + ${prefill_head_executions} + ${decode_executions} + ${draft_executions} + ${verify_executions}"
 )
@@ -188,8 +216,13 @@ math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
 math(EXPR expected_dflash_requests "${EXPECTED_RESETS} / 2")
 math(EXPR expected_prefill_feature_rows "${expected_dflash_requests} * 128")
 math(EXPR expected_prefill_control_full_uploads "1")
-set(expected_prefill_control_proposal_uploads 1)
-math(EXPR expected_prefill_control_count_uploads "${expected_dflash_requests} - 1")
+if(ADAPTIVE_PROPOSAL_COUNTS)
+  set(expected_prefill_control_proposal_uploads "${expected_dflash_requests}")
+  set(expected_prefill_control_count_uploads 0)
+else()
+  set(expected_prefill_control_proposal_uploads 1)
+  math(EXPR expected_prefill_control_count_uploads "${expected_dflash_requests} - 1")
+endif()
 math(EXPR expected_prefill_control_base_uploads
   "${prefill_executions} - ${expected_prefill_control_full_uploads} - ${expected_prefill_control_proposal_uploads} - ${expected_prefill_control_count_uploads}"
 )
@@ -272,10 +305,13 @@ if(DECODE_CARRIER_POLICY STREQUAL "last-token-d2d")
   if(NOT report_decode_carrier_policy STREQUAL DECODE_CARRIER_POLICY OR
      NOT decode_uploads EQUAL 0 OR
      NOT decode_carrier_hits EQUAL decode_executions OR
-     NOT decode_multi_token_carrier_hits GREATER 0 OR
      NOT decode_multi_token_carrier_hits LESS decode_carrier_hits OR
      NOT decode_device_compactions EQUAL decode_multi_token_carrier_hits)
     message(FATAL_ERROR "fake last-token D2D counters failed: ${report}")
+  endif()
+  if(NOT ADAPTIVE_PROPOSAL_COUNTS AND
+     NOT decode_multi_token_carrier_hits GREATER 0)
+    message(FATAL_ERROR "fake last-token D2D route had no multi-token hit: ${report}")
   endif()
 elseif(DECODE_CARRIER_POLICY STREQUAL "one-token-h2d")
   if(NOT report_decode_carrier_policy STREQUAL DECODE_CARRIER_POLICY OR
@@ -289,15 +325,35 @@ elseif(DECODE_CARRIER_POLICY STREQUAL "one-token-h2d")
 else()
   message(FATAL_ERROR "unknown DECODE_CARRIER_POLICY=${DECODE_CARRIER_POLICY}")
 endif()
-if(NOT schema_version EQUAL 4 OR
+if(DFLASH_SYNC_WINDOW EQUAL 1)
+  if(NOT speculative_syncs_elided EQUAL 0)
+    message(FATAL_ERROR "window-one run elided a speculative synchronization: ${report}")
+  endif()
+elseif(DFLASH_SYNC_WINDOW EQUAL 2)
+  if(NOT speculative_syncs_elided GREATER 0)
+    message(FATAL_ERROR "window-two run did not elide a speculative synchronization: ${report}")
+  endif()
+else()
+  message(FATAL_ERROR "unknown DFLASH_SYNC_WINDOW=${DFLASH_SYNC_WINDOW}")
+endif()
+if(ADAPTIVE_PROPOSAL_COUNTS AND
+   NOT proposal_uploads EQUAL expected_dflash_requests)
+  message(FATAL_ERROR "adaptive-K proposal uploads differ: ${report}")
+endif()
+if(NOT schema_version EQUAL 5 OR
    NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR
    NOT repetitions EQUAL REPETITIONS OR NOT model_count EQUAL EXPECTED_MODEL_COUNT OR
    NOT report_protocol STREQUAL MEASUREMENT_PROTOCOL OR
+   NOT report_dflash_sync_window EQUAL DFLASH_SYNC_WINDOW OR
+   NOT maximum_dflash_sync_window EQUAL 2 OR
    NOT model_executions EQUAL role_total OR
-   NOT synchronizations EQUAL transactions OR
-   NOT d2h_operations EQUAL transactions OR
+   NOT closed_speculative_transactions EQUAL verify_executions OR
+   NOT speculative_d2h_elided EQUAL speculative_syncs_elided OR
+   NOT speculative_d2h_padding EQUAL expected_speculative_d2h_padding OR
+   NOT synchronizations EQUAL expected_synchronizations OR
+   NOT closed_d2h_transactions EQUAL transactions OR
    NOT resets EQUAL EXPECTED_RESETS OR
    NOT prefill_executions EQUAL expected_prefill_executions OR
    NOT prefill_head_executions EQUAL EXPECTED_RESETS OR
@@ -309,7 +365,7 @@ if(NOT schema_version EQUAL 4 OR
    NOT prefill_draft_executions EQUAL expected_dflash_requests OR
    NOT prefill_draft_elided EQUAL expected_dflash_requests OR
    NOT prefill_feature_rows EQUAL expected_prefill_feature_rows OR
-   NOT draft_executions EQUAL expected_dflash_requests OR
+   draft_executions LESS expected_dflash_requests OR
    NOT prefill_staging_slots EQUAL 2 OR
    NOT prefill_control_slot_bytes EQUAL EXPECTED_PREFILL_CONTROL_BYTES OR
    NOT prefill_base_control_slot_bytes EQUAL 578 OR
@@ -334,7 +390,15 @@ if(NOT schema_version EQUAL 4 OR
    NOT decode_device_compaction_bytes EQUAL expected_decode_device_compaction_bytes OR
    NOT decode_upload_bytes EQUAL expected_decode_upload_bytes OR
    NOT compact_ping_pong_bytes GREATER 0 OR
+   NOT compact_slot_bytes EQUAL 512 OR
+   NOT compact_ordinary_bytes EQUAL 257 OR
+   NOT compact_verify_bytes EQUAL 452 OR
+   NOT memory_compact_slot_bytes EQUAL compact_slot_bytes OR
+   NOT memory_compact_ordinary_bytes EQUAL compact_ordinary_bytes OR
+   NOT memory_compact_verify_bytes EQUAL compact_verify_bytes OR
    NOT proposal_upload_bytes EQUAL expected_proposal_upload_bytes OR
+   NOT proposal_staging_bytes EQUAL 8 OR
+   NOT memory_proposal_staging_bytes EQUAL proposal_staging_bytes OR
    NOT h2d_operations EQUAL closed_h2d_operations OR
    NOT h2d_bytes EQUAL closed_h2d_bytes OR
    NOT report_reset_policy STREQUAL RESET_POLICY OR

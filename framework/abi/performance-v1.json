@@ -17,7 +17,8 @@
     "prompt token IDs",
     "max new tokens",
     "maximum draft tokens",
-    "decode carrier policy"
+    "decode carrier policy",
+    "DFlash synchronization window"
   ],
   "runner_contract": {
     "modes": ["ordinary", "dflash"],
@@ -32,10 +33,14 @@
     ],
     "stable_token_ids_across_repetitions": true,
     "current_integrated_om_io": "persistent input device mirror with changed-range H2D; Target D2H tail is bounded by K+1; full Draft ID D2H; one stream synchronization per model execution",
-    "incremental_five_om_io": "one aligned prefill control carrier uploads only the live base/count/proposal/full prefix while its EOS tail stays process-resident; compact Target results ping-pong with Target state; one-token-h2d retains direct row-zero binding and falls back to pinned-host H2D after multi-token commits, while last-token-d2d retains every last committed token and copies later rows D2D into the aligned scalar; an explicit caller override uses the exact 8-byte H2D fallback in either policy",
+    "incremental_five_om_io": "one aligned prefill control carrier uploads only the live base/count/proposal/full prefix while its EOS tail stays process-resident; compact Target results ping-pong with Target state; one-token-h2d retains direct row-zero binding and falls back to pinned-host H2D after multi-token commits, while last-token-d2d retains every last committed token and copies later rows D2D into the aligned scalar; an explicit caller override uses the exact 8-byte H2D fallback in either policy; exact DFlash synchronization window 2 may queue two complete transactions and their two compact D2H copies before one barrier without changing OM tensor ABI",
     "required_io_counters": [
       "model_executions",
       "stream_synchronizations",
+      "speculative_sync_windows and speculative_synchronizations_elided",
+      "speculative_d2h_operations_elided and speculative_d2h_padding_bytes",
+      "compact_slot_bytes, compact_ordinary_result_bytes and compact_verify_result_bytes",
+      "proposal_count_staging_pinned_host_bytes",
       "host_to_device_bytes and full_host_to_device_bytes",
       "device_to_host_bytes and full_device_to_host_bytes",
       "maximum_target_elements_per_call",

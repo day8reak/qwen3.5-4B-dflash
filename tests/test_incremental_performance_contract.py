@@ -206,9 +206,14 @@ def test_hot_loop_keeps_large_state_and_proposals_on_device() -> None:
     assert "target GDR state banks" in state["host_forbidden_payloads_per_round"]
     assert "target or Draft KV cache" in state["host_forbidden_payloads_per_round"]
     assert "stays on device" in contract["hot_loop"]["draft_to_verify"]
-    assert contract["hot_loop"]["synchronization"].startswith(
-        "one host-visible synchronization"
-    )
+    assert "window 2" in contract["hot_loop"]["synchronization"]
+    assert set(contract["hot_loop"]["dflash_sync_window_policies"]) == {
+        "1",
+        "2",
+    }
+    assert "K1 may be smaller" in contract["hot_loop"][
+        "dflash_sync_window_budget_guard"
+    ]
     transaction = contract["strict_greedy_transaction"]
     assert transaction["selected_target_state_slot"].startswith("a because")
     assert transaction["committed_target_input_rows"] == "1 + a"
@@ -251,6 +256,8 @@ def test_document_contains_memory_inspector_and_claim_boundary() -> None:
     assert "expected/observed" in document
     assert "one-token-h2d" in document
     assert "last-token-d2d" in document
+    assert "--dflash-sync-window" in document
+    assert "K0=15,K1=14" in document
     assert "不能宣称" in document
 
 
@@ -362,3 +369,82 @@ def test_decode_device_carrier_contract_closes_frozen_fake_acl_work() -> None:
     assert evidence["additional_compact_device_bytes_vs_previous_runner"] == 512
     assert evidence["device_to_host_operations_unchanged"] == 117
     assert evidence["device_to_host_bytes_unchanged"] == 32604
+
+
+def test_two_transaction_window_contract_closes_matched_fake_acl_work() -> None:
+    hot_loop = _contract()["hot_loop"]
+    evidence = hot_loop[
+        "fake_acl_adaptive_k_sync_window_70_token_32_output_paired_3_plus_10"
+    ]
+
+    assert evidence["first_and_second_proposal_counts"] == [15, 14]
+    assert evidence["token_id_mismatches"] == 0
+    assert evidence["eos_mismatches"] == 0
+    for field in (
+        "model_executions",
+        "host_to_device_operations",
+        "host_to_device_bytes",
+        "proposal_count_upload_operations",
+    ):
+        assert evidence[f"{field}_both"] > 0
+    assert (
+        evidence["window_1_device_to_host_operations"]
+        - evidence["window_2_device_to_host_operations"]
+        == evidence["window_2_speculative_d2h_operations_elided"]
+    )
+    assert (
+        evidence["window_2_device_to_host_bytes"]
+        - evidence["window_1_device_to_host_bytes"]
+        == evidence["window_2_speculative_d2h_padding_bytes"]
+    )
+    assert evidence["window_2_speculative_d2h_padding_bytes"] == (
+        evidence["window_2_speculative_d2h_operations_elided"]
+        * (
+            evidence["compact_slot_bytes_both"]
+            - evidence["compact_verify_result_bytes_both"]
+        )
+    )
+    assert evidence["window_1_speculative_sync_windows"] == (
+        evidence["window_2_speculative_sync_windows"]
+        + evidence["window_2_speculative_synchronizations_elided"]
+    )
+    assert (
+        evidence["window_1_stream_synchronizations"]
+        - evidence["window_2_stream_synchronizations"]
+        == evidence["stream_synchronizations_elided"]
+        == evidence["window_2_speculative_synchronizations_elided"]
+        == evidence["window_2_speculative_d2h_operations_elided"]
+    )
+    assert evidence["per_dflash_measurement_transactions_both"] == 2
+    assert evidence["per_dflash_measurement_windows_before"] == 2
+    assert evidence["per_dflash_measurement_windows_after"] == 1
+    assert evidence["proposal_count_staging_pinned_host_bytes_both"] == 8
+
+
+def test_two_transaction_window_short_case_records_coalesced_d2h() -> None:
+    evidence = _contract()["hot_loop"][
+        "fake_acl_two_transaction_sync_window_70_token_paired_3_plus_10"
+    ]
+
+    assert evidence["stable_generated_token_ids_both"] == list(range(11, 21))
+    assert evidence["token_id_mismatches"] == 0
+    assert evidence["eos_mismatches"] == 0
+    assert (
+        evidence["window_1_device_to_host_operations"]
+        - evidence["window_2_device_to_host_operations"]
+        == evidence["window_2_speculative_d2h_operations_elided"]
+        == 13
+    )
+    assert (
+        evidence["window_2_device_to_host_bytes"]
+        - evidence["window_1_device_to_host_bytes"]
+        == evidence["window_2_speculative_d2h_padding_bytes"]
+        == 780
+    )
+    assert evidence["window_2_speculative_d2h_padding_bytes"] == (
+        evidence["window_2_speculative_d2h_operations_elided"]
+        * (
+            evidence["compact_slot_bytes_both"]
+            - evidence["compact_verify_result_bytes_both"]
+        )
+    )

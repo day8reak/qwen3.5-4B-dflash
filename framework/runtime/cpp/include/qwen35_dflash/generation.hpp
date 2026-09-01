@@ -102,12 +102,21 @@ class StatefulGraphExecutor {
 
   virtual StatefulStep SpeculativeStep(
       std::size_t logical_proposal_count) = 0;
+
+  // A concrete executor may enqueue more than one complete speculative
+  // transaction before exposing a host barrier. The default preserves the
+  // synchronous contract and stops before launching work after a reported
+  // EOS. Implementations must return results in execution order.
+  virtual std::size_t max_speculative_sync_window() const noexcept;
+  virtual std::vector<StatefulStep> SpeculativeWindow(
+      const std::vector<std::size_t>& logical_proposal_counts);
 };
 
 struct GenerationOptions {
   std::int64_t pad_token_id = 0;
   std::size_t max_new_tokens = 32;
   std::size_t max_draft_tokens = 15;
+  std::size_t dflash_sync_window = 1;
   std::vector<std::int64_t> eos_token_ids;
 };
 
@@ -116,6 +125,9 @@ struct GenerationCounters {
   std::size_t drafted_tokens = 0;
   std::size_t accepted_draft_tokens = 0;
   std::size_t rejected_draft_tokens = 0;
+  std::size_t speculative_transactions = 0;
+  // Host-visible decode windows. With dflash_sync_window=1 this is also the
+  // transaction count; a larger exact window may contain multiple rounds.
   std::size_t decode_iterations = 0;
 };
 

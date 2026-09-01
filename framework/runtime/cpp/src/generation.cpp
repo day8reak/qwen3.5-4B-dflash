@@ -206,6 +206,31 @@ const char* ModeName(GenerationMode mode) noexcept {
                                             : "dflash-strict-greedy";
 }
 
+std::size_t StatefulGraphExecutor::max_speculative_sync_window()
+    const noexcept {
+  return 1;
+}
+
+std::vector<StatefulStep> StatefulGraphExecutor::SpeculativeWindow(
+    const std::vector<std::size_t>& logical_proposal_counts) {
+  if (logical_proposal_counts.empty() ||
+      logical_proposal_counts.size() > max_speculative_sync_window()) {
+    throw std::invalid_argument(
+        "speculative sync window exceeds executor capability");
+  }
+  std::vector<StatefulStep> result;
+  result.reserve(logical_proposal_counts.size());
+  for (const std::size_t logical_proposal_count : logical_proposal_counts) {
+    StatefulStep step = SpeculativeStep(logical_proposal_count);
+    const bool finished = step.finished;
+    result.push_back(std::move(step));
+    if (finished) {
+      break;
+    }
+  }
+  return result;
+}
+
 namespace {
 
 GenerationMeasurement GenerateOnceWithContext(
@@ -438,6 +463,12 @@ void ValidateStatefulInputs(
   if (options.max_new_tokens == 0 || options.max_draft_tokens == 0) {
     throw std::invalid_argument("generation limits must be positive");
   }
+  if (options.dflash_sync_window == 0 ||
+      options.dflash_sync_window >
+          executor.max_speculative_sync_window()) {
+    throw std::invalid_argument(
+        "DFlash sync window exceeds executor capability");
+  }
   if (prompt.size() + options.max_new_tokens - 1 >
       executor.sequence_length()) {
     throw std::invalid_argument(
@@ -592,26 +623,68 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
         result.counters.graph_calls, decode_iteration, 0.0);
     const auto decode_start = Clock::now();
 
-    StatefulStep step;
+    std::vector<StatefulStep> steps;
+    bool speculative = false;
+    std::vector<std::size_t> proposal_counts;
     if (mode == GenerationMode::kOrdinary || remaining == 1) {
-      step = executor.DecodeOne(prefix.back());
-      ValidateStatefulStep(step, eos, false, 0);
+      steps.push_back(executor.DecodeOne(prefix.back()));
     } else {
-      const std::size_t proposal_count = std::min(
+      speculative = true;
+      const std::size_t first_proposal_count = std::min(
           {options.max_draft_tokens,
            executor.proposal_width(),
            remaining - 1});
-      step = executor.SpeculativeStep(proposal_count);
-      ValidateStatefulStep(step, eos, true, proposal_count);
-      result.counters.drafted_tokens += step.drafted_tokens;
-      result.counters.accepted_draft_tokens +=
-          step.accepted_draft_tokens;
-      result.counters.rejected_draft_tokens +=
-          step.rejected_draft_tokens;
+      proposal_counts.push_back(first_proposal_count);
+      if (options.dflash_sync_window > 1) {
+        const std::size_t remaining_after_worst_first =
+            remaining - (first_proposal_count + 1);
+        if (remaining_after_worst_first > 1) {
+          proposal_counts.push_back(std::min(
+              {options.max_draft_tokens,
+               executor.proposal_width(),
+               remaining_after_worst_first - 1}));
+        }
+      }
+      steps = executor.SpeculativeWindow(proposal_counts);
+      if (steps.empty() || steps.size() > proposal_counts.size()) {
+        throw std::runtime_error(
+            "stateful executor returned an invalid speculative window");
+      }
     }
-    result.counters.graph_calls += step.model_executions;
-    AppendCommitted(
-        step.token_ids, remaining, eos, &generated, &prefix, &finished);
+    for (const auto& step : steps) {
+      result.counters.graph_calls += step.model_executions;
+    }
+    if (speculative) {
+      result.counters.speculative_transactions += steps.size();
+    }
+    for (std::size_t step_index = 0;
+         step_index < steps.size(); ++step_index) {
+      const auto& step = steps[step_index];
+      if (finished) {
+        break;
+      }
+      ValidateStatefulStep(
+          step,
+          eos,
+          speculative,
+          speculative ? proposal_counts.at(step_index) : 0);
+      if (speculative) {
+        result.counters.drafted_tokens += step.drafted_tokens;
+        result.counters.accepted_draft_tokens +=
+            step.accepted_draft_tokens;
+        result.counters.rejected_draft_tokens +=
+            step.rejected_draft_tokens;
+      }
+      const std::size_t current_remaining =
+          options.max_new_tokens - generated.size();
+      AppendCommitted(
+          step.token_ids,
+          current_remaining,
+          eos,
+          &generated,
+          &prefix,
+          &finished);
+    }
 
     const auto decode_end = Clock::now();
     const double iteration_ms = Milliseconds(decode_start, decode_end);

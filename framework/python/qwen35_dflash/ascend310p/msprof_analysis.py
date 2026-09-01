@@ -196,6 +196,71 @@ def _validate_runner_report(
     counters = report.get("execution_io_counters")
     if not isinstance(counters, Mapping):
         raise MsprofAnalysisError("runner report omitted execution counters")
+    if int(report.get("schema_version", 0)) >= 5:
+        verify_transactions = counters.get(
+            "target_verify_commit_executions"
+        )
+        speculative_windows = counters.get("speculative_sync_windows")
+        speculative_elided = counters.get(
+            "speculative_synchronizations_elided"
+        )
+        speculative_d2h_elided = counters.get(
+            "speculative_d2h_operations_elided"
+        )
+        speculative_d2h_padding = counters.get(
+            "speculative_d2h_padding_bytes"
+        )
+        compact_slot_bytes = counters.get("compact_slot_bytes")
+        compact_verify_bytes = counters.get("compact_verify_result_bytes")
+        prefill_completions = counters.get(
+            "prefill_completion_synchronizations"
+        )
+        decode_transactions = counters.get("target_decode1_executions")
+        stream_synchronizations = counters.get("stream_synchronizations")
+        device_to_host_operations = counters.get("device_to_host_operations")
+        values = (
+            verify_transactions,
+            speculative_windows,
+            speculative_elided,
+            speculative_d2h_elided,
+            speculative_d2h_padding,
+            compact_slot_bytes,
+            compact_verify_bytes,
+            prefill_completions,
+            decode_transactions,
+            stream_synchronizations,
+            device_to_host_operations,
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in values
+        ):
+            raise MsprofAnalysisError(
+                "runner speculative synchronization counters are invalid"
+            )
+        if (
+            speculative_windows + speculative_elided
+            != verify_transactions
+            or stream_synchronizations
+            != prefill_completions
+            + decode_transactions
+            + speculative_windows
+            or device_to_host_operations
+            + speculative_d2h_elided
+            != prefill_completions
+            + decode_transactions
+            + verify_transactions
+            or speculative_d2h_elided != speculative_elided
+            or compact_slot_bytes < compact_verify_bytes
+            or speculative_d2h_padding
+            != speculative_d2h_elided
+            * (compact_slot_bytes - compact_verify_bytes)
+        ):
+            raise MsprofAnalysisError(
+                "runner speculative synchronization counters do not close"
+            )
     counter_names = {
         "target-prefill": "target_prefill_executions",
         "target-prefill-head": "target_prefill_head_executions",
@@ -638,6 +703,22 @@ def analyze_incremental_msprof(
     )
 
     counters = report["execution_io_counters"]
+    verify_transactions = int(counters["target_verify_commit_executions"])
+    speculative_windows = int(
+        counters.get("speculative_sync_windows", verify_transactions)
+    )
+    speculative_elided = int(
+        counters.get(
+            "speculative_synchronizations_elided",
+            verify_transactions - speculative_windows,
+        )
+    )
+    speculative_d2h_elided = int(
+        counters.get("speculative_d2h_operations_elided", 0)
+    )
+    speculative_d2h_padding = int(
+        counters.get("speculative_d2h_padding_bytes", 0)
+    )
     expected_api_counts = {
         "aclmdlExecuteAsync": int(counters["model_executions"]),
         "aclrtMemcpyAsync": (
@@ -743,6 +824,25 @@ def analyze_incremental_msprof(
             "manual_timeline_gate": (
                 "Match these direction/count/byte totals against MemcpyAsync "
                 "events; api_statistic has duration/count but no copy size."
+            ),
+        },
+        "expected_synchronization_signature": {
+            "stream_synchronizations": counters["stream_synchronizations"],
+            "speculative_transactions": verify_transactions,
+            "speculative_sync_windows": speculative_windows,
+            "speculative_synchronizations_elided": speculative_elided,
+            "speculative_d2h_operations_elided": speculative_d2h_elided,
+            "speculative_d2h_padding_bytes": speculative_d2h_padding,
+            "closure": (
+                "speculative_sync_windows + "
+                "speculative_synchronizations_elided == "
+                "speculative_transactions"
+            ),
+            "device_to_host_closure": (
+                "device_to_host_operations + "
+                "speculative_d2h_operations_elided == "
+                "prefill_completion_synchronizations + "
+                "target_decode1_executions + speculative_transactions"
             ),
         },
         "claim_boundary": (

@@ -60,6 +60,7 @@ struct Arguments {
   std::int64_t pad_token_id = 0;
   std::size_t max_new_tokens = 32;
   std::size_t max_draft_tokens = 15;
+  std::size_t dflash_sync_window = 1;
   std::size_t warmup = 3;
   std::size_t repetitions = 10;
   int device_id = 0;
@@ -90,6 +91,7 @@ void Usage(std::ostream& stream) {
       << "  --pad-token-id ID                        default 0\n"
       << "  --max-new-tokens N                       default 32\n"
       << "  --max-draft-tokens N                     default 15\n"
+      << "  --dflash-sync-window N                   1 (default) or exact two-round window\n"
       << "  --warmup N                               evidence=3, profile=1\n"
       << "  --repetitions N                          evidence=10, profile=1\n"
       << "  --device-id N                            default 0\n"
@@ -279,6 +281,12 @@ Arguments ParseArguments(int argc, char** argv) {
       TakeOptional(&values, "max-new-tokens", "32"), "max-new-tokens");
   result.max_draft_tokens = ParseSize(
       TakeOptional(&values, "max-draft-tokens", "15"), "max-draft-tokens");
+  result.dflash_sync_window = ParseSize(
+      TakeOptional(&values, "dflash-sync-window", "1"),
+      "dflash-sync-window");
+  if (result.dflash_sync_window > 2) {
+    throw std::invalid_argument("dflash-sync-window must be 1 or 2");
+  }
   result.warmup = ParseSize(TakeOptional(&values, "warmup", "3"), "warmup");
   result.repetitions = ParseSize(
       TakeOptional(&values, "repetitions", "10"), "repetitions");
@@ -429,6 +437,8 @@ void WriteMeasurement(
          << value.counters.accepted_draft_tokens
          << ",\"rejected_draft_tokens\":"
          << value.counters.rejected_draft_tokens
+         << ",\"speculative_transactions\":"
+         << value.counters.speculative_transactions
          << ",\"decode_iterations\":" << value.counters.decode_iterations
          << "},\"latency_ms\":{\"prefill\":" << value.prefill_ms
          << ",\"decode\":" << value.decode_ms
@@ -519,13 +529,36 @@ void WriteReport(
     throw std::runtime_error(
         "profile model execution trace does not close");
   }
+  if (execution.speculative_sync_windows +
+              execution.speculative_synchronizations_elided !=
+          execution.target_verify_commit_executions ||
+      execution.speculative_d2h_operations_elided !=
+          execution.speculative_synchronizations_elided ||
+      execution.compact_slot_bytes <
+          execution.compact_verify_result_bytes ||
+      execution.speculative_d2h_padding_bytes !=
+          execution.speculative_d2h_operations_elided *
+              (execution.compact_slot_bytes -
+               execution.compact_verify_result_bytes) ||
+      execution.stream_synchronizations !=
+          execution.prefill_completion_synchronizations +
+              execution.target_decode1_executions +
+              execution.speculative_sync_windows ||
+      execution.device_to_host_operations +
+              execution.speculative_d2h_operations_elided !=
+          execution.prefill_completion_synchronizations +
+              execution.target_decode1_executions +
+              execution.target_verify_commit_executions) {
+    throw std::runtime_error(
+        "speculative synchronization window counters do not close");
+  }
   const double speedup = result.dflash.model_total_ms.median > 0.0
       ? result.ordinary.model_total_ms.median /
             result.dflash.model_total_ms.median
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":4,\"status\":\"PASS\","
+         << "{\"schema_version\":5,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
          << (executor.unified_target_step() ? "four" : "five")
          << "-resident-OM paired model loop\","
@@ -574,6 +607,11 @@ void WriteReport(
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
          << ",\"compact_ping_pong_device_bytes\":"
          << execution.compact_ping_pong_device_bytes
+         << ",\"compact_slot_bytes\":" << execution.compact_slot_bytes
+         << ",\"compact_ordinary_result_bytes\":"
+         << execution.compact_ordinary_result_bytes
+         << ",\"compact_verify_result_bytes\":"
+         << execution.compact_verify_result_bytes
          << ",\"prefill_control_bytes_per_slot\":"
          << execution.prefill_control_bytes_per_slot
          << ",\"prefill_base_control_bytes_per_slot\":"
@@ -586,6 +624,8 @@ void WriteReport(
          << execution.prefill_persistent_control_tail_bytes_per_slot
          << ",\"prefill_staging_pinned_host_bytes\":"
          << execution.prefill_staging_pinned_host_bytes
+         << ",\"proposal_count_staging_pinned_host_bytes\":"
+         << execution.proposal_count_staging_pinned_host_bytes
          << ",\"prefill_feature_slab_bytes\":"
          << execution.prefill_feature_slab_bytes
          << ",\"prefill_feature_arena_bytes\":"
@@ -612,6 +652,13 @@ void WriteReport(
          << (formal_latency_evidence ? "true" : "false")
          << ",\"profile_model_execution_trace_enabled\":"
          << (formal_latency_evidence ? "false" : "true")
+         << ",\"dflash_sync_window\":"
+         << arguments.dflash_sync_window
+         << ",\"maximum_supported_dflash_sync_window\":"
+         << executor.max_speculative_sync_window()
+         << ",\"decode_iteration_scope\":\"one host-visible "
+            "synchronization window; a DFlash window may contain one or two "
+            "complete speculative transactions\""
          << ",\"order\":\"alternating ordinary/DFlash in one "
          << (executor.unified_target_step() ? "four" : "five")
          << "-model process\","
@@ -680,8 +727,10 @@ void WriteReport(
          << "\"execution_io_counters\":{"
          << "\"scope\":\"paired warmups and measurements\","
          << "\"proposal_policy\":\"Draft-to-verify device carrier; no proposal D2H/H2D\","
-         << "\"result_policy\":\"one compact D2H and one barrier per "
-            "complete prompt/decode/speculative transaction; no host-visible "
+         << "\"result_policy\":\"one logical compact result per complete "
+            "transaction; an exact two-transaction DFlash window coalesces "
+            "adjacent compact slots into one D2H; one barrier per prompt/decode "
+            "transaction or DFlash synchronization window; no host-visible "
             "result for intermediate prefill chunks\","
          << "\"model_executions\":" << model_executions
          << ",\"target_prefill_executions\":"
@@ -708,6 +757,14 @@ void WriteReport(
          << execution.target_step_zero_count_bindings
          << ",\"stream_synchronizations\":"
          << execution.stream_synchronizations
+         << ",\"speculative_sync_windows\":"
+         << execution.speculative_sync_windows
+         << ",\"speculative_synchronizations_elided\":"
+         << execution.speculative_synchronizations_elided
+         << ",\"speculative_d2h_operations_elided\":"
+         << execution.speculative_d2h_operations_elided
+         << ",\"speculative_d2h_padding_bytes\":"
+         << execution.speculative_d2h_padding_bytes
          << ",\"prefill_completion_synchronizations\":"
          << execution.prefill_completion_synchronizations
          << ",\"deferred_prefill_chunks\":"
@@ -756,6 +813,8 @@ void WriteReport(
          << execution.proposal_count_upload_operations
          << ",\"proposal_count_upload_bytes\":"
          << execution.proposal_count_upload_bytes
+         << ",\"proposal_count_staging_pinned_host_bytes\":"
+         << execution.proposal_count_staging_pinned_host_bytes
          << ",\"state_resets\":" << execution.state_resets
          << ",\"state_memset_operations\":"
          << execution.state_memset_operations
@@ -782,6 +841,11 @@ void WriteReport(
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
          << ",\"compact_ping_pong_device_bytes\":"
          << execution.compact_ping_pong_device_bytes
+         << ",\"compact_slot_bytes\":" << execution.compact_slot_bytes
+         << ",\"compact_ordinary_result_bytes\":"
+         << execution.compact_ordinary_result_bytes
+         << ",\"compact_verify_result_bytes\":"
+         << execution.compact_verify_result_bytes
          << ",\"prefill_staging_slots\":"
          << execution.prefill_staging_slots
          << ",\"prefill_control_bytes_per_slot\":"
@@ -942,6 +1006,7 @@ int main(int argc, char** argv) {
     options.pad_token_id = arguments.pad_token_id;
     options.max_new_tokens = arguments.max_new_tokens;
     options.max_draft_tokens = arguments.max_draft_tokens;
+    options.dflash_sync_window = arguments.dflash_sync_window;
     options.eos_token_ids = arguments.eos_token_ids;
     PrintProgress(
         arguments.progress,

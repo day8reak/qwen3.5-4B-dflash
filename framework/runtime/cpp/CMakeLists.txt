@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(qwen35_dflash_acl_runner VERSION 1.12.0 LANGUAGES CXX)
+project(qwen35_dflash_acl_runner VERSION 1.13.0 LANGUAGES CXX)
 
 option(QWEN35_DFLASH_BUILD_ACL_RUNNER "Build the AscendCL executable" ON)
 option(QWEN35_DFLASH_BUILD_TESTS "Build host-only scheduler tests" ON)
@@ -212,6 +212,25 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
   )
   add_test(
+    NAME qwen35_dflash_fake_incremental_acl_runner_window2
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
+      -DDECODE_SHA=${_decode_om_sha256}
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DDRAFT_SHA=${_draft_om_sha256}
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om
+      -DVERIFY_SHA=${_verify_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-incremental-window2-report.json
+      -DDFLASH_SYNC_WINDOW=2
+      -DMAX_NEW_TOKENS=10
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
+  )
+  add_test(
     NAME qwen35_dflash_fake_incremental_acl_runner_immutable_zero
     COMMAND "${CMAKE_COMMAND}"
       -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
@@ -296,6 +315,82 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-unified-target-step-profile-report.json
       -DUNIFIED_TARGET_STEP=ON
       -DMEASUREMENT_PROTOCOL=profile
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_unified_target_step_runner_window1_long
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DDRAFT_SHA=${_draft_om_sha256}
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om
+      -DVERIFY_SHA=${_dynamic_verify_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-unified-target-step-window1-long-report.json
+      -DUNIFIED_TARGET_STEP=ON
+      -DDFLASH_SYNC_WINDOW=1
+      -DMAX_NEW_TOKENS=10
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_unified_target_step_runner_window2
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DDRAFT_SHA=${_draft_om_sha256}
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om
+      -DVERIFY_SHA=${_dynamic_verify_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-unified-target-step-window2-report.json
+      -DUNIFIED_TARGET_STEP=ON
+      -DDFLASH_SYNC_WINDOW=2
+      -DMAX_NEW_TOKENS=10
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_unified_target_step_runner_window1_adaptive_k
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DDRAFT_SHA=${_draft_om_sha256}
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om
+      -DVERIFY_SHA=${_dynamic_verify_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-unified-target-step-window1-adaptive-k-report.json
+      -DUNIFIED_TARGET_STEP=ON
+      -DDFLASH_SYNC_WINDOW=1
+      -DMAX_NEW_TOKENS=32
+      -DMAX_DRAFT_TOKENS=15
+      -DADAPTIVE_PROPOSAL_COUNTS=ON
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_unified_target_step_runner_window2_adaptive_k
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DDRAFT_SHA=${_draft_om_sha256}
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om
+      -DVERIFY_SHA=${_dynamic_verify_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-unified-target-step-window2-adaptive-k-report.json
+      -DUNIFIED_TARGET_STEP=ON
+      -DDFLASH_SYNC_WINDOW=2
+      -DMAX_NEW_TOKENS=32
+      -DMAX_DRAFT_TOKENS=15
+      -DADAPTIVE_PROPOSAL_COUNTS=ON
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
   )
   add_test(

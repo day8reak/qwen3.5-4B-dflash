@@ -41,6 +41,9 @@ void RunPolicy(
   Require(executor.prefill_width() == 64, "fake prefill gear differs");
   Require(executor.proposal_width() == 15, "fake proposal width differs");
   Require(executor.eos_table_width() == 4, "fake EOS width differs");
+  Require(
+      executor.max_speculative_sync_window() == 2,
+      "fake executor sync-window capability differs");
   Require(executor.state_reset_policy() == reset_policy, "reset policy differs");
   Require(
       executor.decode_carrier_policy() == decode_carrier_policy,
@@ -132,7 +135,8 @@ void RunPolicy(
           stats.prefill_count_control_bytes_per_slot == 644 &&
           stats.prefill_proposal_control_bytes_per_slot == 708 &&
           stats.prefill_persistent_control_tail_bytes_per_slot == 188 &&
-          stats.prefill_staging_pinned_host_bytes == 1792,
+          stats.prefill_staging_pinned_host_bytes == 1792 &&
+          stats.proposal_count_staging_pinned_host_bytes == 8,
       "prefill pinned-host staging ring differs");
   Require(
       stats.prefill_draft_propose_executions == 3 &&
@@ -221,6 +225,11 @@ void RunPolicy(
   Require(stats.working_state_device_bytes > 0, "working state is missing");
   Require(
       stats.compact_ping_pong_device_bytes > 0 &&
+          stats.compact_ping_pong_device_bytes ==
+              2 * stats.compact_slot_bytes &&
+          stats.compact_slot_bytes == 512 &&
+          stats.compact_ordinary_result_bytes == 257 &&
+          stats.compact_verify_result_bytes == 452 &&
           stats.carrier_device_bytes > stats.compact_ping_pong_device_bytes,
       "compact result ping-pong allocation was not reported");
   Require(stats.state_reset_bytes_per_request > 0, "reset byte set is empty");
@@ -258,13 +267,26 @@ void RunPolicy(
         "immutable zero startup initialization counters differ");
   }
   Require(
-      stats.stream_synchronizations ==
+      stats.speculative_sync_windows +
+              stats.speculative_synchronizations_elided ==
+          stats.target_verify_commit_executions &&
+          stats.speculative_d2h_operations_elided ==
+              stats.speculative_synchronizations_elided &&
+          stats.speculative_d2h_padding_bytes ==
+              stats.speculative_d2h_operations_elided *
+                  (stats.compact_slot_bytes -
+                   stats.compact_verify_result_bytes) &&
+          stats.stream_synchronizations ==
+              stats.prefill_completion_synchronizations +
+                  stats.target_decode1_executions +
+                  stats.speculative_sync_windows,
+      "reset or Draft introduced an extra transaction barrier");
+  Require(
+      stats.device_to_host_operations +
+              stats.speculative_d2h_operations_elided ==
           stats.prefill_completion_synchronizations +
               stats.target_decode1_executions +
               stats.target_verify_commit_executions,
-      "reset or Draft introduced an extra transaction barrier");
-  Require(
-      stats.device_to_host_operations == stats.stream_synchronizations,
       "each transaction must return exactly one compact host result");
   Require(stats.state_device_bytes > 0, "state arenas were not reported");
   Require(

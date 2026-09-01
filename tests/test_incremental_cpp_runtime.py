@@ -58,6 +58,7 @@ def _report(
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     prompt_token_ids: list[int] | None = None,
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+    dflash_sync_window: int = 1,
 ) -> dict[str, object]:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
     request_count = 26
@@ -97,6 +98,8 @@ def _report(
         - prefill_control_upload_bytes
     )
     decode_executions = 65
+    speculative_windows = 26 if dflash_sync_window == 1 else 13
+    speculative_syncs_elided = 26 - speculative_windows
     last_token_d2d = (
         decode_carrier_policy == LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
     )
@@ -124,7 +127,7 @@ def _report(
         for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -139,6 +142,12 @@ def _report(
             "kind": "evidence",
             "formal_latency_evidence": True,
             "profile_model_execution_trace_enabled": False,
+            "dflash_sync_window": dflash_sync_window,
+            "maximum_supported_dflash_sync_window": 2,
+            "decode_iteration_scope": (
+                "one host-visible synchronization window; a DFlash window "
+                "may contain one or two complete speculative transactions"
+            ),
             "prefill_completion_policy": (
                 "intermediate prompt chunks stay queued; final chunk performs "
                 "the only compact D2H and stream synchronization"
@@ -209,6 +218,9 @@ def _report(
             "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 4096,
             "compact_ping_pong_device_bytes": 1024,
+            "compact_slot_bytes": 512,
+            "compact_ordinary_result_bytes": 257,
+            "compact_verify_result_bytes": 452,
             "prefill_control_bytes_per_slot": prefill_control_bytes,
             "prefill_base_control_bytes_per_slot": (
                 prefill_base_control_bytes
@@ -223,6 +235,7 @@ def _report(
                 prefill_persistent_control_tail_bytes
             ),
             "prefill_staging_pinned_host_bytes": 1792,
+            "proposal_count_staging_pinned_host_bytes": 8,
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
             "draft_dynamic_gear_count": 3,
@@ -250,7 +263,19 @@ def _report(
             "target_decode1_executions": decode_executions,
             "draft_propose_executions": draft_propose_executions,
             "target_verify_commit_executions": 26,
-            "stream_synchronizations": 117,
+            "stream_synchronizations": (
+                request_count + decode_executions + speculative_windows
+            ),
+            "speculative_sync_windows": speculative_windows,
+            "speculative_synchronizations_elided": (
+                speculative_syncs_elided
+            ),
+            "speculative_d2h_operations_elided": (
+                speculative_syncs_elided
+            ),
+            "speculative_d2h_padding_bytes": (
+                speculative_syncs_elided * 60
+            ),
             "prefill_completion_synchronizations": request_count,
             "deferred_prefill_chunks": deferred_prefill,
             "prefill_synchronizations_elided": deferred_prefill,
@@ -291,6 +316,7 @@ def _report(
             ),
             "proposal_count_upload_operations": proposal_upload_operations,
             "proposal_count_upload_bytes": proposal_upload_operations * 4,
+            "proposal_count_staging_pinned_host_bytes": 8,
             "state_resets": 26,
             "state_memset_operations": 0 if immutable_zero else 52,
             "state_memset_bytes": 0 if immutable_zero else 26 * reset_bytes,
@@ -309,14 +335,21 @@ def _report(
                 + decode_upload_operations * 8
                 + proposal_upload_operations * 4
             ),
-            "device_to_host_operations": 117,
-            "device_to_host_bytes": 8192,
+            "device_to_host_operations": (
+                117 - speculative_syncs_elided
+            ),
+            "device_to_host_bytes": (
+                8192 + speculative_syncs_elided * 60
+            ),
             "state_device_bytes": state_bytes,
             "working_state_device_bytes": working_state_bytes,
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 4096,
             "compact_ping_pong_device_bytes": 1024,
+            "compact_slot_bytes": 512,
+            "compact_ordinary_result_bytes": 257,
+            "compact_verify_result_bytes": 452,
             "prefill_staging_slots": 2,
             "prefill_control_bytes_per_slot": prefill_control_bytes,
             "prefill_base_control_bytes_per_slot": (
@@ -332,6 +365,7 @@ def _report(
                 prefill_persistent_control_tail_bytes
             ),
             "prefill_staging_pinned_host_bytes": 1792,
+            "proposal_count_staging_pinned_host_bytes": 8,
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
             "draft_dynamic_gear_count": 3,
@@ -433,6 +467,7 @@ def _validate(
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     prompt_token_ids: list[int] | None = None,
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+    dflash_sync_window: int = 1,
     unified_target_step: bool = False,
 ) -> None:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
@@ -451,6 +486,7 @@ def _validate(
         max_draft_tokens=3,
         state_reset_policy=state_reset_policy,
         decode_carrier_policy=decode_carrier_policy,
+        dflash_sync_window=dflash_sync_window,
     )
 
 
@@ -510,6 +546,10 @@ def test_incremental_runner_rejects_decode_carrier_policy_mismatch() -> None:
     ("field", "value"),
     [
         ("stream_synchronizations", 118),
+        ("speculative_sync_windows", 25),
+        ("speculative_synchronizations_elided", 1),
+        ("speculative_d2h_operations_elided", 1),
+        ("speculative_d2h_padding_bytes", 1),
         ("device_to_host_operations", 118),
         ("state_resets", 25),
         ("model_executions", 157),
@@ -531,7 +571,11 @@ def test_incremental_runner_rejects_decode_carrier_policy_mismatch() -> None:
         ("decode_id_device_compaction_operations", 12),
         ("decode_id_device_compaction_bytes", 1),
         ("compact_ping_pong_device_bytes", 1),
+        ("compact_slot_bytes", 511),
+        ("compact_ordinary_result_bytes", 256),
+        ("compact_verify_result_bytes", 451),
         ("proposal_count_upload_bytes", 7),
+        ("proposal_count_staging_pinned_host_bytes", 1),
     ],
 )
 def test_incremental_runner_rejects_inconsistent_execution_counters(
@@ -573,6 +617,7 @@ def test_incremental_runner_config_is_explicit() -> None:
             "state_policy": INCREMENTAL_STATE_POLICY,
             "state_reset_policy": IMMUTABLE_ZERO_STATE_RESET_POLICY,
             "decode_carrier_policy": ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
+            "dflash_sync_window": 2,
             "pad_token_id": 0,
         },
         0,
@@ -586,6 +631,7 @@ def test_incremental_runner_config_is_explicit() -> None:
         identity["decode_carrier_policy"]
         == ONE_TOKEN_H2D_DECODE_CARRIER_POLICY
     )
+    assert identity["dflash_sync_window"] == 2
 
 
 def test_incremental_runner_rejects_unknown_state_reset_policy() -> None:
@@ -618,6 +664,31 @@ def test_incremental_runner_rejects_unknown_decode_carrier_policy() -> None:
             },
             0,
         )
+
+
+def test_incremental_runner_rejects_unknown_dflash_sync_window() -> None:
+    with pytest.raises(ValueError, match="dflash_sync_window"):
+        validate_cpp_runner_options(
+            {
+                "device_model": "Ascend310P3",
+                "cann": "test-cann",
+                "driver": "test-driver",
+                "firmware": "test-firmware",
+                "runtime": "AscendCL",
+                "state_policy": INCREMENTAL_STATE_POLICY,
+                "dflash_sync_window": 3,
+            },
+            0,
+        )
+
+
+def test_incremental_runner_rejects_dflash_sync_window_report_mismatch() -> None:
+    with pytest.raises(RuntimeError, match="sync window"):
+        _validate(_report(dflash_sync_window=1), dflash_sync_window=2)
+
+
+def test_incremental_runner_accepts_closed_two_transaction_window() -> None:
+    _validate(_report(dflash_sync_window=2), dflash_sync_window=2)
 
 
 def test_resolve_incremental_oms_locks_all_five_abis_and_hashes(
@@ -798,6 +869,7 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
     assert command[command.index("--decode-carrier-policy") + 1] == (
         LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
     )
+    assert command[command.index("--dflash-sync-window") + 1] == "1"
     assert command[command.index("--measurement-protocol") + 1] == "evidence"
     assert payload["backend_metadata"]["state_policy"] == (
         INCREMENTAL_STATE_POLICY

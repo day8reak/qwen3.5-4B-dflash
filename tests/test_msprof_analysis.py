@@ -37,10 +37,10 @@ def _runner_report() -> dict[str, object]:
         {"ordinal": 7, "model_id": 4, "physical_rows": 1},
     ]
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "status": "PASS",
         "runner_id": "qwen35-dflash-ascendcl-cpp-incremental-v3",
-        "runner_version": "1.12.0",
+        "runner_version": "1.13.0",
         "cpu_fallback": False,
         "device_id": 0,
         "models": models,
@@ -55,6 +55,7 @@ def _runner_report() -> dict[str, object]:
             "kind": "profile",
             "formal_latency_evidence": False,
             "profile_model_execution_trace_enabled": True,
+            "dflash_sync_window": 1,
         },
         "execution_io_counters": {
             "model_executions": 8,
@@ -72,6 +73,13 @@ def _runner_report() -> dict[str, object]:
             "state_memset_operations": 2,
             "state_initialization_memset_operations": 0,
             "stream_synchronizations": 4,
+            "speculative_sync_windows": 1,
+            "speculative_synchronizations_elided": 0,
+            "speculative_d2h_operations_elided": 0,
+            "speculative_d2h_padding_bytes": 0,
+            "compact_slot_bytes": 512,
+            "compact_verify_result_bytes": 452,
+            "prefill_completion_synchronizations": 1,
             "state_initialization_stream_synchronizations": 0,
         },
         "profile_model_execution_trace": trace,
@@ -204,6 +212,25 @@ def test_msprof_analysis_attributes_every_role_and_dynamic_gear(
         "operations": 3,
         "bytes": 1024,
     }
+    assert payload["expected_synchronization_signature"] == {
+        "stream_synchronizations": 4,
+        "speculative_transactions": 1,
+        "speculative_sync_windows": 1,
+        "speculative_synchronizations_elided": 0,
+        "speculative_d2h_operations_elided": 0,
+        "speculative_d2h_padding_bytes": 0,
+        "closure": (
+            "speculative_sync_windows + "
+            "speculative_synchronizations_elided == "
+            "speculative_transactions"
+        ),
+        "device_to_host_closure": (
+            "device_to_host_operations + "
+            "speculative_d2h_operations_elided == "
+            "prefill_completion_synchronizations + "
+            "target_decode1_executions + speculative_transactions"
+        ),
+    }
 
 
 def test_msprof_analysis_accepts_legacy_ids_from_filename(
@@ -259,6 +286,38 @@ def test_msprof_analysis_rejects_api_count_drift(tmp_path: Path) -> None:
         analyze_incremental_msprof(
             profile_dir=profile,
             runner_report=report,
+        )
+
+
+def test_msprof_analysis_rejects_sync_window_counter_drift(
+    tmp_path: Path,
+) -> None:
+    report_path, profile = _case(tmp_path)
+    report = _runner_report()
+    report["execution_io_counters"][
+        "speculative_synchronizations_elided"
+    ] = 1
+    _write_json(report_path, report)
+    with pytest.raises(MsprofAnalysisError, match="do not close"):
+        analyze_incremental_msprof(
+            profile_dir=profile,
+            runner_report=report_path,
+        )
+
+
+def test_msprof_analysis_rejects_coalesced_d2h_padding_drift(
+    tmp_path: Path,
+) -> None:
+    report_path, profile = _case(tmp_path)
+    report = _runner_report()
+    report["execution_io_counters"][
+        "speculative_d2h_padding_bytes"
+    ] = 1
+    _write_json(report_path, report)
+    with pytest.raises(MsprofAnalysisError, match="do not close"):
+        analyze_incremental_msprof(
+            profile_dir=profile,
+            runner_report=report_path,
         )
 
 

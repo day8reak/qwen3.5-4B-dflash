@@ -66,6 +66,10 @@ struct IncrementalAclExecutionStats {
   std::size_t draft_propose_executions = 0;
   std::size_t target_verify_commit_executions = 0;
   std::size_t stream_synchronizations = 0;
+  std::size_t speculative_sync_windows = 0;
+  std::size_t speculative_synchronizations_elided = 0;
+  std::size_t speculative_d2h_operations_elided = 0;
+  std::size_t speculative_d2h_padding_bytes = 0;
   std::size_t prefill_completion_synchronizations = 0;
   std::size_t deferred_prefill_chunks = 0;
   std::size_t prefill_synchronizations_elided = 0;
@@ -90,6 +94,7 @@ struct IncrementalAclExecutionStats {
   std::size_t decode_id_device_compaction_bytes = 0;
   std::size_t proposal_count_upload_operations = 0;
   std::size_t proposal_count_upload_bytes = 0;
+  std::size_t proposal_count_staging_pinned_host_bytes = 0;
   std::size_t state_resets = 0;
   std::size_t state_memset_operations = 0;
   std::size_t state_memset_bytes = 0;
@@ -106,6 +111,9 @@ struct IncrementalAclExecutionStats {
   std::size_t state_reset_bytes_per_request = 0;
   std::size_t carrier_device_bytes = 0;
   std::size_t compact_ping_pong_device_bytes = 0;
+  std::size_t compact_slot_bytes = 0;
+  std::size_t compact_ordinary_result_bytes = 0;
+  std::size_t compact_verify_result_bytes = 0;
   std::size_t prefill_staging_slots = 0;
   std::size_t prefill_control_bytes_per_slot = 0;
   std::size_t prefill_base_control_bytes_per_slot = 0;
@@ -186,6 +194,9 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
   StatefulStep DecodeOne(std::int64_t input_token_id) override;
   StatefulStep SpeculativeStep(
       std::size_t logical_proposal_count) override;
+  std::size_t max_speculative_sync_window() const noexcept override;
+  std::vector<StatefulStep> SpeculativeWindow(
+      const std::vector<std::size_t>& logical_proposal_counts) override;
 
   const std::vector<IncrementalModelMemory>& model_memory() const noexcept;
   const std::vector<IncrementalModelExecutionTrace>&
