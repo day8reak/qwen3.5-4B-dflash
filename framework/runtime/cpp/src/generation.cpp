@@ -411,6 +411,224 @@ GenerationMeasurement GenerateOnceWithContext(
   return result;
 }
 
+void ValidateStatefulInputs(
+    const StatefulGraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt,
+    const GenerationOptions& options) {
+  if (executor.sequence_length() <= 1) {
+    throw std::invalid_argument("stateful OM capacity must exceed one token");
+  }
+  if (executor.prefill_width() == 0) {
+    throw std::invalid_argument("stateful prefill width must be positive");
+  }
+  if (executor.proposal_width() == 0) {
+    throw std::invalid_argument("stateful proposal width must be positive");
+  }
+  if (prompt.empty()) {
+    throw std::invalid_argument("prompt token IDs must not be empty");
+  }
+  RequireNonNegative(prompt, "prompt");
+  RequireNonNegative(options.eos_token_ids, "EOS set");
+  if (options.eos_token_ids.size() > executor.eos_table_width()) {
+    throw std::invalid_argument("EOS set exceeds the exported fixed table width");
+  }
+  if (options.pad_token_id < 0) {
+    throw std::invalid_argument("pad token ID must be non-negative");
+  }
+  if (options.max_new_tokens == 0 || options.max_draft_tokens == 0) {
+    throw std::invalid_argument("generation limits must be positive");
+  }
+  if (prompt.size() + options.max_new_tokens - 1 >
+      executor.sequence_length()) {
+    throw std::invalid_argument(
+        "prompt plus requested generation exceeds the state cache capacity");
+  }
+}
+
+void ValidateStatefulStep(
+    const StatefulStep& step,
+    const std::unordered_set<std::int64_t>& eos,
+    bool speculative,
+    std::size_t proposal_limit) {
+  if (step.model_executions == 0) {
+    throw std::runtime_error("stateful executor reported no OM execution");
+  }
+  if (step.token_ids.empty()) {
+    throw std::runtime_error("stateful graph committed no token");
+  }
+  RequireNonNegative(step.token_ids, "stateful graph output");
+  bool host_finished = false;
+  for (std::size_t index = 0; index < step.token_ids.size(); ++index) {
+    if (IsEos(step.token_ids[index], eos)) {
+      if (index + 1 != step.token_ids.size()) {
+        throw std::runtime_error("stateful graph returned tokens after EOS");
+      }
+      host_finished = true;
+    }
+  }
+  if (host_finished != step.finished) {
+    throw std::runtime_error("device and host EOS decisions differ");
+  }
+  if (!speculative) {
+    if (step.token_ids.size() != 1 || step.drafted_tokens != 0 ||
+        step.accepted_draft_tokens != 0 ||
+        step.rejected_draft_tokens != 0) {
+      throw std::runtime_error("ordinary Target step returned speculative data");
+    }
+    return;
+  }
+  if (step.drafted_tokens == 0 || step.drafted_tokens > proposal_limit) {
+    throw std::runtime_error("verify graph returned an invalid drafted count");
+  }
+  if (step.accepted_draft_tokens + step.rejected_draft_tokens !=
+      step.drafted_tokens) {
+    throw std::runtime_error("verify acceptance counters do not close");
+  }
+  if (step.token_ids.size() > step.accepted_draft_tokens + 1) {
+    throw std::runtime_error("verify graph committed too many tokens");
+  }
+}
+
+GenerationMeasurement GenerateStatefulOnceWithContext(
+    StatefulGraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    GenerationMode mode,
+    const GenerationOptions& options,
+    const ProgressCallback& progress,
+    const char* phase,
+    std::size_t run_index,
+    std::size_t run_total) {
+  ValidateStatefulInputs(executor, prompt_token_ids, options);
+  const std::unordered_set<std::int64_t> eos(
+      options.eos_token_ids.begin(), options.eos_token_ids.end());
+
+  EmitProgress(
+      progress, phase, mode, run_index, run_total, "state-reset-start", 0,
+      options.max_new_tokens, prompt_token_ids.size(), 0, 0, 0.0);
+  executor.Reset(options.pad_token_id, options.eos_token_ids);
+  EmitProgress(
+      progress, phase, mode, run_index, run_total, "state-reset-done", 0,
+      options.max_new_tokens, prompt_token_ids.size(), 0, 0, 0.0);
+
+  std::vector<std::int64_t> prefix = prompt_token_ids;
+  prefix.reserve(executor.sequence_length() + 1);
+  std::vector<std::int64_t> generated;
+  generated.reserve(options.max_new_tokens);
+  GenerationMeasurement result;
+
+  EmitProgress(
+      progress, phase, mode, run_index, run_total, "run-start", 0,
+      options.max_new_tokens, prefix.size(), 0, 0, 0.0);
+  EmitProgress(
+      progress, phase, mode, run_index, run_total, "prefill-start", 0,
+      options.max_new_tokens, prefix.size(), 0, 0, 0.0);
+  const auto prefill_start = Clock::now();
+
+  StatefulStep final_prefill;
+  std::size_t prompt_offset = 0;
+  while (prompt_offset < prompt_token_ids.size()) {
+    const std::size_t chunk_size = std::min(
+        executor.prefill_width(), prompt_token_ids.size() - prompt_offset);
+    const bool last_chunk =
+        prompt_offset + chunk_size == prompt_token_ids.size();
+    const bool prepare_draft =
+        mode == GenerationMode::kDFlash && options.max_new_tokens > 1;
+    const std::size_t proposal_count = prepare_draft
+        ? (last_chunk
+               ? std::min(
+                     {options.max_draft_tokens,
+                      executor.proposal_width(),
+                      options.max_new_tokens - 1})
+               : std::min(
+                     options.max_draft_tokens,
+                     executor.proposal_width()))
+        : 0;
+    std::vector<std::int64_t> chunk(
+        prompt_token_ids.begin() + static_cast<std::ptrdiff_t>(prompt_offset),
+        prompt_token_ids.begin() +
+            static_cast<std::ptrdiff_t>(prompt_offset + chunk_size));
+    StatefulStep step = executor.PrefillChunk(
+        chunk, prepare_draft, proposal_count);
+    ValidateStatefulStep(step, eos, false, 0);
+    result.counters.graph_calls += step.model_executions;
+    if (last_chunk) {
+      final_prefill = std::move(step);
+    }
+    prompt_offset += chunk_size;
+  }
+
+  bool finished = false;
+  AppendCommitted(
+      final_prefill.token_ids,
+      options.max_new_tokens,
+      eos,
+      &generated,
+      &prefix,
+      &finished);
+  const auto prefill_end = Clock::now();
+  result.prefill_ms = Milliseconds(prefill_start, prefill_end);
+  EmitProgress(
+      progress, phase, mode, run_index, run_total, "prefill-done",
+      generated.size(), options.max_new_tokens, prefix.size(),
+      result.counters.graph_calls, 0, result.prefill_ms);
+
+  while (!finished && generated.size() < options.max_new_tokens) {
+    const std::size_t remaining = options.max_new_tokens - generated.size();
+    const std::size_t decode_iteration =
+        result.counters.decode_iterations + 1;
+    EmitProgress(
+        progress, phase, mode, run_index, run_total, "decode-start",
+        generated.size(), options.max_new_tokens, prefix.size(),
+        result.counters.graph_calls, decode_iteration, 0.0);
+    const auto decode_start = Clock::now();
+
+    StatefulStep step;
+    if (mode == GenerationMode::kOrdinary || remaining == 1) {
+      step = executor.DecodeOne(prefix.back());
+      ValidateStatefulStep(step, eos, false, 0);
+    } else {
+      const std::size_t proposal_count = std::min(
+          {options.max_draft_tokens,
+           executor.proposal_width(),
+           remaining - 1});
+      step = executor.SpeculativeStep(proposal_count);
+      ValidateStatefulStep(step, eos, true, proposal_count);
+      result.counters.drafted_tokens += step.drafted_tokens;
+      result.counters.accepted_draft_tokens +=
+          step.accepted_draft_tokens;
+      result.counters.rejected_draft_tokens +=
+          step.rejected_draft_tokens;
+    }
+    result.counters.graph_calls += step.model_executions;
+    AppendCommitted(
+        step.token_ids, remaining, eos, &generated, &prefix, &finished);
+
+    const auto decode_end = Clock::now();
+    const double iteration_ms = Milliseconds(decode_start, decode_end);
+    result.decode_iteration_ms.push_back(iteration_ms);
+    result.decode_ms += iteration_ms;
+    ++result.counters.decode_iterations;
+    EmitProgress(
+        progress, phase, mode, run_index, run_total, "decode-done",
+        generated.size(), options.max_new_tokens, prefix.size(),
+        result.counters.graph_calls, decode_iteration, iteration_ms);
+  }
+
+  result.generated_token_ids = std::move(generated);
+  result.stop_reason =
+      (!result.generated_token_ids.empty() &&
+       IsEos(result.generated_token_ids.back(), eos))
+          ? "eos"
+          : "length";
+  result.model_total_ms = result.prefill_ms + result.decode_ms;
+  EmitProgress(
+      progress, phase, mode, run_index, run_total, "run-done",
+      result.generated_token_ids.size(), options.max_new_tokens,
+      prefix.size(), result.counters.graph_calls,
+      result.counters.decode_iterations, result.model_total_ms);
+  return result;
+}
+
 }  // namespace
 
 GenerationMeasurement GenerateOnce(
@@ -542,6 +760,139 @@ PairedBenchmarkResult BenchmarkPair(
   if (result.token_id_mismatches != 0 || result.eos_mismatches != 0) {
     throw std::runtime_error(
         "DFlash output differs from the ordinary greedy authority");
+  }
+  return result;
+}
+
+GenerationMeasurement GenerateStatefulOnce(
+    StatefulGraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    GenerationMode mode,
+    const GenerationOptions& options,
+    const ProgressCallback& progress) {
+  return GenerateStatefulOnceWithContext(
+      executor,
+      prompt_token_ids,
+      mode,
+      options,
+      progress,
+      "single",
+      1,
+      1);
+}
+
+BenchmarkResult BenchmarkStateful(
+    StatefulGraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    GenerationMode mode,
+    const GenerationOptions& options,
+    std::size_t warmup,
+    std::size_t repetitions,
+    const ProgressCallback& progress) {
+  if (repetitions == 0) {
+    throw std::invalid_argument("benchmark repetitions must be positive");
+  }
+  for (std::size_t index = 0; index < warmup; ++index) {
+    static_cast<void>(GenerateStatefulOnceWithContext(
+        executor,
+        prompt_token_ids,
+        mode,
+        options,
+        progress,
+        "warmup",
+        index + 1,
+        warmup));
+  }
+  std::vector<GenerationMeasurement> measurements;
+  measurements.reserve(repetitions);
+  for (std::size_t index = 0; index < repetitions; ++index) {
+    measurements.push_back(GenerateStatefulOnceWithContext(
+        executor,
+        prompt_token_ids,
+        mode,
+        options,
+        progress,
+        "measurement",
+        index + 1,
+        repetitions));
+  }
+  return FinalizeBenchmark(mode, warmup, std::move(measurements));
+}
+
+PairedBenchmarkResult BenchmarkPairStateful(
+    StatefulGraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    const GenerationOptions& options,
+    std::size_t warmup,
+    std::size_t repetitions,
+    const ProgressCallback& progress) {
+  if (repetitions == 0) {
+    throw std::invalid_argument("benchmark repetitions must be positive");
+  }
+  for (std::size_t index = 0; index < warmup; ++index) {
+    if (index % 2 == 0) {
+      static_cast<void>(GenerateStatefulOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
+          progress, "warmup", index + 1, warmup));
+      static_cast<void>(GenerateStatefulOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options,
+          progress, "warmup", index + 1, warmup));
+    } else {
+      static_cast<void>(GenerateStatefulOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options,
+          progress, "warmup", index + 1, warmup));
+      static_cast<void>(GenerateStatefulOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
+          progress, "warmup", index + 1, warmup));
+    }
+  }
+
+  std::vector<GenerationMeasurement> ordinary;
+  std::vector<GenerationMeasurement> dflash;
+  ordinary.reserve(repetitions);
+  dflash.reserve(repetitions);
+  for (std::size_t index = 0; index < repetitions; ++index) {
+    if (index % 2 == 0) {
+      ordinary.push_back(GenerateStatefulOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
+          progress, "measurement", index + 1, repetitions));
+      dflash.push_back(GenerateStatefulOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options,
+          progress, "measurement", index + 1, repetitions));
+    } else {
+      dflash.push_back(GenerateStatefulOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kDFlash, options,
+          progress, "measurement", index + 1, repetitions));
+      ordinary.push_back(GenerateStatefulOnceWithContext(
+          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
+          progress, "measurement", index + 1, repetitions));
+    }
+  }
+
+  PairedBenchmarkResult result{
+      FinalizeBenchmark(
+          GenerationMode::kOrdinary, warmup, std::move(ordinary)),
+      FinalizeBenchmark(
+          GenerationMode::kDFlash, warmup, std::move(dflash)),
+      0,
+      0,
+  };
+  const auto& expected = result.ordinary.stable_generated_token_ids;
+  const auto& actual = result.dflash.stable_generated_token_ids;
+  const std::size_t width = std::max(expected.size(), actual.size());
+  for (std::size_t index = 0; index < width; ++index) {
+    if (index >= expected.size() || index >= actual.size() ||
+        expected[index] != actual[index]) {
+      ++result.token_id_mismatches;
+    }
+  }
+  result.eos_mismatches =
+      result.ordinary.stable_stop_reason == result.dflash.stable_stop_reason
+          ? 0
+          : 1;
+  if (result.token_id_mismatches != 0 || result.eos_mismatches != 0) {
+    throw std::runtime_error(
+        "stateful DFlash output differs from ordinary greedy authority");
   }
   return result;
 }

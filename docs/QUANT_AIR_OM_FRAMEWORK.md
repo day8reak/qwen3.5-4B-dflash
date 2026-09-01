@@ -134,9 +134,16 @@ Fake/Meta 不执行任何算子数值，正式 eager、AIR 和 OM 也不会执�
 W8A8 matmul 不再把 `npu.npu_quant_matmul.default` 直接交给项目 converter。receiver
 自带的 TorchAir 已经为这个同名 target 注册了 `QuantBatchMatmulV3` converter，重复注册的
 项目 converter 不一定能替换 registry 实际使用的旧项。AIR 导出因此改用项目私有、无冲突的
-`qwen35_dflash.npu_quant_matmul_v4444.default` 前端；它的 eager 实现精确转发到原始
-`npu::npu_quant_matmul`，普通推理在未安装 AIR 前端时仍直接调用 `torch_npu`。310P3 receiver
-安装的是 `QuantBatchMatmulV4444`，其 GE 输入顺序
+`qwen35_dflash.npu_quant_matmul_v4444.default` 前端。普通 `torch_npu` eager 与 AIR 不再根据
+“私有 op 是否已经注册”隐式选路：每个 `QLinear` 默认固定走 eager，AIR factory 加载量化 Target
+后才显式打开 export mode，并核对打开的 QLinear 数量与量化审计中的 `qlinear_count` 完全一致。
+
+量化文件中的权重 scale 继续保留为 FP32，这是 AIR/`QuantBatchMatmulV4444` 需要的输入；普通
+Ascend310P ACLNN V4 eager 路径则在第一次调用每个 QLinear 时使用
+`torch_npu.npu_trans_quant_param` 生成 INT64/UINT64 编码 scale，并缓存为 non-persistent buffer。
+后续 token 不会重复转换，FP32 原值也不会被覆盖。因此同一份权重同时满足直接 `torch_npu`
+推理和 AIR/OM 导出，且在同一 Python 进程中先导出再 eager 也不会串路。310P3 receiver 安装的是
+`QuantBatchMatmulV4444`，其 GE 输入顺序
 `x1,x2,scale,offset,bias,pertoken_scale` 与 PyTorch 前端的
 `x1,x2,scale,offset,pertoken_scale,bias` 不同，因此框架按名称绑定六个输入，并显式写入：
 
@@ -956,6 +963,7 @@ rg --files "$PROF_DIR" | \
 | `schema drifted from the locked export contract` | torch-npu/receiver 算子签名与当前锁不一致 | 记录 dispatcher schema；按真实版本更新 schema、Fake、converter 和测试，不能跳过校验 |
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
 | `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
+| `aclnnQuantMatmulV4 failed, error code is 161002`，并提示 `Scale dtype should be UINT64 or INT64, actual dtype is DT_FLOAT` | 普通 eager 把量化文件中的 FP32 scale 直接交给当前 310P ACLNN V4；这不是权重文件损坏，远程 quant 加载器本来也会保留 FP32 | 更新本分支；普通 eager 会一次性调用 `npu_trans_quant_param` 并缓存编码 scale，AIR 仍保留 FP32 scale。不要用 `.to(torch.int64)` 做数值截断，也不要把 AIR 图改成 encoded-scale ABI |
 | `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 旧版 AIR 路径把 `Tensor(a!) -> Tensor(a!)` 直接交给 AOTAutograd；Fake 正确也无法 functionalize | 更新本分支；确认 FX target 为 `qwen35_dflash.npu_cache_update.default`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
 | `ERR03005 GRAPH internal error`，`Original traceback` 指向 `qwen35_dflash.npu_cache_update.default`，Meta 单测通过 | 旧 converter 把前端 snake_case 参数按 positional 传入，但 GE `CacheUpdate` 原型要求 `x/updates/targetBlock/offsetInBlock -> x` | 更新本分支；确认 AIR manifest 中该算子的 `converter_mode` 为 `named-cache-update-x-v1` |
 | `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |

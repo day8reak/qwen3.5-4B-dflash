@@ -1,6 +1,6 @@
 {
-  "schema_version": 10,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v10",
+  "schema_version": 11,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v11",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -57,7 +57,7 @@
           "broadcast batch + [x1[-2], x2[-1]], requested output dtype, input device"
         ],
         "default_ge_op_type": "QuantBatchMatmulV4444",
-        "constraints": "private functional AIR frontend avoids the receiver TorchAir builtin V3 converter registered on the source target; eager forwards exactly to the source op",
+        "constraints": "private functional AIR frontend avoids the receiver TorchAir builtin V3 converter registered on the source target and consumes the original FP32 weight scale; ordinary eager is explicitly isolated, encodes FP32 scale once with torch_npu.npu_trans_quant_param, caches the INT64/UINT64 result, and then calls the source op",
         "converter": "framework registered GE IR on the private target; named receiver ABI; FP16 dtype=DT_FLOAT16; group_size=0",
         "minimum_occurrences": 1
       },
@@ -172,7 +172,9 @@
     "synchronization": "one stream synchronization per OM invocation",
     "generation": "ordinary greedy and strict-greedy DFlash",
     "execution_io_evidence": "runner JSON records actual/full-equivalent H2D and D2H bytes, copy counts, model executions, and one synchronization per model execution",
-    "incremental_performance_proposal": "framework/abi/incremental-performance-v2.json is PROPOSED_NOT_ACTIVE; physical OM count is selected by exactness, complete-set memory/load, and same-device latency gates"
+    "incremental_performance_candidate": "framework/abi/incremental-performance-v2.json is APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE; exact device-state implementation is authorized, while activation still requires export/ATC/parity/memory and same-device latency gates",
+    "incremental_approval_record": "framework/abi/approvals/incremental-performance-v2.json",
+    "incremental_transaction_tail": "ExactAcceptCommitStateGraph uses fixed physical T=16, logical K=1..15, device-side longest-prefix acceptance, EOS truncation, scalar state selection and compact output"
   },
   "correctness_gate": {
     "token_id_mismatches": 0,

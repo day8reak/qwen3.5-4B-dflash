@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "approval_id": "qwen35-4b-dflash-incremental-performance-v2-approval",
+  "status": "APPROVED",
+  "approved_at": "2026-09-01T12:20:43+08:00",
+  "approved_by": "repository owner",
+  "approval_statement": "批准多OM状态图",
+  "proposal": {
+    "path": "framework/abi/incremental-performance-v2.json",
+    "sha256_before_approval": "597d342e8bcd8b8ca3c76ee951f6cacad9b464257bbdfe8880c6f7a0d7a4d2ed",
+    "git_commit": "51f57d17bcb12bc1f456f2d8bbc91a0a289d8305"
+  },
+  "approved_scope": [
+    "replace full-prefix recompute in the performance candidate with explicit device-resident Target and Draft state",
+    "use multiple logical OM roles for prefill, decode, proposal and exact verify/commit",
+    "perform strict-greedy acceptance, state-slot selection and compact commit inside the Target verify graph"
+  ],
+  "constraints": {
+    "ordinary_target_remains_authoritative": true,
+    "token_id_mismatches_allowed": 0,
+    "eos_mismatches_allowed": 0,
+    "approximation_allowed": false,
+    "real_target_evidence_required_before_activation": true
+  },
+  "rollback": {
+    "safe_git_commit": "51f57d17bcb12bc1f456f2d8bbc91a0a289d8305",
+    "meaning": "last pushed full-prefix ABI implementation before the approved multi-OM implementation"
+  }
+}

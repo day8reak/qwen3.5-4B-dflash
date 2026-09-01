@@ -1,9 +1,12 @@
 #include <acl/acl.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <new>
+#include <string>
 #include <vector>
 
 struct aclDataBuffer {
@@ -13,29 +16,409 @@ struct aclDataBuffer {
 
 struct aclmdlDataset {
   std::vector<aclDataBuffer*> buffers;
+  aclmdlIODims dynamic_dims{};
 };
-
-struct aclmdlDesc {};
 
 namespace {
 
+enum class Role {
+  kIntegrated,
+  kTargetPrefill,
+  kTargetDecode,
+  kDraftPropose,
+  kTargetVerify,
+};
+
+struct Spec {
+  aclDataType dtype;
+  std::vector<std::int64_t> shape;
+  const char* name;
+};
+
 constexpr std::size_t kSequenceLength = 32;
-constexpr std::size_t kDraftWidth = 15;
+constexpr std::size_t kIntegratedDraftWidth = 15;
+constexpr std::size_t kPrefillRows = 64;
+constexpr std::size_t kVerifyRows = 16;
 constexpr std::size_t kModelWorkBytes = 64;
 constexpr std::size_t kModelWeightBytes = 256;
 
-aclError SetDims(aclmdlIODims* dimensions, std::int64_t width) {
-  if (dimensions == nullptr) {
+const Spec kTargetConv{ACL_FLOAT16, {2, 1, 8, 4}, "target_conv_state"};
+const Spec kTargetRecurrent{
+    ACL_FLOAT, {2, 1, 2, 4, 4}, "target_recurrent_state"};
+const Spec kTargetKey{
+    ACL_FLOAT16, {8, 1, 1, 64, 16}, "target_key_cache"};
+const Spec kTargetValue{
+    ACL_FLOAT16, {8, 1, 1, 64, 16}, "target_value_cache"};
+const Spec kTargetCursor{ACL_INT64, {1}, "logical_target_cursor"};
+const Spec kDraftKey{
+    ACL_FLOAT16, {6, 1, 2, 64, 4}, "draft_key_cache"};
+const Spec kDraftValue{
+    ACL_FLOAT16, {6, 1, 2, 64, 4}, "draft_value_cache"};
+const Spec kDraftCursor{ACL_INT64, {1}, "logical_draft_cursor"};
+
+std::map<std::uint32_t, Role> g_models;
+std::uint32_t g_next_model_id = 1;
+
+Role RoleFromPath(const char* path) {
+  const std::string value = path == nullptr ? "" : path;
+  if (value.find("target-prefill") != std::string::npos) {
+    return Role::kTargetPrefill;
+  }
+  if (value.find("target-decode1") != std::string::npos) {
+    return Role::kTargetDecode;
+  }
+  if (value.find("draft-propose") != std::string::npos) {
+    return Role::kDraftPropose;
+  }
+  if (value.find("target-verify-commit") != std::string::npos) {
+    return Role::kTargetVerify;
+  }
+  return Role::kIntegrated;
+}
+
+std::size_t TypeBytes(aclDataType dtype) {
+  switch (dtype) {
+    case ACL_FLOAT:
+    case ACL_INT32:
+    case ACL_UINT32:
+      return 4;
+    case ACL_FLOAT16:
+    case ACL_INT16:
+    case ACL_UINT16:
+      return 2;
+    case ACL_INT64:
+    case ACL_UINT64:
+    case ACL_DOUBLE:
+      return 8;
+    case ACL_INT8:
+    case ACL_UINT8:
+    case ACL_BOOL:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+std::size_t Bytes(const Spec& spec) {
+  std::size_t result = TypeBytes(spec.dtype);
+  for (const std::int64_t raw : spec.shape) {
+    const std::size_t value =
+        raw == -1 ? kPrefillRows : static_cast<std::size_t>(raw);
+    result *= value;
+  }
+  return result;
+}
+
+const std::vector<Spec>& Inputs(Role role) {
+  static const std::vector<Spec> integrated{
+      {ACL_INT64, {1, 32}, "input_ids"},
+      {ACL_INT64, {1, 32}, "attention_mask"},
+  };
+  static const std::vector<Spec> prefill{
+      {ACL_INT64, {1, 64}, "input_ids"},
+      {ACL_INT16, {1}, "effective_length"},
+      {ACL_INT64, {4}, "eos_token_ids"},
+      {ACL_INT32, {1}, "eos_token_count"},
+      kTargetConv,
+      kTargetRecurrent,
+      kTargetKey,
+      kTargetValue,
+      kTargetCursor,
+  };
+  static const std::vector<Spec> decode{
+      {ACL_INT64, {1, 1}, "input_ids"},
+      {ACL_INT64, {4}, "eos_token_ids"},
+      {ACL_INT32, {1}, "eos_token_count"},
+      kTargetConv,
+      kTargetRecurrent,
+      kTargetKey,
+      kTargetValue,
+      kTargetCursor,
+  };
+  static const std::vector<Spec> draft{
+      {ACL_FLOAT16, {1, -1, 8}, "target_feature_tail"},
+      {ACL_INT32, {1}, "committed_input_count"},
+      {ACL_INT64, {1, 16}, "previous_committed_token_ids"},
+      {ACL_INT32, {1}, "previous_commit_count"},
+      {ACL_INT32, {1}, "logical_proposal_count"},
+      kDraftKey,
+      kDraftValue,
+      kDraftCursor,
+      {ACL_UINT64, {64}, "ascend_mbatch_shape_data"},
+  };
+  static const std::vector<Spec> verify{
+      {ACL_INT64, {1, 16}, "verify_input_ids"},
+      {ACL_INT32, {1}, "logical_proposal_count"},
+      {ACL_INT64, {4}, "eos_token_ids"},
+      {ACL_INT32, {1}, "eos_token_count"},
+      kTargetConv,
+      kTargetRecurrent,
+      kTargetKey,
+      kTargetValue,
+      kTargetCursor,
+  };
+  switch (role) {
+    case Role::kTargetPrefill:
+      return prefill;
+    case Role::kTargetDecode:
+      return decode;
+    case Role::kDraftPropose:
+      return draft;
+    case Role::kTargetVerify:
+      return verify;
+    case Role::kIntegrated:
+      return integrated;
+  }
+  return integrated;
+}
+
+const std::vector<Spec>& Outputs(Role role) {
+  static const std::vector<Spec> integrated{
+      {ACL_INT64, {1, 32}, "target_top1"},
+      {ACL_INT64, {1, 15}, "draft_top1"},
+  };
+  static const std::vector<Spec> prefill{
+      {ACL_INT64, {1, 16}, "committed_token_ids"},
+      {ACL_INT32, {1}, "commit_count"},
+      {ACL_BOOL, {1}, "finished"},
+      {ACL_FLOAT16, {1, 64, 8}, "target_feature_tail"},
+      {ACL_INT32, {1}, "committed_input_count"},
+      kTargetConv,
+      kTargetRecurrent,
+      kTargetKey,
+      kTargetValue,
+      kTargetCursor,
+  };
+  static const std::vector<Spec> decode{
+      {ACL_INT64, {1, 16}, "committed_token_ids"},
+      {ACL_INT32, {1}, "commit_count"},
+      {ACL_BOOL, {1}, "finished"},
+      kTargetConv,
+      kTargetRecurrent,
+      kTargetKey,
+      kTargetValue,
+      kTargetCursor,
+  };
+  static const std::vector<Spec> draft{
+      {ACL_INT64, {1, 16}, "verify_input_ids"},
+      kDraftKey,
+      kDraftValue,
+      kDraftCursor,
+  };
+  static const std::vector<Spec> verify{
+      {ACL_INT64, {1, 16}, "committed_token_ids"},
+      {ACL_INT32, {1}, "commit_count"},
+      {ACL_INT32, {1}, "drafted_count"},
+      {ACL_INT32, {1}, "accepted_count"},
+      {ACL_INT32, {1}, "rejected_count"},
+      kTargetConv,
+      kTargetRecurrent,
+      {ACL_FLOAT16, {1, 16, 8}, "target_feature_tail"},
+      {ACL_INT32, {1}, "committed_input_count"},
+      kTargetCursor,
+      {ACL_BOOL, {1}, "finished"},
+      kTargetKey,
+      kTargetValue,
+  };
+  switch (role) {
+    case Role::kTargetPrefill:
+      return prefill;
+    case Role::kTargetDecode:
+      return decode;
+    case Role::kDraftPropose:
+      return draft;
+    case Role::kTargetVerify:
+      return verify;
+    case Role::kIntegrated:
+      return integrated;
+  }
+  return integrated;
+}
+
+aclError SetDims(aclmdlIODims* dimensions, const Spec& spec) {
+  if (dimensions == nullptr || spec.shape.size() > 128) {
     return 1;
   }
   std::memset(dimensions, 0, sizeof(*dimensions));
-  dimensions->dimCount = 2;
-  dimensions->dims[0] = 1;
-  dimensions->dims[1] = width;
+  std::strncpy(dimensions->name, spec.name, sizeof(dimensions->name) - 1);
+  dimensions->dimCount = spec.shape.size();
+  std::copy(spec.shape.begin(), spec.shape.end(), dimensions->dims);
+  return ACL_SUCCESS;
+}
+
+template <typename Value>
+Value Scalar(const aclDataBuffer* buffer) {
+  Value value{};
+  std::memcpy(&value, buffer->data, sizeof(value));
+  return value;
+}
+
+template <typename Value>
+void SetScalar(aclDataBuffer* buffer, Value value) {
+  std::memcpy(buffer->data, &value, sizeof(value));
+}
+
+void Copy(aclDataBuffer* output, const aclDataBuffer* input) {
+  std::memcpy(output->data, input->data, std::min(output->size, input->size));
+}
+
+bool IsEos(
+    std::int64_t token,
+    const aclDataBuffer* eos_ids,
+    const aclDataBuffer* eos_count) {
+  const auto count = Scalar<std::int32_t>(eos_count);
+  const auto* values = static_cast<const std::int64_t*>(eos_ids->data);
+  for (std::int32_t index = 0; index < count; ++index) {
+    if (values[index] == token) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void FillCommitted(aclDataBuffer* output, const std::vector<std::int64_t>& values) {
+  auto* tokens = static_cast<std::int64_t*>(output->data);
+  std::fill_n(tokens, kVerifyRows, 0);
+  std::copy(values.begin(), values.end(), tokens);
+}
+
+aclError ExecuteIntegrated(const aclmdlDataset* input, aclmdlDataset* output) {
+  if (input->buffers.size() != 2 || output->buffers.size() != 2) {
+    return 1;
+  }
+  const auto* ids = static_cast<const std::int64_t*>(input->buffers[0]->data);
+  const auto* mask = static_cast<const std::int64_t*>(input->buffers[1]->data);
+  auto* target = static_cast<std::int64_t*>(output->buffers[0]->data);
+  auto* draft = static_cast<std::int64_t*>(output->buffers[1]->data);
+  std::fill_n(target, kSequenceLength, 0);
+  std::size_t prefix = 0;
+  while (prefix < kSequenceLength && mask[prefix] == 1) {
+    target[prefix] = ids[prefix] + 1;
+    ++prefix;
+  }
+  if (prefix == 0) {
+    return 1;
+  }
+  for (std::size_t index = 0; index < kIntegratedDraftWidth; ++index) {
+    draft[index] = ids[prefix - 1] + static_cast<std::int64_t>(index) + 1;
+  }
+  return ACL_SUCCESS;
+}
+
+aclError ExecutePrefill(const aclmdlDataset* input, aclmdlDataset* output) {
+  const auto length = Scalar<std::int16_t>(input->buffers[1]);
+  if (length <= 0 || length > static_cast<std::int16_t>(kPrefillRows)) {
+    return 1;
+  }
+  const auto* ids = static_cast<const std::int64_t*>(input->buffers[0]->data);
+  const std::int64_t token = ids[length - 1] + 1;
+  FillCommitted(output->buffers[0], {token});
+  SetScalar<std::int32_t>(output->buffers[1], 1);
+  SetScalar<std::uint8_t>(
+      output->buffers[2], IsEos(token, input->buffers[2], input->buffers[3]));
+  std::memset(output->buffers[3]->data, 0, output->buffers[3]->size);
+  SetScalar<std::int32_t>(output->buffers[4], length);
+  for (std::size_t index = 0; index < 4; ++index) {
+    Copy(output->buffers[5 + index], input->buffers[4 + index]);
+  }
+  SetScalar<std::int64_t>(
+      output->buffers[9],
+      Scalar<std::int64_t>(input->buffers[8]) + length);
+  return ACL_SUCCESS;
+}
+
+aclError ExecuteDecode(const aclmdlDataset* input, aclmdlDataset* output) {
+  const std::int64_t token = Scalar<std::int64_t>(input->buffers[0]) + 1;
+  FillCommitted(output->buffers[0], {token});
+  SetScalar<std::int32_t>(output->buffers[1], 1);
+  SetScalar<std::uint8_t>(
+      output->buffers[2], IsEos(token, input->buffers[1], input->buffers[2]));
+  for (std::size_t index = 0; index < 4; ++index) {
+    Copy(output->buffers[3 + index], input->buffers[3 + index]);
+  }
+  SetScalar<std::int64_t>(
+      output->buffers[7], Scalar<std::int64_t>(input->buffers[7]) + 1);
+  return ACL_SUCCESS;
+}
+
+aclError ExecuteDraft(const aclmdlDataset* input, aclmdlDataset* output) {
+  const auto commit_count = Scalar<std::int32_t>(input->buffers[3]);
+  const auto proposal_count = Scalar<std::int32_t>(input->buffers[4]);
+  if (commit_count <= 0 || commit_count > 16 || proposal_count <= 0 ||
+      proposal_count > 15) {
+    return 1;
+  }
+  const auto* previous =
+      static_cast<const std::int64_t*>(input->buffers[2]->data);
+  const std::int64_t anchor = previous[commit_count - 1];
+  auto* verify = static_cast<std::int64_t*>(output->buffers[0]->data);
+  verify[0] = anchor;
+  for (std::size_t index = 1; index < kVerifyRows; ++index) {
+    verify[index] = anchor + static_cast<std::int64_t>(index);
+  }
+  Copy(output->buffers[1], input->buffers[5]);
+  Copy(output->buffers[2], input->buffers[6]);
+  SetScalar<std::int64_t>(
+      output->buffers[3],
+      Scalar<std::int64_t>(input->buffers[7]) +
+          Scalar<std::int32_t>(input->buffers[1]));
+  return ACL_SUCCESS;
+}
+
+aclError ExecuteVerify(const aclmdlDataset* input, aclmdlDataset* output) {
+  const auto proposal_count = Scalar<std::int32_t>(input->buffers[1]);
+  if (proposal_count <= 0 || proposal_count > 15) {
+    return 1;
+  }
+  const auto* verify = static_cast<const std::int64_t*>(input->buffers[0]->data);
+  std::vector<std::int64_t> proposals;
+  for (std::int32_t index = 0; index < proposal_count; ++index) {
+    const std::int64_t token = verify[index + 1];
+    proposals.push_back(token);
+    if (IsEos(token, input->buffers[2], input->buffers[3])) {
+      break;
+    }
+  }
+  std::size_t accepted = 0;
+  while (accepted < proposals.size() &&
+         proposals[accepted] == verify[accepted] + 1) {
+    ++accepted;
+  }
+  std::vector<std::int64_t> committed(
+      proposals.begin(),
+      proposals.begin() + static_cast<std::ptrdiff_t>(accepted));
+  const bool accepted_eos =
+      !committed.empty() &&
+      IsEos(committed.back(), input->buffers[2], input->buffers[3]);
+  if (!accepted_eos) {
+    committed.push_back(verify[accepted] + 1);
+  }
+  FillCommitted(output->buffers[0], committed);
+  SetScalar<std::int32_t>(output->buffers[1], committed.size());
+  SetScalar<std::int32_t>(output->buffers[2], proposals.size());
+  SetScalar<std::int32_t>(output->buffers[3], accepted);
+  SetScalar<std::int32_t>(
+      output->buffers[4], proposals.size() - accepted);
+  Copy(output->buffers[5], input->buffers[4]);
+  Copy(output->buffers[6], input->buffers[5]);
+  std::memset(output->buffers[7]->data, 0, output->buffers[7]->size);
+  SetScalar<std::int32_t>(output->buffers[8], accepted + 1);
+  SetScalar<std::int64_t>(
+      output->buffers[9],
+      Scalar<std::int64_t>(input->buffers[8]) + accepted + 1);
+  SetScalar<std::uint8_t>(
+      output->buffers[10],
+      IsEos(committed.back(), input->buffers[2], input->buffers[3]));
+  Copy(output->buffers[11], input->buffers[6]);
+  Copy(output->buffers[12], input->buffers[7]);
   return ACL_SUCCESS;
 }
 
 }  // namespace
+
+struct aclmdlDesc {
+  Role role = Role::kIntegrated;
+};
 
 extern "C" {
 
@@ -114,11 +497,25 @@ aclError aclrtMemcpyAsync(
   return ACL_SUCCESS;
 }
 
-aclError aclmdlLoadFromFile(const char*, std::uint32_t* model_id) {
+aclError aclrtMemsetAsync(
+    void* device_ptr,
+    std::size_t max_count,
+    std::int32_t value,
+    std::size_t count,
+    aclrtStream) {
+  if (device_ptr == nullptr || count > max_count) {
+    return 1;
+  }
+  std::memset(device_ptr, value, count);
+  return ACL_SUCCESS;
+}
+
+aclError aclmdlLoadFromFile(const char* path, std::uint32_t* model_id) {
   if (model_id == nullptr) {
     return 1;
   }
-  *model_id = 1;
+  *model_id = g_next_model_id++;
+  g_models[*model_id] = RoleFromPath(path);
   return ACL_SUCCESS;
 }
 
@@ -132,7 +529,10 @@ aclError aclmdlQuerySize(
   return ACL_SUCCESS;
 }
 
-aclError aclmdlUnload(std::uint32_t) { return ACL_SUCCESS; }
+aclError aclmdlUnload(std::uint32_t model_id) {
+  g_models.erase(model_id);
+  return ACL_SUCCESS;
+}
 
 aclmdlDesc* aclmdlCreateDesc() { return new (std::nothrow) aclmdlDesc(); }
 
@@ -141,39 +541,123 @@ aclError aclmdlDestroyDesc(aclmdlDesc* description) {
   return ACL_SUCCESS;
 }
 
-aclError aclmdlGetDesc(aclmdlDesc*, std::uint32_t) { return ACL_SUCCESS; }
-std::size_t aclmdlGetNumInputs(const aclmdlDesc*) { return 2; }
-std::size_t aclmdlGetNumOutputs(const aclmdlDesc*) { return 2; }
+aclError aclmdlGetDesc(aclmdlDesc* description, std::uint32_t model_id) {
+  const auto iterator = g_models.find(model_id);
+  if (description == nullptr || iterator == g_models.end()) {
+    return 1;
+  }
+  description->role = iterator->second;
+  return ACL_SUCCESS;
+}
 
-aclError aclmdlGetInputDims(const aclmdlDesc*, std::size_t index, aclmdlIODims* dims) {
-  return index < 2 ? SetDims(dims, kSequenceLength) : 1;
+std::size_t aclmdlGetNumInputs(const aclmdlDesc* description) {
+  return description == nullptr ? 0 : Inputs(description->role).size();
+}
+
+std::size_t aclmdlGetNumOutputs(const aclmdlDesc* description) {
+  return description == nullptr ? 0 : Outputs(description->role).size();
+}
+
+aclError aclmdlGetInputDims(
+    const aclmdlDesc* description,
+    std::size_t index,
+    aclmdlIODims* dimensions) {
+  if (description == nullptr || index >= Inputs(description->role).size()) {
+    return 1;
+  }
+  return SetDims(dimensions, Inputs(description->role)[index]);
 }
 
 aclError aclmdlGetOutputDims(
-    const aclmdlDesc*, std::size_t index, aclmdlIODims* dims) {
-  if (index == 0) {
-    return SetDims(dims, kSequenceLength);
+    const aclmdlDesc* description,
+    std::size_t index,
+    aclmdlIODims* dimensions) {
+  if (description == nullptr || index >= Outputs(description->role).size()) {
+    return 1;
   }
-  return index == 1 ? SetDims(dims, kDraftWidth) : 1;
+  return SetDims(dimensions, Outputs(description->role)[index]);
 }
 
-aclDataType aclmdlGetInputDataType(const aclmdlDesc*, std::size_t index) {
-  return index < 2 ? ACL_INT64 : ACL_DT_UNDEFINED;
+aclDataType aclmdlGetInputDataType(
+    const aclmdlDesc* description, std::size_t index) {
+  return description != nullptr && index < Inputs(description->role).size()
+      ? Inputs(description->role)[index].dtype
+      : ACL_DT_UNDEFINED;
 }
 
-aclDataType aclmdlGetOutputDataType(const aclmdlDesc*, std::size_t index) {
-  return index < 2 ? ACL_INT64 : ACL_DT_UNDEFINED;
+aclDataType aclmdlGetOutputDataType(
+    const aclmdlDesc* description, std::size_t index) {
+  return description != nullptr && index < Outputs(description->role).size()
+      ? Outputs(description->role)[index].dtype
+      : ACL_DT_UNDEFINED;
 }
 
-std::size_t aclmdlGetInputSizeByIndex(const aclmdlDesc*, std::size_t index) {
-  return index < 2 ? kSequenceLength * sizeof(std::int64_t) : 0;
+std::size_t aclmdlGetInputSizeByIndex(
+    const aclmdlDesc* description, std::size_t index) {
+  return description != nullptr && index < Inputs(description->role).size()
+      ? Bytes(Inputs(description->role)[index])
+      : 0;
 }
 
-std::size_t aclmdlGetOutputSizeByIndex(const aclmdlDesc*, std::size_t index) {
-  if (index == 0) {
-    return kSequenceLength * sizeof(std::int64_t);
+std::size_t aclmdlGetOutputSizeByIndex(
+    const aclmdlDesc* description, std::size_t index) {
+  return description != nullptr && index < Outputs(description->role).size()
+      ? Bytes(Outputs(description->role)[index])
+      : 0;
+}
+
+aclError aclmdlGetInputIndexByName(
+    const aclmdlDesc* description,
+    const char* name,
+    std::size_t* index) {
+  if (description == nullptr || name == nullptr || index == nullptr) {
+    return 1;
   }
-  return index == 1 ? kDraftWidth * sizeof(std::int64_t) : 0;
+  const auto& inputs = Inputs(description->role);
+  for (std::size_t candidate = 0; candidate < inputs.size(); ++candidate) {
+    if (inputs[candidate].name == std::string(name)) {
+      *index = candidate;
+      return ACL_SUCCESS;
+    }
+  }
+  return 1;
+}
+
+aclError aclmdlGetInputDynamicGearCount(
+    const aclmdlDesc* description,
+    std::size_t,
+    std::size_t* gear_count) {
+  if (description == nullptr || gear_count == nullptr ||
+      description->role != Role::kDraftPropose) {
+    return 1;
+  }
+  *gear_count = 2;
+  return ACL_SUCCESS;
+}
+
+aclError aclmdlGetInputDynamicDims(
+    const aclmdlDesc* description,
+    std::size_t,
+    aclmdlIODims* dimensions,
+    std::size_t gear_count) {
+  if (description == nullptr || dimensions == nullptr || gear_count != 2 ||
+      description->role != Role::kDraftPropose) {
+    return 1;
+  }
+  for (std::size_t gear = 0; gear < 2; ++gear) {
+    const std::int64_t rows = gear == 0 ? 16 : 64;
+    std::memset(&dimensions[gear], 0, sizeof(aclmdlIODims));
+    std::vector<std::int64_t> flat;
+    const auto& inputs = Inputs(Role::kDraftPropose);
+    for (std::size_t input = 0; input + 1 < inputs.size(); ++input) {
+      for (const std::int64_t value : inputs[input].shape) {
+        flat.push_back(value == -1 ? rows : value);
+      }
+    }
+    dimensions[gear].dimCount = flat.size();
+    std::copy(flat.begin(), flat.end(), dimensions[gear].dims);
+  }
+  return ACL_SUCCESS;
 }
 
 aclmdlDataset* aclmdlCreateDataset() {
@@ -206,32 +690,42 @@ aclError aclmdlAddDatasetBuffer(
   return ACL_SUCCESS;
 }
 
+aclError aclmdlSetInputDynamicDims(
+    std::uint32_t model_id,
+    aclmdlDataset* dataset,
+    std::size_t index,
+    const aclmdlIODims* dimensions) {
+  const auto iterator = g_models.find(model_id);
+  if (iterator == g_models.end() || iterator->second != Role::kDraftPropose ||
+      dataset == nullptr || index != 8 || dimensions == nullptr) {
+    return 1;
+  }
+  dataset->dynamic_dims = *dimensions;
+  return ACL_SUCCESS;
+}
+
 aclError aclmdlExecuteAsync(
-    std::uint32_t,
+    std::uint32_t model_id,
     const aclmdlDataset* input,
     aclmdlDataset* output,
     aclrtStream) {
-  if (input == nullptr || output == nullptr || input->buffers.size() != 2 ||
-      output->buffers.size() != 2) {
+  const auto iterator = g_models.find(model_id);
+  if (iterator == g_models.end() || input == nullptr || output == nullptr) {
     return 1;
   }
-  const auto* ids = static_cast<const std::int64_t*>(input->buffers[0]->data);
-  const auto* mask = static_cast<const std::int64_t*>(input->buffers[1]->data);
-  auto* target = static_cast<std::int64_t*>(output->buffers[0]->data);
-  auto* draft = static_cast<std::int64_t*>(output->buffers[1]->data);
-  std::fill_n(target, kSequenceLength, 0);
-  std::size_t prefix = 0;
-  while (prefix < kSequenceLength && mask[prefix] == 1) {
-    target[prefix] = ids[prefix] + 1;
-    ++prefix;
+  switch (iterator->second) {
+    case Role::kIntegrated:
+      return ExecuteIntegrated(input, output);
+    case Role::kTargetPrefill:
+      return ExecutePrefill(input, output);
+    case Role::kTargetDecode:
+      return ExecuteDecode(input, output);
+    case Role::kDraftPropose:
+      return ExecuteDraft(input, output);
+    case Role::kTargetVerify:
+      return ExecuteVerify(input, output);
   }
-  if (prefix == 0) {
-    return 1;
-  }
-  for (std::size_t index = 0; index < kDraftWidth; ++index) {
-    draft[index] = ids[prefix - 1] + static_cast<std::int64_t>(index) + 1;
-  }
-  return ACL_SUCCESS;
+  return 1;
 }
 
 }  // extern "C"

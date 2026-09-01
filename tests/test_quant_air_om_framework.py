@@ -36,6 +36,8 @@ from qwen35_dflash.ascend310p.custom_op_export import (
     NPU_CACHE_UPDATE_TORCH_OP,
     NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
     NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+    NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+    NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
     NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
     NPU_DYNAMIC_QUANT_TORCH_OP,
     NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
@@ -56,6 +58,7 @@ from qwen35_dflash.ascend310p.quant_factory import (
     AirDFlashOps,
     QUANT_BASE_REVISION,
     QuantFullPrefixExportTarget,
+    _enable_target_quant_matmul_export_mode,
     create_quant_recompute_graph,
 )
 from qwen35_dflash.ascend310p.standard_op_export import (
@@ -103,6 +106,13 @@ _TARGET_TEST_SCHEMAS = {
         "Tensor effective_length, int chunk_size=64, "
         "Tensor? initial_state=None, bool output_final_state=False, "
         "bool use_qk_l2norm_in_kernel=False) -> (Tensor, Tensor)"
+    ),
+    "npu_gated_delta_rule_mtp": (
+        "npu_gated_delta_rule_mtp("
+        "Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
+        "Tensor initial_state, Tensor accepted_tokens, int chunk_size=64, "
+        "bool output_final_state=True, "
+        "bool use_qk_l2norm_in_kernel=True) -> (Tensor, Tensor)"
     ),
     "npu_dynamic_quant": (
         "npu_dynamic_quant(Tensor input, *, Tensor? smooth_scales=None, "
@@ -975,6 +985,81 @@ def test_gdr_fake_keeps_frontend_operator_in_strict_export() -> None:
     assert "npu.npu_chunk_gated_delta_rule.default" in targets
 
 
+def test_gdr_mtp_fake_and_named_converter_preserve_state_bank_node() -> None:
+    operation = _ensure_target_test_schema("npu_gated_delta_rule_mtp")
+    torchair = _FakeTorchAir()
+    session = prepare_custom_op_export(
+        CustomOpExportSpec(
+            NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
+            NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+        ),
+        torchair,
+    )
+
+    class UsesGdrMtp(nn.Module):
+        def forward(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            gate: torch.Tensor,
+            beta: torch.Tensor,
+            state: torch.Tensor,
+            accepted: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return operation(
+                query,
+                key,
+                value,
+                gate,
+                beta,
+                state,
+                accepted,
+                64,
+                True,
+                True,
+            )
+
+    query = torch.randn(1, 3, 2, 8, dtype=torch.float16)
+    args = (
+        query,
+        query.clone(),
+        torch.randn(1, 3, 2, 16, dtype=torch.float16),
+        torch.randn(1, 3, 2, dtype=torch.float32),
+        torch.randn(1, 3, 2, dtype=torch.float16),
+        torch.randn(1, 3, 2, 8, 16, dtype=torch.float32),
+        torch.tensor([0], dtype=torch.int8),
+    )
+    exported = torch.export.export(UsesGdrMtp(), args, strict=True)
+    targets = [str(node.target) for node in exported.graph.nodes]
+    assert "npu.npu_gated_delta_rule_mtp.default" in targets
+
+    placeholders = tuple(object() for _ in range(7))
+    converter = torchair.converters[operation]
+    converter(*placeholders, 64, True, True)
+    call = torchair.ge.calls[-1]
+    assert call[0] == NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE
+    assert call[1] == ()
+    assert call[2] == {
+        "inputs": {
+            "query": placeholders[0],
+            "key": placeholders[1],
+            "value": placeholders[2],
+            "g": placeholders[3],
+            "beta": placeholders[4],
+            "initial_state": placeholders[5],
+            "accepted_tokens": placeholders[6],
+        },
+        "outputs": ["core_attn", "state_bank"],
+        "attrs": {
+            "chunk_size": ("int", 64),
+            "output_final_state": ("bool", True),
+            "use_qk_l2norm_in_kernel": ("bool", True),
+        },
+    }
+    assert session.converter_mode == "named-gdr-mtp-state-bank-v1"
+
+
 def test_fused_attention_fake_keeps_frontend_operator_in_strict_export() -> None:
     operation = _ensure_target_test_schema("adn_fused_infer_attention")
     prepare_custom_op_export(
@@ -1138,6 +1223,7 @@ def test_qlinear_helper_captures_private_v4444_frontend(
                 scale,
                 pertoken_scale=pertoken_scale,
                 output_dtype=torch.float16,
+                export_flag=True,
             )
 
     exported = torch.export.export(
@@ -1153,6 +1239,104 @@ def test_qlinear_helper_captures_private_v4444_frontend(
     targets = [str(node.target) for node in exported.graph.nodes]
     assert "qwen35_dflash.npu_quant_matmul_v4444.default" in targets
     assert "npu.npu_quant_matmul.default" not in targets
+
+
+def test_qlinear_eager_encodes_and_caches_scale_outside_air(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ensure_target_test_schema("npu_quant_matmul")
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
+            NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+        ),
+        _FakeTorchAir(),
+    )
+    fake_torch_npu = ModuleType("torch_npu")
+    fake_torch_npu.__spec__ = importlib.machinery.ModuleSpec(
+        "torch_npu",
+        loader=None,
+    )
+    converted: list[torch.Tensor] = []
+    observed_scales: list[torch.Tensor] = []
+
+    def dynamic_quant(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return value.to(torch.int8), torch.ones(
+            value.shape[:-1], dtype=torch.float32, device=value.device
+        )
+
+    def trans_quant_param(scale: torch.Tensor) -> torch.Tensor:
+        converted.append(scale)
+        return torch.arange(
+            scale.numel(), dtype=torch.int64, device=scale.device
+        ).reshape(scale.shape)
+
+    def quant_matmul(
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        pertoken_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        del pertoken_scale
+        observed_scales.append(scale)
+        return torch.zeros(
+            (*x1.shape[:-1], x2.shape[-1]),
+            dtype=output_dtype,
+            device=x1.device,
+        )
+
+    fake_torch_npu.npu_dynamic_quant = dynamic_quant
+    fake_torch_npu.npu_trans_quant_param = trans_quant_param
+    fake_torch_npu.npu_quant_matmul = quant_matmul
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+    modeling = importlib.import_module("models.modeling_qwen3_5_hiai_nd")
+    monkeypatch.setattr(modeling, "torch_npu", fake_torch_npu)
+
+    layer = modeling.QLinear(
+        W_q=torch.ones((4, 3), dtype=torch.int8),
+        scale=torch.tensor([0.25, 0.5, 0.75], dtype=torch.float32),
+        idx=0,
+    )
+    value = torch.ones((2, 4), dtype=torch.float16)
+    first = layer(value)
+    second = layer(value)
+
+    assert first.shape == second.shape == (2, 3)
+    assert len(converted) == 1
+    assert len(observed_scales) == 2
+    assert all(scale.dtype == torch.int64 for scale in observed_scales)
+    assert layer.scale.dtype == torch.float32
+    assert layer._eager_encoded_scale is observed_scales[0]
+    assert observed_scales[0] is observed_scales[1]
+
+
+def test_air_factory_enables_private_quant_frontend_on_every_qlinear() -> None:
+    class ExportAwareLinear(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.enabled = False
+
+        def set_quant_matmul_export_mode(self, enabled: bool = True) -> None:
+            self.enabled = enabled
+
+    class ExportTarget(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.execution = nn.Sequential(
+                ExportAwareLinear(),
+                ExportAwareLinear(),
+            )
+            self.dflash_target_quantization_audit = {"qlinear_count": 2}
+
+        @property
+        def dflash_execution_model(self) -> nn.Module:
+            return self.execution
+
+    target = ExportTarget()
+    assert _enable_target_quant_matmul_export_mode(target) == 2
+    assert all(layer.enabled for layer in target.execution)
 
 
 @pytest.mark.parametrize(

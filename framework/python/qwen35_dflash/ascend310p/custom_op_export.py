@@ -32,6 +32,7 @@ FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP = (
 )
 NPU_CACHE_UPDATE_TORCH_OP = "npu::npu_cache_update_"
 NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP = "npu::npu_chunk_gated_delta_rule"
+NPU_GATED_DELTA_RULE_MTP_TORCH_OP = "npu::npu_gated_delta_rule_mtp"
 NPU_DYNAMIC_QUANT_TORCH_OP = "npu::npu_dynamic_quant"
 NPU_QUANT_MATMUL_TORCH_OP = "npu::npu_quant_matmul"
 NPU_SCATTER_ND_UPDATE_TORCH_OP = "npu::npu_scatter_nd_update_"
@@ -40,6 +41,7 @@ ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE = "AdnFusedInferAttention"
 ADN_RMS_NORM_DEFAULT_GE_OP_TYPE = "RmsNorm"
 NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE = "CacheUpdate"
 NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE = "ChunkGatedDeltaRule"
+NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE = "GatedDeltaRuleMTP"
 NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE = "DynamicQuant"
 NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE = "QuantBatchMatmulV4444"
 NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE = "ScatterNdUpdate"
@@ -427,6 +429,33 @@ def _fake_npu_chunk_gated_delta_rule(
     return output, final_state
 
 
+def _fake_npu_gated_delta_rule_mtp(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    chunk_size: int = 64,
+    output_final_state: bool = True,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Describe the exact MTP recurrent-bank output metadata."""
+
+    del key, g, beta, accepted_tokens, chunk_size, use_qk_l2norm_in_kernel
+    if not output_final_state:
+        raise RuntimeError(
+            "the locked Qwen3.5 GDR-MTP export requires output_final_state=True"
+        )
+    if initial_state.dtype != torch.float32:
+        raise RuntimeError("GDR-MTP initial state bank must use float32")
+    return (
+        value.new_empty(value.shape, dtype=query.dtype),
+        initial_state.new_empty(initial_state.shape),
+    )
+
+
 def _first_tensor(values: Sequence[torch.Tensor], name: str) -> torch.Tensor:
     if not values:
         raise RuntimeError(f"{name} must contain at least one tensor")
@@ -674,6 +703,35 @@ def _validate_npu_chunk_gated_delta_rule_meta(operation: Any) -> None:
     )
 
 
+def _validate_npu_gated_delta_rule_mtp_meta(operation: Any) -> None:
+    query = torch.empty((1, 16, 32, 128), dtype=torch.float16, device="meta")
+    key = torch.empty_like(query)
+    value = torch.empty_like(query)
+    gate = torch.empty((1, 16, 32), dtype=torch.float32, device="meta")
+    beta = torch.empty((1, 16, 32), dtype=torch.float16, device="meta")
+    state = torch.empty(
+        (1, 16, 32, 128, 128),
+        dtype=torch.float32,
+        device="meta",
+    )
+    accepted = torch.empty((1,), dtype=torch.int8, device="meta")
+    result = operation(
+        query, key, value, gate, beta, state, accepted, 64, True, True
+    )
+    if not isinstance(result, (tuple, list)) or len(result) != 2:
+        raise RuntimeError(
+            "npu::npu_gated_delta_rule_mtp Meta kernel must return two tensors"
+        )
+    _expect_tensor(
+        result[0], shape=(1, 16, 32, 128), dtype=torch.float16,
+        label="npu::npu_gated_delta_rule_mtp output[0]",
+    )
+    _expect_tensor(
+        result[1], shape=(1, 16, 32, 128, 128), dtype=torch.float32,
+        label="npu::npu_gated_delta_rule_mtp output[1]",
+    )
+
+
 def _validate_adn_fused_infer_attention_meta(operation: Any) -> None:
     query = torch.empty((1, 256, 3, 16), dtype=torch.float16, device="meta")
     key = torch.empty((1, 64, 64, 16), dtype=torch.float16, device="meta")
@@ -805,6 +863,23 @@ _ADAPTERS = {
         return_types=("Tensor", "Tensor"),
         fake_kernel=_fake_npu_chunk_gated_delta_rule,
         validate_meta=_validate_npu_chunk_gated_delta_rule_meta,
+        converter_policy=_FRAMEWORK_CONVERTER,
+    ),
+    NPU_GATED_DELTA_RULE_MTP_TORCH_OP: _OperatorAdapter(
+        torch_op=NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
+        argument_names=(
+            "query", "key", "value", "g", "beta", "initial_state",
+            "accepted_tokens", "chunk_size", "output_final_state",
+            "use_qk_l2norm_in_kernel",
+        ),
+        argument_types=(
+            "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Tensor",
+            "Tensor", "int", "bool", "bool",
+        ),
+        kwarg_only=(False,) * 10,
+        return_types=("Tensor", "Tensor"),
+        fake_kernel=_fake_npu_gated_delta_rule_mtp,
+        validate_meta=_validate_npu_gated_delta_rule_mtp_meta,
         converter_policy=_FRAMEWORK_CONVERTER,
     ),
     ADN_FUSED_INFER_ATTENTION_TORCH_OP: _OperatorAdapter(
@@ -1292,6 +1367,69 @@ def _register_framework_converter(
 
         converter.__name__ = "convert_npu_chunk_gated_delta_rule_default"
         session.converter_mode = "named-gdr-effective-length-v2"
+    elif adapter.torch_op == NPU_GATED_DELTA_RULE_MTP_TORCH_OP:
+        if spec.ge_op_type != NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE:
+            raise RuntimeError(
+                "npu_gated_delta_rule_mtp currently has an exact named lowering "
+                f"only to {NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE}"
+            )
+        _require_ge_attrs(ge_api, ("Int", "Bool"))
+
+        def converter(
+            query: Any,
+            key: Any,
+            value: Any,
+            g: Any,
+            beta: Any,
+            initial_state: Any,
+            accepted_tokens: Any,
+            chunk_size: int = 64,
+            output_final_state: bool = True,
+            use_qk_l2norm_in_kernel: bool = True,
+            meta_outputs: Any = None,
+        ) -> Any:
+            del meta_outputs
+            if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+                raise TypeError("GDR-MTP chunk_size must be a compile-time int")
+            if not isinstance(output_final_state, bool):
+                raise TypeError(
+                    "GDR-MTP output_final_state must be a compile-time bool"
+                )
+            if not isinstance(use_qk_l2norm_in_kernel, bool):
+                raise TypeError(
+                    "GDR-MTP use_qk_l2norm_in_kernel must be a compile-time bool"
+                )
+            session.converter_calls += 1
+            result = custom_op(
+                spec.ge_op_type,
+                inputs={
+                    "query": query,
+                    "key": key,
+                    "value": value,
+                    "g": g,
+                    "beta": beta,
+                    "initial_state": initial_state,
+                    "accepted_tokens": accepted_tokens,
+                },
+                outputs=["core_attn", "state_bank"],
+                attrs={
+                    "chunk_size": ge_api.attr.Int(chunk_size),
+                    "output_final_state": ge_api.attr.Bool(
+                        output_final_state
+                    ),
+                    "use_qk_l2norm_in_kernel": ge_api.attr.Bool(
+                        use_qk_l2norm_in_kernel
+                    ),
+                },
+            )
+            if not isinstance(result, (tuple, list)) or len(result) != 2:
+                raise RuntimeError(
+                    "GatedDeltaRuleMTP GE IR must return core_attn and state_bank"
+                )
+            return result
+
+        converter.__name__ = "convert_npu_gated_delta_rule_mtp_default"
+        session.converter_mode = "named-gdr-mtp-state-bank-v1"
     elif adapter.torch_op == FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP:
         if spec.ge_op_type != NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE:
             raise RuntimeError(
@@ -1611,6 +1749,8 @@ __all__ = [
     "NPU_CACHE_UPDATE_TORCH_OP",
     "NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE",
     "NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP",
+    "NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE",
+    "NPU_GATED_DELTA_RULE_MTP_TORCH_OP",
     "NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE",
     "NPU_DYNAMIC_QUANT_TORCH_OP",
     "NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE",

@@ -62,17 +62,23 @@ def _npu_quant_matmul_with_export_frontend(
     *,
     pertoken_scale: torch.Tensor,
     output_dtype: torch.dtype,
+    export_flag: bool,
 ) -> torch.Tensor:
-    """Use the collision-free V4444 frontend when export installed it."""
+    """Keep eager ACLNN and AIR V4444 scale ABIs strictly separated."""
 
-    namespace = getattr(torch.ops, "qwen35_dflash", None)
-    packet = (
-        None
-        if namespace is None
-        else getattr(namespace, "npu_quant_matmul_v4444", None)
-    )
-    operation = None if packet is None else getattr(packet, "default", None)
-    if operation is not None:
+    if export_flag:
+        namespace = getattr(torch.ops, "qwen35_dflash", None)
+        packet = (
+            None
+            if namespace is None
+            else getattr(namespace, "npu_quant_matmul_v4444", None)
+        )
+        operation = None if packet is None else getattr(packet, "default", None)
+        if operation is None:
+            raise RuntimeError(
+                "AIR QLinear requires the registered "
+                "qwen35_dflash::npu_quant_matmul_v4444 frontend"
+            )
         return operation(
             x1,
             x2,
@@ -87,6 +93,37 @@ def _npu_quant_matmul_with_export_frontend(
         pertoken_scale=pertoken_scale,
         output_dtype=output_dtype,
     )
+
+
+def _encode_eager_npu_quant_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Encode one FP32 scale for the receiver's ACLNN QuantMatmulV4 ABI."""
+
+    if scale.dtype == torch.int64 or str(scale.dtype) == "torch.uint64":
+        return scale
+    if scale.dtype != torch.float32:
+        raise TypeError(
+            "eager QLinear scale must be FP32 or an encoded INT64/UINT64 Tensor"
+        )
+    converter = getattr(torch_npu, "npu_trans_quant_param", None)
+    if not callable(converter):
+        raise RuntimeError(
+            "this torch_npu build lacks npu_trans_quant_param required by "
+            "the Ascend310P ACLNN QuantMatmulV4 eager route"
+        )
+    encoded = converter(scale.contiguous())
+    if not isinstance(encoded, torch.Tensor):
+        raise TypeError("npu_trans_quant_param must return one Tensor")
+    if encoded.dtype != torch.int64 and str(encoded.dtype) != "torch.uint64":
+        raise TypeError(
+            "npu_trans_quant_param must return an INT64/UINT64 Tensor, got "
+            f"{encoded.dtype}"
+        )
+    if tuple(encoded.shape) != tuple(scale.shape):
+        raise ValueError(
+            "npu_trans_quant_param changed the quant scale shape from "
+            f"{tuple(scale.shape)} to {tuple(encoded.shape)}"
+        )
+    return encoded
 
 
 def _cache_update_for_export(
@@ -160,17 +197,51 @@ class QLinear(nn.Module):
         super().__init__()
         self.register_buffer("W_q", W_q)
         self.register_buffer("scale", scale)
+        self.register_buffer("_eager_encoded_scale", None, persistent=False)
+        self._eager_encoded_scale_source_version = -1
+        self._quant_matmul_export_mode = False
         self.idx = idx
+
+    def set_quant_matmul_export_mode(self, enabled: bool = True):
+        """Select the private float-scale frontend only for AIR capture."""
+
+        if not isinstance(enabled, bool):
+            raise TypeError("quant matmul export mode must be a bool")
+        self._quant_matmul_export_mode = enabled
+        return self
+
+    def _eager_scale(self, device: torch.device) -> torch.Tensor:
+        scale = self.scale.to(device).contiguous()
+        if scale.dtype == torch.int64 or str(scale.dtype) == "torch.uint64":
+            return scale
+        source_version = int(getattr(self.scale, "_version", -1))
+        cached = self._eager_encoded_scale
+        if (
+            cached is None
+            or cached.device != scale.device
+            or tuple(cached.shape) != tuple(scale.shape)
+            or self._eager_encoded_scale_source_version != source_version
+        ):
+            cached = _encode_eager_npu_quant_scale(scale)
+            self._eager_encoded_scale = cached
+            self._eager_encoded_scale_source_version = source_version
+        return cached
 
     def forward(self, x):
         x_quant, pertoken_scale = torch_npu.npu_dynamic_quant(x)
         pertoken_scale = pertoken_scale.reshape(-1).to(torch.float32)
+        scale = (
+            self.scale.to(x.device)
+            if self._quant_matmul_export_mode
+            else self._eager_scale(x.device)
+        )
         npu_out = _npu_quant_matmul_with_export_frontend(
             x_quant,
             self.W_q.to(x.device),
-            self.scale.to(x.device),
+            scale,
             pertoken_scale=pertoken_scale,
             output_dtype=torch.float16,
+            export_flag=self._quant_matmul_export_mode,
         )
         return npu_out.to(torch.float16)
 

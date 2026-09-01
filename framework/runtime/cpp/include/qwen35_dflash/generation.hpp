@@ -34,6 +34,20 @@ struct GraphOutputs {
   std::vector<std::int64_t> draft_top1;
 };
 
+// Compact host-visible result produced by one explicit-state Target graph.
+// All large Target/Draft states and feature carriers remain owned by the
+// concrete executor on device.  model_executions counts enqueued OM calls;
+// one method call may execute Draft followed by Target while synchronizing
+// only once.
+struct StatefulStep {
+  std::vector<std::int64_t> token_ids;
+  std::size_t model_executions = 0;
+  std::size_t drafted_tokens = 0;
+  std::size_t accepted_draft_tokens = 0;
+  std::size_t rejected_draft_tokens = 0;
+  bool finished = false;
+};
+
 // The implementation owns all input/output storage. Execute must not allocate
 // ACL buffers or reload the model; callers invoke it in the decode hot path.
 class GraphExecutor {
@@ -45,6 +59,35 @@ class GraphExecutor {
   virtual const GraphOutputs& Execute(
       const std::vector<std::int64_t>& committed_prefix,
       std::int64_t pad_token_id) = 0;
+};
+
+// Exact explicit-state graph suite used by the approved multi-OM route.
+// Reset, state initialization and EOS-table upload are outside model latency.
+// PrefillChunk and DecodeOne each expose one Target completion barrier.
+// SpeculativeStep enqueues Draft -> Target verify/commit and exposes exactly
+// one completion barrier for the whole transaction.
+class StatefulGraphExecutor {
+ public:
+  virtual ~StatefulGraphExecutor() = default;
+
+  virtual std::size_t sequence_length() const noexcept = 0;
+  virtual std::size_t prefill_width() const noexcept = 0;
+  virtual std::size_t proposal_width() const noexcept = 0;
+  virtual std::size_t eos_table_width() const noexcept = 0;
+
+  virtual void Reset(
+      std::int64_t pad_token_id,
+      const std::vector<std::int64_t>& eos_token_ids) = 0;
+
+  virtual StatefulStep PrefillChunk(
+      const std::vector<std::int64_t>& token_ids,
+      bool prepare_draft,
+      std::size_t logical_proposal_count) = 0;
+
+  virtual StatefulStep DecodeOne(std::int64_t input_token_id) = 0;
+
+  virtual StatefulStep SpeculativeStep(
+      std::size_t logical_proposal_count) = 0;
 };
 
 struct GenerationOptions {
@@ -127,6 +170,30 @@ BenchmarkResult Benchmark(
 // alternate order to reduce thermal/order bias while preserving raw samples.
 PairedBenchmarkResult BenchmarkPair(
     GraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    const GenerationOptions& options,
+    std::size_t warmup,
+    std::size_t repetitions,
+    const ProgressCallback& progress = {});
+
+GenerationMeasurement GenerateStatefulOnce(
+    StatefulGraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    GenerationMode mode,
+    const GenerationOptions& options,
+    const ProgressCallback& progress = {});
+
+BenchmarkResult BenchmarkStateful(
+    StatefulGraphExecutor& executor,
+    const std::vector<std::int64_t>& prompt_token_ids,
+    GenerationMode mode,
+    const GenerationOptions& options,
+    std::size_t warmup,
+    std::size_t repetitions,
+    const ProgressCallback& progress = {});
+
+PairedBenchmarkResult BenchmarkPairStateful(
+    StatefulGraphExecutor& executor,
     const std::vector<std::int64_t>& prompt_token_ids,
     const GenerationOptions& options,
     std::size_t warmup,

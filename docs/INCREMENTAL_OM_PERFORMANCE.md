@@ -9,12 +9,15 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
 - prompt 只 prefill 一次；
 - ordinary decode 每次只处理 1 行且不运行 Draft；
 - Draft 复用自己的 KV 和 Target 新增 feature，只生成最多 15 个 proposal；
-- Target verify 只处理 `[anchor, proposals]` 的 2..16 行，不再重算历史前缀；
+- Target verify 固定处理 16 个因果行，但只提交运行时 `logical_proposal_count` 指定的前缀，
+  不再重算历史前缀；
 - proposal、KV、GDR/conv state 和 feature 全部留在 device；
 - 一个 speculative round 只在 accept/commit 后同步一次，并只回传少量 token ID 和计数。
 
-完整机器可读合同见 `framework/abi/incremental-performance-v2.json`。该合同当前是
-`PROPOSED_NOT_ACTIVE`，不会冒充已经生成或验证过的 OM。
+完整机器可读合同见 `framework/abi/incremental-performance-v2.json`。用户已明确批准该状态图，
+批准记录位于 `framework/abi/approvals/incremental-performance-v2.json`，当前状态是
+`APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE`：可以实现，但还不能冒充已经生成、真机验证或达到性能
+目标的 OM。
 
 ## 1. “4 个 OM”只是候选，不是结论
 
@@ -24,8 +27,8 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
 | --- | --- | --- |
 | `target-prefill` | 1..64 行 prompt chunk，原 ChunkGatedDeltaRule | 非末 chunk 的完整 LM head、Draft proposal |
 | `target-decode1` | 1 行普通 decode / zero-accept fallback | Draft |
-| `draft-propose` | 复用 Draft KV，生成 1..15 个 proposal | Target |
-| `target-verify-commit` | 2..16 行 verify、精确 accept、状态选择 | 历史前缀重算、host state 搬运 |
+| `draft-propose` | 复用 Draft KV，输出固定 `[anchor,p0..p14]` device carrier | Target |
+| `target-verify-commit` | 固定 T=16 verify、逻辑 K=1..15、精确 accept/状态选择 | 历史前缀重算、host state 搬运 |
 
 物理文件不一定恰好是四个：
 
@@ -67,7 +70,7 @@ logit、allocator 和并存服务重新声明。`DEVICE_BUDGET_BYTES` 必须来�
 
 ```bash
 CPP_BUILD="$AI_RUN_DIR/build/cpp-performance"
-STATE_BYTES=974651392
+STATE_BYTES=999817216
 IO_RUNTIME_MARGIN_BYTES=1073741824
 DEVICE_BUDGET_BYTES=<本次进程可使用的设备字节预算>
 
@@ -106,10 +109,10 @@ jq '{models, budget, assumptions, claim_boundary}' \
 | 项目 | 字节 | MiB | 生命周期 |
 | --- | ---: | ---: | --- |
 | Target scalar conv FP16 | 1,572,864 | 1.5 | persistent |
-| Target scalar recurrent FP16 | 25,165,824 | 24 | persistent |
+| Target scalar recurrent FP32 | 50,331,648 | 48 | persistent |
 | 8 层 Target K/V FP16 | 67,108,864 | 64 | persistent |
 | 6 层 Draft K/V FP16 | 50,331,648 | 48 | persistent |
-| persistent state 小计 | 144,179,200 | 137.5 | request lifetime |
+| persistent state 小计 | 169,345,024 | 161.5 | request lifetime |
 | Target conv bank FP16 | 25,165,824 | 24 | verify transient |
 | Target recurrent bank FP32 | 805,306,368 | 768 | verify transient |
 | verify bank 小计 | 830,472,192 | 792 | graph workspace/transient |
@@ -118,6 +121,10 @@ jq '{models, budget, assumptions, claim_boundary}' \
 尤其是 792 MiB state bank：它不应该每轮搬回 host，也不应该作为下一轮的持久输出。推荐在
 verify graph 尾部根据接受数 `a` gather slot `a`，只持久化选中的 scalar state；bank 只作为当轮
 workspace。
+
+持久 recurrent 统一用 FP32：普通 GDR 仍保留 receiver 现有的 FP16 输出边界，再把该结果无损
+扩宽到 FP32；GDR-MTP 选中的 FP32 state 则无需每轮降回 FP16。这样 prefill/decode/verify 的
+外部 binding dtype 固定，同时不丢掉 rollback 路线已经保留的 FP32 state。
 
 ## 4. 精确 accept/commit 合同
 
@@ -135,6 +142,21 @@ top1  = [t0,     t1, t2, ..., tK]
 Target 真正提交的输入行永远是 `anchor + a 个 accepted proposal`，即 `1+a` 行；对应 GDR/conv
 bank slot 正好是 `a`。correction/bonus 虽然已经作为生成 token 输出，但仍是下一轮尚未处理的
 anchor。这一规则与当前 rollback scheduler 一致，不能为了融合而改变。
+
+生产 verify 固定物理 `T=16`，另传 `[1] INT32 logical_proposal_count`。如果本轮只需要 K 个
+proposal，`pK..p14` 是 scratch suffix。Target 的 attention、GDR、conv、MLP 和 LM head 都是
+因果计算，因此 suffix 不能影响前面的 logit、feature 或 state slot；graph tail 只比较逻辑前缀、
+只 gather slot `a`、只推进 `1+a`。这不是 padding 近似：promote 前仍必须在逻辑
+`K=1/3/5/7/15`、跨 62/63/64/65 位置以及拒绝后续跑 token 的测试中证明该因果 suffix 约束。
+
+设备侧实现位于 `ExactAcceptCommitStateGraph`。它还会在第一个 proposal EOS 截断 drafted/accepted
+范围、抑制 EOS 后 bonus，并把未提交 feature 行清零。主机可先运行捕获与穷举测试：
+
+```bash
+PYTHONPATH="$PWD/framework/python:$PWD" "$MODEL_PYTHON" -m pytest -q \
+  tests/test_incremental_om_transaction.py \
+  tests/test_incremental_performance_contract.py
+```
 
 ## 5. C++ 热循环目标
 
@@ -154,7 +176,7 @@ proposal/verify/commit 小 buffer
 
 ```text
 enqueue draft-propose
-  proposal device buffer ───────────────┐
+  [anchor,p0..p14] device buffer ───────┐
 enqueue target-verify-commit <──────────┘
 enqueue compact commit result D2H
 aclrtSynchronizeStream                  # 本轮唯一 host-visible barrier

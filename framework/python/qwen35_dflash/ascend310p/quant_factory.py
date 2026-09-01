@@ -40,6 +40,8 @@ from .custom_op_export import (
     NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
     NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
     NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+    NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+    NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
     NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
     NPU_DYNAMIC_QUANT_TORCH_OP,
     NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
@@ -50,10 +52,14 @@ from .integrated import (
     enable_padded_draft_context,
     integrated_recompute_graph_spec,
 )
+from .incremental_graphs import incremental_state_graph_specs
 
 
 QUANT_BASE_REVISION = "28f93e784a2beed87020a80bd93c8788754eab1c"
 QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v4"
+QUANT_INCREMENTAL_GRAPH_FACTORY_ID = (
+    "qwen3.5-4b-quant-w8a8-dflash-incremental-state-v2"
+)
 _TARGET_GDN_CHUNK = 64
 _GDR_EFFECTIVE_LENGTH_MAX = torch.iinfo(torch.int16).max
 _DTYPES = {"float16": torch.float16}
@@ -65,6 +71,29 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _enable_target_quant_matmul_export_mode(target: nn.Module) -> int:
+    """Make every receiver QLinear select the private AIR-only frontend."""
+
+    execution_model = getattr(target, "dflash_execution_model", target)
+    if not isinstance(execution_model, nn.Module):
+        raise TypeError("quant Target execution model must be an nn.Module")
+    enabled = 0
+    for module in execution_model.modules():
+        setter = getattr(module, "set_quant_matmul_export_mode", None)
+        if not callable(setter):
+            continue
+        setter(True)
+        enabled += 1
+    audit = dict(getattr(target, "dflash_target_quantization_audit", {}))
+    expected = int(audit.get("qlinear_count", 0))
+    if expected and enabled != expected:
+        raise RuntimeError(
+            "AIR quant-matmul frontend coverage differs from the Target "
+            f"quantization audit: enabled={enabled}, expected={expected}"
+        )
+    return enabled
 
 
 def _verify_quant_source_lock() -> dict[str, Any]:
@@ -371,33 +400,33 @@ class QuantFullPrefixExportTarget(nn.Module):
         return logits, features
 
 
-def create_quant_recompute_graph(
+def _target_custom_op_exports(
     config: Mapping[str, Any],
-) -> tuple[AirGraphSpec, ...]:
-    """Load the locked quant Target/Draft pair and return one AIR graph spec."""
-
-    max_sequence_length = int(config.get("max_sequence_length", 0))
-    if max_sequence_length <= 0 or max_sequence_length % _TARGET_GDN_CHUNK:
-        raise ValueError(
-            "max_sequence_length must be positive and divisible by the "
-            "quant Target's 64-token GDN chunk"
+    *,
+    mtp: bool,
+) -> tuple[CustomOpExportSpec, ...]:
+    gdr = (
+        CustomOpExportSpec(
+            torch_op=NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
+            ge_op_type=str(
+                config.get(
+                    "npu_gated_delta_rule_mtp_ge_op_type",
+                    NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+                )
+            ),
         )
-    if max_sequence_length > _GDR_EFFECTIVE_LENGTH_MAX:
-        raise ValueError(
-            "max_sequence_length exceeds the original GDR INT16 "
-            "effective_length ABI"
+        if mtp
+        else CustomOpExportSpec(
+            torch_op=NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+            ge_op_type=str(
+                config.get(
+                    "npu_chunk_gated_delta_rule_ge_op_type",
+                    NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+                )
+            ),
         )
-    example_sequence_length = int(config.get("example_sequence_length", 2))
-    if not 1 <= example_sequence_length <= max_sequence_length:
-        raise ValueError("example_sequence_length is outside the fixed gear")
-    dtype_name = str(config.get("dtype", "float16"))
-    if dtype_name not in _DTYPES:
-        raise ValueError("quant AIR export supports Target/Draft float16 only")
-    dtype = _DTYPES[dtype_name]
-    device = str(config.get("device", "npu:0"))
-    if not device.startswith("npu"):
-        raise ValueError("formal quant AIR export requires an explicit NPU device")
-    custom_op_exports = (
+    )
+    return (
         CustomOpExportSpec(
             torch_op=NPU_DYNAMIC_QUANT_TORCH_OP,
             ge_op_type=str(
@@ -425,15 +454,7 @@ def create_quant_recompute_graph(
                 )
             ),
         ),
-        CustomOpExportSpec(
-            torch_op=NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
-            ge_op_type=str(
-                config.get(
-                    "npu_chunk_gated_delta_rule_ge_op_type",
-                    NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
-                )
-            ),
-        ),
+        gdr,
         CustomOpExportSpec(
             torch_op=FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
             ge_op_type=str(
@@ -452,9 +473,6 @@ def create_quant_recompute_graph(
                 )
             ),
         ),
-        # forward1 is not selected by the fixed recompute graph, but its
-        # schema/Meta contract must still be valid if that receiver path is
-        # enabled later. Zero means preflight it without inventing a graph hit.
         CustomOpExportSpec(
             torch_op=NPU_SCATTER_ND_UPDATE_TORCH_OP,
             ge_op_type=str(
@@ -466,17 +484,21 @@ def create_quant_recompute_graph(
             minimum_occurrences=0,
         ),
     )
+
+
+def _load_quant_components(
+    config: Mapping[str, Any],
+    *,
+    max_sequence_length: int,
+    device: str,
+    dtype: torch.dtype,
+    rollback: bool,
+) -> tuple[nn.Module, nn.Module, dict[str, Any]]:
     target_dir = _required_directory(config, "target_dir")
     draft_dir = _required_directory(config, "draft_dir")
     quant_config = _required_file(config, "quant_config")
     input_manifest = _required_file(config, "input_manifest")
     receiver_models_dir = _required_directory(config, "receiver_models_dir")
-    if (
-        receiver_models_dir.is_symlink() or not receiver_models_dir.is_dir()
-    ):
-        raise FileNotFoundError(
-            f"receiver_models_dir is not a regular directory: {receiver_models_dir}"
-        )
     source_lock_identity = _verify_quant_source_lock()
     from .input_manifest import verify_quant_input_manifest
 
@@ -484,18 +506,9 @@ def create_quant_recompute_graph(
     locked_roots = locked_inputs["roots"]
     locked_files = locked_inputs["files"]
     expected_paths = {
-        "target_dir": (
-            target_dir,
-            locked_roots["target_checkpoint"],
-        ),
-        "draft_dir": (
-            draft_dir,
-            locked_roots["draft_checkpoint"],
-        ),
-        "quant_config": (
-            quant_config,
-            locked_files["quant_config"][0],
-        ),
+        "target_dir": (target_dir, locked_roots["target_checkpoint"]),
+        "draft_dir": (draft_dir, locked_roots["draft_checkpoint"]),
+        "quant_config": (quant_config, locked_files["quant_config"][0]),
         "receiver_wrapper": (
             receiver_models_dir / "export_model_wrapper_qwen3_5.py",
             locked_files["receiver_wrapper"][0],
@@ -510,19 +523,25 @@ def create_quant_recompute_graph(
         raise ValueError(f"factory paths differ from input_manifest: {mismatches}")
     _append_receiver_models(receiver_models_dir)
 
-    # Fail before loading 4B weights if the NPU extension is unavailable.
     try:
         importlib.import_module("torch_npu")
     except ImportError as error:
         raise RuntimeError("torch_npu is required for quant AIR export") from error
 
     from models.dflash_v1.modeling_dflash import DFlashDraftModel
-    from models.internal_dflash_bridge import load_qwen35_target
+    if rollback:
+        from models.internal_dflash_bridge import load_qwen35_rollback_target
 
+        loader = load_qwen35_rollback_target
+    else:
+        from models.internal_dflash_bridge import load_qwen35_target
+
+        loader = load_qwen35_target
     with _quant_environment(
         quant_config=quant_config,
         kv_cache_max_len=max_sequence_length,
-    ) as quant_identity:
+    ) as raw_quant_identity:
+        quant_identity = dict(raw_quant_identity)
         quant_paths = {
             Path(str(quant_identity["quant_weight_path"])).resolve(),
             Path(str(quant_identity["embedding_weight_path"])).resolve(),
@@ -536,17 +555,74 @@ def create_quant_recompute_graph(
             raise ValueError(
                 "quant YAML artifact paths differ from the input_manifest"
             )
-        target = load_qwen35_target(
+        target = loader(
             str(target_dir),
             device=torch.device(device),
             dtype=dtype,
         )
+    quant_matmul_export_qlinear_count = (
+        _enable_target_quant_matmul_export_mode(target)
+    )
     draft = DFlashDraftModel.from_pretrained(
         draft_dir,
         ops=AirDFlashOps(),
         device=device,
         dtype=dtype,
     ).eval()
+    identity = {
+        "quant_source_lock": source_lock_identity,
+        "locked_inputs": locked_inputs,
+        "target_dir": target_dir,
+        "draft_dir": draft_dir,
+        "receiver_models_dir": receiver_models_dir,
+        "quant_config": quant_identity,
+        "quant_matmul_export_qlinear_count": (
+            quant_matmul_export_qlinear_count
+        ),
+    }
+    return target, draft, identity
+
+
+def create_quant_recompute_graph(
+    config: Mapping[str, Any],
+) -> tuple[AirGraphSpec, ...]:
+    """Load the locked quant Target/Draft pair and return one AIR graph spec."""
+
+    max_sequence_length = int(config.get("max_sequence_length", 0))
+    if max_sequence_length <= 0 or max_sequence_length % _TARGET_GDN_CHUNK:
+        raise ValueError(
+            "max_sequence_length must be positive and divisible by the "
+            "quant Target's 64-token GDN chunk"
+        )
+    if max_sequence_length > _GDR_EFFECTIVE_LENGTH_MAX:
+        raise ValueError(
+            "max_sequence_length exceeds the original GDR INT16 "
+            "effective_length ABI"
+        )
+    example_sequence_length = int(config.get("example_sequence_length", 2))
+    if not 1 <= example_sequence_length <= max_sequence_length:
+        raise ValueError("example_sequence_length is outside the fixed gear")
+    dtype_name = str(config.get("dtype", "float16"))
+    if dtype_name not in _DTYPES:
+        raise ValueError("quant AIR export supports Target/Draft float16 only")
+    dtype = _DTYPES[dtype_name]
+    device = str(config.get("device", "npu:0"))
+    if not device.startswith("npu"):
+        raise ValueError("formal quant AIR export requires an explicit NPU device")
+    custom_op_exports = _target_custom_op_exports(config, mtp=False)
+    target, draft, component_identity = _load_quant_components(
+        config,
+        max_sequence_length=max_sequence_length,
+        device=device,
+        dtype=dtype,
+        rollback=False,
+    )
+    locked_inputs = component_identity["locked_inputs"]
+    target_dir = component_identity["target_dir"]
+    draft_dir = component_identity["draft_dir"]
+    receiver_models_dir = component_identity["receiver_models_dir"]
+    quant_identity = component_identity["quant_config"]
+    source_lock_identity = component_identity["quant_source_lock"]
     enable_padded_draft_context(draft)
     target_adapter = QuantFullPrefixExportTarget(target).eval()
     pad_token_id = int(config.get("pad_token_id", 0))
@@ -580,6 +656,9 @@ def create_quant_recompute_graph(
         "target_quantization_audit": dict(
             getattr(target, "dflash_target_quantization_audit", {})
         ),
+        "quant_matmul_export_qlinear_count": component_identity[
+            "quant_matmul_export_qlinear_count"
+        ],
         "physical_target_gear": max_sequence_length,
         "valid_prefix_policy": "right-padded causal rows only",
         "gdr_effective_length_contract": (
@@ -618,10 +697,113 @@ def create_quant_recompute_graph(
     )
 
 
+def create_quant_incremental_state_graphs(
+    config: Mapping[str, Any],
+) -> tuple[AirGraphSpec, ...]:
+    """Build the four approved explicit-state logical AIR roles.
+
+    This is an implementation candidate, not the default factory.  Export,
+    ATC, real-model parity, complete resident-set memory and latency all remain
+    promotion gates.
+    """
+
+    max_sequence_length = int(config.get("max_sequence_length", 0))
+    if max_sequence_length <= 0 or max_sequence_length % _TARGET_GDN_CHUNK:
+        raise ValueError(
+            "max_sequence_length must be positive and divisible by 64"
+        )
+    if max_sequence_length > _GDR_EFFECTIVE_LENGTH_MAX:
+        raise ValueError(
+            "max_sequence_length exceeds the GDR INT16 effective-length ABI"
+        )
+    dtype_name = str(config.get("dtype", "float16"))
+    if dtype_name not in _DTYPES:
+        raise ValueError("incremental quant AIR supports float16 only")
+    dtype = _DTYPES[dtype_name]
+    device = str(config.get("device", "npu:0"))
+    if not device.startswith("npu"):
+        raise ValueError("formal incremental AIR export requires NPU")
+    eos_table_width = int(config.get("eos_table_width", 4))
+    if eos_table_width <= 0:
+        raise ValueError("eos_table_width must be positive")
+
+    # Fail before checkpoint load if the one operator unique to verify is not
+    # registered. Exact schema/Meta/lowering validation still runs in exporter.
+    try:
+        importlib.import_module("torch_npu")
+        mtp_operation = torch.ops.npu.npu_gated_delta_rule_mtp.default
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            "incremental verify requires registered "
+            "npu::npu_gated_delta_rule_mtp before checkpoint load"
+        ) from error
+    if getattr(mtp_operation, "_schema", None) is None:
+        raise RuntimeError("GDR-MTP does not expose a dispatcher schema")
+
+    target, draft, identity = _load_quant_components(
+        config,
+        max_sequence_length=max_sequence_length,
+        device=device,
+        dtype=dtype,
+        rollback=True,
+    )
+    locked_inputs = identity["locked_inputs"]
+    metadata = {
+        "factory_id": QUANT_INCREMENTAL_GRAPH_FACTORY_ID,
+        "quant_branch_base_revision": QUANT_BASE_REVISION,
+        "quant_source_lock": identity["quant_source_lock"],
+        "target_precision": "W8A8 dynamic QLinear with FP16 outputs",
+        "target_embedding": "INT8 weight * FP32 row scale -> FP16",
+        "draft_precision": "FP16",
+        "dtype": dtype_name,
+        "target_checkpoint_manifest_sha256": locked_inputs["group_sha256"][
+            "target_checkpoint"
+        ],
+        "draft_checkpoint_manifest_sha256": locked_inputs["group_sha256"][
+            "draft_checkpoint"
+        ],
+        "quant_input_manifest_sha256": locked_inputs["manifest_sha256"],
+        "quant_linear_manifest_sha256": locked_inputs["group_sha256"][
+            "quant_linear_weights"
+        ],
+        "quant_embedding_manifest_sha256": locked_inputs["group_sha256"][
+            "quant_embedding"
+        ],
+        "target_dir": str(identity["target_dir"]),
+        "draft_dir": str(identity["draft_dir"]),
+        "receiver_models_dir": str(identity["receiver_models_dir"]),
+        "quant_config": dict(identity["quant_config"]),
+        "target_quantization_audit": dict(
+            getattr(target, "dflash_target_quantization_audit", {})
+        ),
+        "quant_matmul_export_qlinear_count": identity[
+            "quant_matmul_export_qlinear_count"
+        ],
+        "kv_cache_max_len": max_sequence_length,
+        "eos_table_width": eos_table_width,
+        "approval_record": "framework/abi/approvals/incremental-performance-v2.json",
+        "approval_status": "APPROVED",
+        "activation_status": "NOT_ACTIVE",
+    }
+    return incremental_state_graph_specs(
+        target,
+        draft,
+        kv_cache_max_len=max_sequence_length,
+        device=device,
+        dtype=dtype,
+        eos_table_width=eos_table_width,
+        ordinary_custom_ops=_target_custom_op_exports(config, mtp=False),
+        verify_custom_ops=_target_custom_op_exports(config, mtp=True),
+        metadata=metadata,
+    )
+
+
 __all__ = [
     "AirDFlashOps",
     "QUANT_BASE_REVISION",
     "QUANT_GRAPH_FACTORY_ID",
+    "QUANT_INCREMENTAL_GRAPH_FACTORY_ID",
     "QuantFullPrefixExportTarget",
     "create_quant_recompute_graph",
+    "create_quant_incremental_state_graphs",
 ]

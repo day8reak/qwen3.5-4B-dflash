@@ -6,6 +6,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "framework" / "abi" / "incremental-performance-v2.json"
+APPROVAL_PATH = (
+    ROOT
+    / "framework"
+    / "abi"
+    / "approvals"
+    / "incremental-performance-v2.json"
+)
 DOCUMENT_PATH = ROOT / "docs" / "INCREMENTAL_OM_PERFORMANCE.md"
 FRAMEWORK_LOCK_PATH = ROOT / "framework" / "FRAMEWORK_LOCK.json"
 DEPLOYMENT_PATH = ROOT / "framework" / "abi" / "dflash-deployment-v1.json"
@@ -16,15 +23,28 @@ def _contract() -> dict[str, object]:
     return json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
 
-def test_incremental_contract_is_a_non_active_exact_proposal() -> None:
+def test_incremental_contract_has_exact_approval_but_is_not_active() -> None:
     contract = _contract()
-    assert contract["status"] == "PROPOSED_NOT_ACTIVE"
+    approval = json.loads(APPROVAL_PATH.read_text(encoding="utf-8"))
+    assert contract["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
+    assert approval["status"] == "APPROVED"
+    assert approval["approval_statement"] == "批准多OM状态图"
+    assert approval["proposal"]["sha256_before_approval"] == (
+        contract["approval"]["approved_proposal_sha256"]
+    )
+    assert approval["proposal"]["git_commit"] == (
+        contract["approval"]["approved_base_commit"]
+    )
     correctness = contract["non_negotiable_correctness"]
     assert correctness["ordinary_target_is_authoritative"] is True
     assert correctness["allowed_token_id_mismatches"] == 0
     assert correctness["allowed_eos_mismatches"] == 0
     assert correctness["approximation_allowed"] is False
-    assert contract["activation_gate"]["requires_explicit_approval"] is True
+    assert contract["activation_gate"]["requires_explicit_approval"] is False
+    assert contract["activation_gate"]["explicit_approval_status"] == (
+        "PASS_RECORDED"
+    )
+    assert approval["constraints"]["approximation_allowed"] is False
 
 
 def test_incremental_state_budget_matches_locked_qwen35_shapes() -> None:
@@ -43,12 +63,12 @@ def test_incremental_state_budget_matches_locked_qwen35_shapes() -> None:
         * symbols["conv_window"]
         * 2
     )
-    target_recurrent = (
+    target_recurrent_fp32 = (
         linear_layers
         * symbols["gdr_value_heads"]
         * symbols["gdr_key_dim"]
         * symbols["gdr_value_dim"]
-        * 2
+        * 4
     )
     target_kv = (
         full_layers
@@ -66,18 +86,18 @@ def test_incremental_state_budget_matches_locked_qwen35_shapes() -> None:
         * symbols["draft_head_dim"]
         * 2
     )
-    recurrent_bank_fp32 = target_recurrent * verify_rows * 2
+    recurrent_bank_fp32 = target_recurrent_fp32 * verify_rows
     conv_bank_fp16 = target_conv * verify_rows
 
     assert budget["target_scalar_conv_fp16"] == target_conv
-    assert budget["target_scalar_recurrent_fp16"] == target_recurrent
+    assert budget["target_scalar_recurrent_fp32"] == target_recurrent_fp32
     assert budget["target_full_attention_kv_fp16"] == target_kv
     assert budget["draft_persistent_kv_fp16"] == draft_kv
     assert budget["target_persistent_state_total"] == (
-        target_conv + target_recurrent + target_kv
+        target_conv + target_recurrent_fp32 + target_kv
     )
     assert budget["persistent_state_subtotal"] == (
-        target_conv + target_recurrent + target_kv + draft_kv
+        target_conv + target_recurrent_fp32 + target_kv + draft_kv
     )
     assert budget["transient_target_recurrent_bank_fp32"] == recurrent_bank_fp32
     assert budget["transient_target_conv_bank_fp16"] == conv_bank_fp16
@@ -107,15 +127,33 @@ def test_hot_loop_keeps_large_state_and_proposals_on_device() -> None:
     state = contract["state_ownership"]
     assert "target GDR state banks" in state["host_forbidden_payloads_per_round"]
     assert "target or Draft KV cache" in state["host_forbidden_payloads_per_round"]
-    assert contract["hot_loop"]["draft_to_verify"].startswith(
-        "proposal IDs stay on device"
-    )
+    assert "stays on device" in contract["hot_loop"]["draft_to_verify"]
     assert contract["hot_loop"]["synchronization"].startswith(
         "one host-visible synchronization"
     )
     transaction = contract["strict_greedy_transaction"]
     assert transaction["selected_target_state_slot"].startswith("a because")
     assert transaction["committed_target_input_rows"] == "1 + a"
+    assert transaction["fixed_physical_verify"].startswith(
+        "the Target always executes 16 causal rows"
+    )
+
+
+def test_tensor_abi_persists_only_scalar_target_state() -> None:
+    contract = _contract()
+    tensor_abi = contract["tensor_abi"]
+    target = {item["name"]: item for item in tensor_abi["target_persistent_state"]}
+    assert target["target_conv_state"]["shape"][:2] == [24, 1]
+    assert target["target_recurrent_state"]["dtype"] == "float32"
+    assert target["target_key_cache"]["shape"][0] == 8
+    assert target["target_value_cache"]["shape"][0] == 8
+    assert tensor_abi["external_transient_banks_forbidden"] == [
+        "target_conv_state_bank [24,1,16,8192,4]",
+        "target_recurrent_state_bank [24,1,16,32,128,128]",
+    ]
+    carriers = {item["name"]: item for item in tensor_abi["round_carriers"]}
+    assert carriers["verify_input_ids"]["shape"] == [1, 16]
+    assert carriers["logical_proposal_count"]["range"] == [1, 15]
 
 
 def test_document_contains_memory_inspector_and_claim_boundary() -> None:
@@ -124,7 +162,7 @@ def test_document_contains_memory_inspector_and_claim_boundary() -> None:
     assert "--model target-prefill=" in document
     assert "--model target-verify-commit=" in document
     assert "--state-bytes" in document
-    assert "PROPOSED_NOT_ACTIVE" in document
+    assert "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE" in document
     assert "不能宣称" in document
 
 
@@ -133,7 +171,7 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 10
+    assert framework_lock["schema_version"] == 11
     runtime = framework_lock["runtime"]
     assert "input device mirrors" in runtime["memory"]
     assert "last K+1 rows" in runtime["memory"]

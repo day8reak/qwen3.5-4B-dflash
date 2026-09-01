@@ -77,6 +77,12 @@ aclError aclrtMemcpyAsync(
     std::size_t count,
     aclrtMemcpyKind kind,
     aclrtStream stream);
+aclError aclrtMemsetAsync(
+    void* device_ptr,
+    std::size_t max_count,
+    std::int32_t value,
+    std::size_t count,
+    aclrtStream stream);
 
 aclError aclmdlLoadFromFile(const char* model_path, std::uint32_t* model_id);
 aclError aclmdlQuerySize(
@@ -109,6 +115,19 @@ std::size_t aclmdlGetInputSizeByIndex(
 std::size_t aclmdlGetOutputSizeByIndex(
     const aclmdlDesc* description,
     std::size_t index);
+aclError aclmdlGetInputIndexByName(
+    const aclmdlDesc* description,
+    const char* name,
+    std::size_t* index);
+aclError aclmdlGetInputDynamicGearCount(
+    const aclmdlDesc* description,
+    std::size_t index,
+    std::size_t* gear_count);
+aclError aclmdlGetInputDynamicDims(
+    const aclmdlDesc* description,
+    std::size_t index,
+    aclmdlIODims* dimensions,
+    std::size_t gear_count);
 aclmdlDataset* aclmdlCreateDataset();
 aclError aclmdlDestroyDataset(aclmdlDataset* dataset);
 aclDataBuffer* aclCreateDataBuffer(void* data, std::size_t size);
@@ -121,6 +140,11 @@ aclError aclmdlExecuteAsync(
     const aclmdlDataset* input,
     aclmdlDataset* output,
     aclrtStream stream);
+aclError aclmdlSetInputDynamicDims(
+    std::uint32_t model_id,
+    aclmdlDataset* dataset,
+    std::size_t index,
+    const aclmdlIODims* dimensions);
 
 #ifdef __cplusplus
 }

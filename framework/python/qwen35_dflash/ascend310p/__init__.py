@@ -8,7 +8,17 @@ from .exporter import export_air_bundle
 from .generation import benchmark_prompt, generate_prompt
 from .integrated import IntegratedDFlashRecomputeGraph, integrated_recompute_graph_spec
 from .input_manifest import build_quant_input_manifest, verify_quant_input_manifest
-from .quant_factory import create_quant_recompute_graph
+from .incremental import ExactAcceptCommitStateGraph
+from .incremental_graphs import (
+    DraftProposeStateGraph,
+    TargetDecodeOneStateGraph,
+    TargetPrefillStateGraph,
+    TargetVerifyCommitStateGraph,
+)
+from .quant_factory import (
+    create_quant_incremental_state_graphs,
+    create_quant_recompute_graph,
+)
 from .recompute_backend import RecomputeDFlashOmBackend
 from .workflow import run_cpp_target_pipeline, run_om_inference, run_target_pipeline
 
@@ -17,13 +27,19 @@ __all__ = [
     "AirGraphSpec",
     "CustomOpExportSpec",
     "GenerationStep",
+    "ExactAcceptCommitStateGraph",
+    "DraftProposeStateGraph",
     "IntegratedDFlashRecomputeGraph",
     "RecomputeDFlashOmBackend",
+    "TargetDecodeOneStateGraph",
+    "TargetPrefillStateGraph",
+    "TargetVerifyCommitStateGraph",
     "benchmark_prompt",
     "build_cpp_runner",
     "build_quant_input_manifest",
     "compile_air_bundle",
     "create_quant_recompute_graph",
+    "create_quant_incremental_state_graphs",
     "export_air_bundle",
     "generate_prompt",
     "integrated_recompute_graph_spec",

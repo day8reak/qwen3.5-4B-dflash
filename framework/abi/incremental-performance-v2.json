@@ -1,7 +1,14 @@
 {
-  "schema_version": 1,
-  "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2-proposal",
-  "status": "PROPOSED_NOT_ACTIVE",
+  "schema_version": 2,
+  "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
+  "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
+  "approval": {
+    "record": "approvals/incremental-performance-v2.json",
+    "approved_proposal_sha256": "597d342e8bcd8b8ca3c76ee951f6cacad9b464257bbdfe8880c6f7a0d7a4d2ed",
+    "approved_base_commit": "51f57d17bcb12bc1f456f2d8bbc91a0a289d8305",
+    "scope": "explicit multi-OM device-state graph boundaries and exact device-side accept/commit",
+    "approximation_approved": false
+  },
   "objective": "strict-greedy batch-1 generation with persistent device state, no historical-prefix recompute, and one host-visible synchronization per speculative round",
   "non_negotiable_correctness": {
     "ordinary_target_is_authoritative": true,
@@ -31,7 +38,10 @@
     "draft_head_dim": 128,
     "paged_kv_block": 64,
     "maximum_verify_rows": 16,
-    "maximum_proposals": 15
+    "maximum_proposals": 15,
+    "physical_verify_rows": 16,
+    "physical_proposal_rows": 15,
+    "eos_table_width": "fixed at export time and at least one"
   },
   "logical_roles": [
     {
@@ -57,17 +67,17 @@
     },
     {
       "role": "draft-propose",
-      "rows": "anchor plus 1..15 masks",
-      "purpose": "reuse committed Draft KV and only newly committed Target features to produce proposal IDs",
+      "rows": "one dynamic new-context tail plus anchor and 15 masks",
+      "purpose": "reuse committed Draft KV, append only newly committed Target features, and produce one fixed [anchor,p0..p14] verify carrier",
       "required_outputs": [
-        "proposal IDs in a device-resident buffer",
+        "fixed 16-row verify input IDs in a device-resident buffer",
         "updated committed Draft KV"
       ]
     },
     {
       "role": "target-verify-commit",
-      "rows": "anchor plus proposals, exact T in 2..16",
-      "purpose": "verify once, compute the longest matching proposal prefix, select the committed Target state slot, and emit a compact transaction result",
+      "rows": "fixed physical T=16: anchor plus 15 proposal rows; logical_proposal_count selects the exact prefix in 1..15",
+      "purpose": "verify once, ignore the causal scratch suffix, compute the longest matching logical proposal prefix, select the committed Target state slot, and emit a compact transaction result",
       "required_outputs": [
         "committed token IDs and count",
         "drafted/accepted/rejected counts",
@@ -77,6 +87,99 @@
       ]
     }
   ],
+  "tensor_abi": {
+    "binding_order_is_normative": true,
+    "target_persistent_state": [
+      {
+        "name": "target_conv_state",
+        "shape": [24, 1, 8192, 4],
+        "dtype": "float16",
+        "semantics": "one committed scalar causal-conv window per linear-attention layer"
+      },
+      {
+        "name": "target_recurrent_state",
+        "shape": [24, 1, 32, 128, 128],
+        "dtype": "float32",
+        "semantics": "one committed recurrent state per linear-attention layer; ordinary FP16 results are widened after their existing FP16 boundary"
+      },
+      {
+        "name": "target_key_cache",
+        "shape": [8, "kv_cache_max_len/64", 64, 64, 16],
+        "dtype": "float16",
+        "semantics": "paged key cache grouped by full-attention layer"
+      },
+      {
+        "name": "target_value_cache",
+        "shape": [8, "kv_cache_max_len/64", 64, 64, 16],
+        "dtype": "float16",
+        "semantics": "paged value cache grouped by full-attention layer"
+      },
+      {
+        "name": "logical_target_cursor",
+        "shape": [1],
+        "dtype": "int64",
+        "semantics": "only positions below this cursor are committed; rejected physical KV slots may be overwritten"
+      }
+    ],
+    "draft_persistent_state": [
+      {
+        "name": "draft_key_cache",
+        "shape": [6, 1, 8, "kv_cache_max_len", 128],
+        "dtype": "float16"
+      },
+      {
+        "name": "draft_value_cache",
+        "shape": [6, 1, 8, "kv_cache_max_len", 128],
+        "dtype": "float16"
+      },
+      {
+        "name": "logical_draft_cursor",
+        "shape": [1],
+        "dtype": "int64"
+      }
+    ],
+    "round_carriers": [
+      {
+        "name": "verify_input_ids",
+        "shape": [1, 16],
+        "dtype": "int64",
+        "producer": "draft-propose",
+        "consumer": "target-verify-commit",
+        "transfer": "same device buffer, no D2H/H2D"
+      },
+      {
+        "name": "logical_proposal_count",
+        "shape": [1],
+        "dtype": "int32",
+        "range": [1, 15]
+      },
+      {
+        "name": "target_feature_tail",
+        "shape": [1, 16, 20480],
+        "dtype": "float16",
+        "semantics": "static carrier; only committed_input_count leading rows are valid"
+      },
+      {
+        "name": "committed_input_count",
+        "shape": [1],
+        "dtype": "int32",
+        "semantics": "anchor plus accepted proposals, equal to accepted_count+1"
+      }
+    ],
+    "compact_host_result": [
+      {"name": "committed_token_ids", "shape": [1, 16], "dtype": "int64"},
+      {"name": "commit_count", "shape": [1], "dtype": "int32"},
+      {"name": "drafted_count", "shape": [1], "dtype": "int32"},
+      {"name": "accepted_count", "shape": [1], "dtype": "int32"},
+      {"name": "rejected_count", "shape": [1], "dtype": "int32"},
+      {"name": "finished", "shape": [1], "dtype": "bool"}
+    ],
+    "external_transient_banks_forbidden": [
+      "target_conv_state_bank [24,1,16,8192,4]",
+      "target_recurrent_state_bank [24,1,16,32,128,128]"
+    ],
+    "bank_policy": "verify constructs banks inside the graph, the exact tail gathers slot accepted_count, and only grouped scalar states persist"
+  },
   "state_ownership": {
     "owner": "one C++ request context with persistent device buffers",
     "host_forbidden_payloads_per_round": [
@@ -105,15 +208,17 @@
     "all_match_commit": "p[0:K] followed by t[K], unless an accepted proposal is EOS",
     "next_anchor": "the correction t[a] or all-match bonus t[K]; it is emitted but not processed by Target until the next call",
     "committed_target_input_rows": "1 + a",
-    "eos": "never emit a token after the first EOS"
+    "eos": "never emit a token after the first EOS",
+    "fixed_physical_verify": "the Target always executes 16 causal rows; logical_proposal_count and the first proposal EOS bound acceptance and state selection, and rows after that bound are scratch only",
+    "causal_suffix_proof_obligation": "for every Target layer, output/logit/feature/state slot i is independent of physical input rows j>i; promotion requires reduced-graph and real-model rejection tests"
   },
   "bytes_at_batch1_kv_max_len_2048_verify_t16": {
     "target_scalar_conv_fp16": 1572864,
-    "target_scalar_recurrent_fp16": 25165824,
+    "target_scalar_recurrent_fp32": 50331648,
     "target_full_attention_kv_fp16": 67108864,
-    "target_persistent_state_total": 93847552,
+    "target_persistent_state_total": 119013376,
     "draft_persistent_kv_fp16": 50331648,
-    "persistent_state_subtotal": 144179200,
+    "persistent_state_subtotal": 169345024,
     "transient_target_conv_bank_fp16": 25165824,
     "transient_target_recurrent_bank_fp32": 805306368,
     "transient_verify_bank_subtotal": 830472192,
@@ -177,23 +282,25 @@
     "resident_models": true,
     "resident_datasets_and_device_buffers": true,
     "stream": "one request stream unless profile proves overlap safe and beneficial",
-    "draft_to_verify": "proposal IDs stay on device and bind directly to Target verify",
+    "draft_to_verify": "the [anchor,p0..p14] carrier stays on device and binds directly to Target verify",
     "synchronization": "one host-visible synchronization after verify/commit per speculative round",
     "ordinary": "never execute Draft",
     "prefill": "never execute Draft proposal or full LM head for non-final prompt chunks",
     "verify": "never recompute the committed historical prefix"
   },
   "activation_gate": {
-    "requires_explicit_approval": true,
+    "requires_explicit_approval": false,
+    "explicit_approval_status": "PASS_RECORDED",
     "approval_scope": "replace the active full-prefix integrated OM ABI with explicit device-state graph boundaries and a device-side exact accept/commit tail",
     "required_before_default": [
       "AIR custom-node preservation for every role",
       "ATC success for every selected gear",
       "ordinary and DFlash zero token/EOS mismatch",
+      "fixed-T16 causal scratch-suffix tests for logical K=1/3/5/7/15",
       "state rejection tests across positions 62/63/64/65",
       "full candidate-set memory/load report",
       "same-device unprofiled performance comparison"
     ]
   },
-  "claim_boundary": "This file freezes a proposed exact ABI and measurement decision rule. It is not evidence that any topology exports, loads, fits, is correct, or is faster on a physical Ascend310P device."
+  "claim_boundary": "Approval authorizes implementation of this exact ABI. APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE is not evidence that any topology exports, loads, fits, is correct, or is faster on a physical Ascend310P device."
 }

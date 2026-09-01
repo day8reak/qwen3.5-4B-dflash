@@ -49,6 +49,138 @@ class FakeExecutor final : public qwen35::dflash::GraphExecutor {
   qwen35::dflash::GraphOutputs outputs_;
 };
 
+class FakeStatefulExecutor final
+    : public qwen35::dflash::StatefulGraphExecutor {
+ public:
+  explicit FakeStatefulExecutor(bool corrupt_second_proposal = false)
+      : corrupt_second_proposal_(corrupt_second_proposal) {}
+
+  std::size_t sequence_length() const noexcept override { return 32; }
+  std::size_t prefill_width() const noexcept override { return 4; }
+  std::size_t proposal_width() const noexcept override { return 3; }
+  std::size_t eos_table_width() const noexcept override { return 4; }
+
+  void Reset(
+      std::int64_t pad_token_id,
+      const std::vector<std::int64_t>& eos_token_ids) override {
+    if (pad_token_id < 0 || eos_token_ids.size() > eos_table_width()) {
+      throw std::invalid_argument("invalid fake state reset");
+    }
+    eos_ = eos_token_ids;
+    anchor_ = 0;
+    prepared_ = false;
+    prepared_count_ = 0;
+  }
+
+  qwen35::dflash::StatefulStep PrefillChunk(
+      const std::vector<std::int64_t>& token_ids,
+      bool prepare_draft,
+      std::size_t logical_proposal_count) override {
+    if (token_ids.empty() || token_ids.size() > prefill_width()) {
+      throw std::invalid_argument("invalid fake prefill chunk");
+    }
+    anchor_ = token_ids.back() + 1;
+    if (prepare_draft) {
+      Prepare(logical_proposal_count);
+    } else if (logical_proposal_count != 0) {
+      throw std::invalid_argument("proposal count without Draft preparation");
+    }
+    return qwen35::dflash::StatefulStep{
+        {anchor_},
+        prepare_draft ? 2U : 1U,
+        0,
+        0,
+        0,
+        IsEos(anchor_),
+    };
+  }
+
+  qwen35::dflash::StatefulStep DecodeOne(
+      std::int64_t input_token_id) override {
+    if (input_token_id < 0) {
+      throw std::invalid_argument("negative fake decode input");
+    }
+    anchor_ = input_token_id + 1;
+    prepared_ = false;
+    return qwen35::dflash::StatefulStep{
+        {anchor_}, 1, 0, 0, 0, IsEos(anchor_)};
+  }
+
+  qwen35::dflash::StatefulStep SpeculativeStep(
+      std::size_t logical_proposal_count) override {
+    if (logical_proposal_count == 0 ||
+        logical_proposal_count > proposal_width()) {
+      throw std::invalid_argument("invalid fake proposal count");
+    }
+    std::size_t executions = 1;
+    if (!prepared_) {
+      Prepare(logical_proposal_count);
+      executions = 2;
+    } else if (prepared_count_ != logical_proposal_count) {
+      throw std::runtime_error("prepared fake proposal count changed");
+    }
+
+    std::size_t drafted = prepared_proposals_.size();
+    std::size_t accepted = 0;
+    while (accepted < drafted &&
+           prepared_proposals_[accepted] ==
+               anchor_ + static_cast<std::int64_t>(accepted) + 1) {
+      ++accepted;
+    }
+    std::vector<std::int64_t> committed(
+        prepared_proposals_.begin(),
+        prepared_proposals_.begin() + static_cast<std::ptrdiff_t>(accepted));
+    const bool accepted_eos =
+        !committed.empty() && IsEos(committed.back());
+    if (!accepted_eos) {
+      committed.push_back(anchor_ + static_cast<std::int64_t>(accepted) + 1);
+    }
+    anchor_ = committed.back();
+    prepared_ = false;
+    return qwen35::dflash::StatefulStep{
+        committed,
+        executions,
+        drafted,
+        accepted,
+        drafted - accepted,
+        IsEos(committed.back()),
+    };
+  }
+
+ private:
+  bool IsEos(std::int64_t token) const {
+    return std::find(eos_.begin(), eos_.end(), token) != eos_.end();
+  }
+
+  void Prepare(std::size_t logical_proposal_count) {
+    if (logical_proposal_count == 0 ||
+        logical_proposal_count > proposal_width()) {
+      throw std::invalid_argument("invalid fake Draft preparation count");
+    }
+    prepared_proposals_.clear();
+    for (std::size_t index = 0; index < logical_proposal_count; ++index) {
+      std::int64_t token =
+          anchor_ + static_cast<std::int64_t>(index) + 1;
+      if (corrupt_second_proposal_ && index == 1) {
+        token += 100;
+      }
+      prepared_proposals_.push_back(token);
+      if (IsEos(token)) {
+        break;
+      }
+    }
+    prepared_count_ = logical_proposal_count;
+    prepared_ = true;
+  }
+
+  bool corrupt_second_proposal_ = false;
+  std::vector<std::int64_t> eos_;
+  std::int64_t anchor_ = 0;
+  bool prepared_ = false;
+  std::size_t prepared_count_ = 0;
+  std::vector<std::int64_t> prepared_proposals_;
+};
+
 void Require(bool condition, const std::string& message) {
   if (!condition) {
     throw std::runtime_error(message);
@@ -176,6 +308,59 @@ void TestProgressReportsPhaseAndTokenMovement() {
       "progress omitted run completion");
 }
 
+void TestStatefulOrdinaryAndDFlashMatchAcrossPromptChunks() {
+  FakeStatefulExecutor executor;
+  auto options = Options();
+  options.max_new_tokens = 9;
+  const std::vector<std::int64_t> prompt{1, 2, 3, 4, 5, 6, 7};
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor, prompt, qwen35::dflash::GenerationMode::kOrdinary, options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor, prompt, qwen35::dflash::GenerationMode::kDFlash, options);
+  const std::vector<std::int64_t> expected{8, 9, 10, 11, 12, 13, 14, 15, 16};
+  Require(ordinary.generated_token_ids == expected, "stateful ordinary differs");
+  Require(dflash.generated_token_ids == expected, "stateful DFlash differs");
+  Require(dflash.counters.accepted_draft_tokens > 0, "stateful Draft unused");
+  Require(
+      dflash.counters.graph_calls < ordinary.counters.graph_calls,
+      "stateful DFlash did not reduce OM calls under full acceptance");
+}
+
+void TestStatefulCorrectionAndEosRemainExact() {
+  FakeStatefulExecutor executor(true);
+  auto options = Options();
+  options.max_new_tokens = 8;
+  options.eos_token_ids = {16};
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kOrdinary, options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(
+      ordinary.generated_token_ids == dflash.generated_token_ids,
+      "stateful correction changed the authoritative tokens");
+  Require(ordinary.stop_reason == "eos", "stateful ordinary missed EOS");
+  Require(dflash.stop_reason == "eos", "stateful DFlash missed EOS");
+  Require(
+      dflash.counters.rejected_draft_tokens > 0,
+      "stateful bad proposal was not rejected");
+}
+
+void TestStatefulPairedBenchmarkAndProgress() {
+  FakeStatefulExecutor executor;
+  bool saw_reset = false;
+  bool saw_decode = false;
+  const auto progress = [&](const qwen35::dflash::ProgressEvent& event) {
+    saw_reset = saw_reset || std::string(event.stage) == "state-reset-done";
+    saw_decode = saw_decode || std::string(event.stage) == "decode-done";
+  };
+  const auto result = qwen35::dflash::BenchmarkPairStateful(
+      executor, {10}, Options(), 1, 3, progress);
+  Require(result.token_id_mismatches == 0, "stateful paired token mismatch");
+  Require(result.eos_mismatches == 0, "stateful paired EOS mismatch");
+  Require(saw_reset, "stateful progress omitted reset");
+  Require(saw_decode, "stateful progress omitted decode");
+}
+
 void TestSha256KnownVector() {
   Require(
       qwen35::dflash::Sha256("abc") ==
@@ -193,8 +378,12 @@ int main() {
     TestCapacityGate();
     TestPairedBenchmarkIsStableAndExact();
     TestProgressReportsPhaseAndTokenMovement();
+    TestStatefulOrdinaryAndDFlashMatchAcrossPromptChunks();
+    TestStatefulCorrectionAndEosRemainExact();
+    TestStatefulPairedBenchmarkAndProgress();
     TestSha256KnownVector();
-    std::cout << "PASS: C++ scheduler, parity, EOS, capacity and SHA-256\n";
+    std::cout << "PASS: recompute/stateful C++ schedulers, parity, EOS, "
+                 "capacity and SHA-256\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

@@ -87,6 +87,21 @@ if(QWEN35_DFLASH_BUILD_TESTS)
   target_include_directories(qwen35_dflash_fake_acl PUBLIC tests/fake_acl)
   target_compile_options(qwen35_dflash_fake_acl PRIVATE -Wall -Wextra -Wpedantic)
 
+  add_executable(qwen35_dflash_incremental_acl_tests
+    src/incremental_acl_executor.cpp
+    tests/test_incremental_acl.cpp
+  )
+  target_include_directories(qwen35_dflash_incremental_acl_tests PRIVATE
+    tests/fake_acl
+  )
+  target_link_libraries(qwen35_dflash_incremental_acl_tests PRIVATE
+    qwen35_dflash_core
+    qwen35_dflash_fake_acl
+  )
+  target_compile_options(qwen35_dflash_incremental_acl_tests PRIVATE
+    -Wall -Wextra -Wpedantic
+  )
+
   add_executable(qwen35_dflash_acl_runner_fake
     src/acl_executor.cpp
     src/main.cpp
@@ -113,7 +128,19 @@ if(QWEN35_DFLASH_BUILD_TESTS)
   )
 
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/fake.om" "fake-om")
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om" "fake-prefill")
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om" "fake-decode")
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om" "fake-draft")
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om" "fake-verify")
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/fake.om" _fake_om_sha256)
+  add_test(
+    NAME qwen35_dflash_incremental_acl_tests
+    COMMAND qwen35_dflash_incremental_acl_tests
+      ${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      ${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
+      ${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      ${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om
+  )
   add_test(
     NAME qwen35_dflash_fake_acl_runner
     COMMAND "${CMAKE_COMMAND}"
