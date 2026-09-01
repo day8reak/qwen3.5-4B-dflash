@@ -293,6 +293,60 @@ def test_draft_graph_keeps_kv_fixed_and_returns_device_verify_carrier() -> None:
         torch.testing.assert_close(actual, expected)
 
 
+def test_draft_graph_batched_prompt_features_match_sequential_chunk_state() -> None:
+    draft = _FakeDraft().eval()
+    input_embedding = nn.Embedding(128, 2, dtype=torch.float16)
+    output_embedding = nn.Linear(2, 128, bias=False, dtype=torch.float16)
+    with torch.no_grad():
+        input_embedding.weight[:, 0] = torch.arange(128)
+        input_embedding.weight[:, 1] = 0
+    graph = DraftProposeStateGraph(
+        draft,
+        input_embedding,
+        output_embedding,
+        kv_cache_max_len=128,
+    ).eval()
+    first = torch.arange(256, dtype=torch.float16).reshape(1, 64, 4)
+    final = torch.zeros((1, 64, 4), dtype=torch.float16)
+    final[:, :6, :] = torch.arange(24, dtype=torch.float16).reshape(1, 6, 4)
+    key = torch.zeros(2, 1, 1, 128, 2, dtype=torch.float16)
+    value = torch.zeros_like(key)
+    proposal_count = torch.tensor([5], dtype=torch.int32)
+
+    first_result = graph(
+        first,
+        torch.tensor([64], dtype=torch.int32),
+        torch.tensor([[40] + [0] * 15], dtype=torch.long),
+        torch.tensor([1], dtype=torch.int32),
+        proposal_count,
+        key,
+        value,
+        torch.tensor([0], dtype=torch.long),
+    )
+    sequential = graph(
+        final,
+        torch.tensor([6], dtype=torch.int32),
+        torch.tensor([[50] + [0] * 15], dtype=torch.long),
+        torch.tensor([1], dtype=torch.int32),
+        proposal_count,
+        first_result[1],
+        first_result[2],
+        first_result[3],
+    )
+    batched = graph(
+        torch.cat((first, final), dim=1),
+        torch.tensor([70], dtype=torch.int32),
+        torch.tensor([[50] + [0] * 15], dtype=torch.long),
+        torch.tensor([1], dtype=torch.int32),
+        proposal_count,
+        key,
+        value,
+        torch.tensor([0], dtype=torch.long),
+    )
+    for actual, expected in zip(batched, sequential):
+        torch.testing.assert_close(actual, expected)
+
+
 def test_four_role_specs_freeze_binding_order_and_reuse_state_examples() -> None:
     target = _FakeTarget().eval()
     draft = _FakeDraft().eval()
@@ -315,6 +369,7 @@ def test_four_role_specs_freeze_binding_order_and_reuse_state_examples() -> None
     ]
     assert [item.role for item in specs] == [item.name for item in specs]
     assert specs[2].dynamic is True
+    assert specs[2].input_dim_gears == {0: {1: (16, 64)}}
     assert specs[0].example_args[5].dtype == torch.float32
     assert specs[0].example_args[7].shape == (1, 1, 1, 64, 16)
     assert specs[2].example_args[5].shape == (2, 1, 1, 64, 2)
@@ -333,3 +388,19 @@ def test_four_role_specs_freeze_binding_order_and_reuse_state_examples() -> None
         item.metadata["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
         for item in specs
     )
+
+
+def test_draft_air_gears_cover_every_prompt_batch_capacity() -> None:
+    specs = incremental_state_graph_specs(
+        _FakeTarget().eval(),
+        _FakeDraft().eval(),
+        kv_cache_max_len=256,
+        device="cpu",
+        dtype=torch.float16,
+        eos_table_width=4,
+        ordinary_custom_ops=(),
+        verify_custom_ops=(),
+    )
+    assert specs[2].input_dim_gears == {
+        0: {1: (16, 64, 128, 192, 256)}
+    }

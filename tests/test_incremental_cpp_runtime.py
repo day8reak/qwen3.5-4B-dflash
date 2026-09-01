@@ -60,8 +60,12 @@ def _report(
     prompt_chunks = (len(prompt) + 63) // 64
     deferred_prefill = request_count * (prompt_chunks - 1)
     target_prefill_executions = request_count * prompt_chunks
-    draft_propose_executions = 39 + 13 * (prompt_chunks - 1)
-    prefill_control_bytes = 832
+    dflash_request_count = request_count // 2
+    draft_propose_executions = 39
+    prefill_draft_executions = dflash_request_count
+    prefill_draft_elided = dflash_request_count * (prompt_chunks - 1)
+    prefill_feature_rows = dflash_request_count * prompt_chunks * 64
+    prefill_control_bytes = 896
     decode_executions = 65
     proposal_upload_operations = 2
     immutable_zero = (
@@ -100,9 +104,23 @@ def _report(
                 "the only compact D2H and stream synchronization"
             ),
             "prefill_control_policy": (
-                "IDs, effective length, proposal count and EOS table share "
-                "one H2D carrier with 64-byte-aligned device subsegments per "
-                "prompt chunk"
+                "IDs, effective length, proposal count, total prompt count "
+                "and EOS table share one H2D carrier with 64-byte-aligned "
+                "device subsegments per prompt chunk"
+            ),
+            "prefill_draft_policy": (
+                "Target feature slabs stay device-resident; non-final prompt "
+                "chunks execute no Draft OM; final prompt completion executes "
+                "one prebound dynamic-gear Draft OM"
+            ),
+            "prefill_feature_arena_policy": (
+                "contiguous 64-row FP16 slabs with 64-byte-aligned starts and "
+                "one terminal guard; no D2D compaction"
+            ),
+            "prefill_target_lm_head_policy": (
+                "current target-prefill OM still executes its LM head for "
+                "every physical chunk; non-final elimination remains pending "
+                "real-profile-driven graph redesign"
             ),
             "device_suballocation_policy": (
                 "64-byte segment starts; ALIGN_UP(payload,32)+32 reserved span"
@@ -134,11 +152,14 @@ def _report(
             "working_state_device_bytes": working_state_bytes,
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
-            "carrier_device_bytes": 512,
+            "carrier_device_bytes": 4096,
             "prefill_control_bytes_per_slot": prefill_control_bytes,
-            "prefill_staging_pinned_host_bytes": 1664,
+            "prefill_staging_pinned_host_bytes": 1792,
+            "prefill_feature_slab_bytes": 1024,
+            "prefill_feature_arena_bytes": 2112,
+            "draft_dynamic_gear_count": 3,
             "explicit_allocated_device_bytes_excluding_runtime": (
-                64 + 1024 + state_bytes + 512
+                64 + 1024 + state_bytes + 4096
             ),
             "load_policy": (
                 "four aclmdlLoadFromFileWithMem sessions; one max-sized serial "
@@ -162,6 +183,9 @@ def _report(
             "deferred_prefill_chunks": deferred_prefill,
             "prefill_synchronizations_elided": deferred_prefill,
             "prefill_compact_downloads_elided": deferred_prefill,
+            "prefill_draft_propose_executions": prefill_draft_executions,
+            "prefill_draft_propose_executions_elided": prefill_draft_elided,
+            "prefill_feature_rows_batched": prefill_feature_rows,
             "prefill_control_upload_operations": target_prefill_executions,
             "prefill_control_upload_bytes": (
                 target_prefill_executions * prefill_control_bytes
@@ -195,10 +219,13 @@ def _report(
             "working_state_device_bytes": working_state_bytes,
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
-            "carrier_device_bytes": 512,
+            "carrier_device_bytes": 4096,
             "prefill_staging_slots": 2,
             "prefill_control_bytes_per_slot": prefill_control_bytes,
-            "prefill_staging_pinned_host_bytes": 1664,
+            "prefill_staging_pinned_host_bytes": 1792,
+            "prefill_feature_slab_bytes": 1024,
+            "prefill_feature_arena_bytes": 2112,
+            "draft_dynamic_gear_count": 3,
         },
         "ordinary": _mode("ordinary-greedy"),
         "dflash": _mode("dflash-strict-greedy"),

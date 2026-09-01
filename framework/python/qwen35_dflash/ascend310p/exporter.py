@@ -73,6 +73,30 @@ def _normalize_specs(value: Any) -> tuple[AirGraphSpec, ...]:
     return specs
 
 
+def _set_input_dim_gears(spec: AirGraphSpec, torchair: Any) -> None:
+    if not spec.input_dim_gears:
+        return
+    inference = getattr(torchair, "inference", None)
+    setter = getattr(inference, "set_dim_gears", None)
+    if setter is None:
+        try:
+            inference = importlib.import_module("torchair.inference")
+        except ImportError as error:
+            raise RuntimeError(
+                "TorchAir dimension gears require torchair.inference.set_dim_gears"
+            ) from error
+        setter = getattr(inference, "set_dim_gears", None)
+    if not callable(setter):
+        raise RuntimeError(
+            "TorchAir dimension gears require torchair.inference.set_dim_gears"
+        )
+    for input_index, dimensions in spec.input_dim_gears.items():
+        setter(
+            spec.example_args[input_index],
+            {axis: list(gears) for axis, gears in dimensions.items()},
+        )
+
+
 def export_air_bundle(
     factory: str | Callable[[Mapping[str, Any]], Sequence[AirGraphSpec]],
     factory_config: Mapping[str, Any],
@@ -115,6 +139,7 @@ def export_air_bundle(
 
     graphs: list[dict[str, Any]] = []
     for spec in specs:
+        _set_input_dim_gears(spec, torchair)
         softplus_calls_before = softplus_export.converter_calls
         graph_dir = air_root / spec.name
         graph_dir.mkdir()
@@ -160,6 +185,13 @@ def export_air_bundle(
                 "name": spec.name,
                 "role": spec.role,
                 "dynamic": bool(spec.dynamic),
+                "input_dim_gears": {
+                    str(input_index): {
+                        str(axis): list(gears)
+                        for axis, gears in dimensions.items()
+                    }
+                    for input_index, dimensions in spec.input_dim_gears.items()
+                },
                 "model_class": f"{type(spec.model).__module__}.{type(spec.model).__qualname__}",
                 "input_names": list(spec.input_names),
                 "output_names": list(spec.output_names),

@@ -168,7 +168,7 @@
     "model_load": "aclmdlLoadFromFile",
     "model_memory_query": "aclmdlQuerySize is recorded for the active integrated OM; qwen35_dflash_om_inspect sums weights and uses the maximum serial workspace across a proposed multi-OM set",
     "execute": "aclmdlExecuteAsync",
-    "memory": "persistent pinned host/device buffers; integrated input device mirrors upload only changed contiguous ranges after the first call and target D2H is limited to the last K+1 rows required by every current scheduler read; the four-OM runner packs prefill IDs, effective length, proposal count and EOS controls into one H2D carrier with 64-byte-aligned device subsegments per chunk and downloads only compact scheduler-visible results",
+    "memory": "persistent pinned host/device buffers; integrated input device mirrors upload only changed contiguous ranges after the first call and target D2H is limited to the last K+1 rows required by every current scheduler read; the four-OM runner packs prefill IDs, effective length, total prompt count, proposal count and EOS controls into one H2D carrier with 64-byte-aligned device subsegments per chunk, accumulates contiguous Target feature slabs in one device arena, and downloads only compact scheduler-visible results",
     "synchronization": "four-OM runner queues every non-final 64-row prompt chunk without compact D2H or host synchronization, completes the prompt once after the final chunk, and retains one synchronization per decode/verify transaction",
     "generation": "ordinary greedy and strict-greedy DFlash",
     "execution_io_evidence": "runner JSON records actual/full-equivalent H2D and D2H bytes, packed-control/decode/proposal copy counts, role executions, one completion per full prompt, elided intermediate-prefill D2H/synchronizations, and one synchronization per decode/verify transaction",
@@ -176,8 +176,8 @@
     "incremental_approval_record": "framework/abi/approvals/incremental-performance-v2.json",
     "incremental_transaction_tail": "ExactAcceptCommitStateGraph uses fixed physical T=16, logical K=1..15, device-side longest-prefix acceptance, EOS truncation, scalar state selection and compact output",
     "incremental_state_reset_candidates": "async-memset clears one Target/Draft input state set inside first-prefill timing; immutable-zero initializes one extra read-only state set at process startup and removes per-request state clears; both preserve the v2 OM ABI and require same-device memory/latency selection",
-    "incremental_prefill_completion": "non-final prompt chunks keep Target/Draft state and features ordered on one stream; a pinned-host staging slot per maximum 64-row chunk prevents asynchronous H2D source reuse, and only the final chunk returns compact output and synchronizes",
-    "incremental_prefill_control": "one carrier with AscendCL-compliant 64-byte-aligned device subsegments coalesces input IDs, effective length, proposal count, EOS IDs and EOS count into exactly one H2D per prompt chunk; strict report counters close every H2D operation and byte",
+    "incremental_prefill_completion": "non-final prompt chunks keep Target state and contiguous feature slabs ordered on one stream without executing Draft; a pinned-host staging slot per maximum 64-row chunk prevents asynchronous H2D source reuse, and only the final chunk executes one prebound dynamic-gear Draft, returns compact output and synchronizes",
+    "incremental_prefill_control": "one carrier with AscendCL-compliant 64-byte-aligned device subsegments coalesces input IDs, effective length, total prompt count, proposal count, EOS IDs and EOS count into exactly one H2D per prompt chunk; strict report counters close every H2D operation and byte",
     "incremental_device_suballocation": "control, compact-result and Target/Draft state arenas reserve ALIGN_UP(payload,32)+32 bytes per segment and begin every segment at a 64-byte-aligned address"
   },
   "correctness_gate": {

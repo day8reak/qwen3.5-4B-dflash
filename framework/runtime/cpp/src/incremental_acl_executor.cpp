@@ -599,6 +599,8 @@ class AclIncrementalExecutor::Impl {
     prepared_proposal_count_ = 0;
     feature_source_ = FeatureSource::kNone;
     prefill_staging_index_ = 0;
+    prefill_total_token_count_ = 0;
+    draft_reset_pending_ = true;
 
     configured_eos_token_ids_ = eos_token_ids;
     ++stats_.state_resets;
@@ -645,7 +647,11 @@ class AclIncrementalExecutor::Impl {
     if (prefill_staging_index_ >= stats_.prefill_staging_slots) {
       throw std::length_error("prefill staging ring capacity was exceeded");
     }
+    if (token_ids.size() > sequence_length_ - prefill_total_token_count_) {
+      throw std::length_error("prefill token count exceeds sequence capacity");
+    }
     const std::size_t staging_index = prefill_staging_index_++;
+    prefill_total_token_count_ += token_ids.size();
     const bool use_immutable_zero = ApplyPendingReset();
     PreparePrefillControl(
         staging_index, token_ids, prepare_draft, logical_proposal_count);
@@ -655,20 +661,24 @@ class AclIncrementalExecutor::Impl {
       Execute(prefill_, initial_prefill_plan_);
       target_state_index_ = 0;
     } else {
-      Execute(prefill_, prefill_plans_[target_state_index_]);
+      Execute(prefill_, prefill_plans_[staging_index][target_state_index_]);
       target_state_index_ = 1 - target_state_index_;
     }
     ++stats_.target_prefill_executions;
     feature_source_ = FeatureSource::kPrefill;
     std::size_t executions = 1;
-    if (prepare_draft) {
-      ExecuteDraft(
-          FeatureSource::kPrefill, prefill_width_, use_immutable_zero);
+    if (prepare_draft && complete) {
+      const std::size_t feature_rows =
+          (staging_index + 1) * prefill_width_;
+      ExecuteDraft(FeatureSource::kPrefill, feature_rows);
       proposal_ready_ = true;
       prepared_proposal_count_ = logical_proposal_count;
       ++executions;
     } else {
       proposal_ready_ = false;
+      if (prepare_draft) {
+        ++stats_.prefill_draft_propose_executions_elided;
+      }
     }
     if (!complete) {
       deferred_prefill_pending_ = true;
@@ -684,6 +694,7 @@ class AclIncrementalExecutor::Impl {
     ++stats_.prefill_completion_synchronizations;
     deferred_prefill_pending_ = false;
     prefill_staging_index_ = 0;
+    prefill_total_token_count_ = 0;
     return ReadCompact(false, executions);
   }
 
@@ -725,7 +736,7 @@ class AclIncrementalExecutor::Impl {
             "no committed Target feature carrier is available for Draft");
       }
       SetProposalCount(logical_proposal_count);
-      ExecuteDraft(FeatureSource::kVerify, verify_width_, false);
+      ExecuteDraft(FeatureSource::kVerify, verify_width_);
       ++executions;
     }
     Execute(verify_, verify_plans_[target_state_index_]);
@@ -963,7 +974,18 @@ class AclIncrementalExecutor::Impl {
           std::to_string(rows));
     };
     draft_gear_verify_ = find(verify_width_);
-    draft_gear_prefill_ = find(prefill_width_);
+    const std::size_t prefill_gears =
+        (sequence_length_ - 1) / prefill_width_ + 1;
+    if (draft_.dynamic_gears.size() != prefill_gears + 1) {
+      throw std::runtime_error(
+          "Draft OM dynamic gear count differs from N=16 plus every "
+          "64-row prompt batch");
+    }
+    draft_gear_prefill_.reserve(prefill_gears);
+    for (std::size_t index = 0; index < prefill_gears; ++index) {
+      draft_gear_prefill_.push_back(find((index + 1) * prefill_width_));
+    }
+    stats_.draft_dynamic_gear_count = draft_.dynamic_gears.size();
   }
 
   void AllocateBuffers() {
@@ -1006,6 +1028,8 @@ class AclIncrementalExecutor::Impl {
         &control_cursor, prefill_.PublicInput(3).bytes);
     effective_length_offset_ = ReserveDeviceSegment(
         &control_cursor, prefill_.PublicInput(1).bytes);
+    prefill_total_count_offset_ = ReserveDeviceSegment(
+        &control_cursor, prefill_.outputs[4].bytes);
     prefill_control_.Allocate(Align(control_cursor, kBufferAlignment));
     decode_id_.Allocate(decode_.PublicInput(0).bytes);
     stats_.prefill_staging_slots =
@@ -1046,24 +1070,53 @@ class AclIncrementalExecutor::Impl {
         compact_rejected_offset_ + verify_.outputs[4].bytes;
     compact_.Allocate(Align(compact_cursor, kBufferAlignment));
 
-    const std::size_t feature_allocation = std::max(
-        {prefill_.outputs[3].bytes,
-         verify_.outputs[7].bytes,
-         draft_.PublicInput(0).bytes});
-    prefill_features_.Allocate(feature_allocation);
-    verify_features_.Allocate(feature_allocation);
+    const std::size_t prefill_feature_payload = prefill_.outputs[3].bytes;
+    if (prefill_feature_payload % kBufferAlignment != 0) {
+      throw std::runtime_error(
+          "prefill feature slab does not preserve 64-byte alignment");
+    }
+    if (stats_.prefill_staging_slots >
+        std::numeric_limits<std::size_t>::max() / prefill_feature_payload) {
+      throw std::overflow_error("prefill feature arena size overflow");
+    }
+    const std::size_t packed_feature_bytes =
+        stats_.prefill_staging_slots * prefill_feature_payload;
+    if (draft_.PublicInput(0).bytes < packed_feature_bytes) {
+      throw std::runtime_error(
+          "Draft feature input buffer is smaller than the maximum prompt batch");
+    }
+    const std::size_t feature_payload =
+        std::max(draft_.PublicInput(0).bytes, packed_feature_bytes);
+    if (feature_payload > std::numeric_limits<std::size_t>::max() - 32) {
+      throw std::overflow_error("prefill feature terminal guard overflow");
+    }
+    prefill_features_.Allocate(
+        Align(feature_payload + 32, kBufferAlignment));
+    stats_.prefill_feature_slab_bytes = prefill_feature_payload;
+    stats_.prefill_feature_arena_bytes = prefill_features_.bytes;
     committed_input_count_.Allocate(prefill_.outputs[4].bytes);
     verify_ids_.Allocate(verify_.PublicInput(0).bytes);
-    for (auto& control : dynamic_controls_) {
+    prefill_dynamic_controls_.resize(stats_.prefill_staging_slots);
+    for (auto& control : prefill_dynamic_controls_) {
       control.Allocate(draft_.inputs.at(draft_.dynamic_input_index).bytes);
+    }
+    verify_dynamic_control_.Allocate(
+        draft_.inputs.at(draft_.dynamic_input_index).bytes);
+
+    prefill_plans_.resize(stats_.prefill_staging_slots);
+    prefill_draft_plans_.resize(stats_.prefill_staging_slots);
+    if (state_reset_policy_ == IncrementalStateResetPolicy::kImmutableZero) {
+      initial_draft_plans_.resize(stats_.prefill_staging_slots);
     }
 
     stats_.carrier_device_bytes =
         prefill_control_.device.bytes + decode_id_.device.bytes +
         compact_.device.bytes + prefill_features_.bytes +
-        verify_features_.bytes + committed_input_count_.bytes +
-        verify_ids_.bytes + dynamic_controls_[0].bytes +
-        dynamic_controls_[1].bytes;
+        committed_input_count_.bytes + verify_ids_.bytes +
+        verify_dynamic_control_.bytes;
+    for (const auto& control : prefill_dynamic_controls_) {
+      stats_.carrier_device_bytes += control.bytes;
+    }
   }
 
   void* PrefillControlHost(std::size_t index) {
@@ -1085,6 +1138,11 @@ class AclIncrementalExecutor::Impl {
   void* EffectiveLengthHost(std::size_t index) {
     return static_cast<std::byte*>(PrefillControlHost(index)) +
         effective_length_offset_;
+  }
+
+  void* PrefillTotalCountHost(std::size_t index) {
+    return static_cast<std::byte*>(PrefillControlHost(index)) +
+        prefill_total_count_offset_;
   }
 
   void* ProposalCountHost(std::size_t index) {
@@ -1138,6 +1196,30 @@ class AclIncrementalExecutor::Impl {
         proposal_count_offset_, verify_.PublicInput(1).bytes);
   }
 
+  BufferView PrefillTotalCountView() const {
+    return PrefillControlView(
+        prefill_total_count_offset_, prefill_.outputs[4].bytes);
+  }
+
+  BufferView PrefillFeatureSlabView(std::size_t index) const {
+    if (index >= stats_.prefill_staging_slots) {
+      throw std::out_of_range("prefill feature slab index is invalid");
+    }
+    const std::size_t offset = index * stats_.prefill_feature_slab_bytes;
+    if (offset > prefill_features_.bytes ||
+        stats_.prefill_feature_slab_bytes > prefill_features_.bytes - offset) {
+      throw std::out_of_range("prefill feature slab exceeds its arena");
+    }
+    return BufferView{
+        static_cast<std::byte*>(prefill_features_.data) + offset,
+        stats_.prefill_feature_slab_bytes,
+    };
+  }
+
+  BufferView PrefillFeatureBatchView() const {
+    return prefill_features_.View(draft_.PublicInput(0).bytes);
+  }
+
   void PreparePrefillControl(
       std::size_t staging_index,
       const std::vector<std::int64_t>& token_ids,
@@ -1149,6 +1231,8 @@ class AclIncrementalExecutor::Impl {
     std::copy(token_ids.begin(), token_ids.end(), input_ids);
     *static_cast<std::int16_t*>(EffectiveLengthHost(staging_index)) =
         static_cast<std::int16_t>(token_ids.size());
+    *static_cast<std::int32_t*>(PrefillTotalCountHost(staging_index)) =
+        static_cast<std::int32_t>(prefill_total_token_count_);
 
     auto* eos_ids = static_cast<std::int64_t*>(EosIdsHost(staging_index));
     std::fill_n(eos_ids, eos_table_width_, 0);
@@ -1237,24 +1321,60 @@ class AclIncrementalExecutor::Impl {
   }
 
   void BuildPlans() {
+    const auto build_draft = [this](
+                                 DatasetPlan& plan,
+                                 const BufferView& features,
+                                 const BufferView& committed_count,
+                                 const std::vector<BufferView>& input_state,
+                                 const std::vector<BufferView>& output_state,
+                                 const BufferView& dynamic_control,
+                                 const aclmdlIODims& gear,
+                                 const char* gear_description) {
+      plan.Build(
+          draft_,
+          {features,
+           committed_count,
+           CompactView(compact_token_offset_, draft_.PublicInput(2).bytes),
+           CompactView(compact_commit_offset_, draft_.PublicInput(3).bytes),
+           ProposalCountView(),
+           input_state.at(0),
+           input_state.at(1),
+           input_state.at(2)},
+          {verify_ids_.View(),
+           output_state.at(0),
+           output_state.at(1),
+           output_state.at(2)},
+          dynamic_control);
+      Check(
+          aclmdlSetInputDynamicDims(
+              draft_.id,
+              plan.input,
+              draft_.dynamic_input_index,
+              &gear),
+          std::string("draft-propose: aclmdlSetInputDynamicDims(") +
+              gear_description + ")");
+    };
+
     for (std::size_t current = 0; current < 2; ++current) {
       const std::size_t next = 1 - current;
-      prefill_plans_[current].Build(
-          prefill_,
-          TargetInputs(
-              {PrefillIdsView(), EffectiveLengthView(), EosIdsView(),
-               EosCountView()},
-              current),
-          {CompactView(compact_token_offset_, prefill_.outputs[0].bytes),
-           CompactView(compact_commit_offset_, prefill_.outputs[1].bytes),
-           CompactView(compact_finished_offset_, prefill_.outputs[2].bytes),
-           prefill_features_.View(prefill_.outputs[3].bytes),
-           committed_input_count_.View(),
-           target_states_[next].tensors[0],
-           target_states_[next].tensors[1],
-           target_states_[next].tensors[2],
-           target_states_[next].tensors[3],
-           target_states_[next].tensors[4]});
+      for (std::size_t slot = 0; slot < prefill_plans_.size(); ++slot) {
+        prefill_plans_[slot][current].Build(
+            prefill_,
+            TargetInputs(
+                {PrefillIdsView(), EffectiveLengthView(), EosIdsView(),
+                 EosCountView()},
+                current),
+            {CompactView(compact_token_offset_, prefill_.outputs[0].bytes),
+             CompactView(compact_commit_offset_, prefill_.outputs[1].bytes),
+             CompactView(compact_finished_offset_, prefill_.outputs[2].bytes),
+             PrefillFeatureSlabView(slot),
+             committed_input_count_.View(),
+             target_states_[next].tensors[0],
+             target_states_[next].tensors[1],
+             target_states_[next].tensors[2],
+             target_states_[next].tensors[3],
+             target_states_[next].tensors[4]});
+      }
       decode_plans_[current].Build(
           decode_,
           TargetInputs(
@@ -1281,42 +1401,32 @@ class AclIncrementalExecutor::Impl {
            CompactView(compact_rejected_offset_, verify_.outputs[4].bytes),
            target_states_[next].tensors[0],
            target_states_[next].tensors[1],
-           verify_features_.View(verify_.outputs[7].bytes),
+           prefill_features_.View(verify_.outputs[7].bytes),
            committed_input_count_.View(),
            target_states_[next].tensors[4],
            CompactView(compact_finished_offset_, verify_.outputs[10].bytes),
            target_states_[next].tensors[2],
            target_states_[next].tensors[3]});
 
-      for (std::size_t source = 0; source < 2; ++source) {
-        const BufferView feature = source == 0
-            ? prefill_features_.View(draft_.PublicInput(0).bytes)
-            : verify_features_.View(draft_.PublicInput(0).bytes);
-        draft_plans_[source][current].Build(
-            draft_,
-            {feature,
-             committed_input_count_.View(),
-             CompactView(compact_token_offset_, draft_.PublicInput(2).bytes),
-             CompactView(compact_commit_offset_, draft_.PublicInput(3).bytes),
-             ProposalCountView(),
-             draft_states_[current].tensors[0],
-             draft_states_[current].tensors[1],
-             draft_states_[current].tensors[2]},
-            {verify_ids_.View(),
-             draft_states_[next].tensors[0],
-             draft_states_[next].tensors[1],
-             draft_states_[next].tensors[2]},
-            dynamic_controls_[source].View());
-        const aclmdlIODims& gear = source == 0
-            ? draft_gear_prefill_
-            : draft_gear_verify_;
-        Check(
-            aclmdlSetInputDynamicDims(
-                draft_.id,
-                draft_plans_[source][current].input,
-                draft_.dynamic_input_index,
-                &gear),
-            "draft-propose: aclmdlSetInputDynamicDims(prebind)");
+      build_draft(
+          verify_draft_plans_[current],
+          PrefillFeatureBatchView(),
+          committed_input_count_.View(),
+          draft_states_[current].tensors,
+          draft_states_[next].tensors,
+          verify_dynamic_control_.View(),
+          draft_gear_verify_,
+          "verify prebind");
+      for (std::size_t slot = 0; slot < prefill_draft_plans_.size(); ++slot) {
+        build_draft(
+            prefill_draft_plans_[slot][current],
+            PrefillFeatureBatchView(),
+            PrefillTotalCountView(),
+            draft_states_[current].tensors,
+            draft_states_[next].tensors,
+            prefill_dynamic_controls_[slot].View(),
+            draft_gear_prefill_[slot],
+            "prefill batch prebind");
       }
     }
     if (state_reset_policy_ ==
@@ -1336,35 +1446,24 @@ class AclIncrementalExecutor::Impl {
           {CompactView(compact_token_offset_, prefill_.outputs[0].bytes),
            CompactView(compact_commit_offset_, prefill_.outputs[1].bytes),
            CompactView(compact_finished_offset_, prefill_.outputs[2].bytes),
-           prefill_features_.View(prefill_.outputs[3].bytes),
+           PrefillFeatureSlabView(0),
            committed_input_count_.View(),
            target_states_[0].tensors[0],
            target_states_[0].tensors[1],
            target_states_[0].tensors[2],
            target_states_[0].tensors[3],
            target_states_[0].tensors[4]});
-      initial_draft_plan_.Build(
-          draft_,
-          {prefill_features_.View(draft_.PublicInput(0).bytes),
-           committed_input_count_.View(),
-           CompactView(compact_token_offset_, draft_.PublicInput(2).bytes),
-           CompactView(compact_commit_offset_, draft_.PublicInput(3).bytes),
-           ProposalCountView(),
-           draft_zero_state_.tensors[0],
-           draft_zero_state_.tensors[1],
-           draft_zero_state_.tensors[2]},
-          {verify_ids_.View(),
-           draft_states_[0].tensors[0],
-           draft_states_[0].tensors[1],
-           draft_states_[0].tensors[2]},
-          dynamic_controls_[0].View());
-      Check(
-          aclmdlSetInputDynamicDims(
-              draft_.id,
-              initial_draft_plan_.input,
-              draft_.dynamic_input_index,
-              &draft_gear_prefill_),
-          "draft-propose: aclmdlSetInputDynamicDims(immutable zero prebind)");
+      for (std::size_t slot = 0; slot < initial_draft_plans_.size(); ++slot) {
+        build_draft(
+            initial_draft_plans_[slot],
+            PrefillFeatureBatchView(),
+            PrefillTotalCountView(),
+            draft_zero_state_.tensors,
+            draft_states_[0].tensors,
+            prefill_dynamic_controls_[slot].View(),
+            draft_gear_prefill_[slot],
+            "immutable zero prefill batch prebind");
+      }
     }
   }
 
@@ -1417,6 +1516,7 @@ class AclIncrementalExecutor::Impl {
       stream_work_pending_ = true;
       ++stats_.state_memset_operations;
       stats_.state_memset_bytes += draft_states_[0].allocation.bytes;
+      draft_reset_pending_ = false;
     }
     reset_pending_ = false;
     return use_immutable_zero;
@@ -1446,22 +1546,44 @@ class AclIncrementalExecutor::Impl {
 
   void ExecuteDraft(
       FeatureSource source,
-      std::size_t feature_rows,
-      bool use_immutable_zero) {
-    if (source == FeatureSource::kNone ||
-        (feature_rows != prefill_width_ && feature_rows != verify_width_)) {
+      std::size_t feature_rows) {
+    if (source == FeatureSource::kNone) {
       throw std::logic_error("invalid Draft feature source/gear");
     }
-    if (use_immutable_zero && source != FeatureSource::kPrefill) {
+    const bool prefill_source = source == FeatureSource::kPrefill;
+    if ((!prefill_source && feature_rows != verify_width_) ||
+        (prefill_source &&
+         (feature_rows == 0 || feature_rows % prefill_width_ != 0 ||
+          feature_rows > sequence_length_))) {
+      throw std::logic_error("invalid Draft feature source/gear");
+    }
+    const bool use_immutable_zero =
+        draft_reset_pending_ &&
+        state_reset_policy_ == IncrementalStateResetPolicy::kImmutableZero;
+    if (draft_reset_pending_ && !use_immutable_zero) {
+      throw std::logic_error("Draft reset was not consumed by prefill");
+    }
+    if (use_immutable_zero && !prefill_source) {
       throw std::logic_error(
           "immutable Draft zero state is valid only for first prefill");
     }
-    DatasetPlan& plan = use_immutable_zero
-        ? initial_draft_plan_
-        : draft_plans_[static_cast<std::size_t>(source)][draft_state_index_];
-    Execute(draft_, plan);
+    DatasetPlan* plan = nullptr;
+    if (prefill_source) {
+      const std::size_t gear_index = feature_rows / prefill_width_ - 1;
+      plan = use_immutable_zero
+          ? &initial_draft_plans_.at(gear_index)
+          : &prefill_draft_plans_.at(gear_index)[draft_state_index_];
+    } else {
+      plan = &verify_draft_plans_[draft_state_index_];
+    }
+    Execute(draft_, *plan);
     ++stats_.draft_propose_executions;
+    if (prefill_source) {
+      ++stats_.prefill_draft_propose_executions;
+      stats_.prefill_feature_rows_batched += feature_rows;
+    }
     draft_state_index_ = use_immutable_zero ? 0 : 1 - draft_state_index_;
+    draft_reset_pending_ = false;
   }
 
   void Execute(const ModelSession& session, DatasetPlan& plan) {
@@ -1570,12 +1692,19 @@ class AclIncrementalExecutor::Impl {
       static_cast<void>(aclrtSynchronizeStream(stream_));
       stream_work_pending_ = false;
     }
-    initial_draft_plan_.Release();
+    for (auto& plan : initial_draft_plans_) {
+      plan.Release();
+    }
+    initial_draft_plans_.clear();
     initial_prefill_plan_.Release();
-    for (auto& by_source : draft_plans_) {
-      for (auto& plan : by_source) {
+    for (auto& by_gear : prefill_draft_plans_) {
+      for (auto& plan : by_gear) {
         plan.Release();
       }
+    }
+    prefill_draft_plans_.clear();
+    for (auto& plan : verify_draft_plans_) {
+      plan.Release();
     }
     for (auto& plan : verify_plans_) {
       plan.Release();
@@ -1583,16 +1712,20 @@ class AclIncrementalExecutor::Impl {
     for (auto& plan : decode_plans_) {
       plan.Release();
     }
-    for (auto& plan : prefill_plans_) {
-      plan.Release();
+    for (auto& by_slot : prefill_plans_) {
+      for (auto& plan : by_slot) {
+        plan.Release();
+      }
     }
+    prefill_plans_.clear();
 
-    for (auto& control : dynamic_controls_) {
+    verify_dynamic_control_.Release();
+    for (auto& control : prefill_dynamic_controls_) {
       control.Release();
     }
+    prefill_dynamic_controls_.clear();
     verify_ids_.Release();
     committed_input_count_.Release();
-    verify_features_.Release();
     prefill_features_.Release();
     compact_.Release();
     for (auto& host : extra_prefill_control_host_) {
@@ -1661,7 +1794,7 @@ class AclIncrementalExecutor::Impl {
   std::size_t feature_width_ = 0;
   std::vector<TensorSpec> target_state_specs_;
   std::vector<TensorSpec> draft_state_specs_;
-  aclmdlIODims draft_gear_prefill_{};
+  std::vector<aclmdlIODims> draft_gear_prefill_;
   aclmdlIODims draft_gear_verify_{};
 
   std::array<StateArena, 2> target_states_;
@@ -1673,10 +1806,10 @@ class AclIncrementalExecutor::Impl {
   std::vector<HostAllocation> extra_prefill_control_host_;
   MirrorBuffer compact_;
   DeviceAllocation prefill_features_;
-  DeviceAllocation verify_features_;
   DeviceAllocation committed_input_count_;
   DeviceAllocation verify_ids_;
-  std::array<DeviceAllocation, 2> dynamic_controls_;
+  std::vector<DeviceAllocation> prefill_dynamic_controls_;
+  DeviceAllocation verify_dynamic_control_;
 
   std::size_t compact_token_offset_ = 0;
   std::size_t compact_commit_offset_ = 0;
@@ -1691,17 +1824,20 @@ class AclIncrementalExecutor::Impl {
   std::size_t eos_ids_offset_ = 0;
   std::size_t eos_count_offset_ = 0;
   std::size_t proposal_count_offset_ = 0;
+  std::size_t prefill_total_count_offset_ = 0;
 
-  std::array<DatasetPlan, 2> prefill_plans_;
+  std::vector<std::array<DatasetPlan, 2>> prefill_plans_;
   std::array<DatasetPlan, 2> decode_plans_;
   std::array<DatasetPlan, 2> verify_plans_;
-  std::array<std::array<DatasetPlan, 2>, 2> draft_plans_;
+  std::vector<std::array<DatasetPlan, 2>> prefill_draft_plans_;
+  std::array<DatasetPlan, 2> verify_draft_plans_;
   DatasetPlan initial_prefill_plan_;
-  DatasetPlan initial_draft_plan_;
+  std::vector<DatasetPlan> initial_draft_plans_;
 
   std::size_t target_state_index_ = 0;
   std::size_t draft_state_index_ = 0;
   std::size_t prefill_staging_index_ = 0;
+  std::size_t prefill_total_token_count_ = 0;
   bool deferred_prefill_pending_ = false;
   bool stream_work_pending_ = false;
   bool proposal_ready_ = false;
@@ -1711,6 +1847,7 @@ class AclIncrementalExecutor::Impl {
   std::size_t proposal_value_ = 0;
   std::int64_t pad_token_id_ = 0;
   bool reset_pending_ = false;
+  bool draft_reset_pending_ = false;
   std::vector<std::int64_t> configured_eos_token_ids_;
   IncrementalAclExecutionStats stats_;
 };

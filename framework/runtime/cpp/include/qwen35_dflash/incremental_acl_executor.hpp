@@ -47,6 +47,9 @@ struct IncrementalAclExecutionStats {
   std::size_t deferred_prefill_chunks = 0;
   std::size_t prefill_synchronizations_elided = 0;
   std::size_t prefill_compact_downloads_elided = 0;
+  std::size_t prefill_draft_propose_executions = 0;
+  std::size_t prefill_draft_propose_executions_elided = 0;
+  std::size_t prefill_feature_rows_batched = 0;
   std::size_t prefill_control_upload_operations = 0;
   std::size_t prefill_control_upload_bytes = 0;
   std::size_t prefill_h2d_operations_elided = 0;
@@ -72,6 +75,9 @@ struct IncrementalAclExecutionStats {
   std::size_t prefill_staging_slots = 0;
   std::size_t prefill_control_bytes_per_slot = 0;
   std::size_t prefill_staging_pinned_host_bytes = 0;
+  std::size_t prefill_feature_slab_bytes = 0;
+  std::size_t prefill_feature_arena_bytes = 0;
+  std::size_t draft_dynamic_gear_count = 0;
 };
 
 using IncrementalModelProgress = std::function<void(

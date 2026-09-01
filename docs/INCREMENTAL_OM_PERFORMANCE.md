@@ -215,27 +215,36 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   仍分配自己的 `weightSize`，不假设跨文件共享权重；
 - Target/Draft state 双缓冲留在 device，proposal 与 feature carrier 不回 host；
 - `draft-propose -> target-verify-commit -> compact D2H -> synchronize` 每轮一个 barrier；
-- 多 chunk prompt 的中间 `target-prefill`/`draft-propose` 只排入同一 stream，不下载 compact
-  结果、不同步；最后一个 chunk 才执行整个 prompt 唯一一次 prefill D2H 和 barrier；
+- 多 chunk prompt 的每个 `target-prefill` 把固定 64 行 feature 直接写入连续 device arena；中间
+  chunk 不执行 `draft-propose`、不下载 compact 结果、不同步；最后一个 chunk 才用完整 prompt
+  对应的动态 gear 执行一次 Draft，并完成整个 prompt 唯一一次 D2H 和 barrier；
 - reset 支持两个精确策略：默认 `async-memset` 把 state clear 排入第一次 prefill；候选
   `immutable-zero` 在进程启动时建立只读零状态，使每次请求不再清零大状态。二者都没有
   reset-only barrier，后者以额外一套 Target+Draft 状态显存换 TTFT；
-- 每个 prompt chunk 的 64 个 ID、有效长度、proposal count 和 EOS 表共用一个 832-byte
+- 每个 prompt chunk 的 64 个 ID、有效长度、累计 prompt token 数、proposal count 和 EOS 表共用
+  一个 896-byte
   host/device control carrier，只下发一次 H2D；每个 device 子段按 64 bytes 对齐并保留 AscendCL
   要求的分段 padding，prefill 后只有 proposal count 真正变化时才单独下发 4-byte H2D；
 - Target/Draft state arena 与 compact result arena 也使用同一条 64-byte 起始地址、
   `ALIGN_UP(payload,32)+32` 分段规则；Fake ACL 会拒绝任何未对齐的模型输入/输出绑定；
-- Draft 的 `N=64/N=16` 动态 gear 在 dataset 建立时预绑定，不在 decode 热循环反复配置；
+- Draft 的 `N=16,64,128,...,kv_cache_max_len` 离散 gear 通过 TorchAir
+  `set_dim_gears` 写入 AIR；C++ 启动时逐档核验并预建 dataset，request 热循环不调用
+  `aclmdlSetInputDynamicDims`；
 - ordinary 路径只执行 `target-prefill`/`target-decode1`，不执行 Draft。
 
 这些是源代码和 Fake-ACL 可验证的执行属性，仍不是物理 310P 的性能结论。
 
-当前四角色 ABI 中，长 prompt 的每个 64-row chunk 都要把 Target feature 送入
-`draft-propose` 来推进 Draft KV；非末 chunk 产生的 proposal 会被丢弃。它避免了历史前缀重算，
-但还没有独立的“只 ingest context、不跑 proposal head”Draft prefill 图。是否值得增加该物理
-角色必须由长 prompt 的 msprof 证明，并需要单独审批 ABI/拓扑变更，不能在本候选中暗改语义。
-当前 C++ runner 已消除这些非末 chunk 的 host round-trip，但并没有把其中的 Draft proposal head
-伪装成已消除：device 计算仍会出现在 `draft-propose` 的 msprof 汇总中。
+当前实现把所有 prompt feature slab 留在 device，并在最后一个 chunk 以一个动态 Draft 调用一次性
+写入 Draft KV。因此每个 DFlash 请求的 prefill Draft 次数固定为 1；长度 2048 时，相比逐 chunk
+执行会少 31 次 Draft。代价是一个连续 feature arena。Qwen3.5-4B 的 feature width 为 20480、
+FP16、capacity=2048 时，arena payload 是 `32*64*20480*2 = 83,886,080` bytes（80 MiB），
+另有一个 terminal guard；该 arena 在 prompt 后复用为 verify feature carrier，相比旧的两块
+64-row carrier 合计增加约 75 MiB，不增加第五个 OM，也不复制新的 Draft 权重。
+
+必须保留一个未完成边界：当前 `target-prefill` OM 仍在每个 chunk 内运行 Target LM head，只是
+中间结果不回 host。已消除的是中间 chunk 的完整 Draft OM，不应把它表述成 LM head 也已消除。
+若真机 msprof 显示 LM head 是剩余主要 TTFT 热点，需要另行设计可跳过 head 的 prefill/finalize
+图，同时重新做完整 resident-weight 预算和 AIR/OM 正确性门禁。
 
 ### 5.2 生成四个 AIR/OM
 
@@ -271,7 +280,11 @@ jq -r '.graphs[] | [.name,.role,.om.path,.om.sha256] | @tsv' \
 
 输出必须恰好包含 `target-prefill`、`target-decode1`、`draft-propose`、
 `target-verify-commit` 四个 role。导出/ATC 仍会按每个 graph 的合同检查自定义节点，不能把它们
-静默分解成普通 Tensor 子图。
+静默分解成普通 Tensor 子图。`draft-propose` 的 gear 由 exporter 在调用
+`torchair.dynamo_export` 前对第 0 个输入执行 `torchair.inference.set_dim_gears`；不要给
+`--framework=1` 的 AIR→OM ATC 命令额外拼 `--dynamic_dims`。生成 OM 后，C++ 启动会要求
+`N=16` 和从 64 到 `max_sequence_length` 的每个 64 倍数都能由
+`aclmdlGetInputDynamicDims` 查询到，缺一档就直接失败。
 
 ### 5.3 构建并通过控制面运行
 
@@ -330,6 +343,9 @@ prefill_completion_synchronizations = R
 deferred_prefill_chunks            = R * (C - 1)
 prefill_synchronizations_elided     = deferred_prefill_chunks
 prefill_compact_downloads_elided    = deferred_prefill_chunks
+prefill_draft_propose_executions    = (R / 2)              # DFlash requests
+prefill_draft_propose_executions_elided = (R / 2) * (C - 1)
+prefill_feature_rows_batched        = (R / 2) * C * 64
 prefill_control_upload_operations   = target_prefill_executions
 prefill_h2d_operations_elided       = target_prefill_executions
 prefill_control_upload_bytes        = target_prefill_executions * control_bytes
@@ -342,21 +358,23 @@ host_to_device_operations           = prefill_control_upload_operations
 
 其中每个字段的 device offset 都按 64 bytes 对齐，每段物理跨度为
 `ALIGN_UP(tensor_bytes,32)+32`，最终 carrier 再按 64 bytes 对齐；默认 `eos_table_width=4` 时为
-832 bytes。最后三个加数分别代表 packed prefill、单 token decode ID 和 prefill 后 proposal
+896 bytes。最后三个加数分别代表 packed prefill、单 token decode ID 和 prefill 后 proposal
 count 改值，三类 operation/byte 分项之和必须严格等于总 H2D 计数。这个布局遵守
 [`aclrtMalloc` 对大块内存二次划分的 64-byte 起始地址与分段跨度约束](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0095.html)。
 
 因此 2048-token prompt 的每次请求会把原来的 32 次 prefill host completion 降为 1 次；整个
-paired 报告应消除 `26*31=806` 次 stream sync 和 compact D2H。它不减少 Target/Draft 的 device
-执行次数。为保证异步 H2D 源不在最终同步前被覆盖，runner 会常驻 `2048/64=32` 个 pinned-host
-staging slot；每个 slot 为 832 字节，总计 26,624 字节，device 侧只需同一个 832-byte packed
+paired 报告应消除 `26*31=806` 次 stream sync 和 compact D2H。它不减少 Target prefill 的
+device 执行次数，但会消除 `13*31=403` 次中间 Draft 执行。为保证异步 H2D 源不在
+最终同步前被覆盖，runner 会常驻 `2048/64=32` 个 pinned-host staging slot；每个 slot 为 896
+字节，总计 28,672 字节，device 侧只需同一个 896-byte packed
 control buffer。相对于每 chunk 分别上传 ID 和有效长度，2048-token paired 报告至少再消除
 `26*32=832` 次小 H2D API 调用。
 
 70-token/two-chunk Fake ACL 的冻结调用证据是 H2D operations 从 185 降为 130（减少 55，约
 29.7%）；由于把 EOS/control 与真机要求的分段 padding 一并装入每个 carrier，H2D payload 从
-27,392 增至 43,888 bytes。这只证明调用合并和计数闭合，不是 310P 时延结论；真机必须以未开
-msprof 的 3+10 报告判断 API 减少是否覆盖多出的 16,496 bytes。把旧 compact/state 子分配修正为
+27,392 增至 47,216 bytes（其中本轮累计 prompt count 使每个 carrier 从 832 增至 896）。这只
+证明调用合并和计数闭合，不是 310P 时延结论；真机必须以未开 msprof 的 3+10 报告判断 API 与
+Draft 调用减少是否覆盖增加的 control/feature 常驻内存。把旧 compact/state 子分配修正为
 官方对齐规则后，同一 Fake ACL 报告的 D2H operations 保持 117，payload 从 15,756 增至 32,604
 bytes；这同样是必须在真机 A/B 中保留的显式代价，不能从 Fake ACL 推断净时延收益。
 

@@ -93,9 +93,15 @@ string(JSON prefill_completions GET "${report}" execution_io_counters prefill_co
 string(JSON deferred_prefill GET "${report}" execution_io_counters deferred_prefill_chunks)
 string(JSON prefill_syncs_elided GET "${report}" execution_io_counters prefill_synchronizations_elided)
 string(JSON prefill_d2h_elided GET "${report}" execution_io_counters prefill_compact_downloads_elided)
+string(JSON prefill_draft_executions GET "${report}" execution_io_counters prefill_draft_propose_executions)
+string(JSON prefill_draft_elided GET "${report}" execution_io_counters prefill_draft_propose_executions_elided)
+string(JSON prefill_feature_rows GET "${report}" execution_io_counters prefill_feature_rows_batched)
 string(JSON prefill_staging_slots GET "${report}" execution_io_counters prefill_staging_slots)
 string(JSON prefill_control_slot_bytes GET "${report}" execution_io_counters prefill_control_bytes_per_slot)
 string(JSON prefill_staging_bytes GET "${report}" execution_io_counters prefill_staging_pinned_host_bytes)
+string(JSON prefill_feature_slab_bytes GET "${report}" execution_io_counters prefill_feature_slab_bytes)
+string(JSON prefill_feature_arena_bytes GET "${report}" execution_io_counters prefill_feature_arena_bytes)
+string(JSON draft_dynamic_gears GET "${report}" execution_io_counters draft_dynamic_gear_count)
 string(JSON prefill_control_uploads GET "${report}" execution_io_counters prefill_control_upload_operations)
 string(JSON prefill_control_upload_bytes GET "${report}" execution_io_counters prefill_control_upload_bytes)
 string(JSON prefill_h2d_elided GET "${report}" execution_io_counters prefill_h2d_operations_elided)
@@ -114,6 +120,8 @@ math(EXPR role_total
 )
 math(EXPR closed_state_bytes "${working_state_bytes} + ${zero_state_bytes}")
 math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
+math(EXPR expected_dflash_requests "${EXPECTED_RESETS} / 2")
+math(EXPR expected_prefill_feature_rows "${expected_dflash_requests} * 128")
 math(EXPR expected_prefill_control_bytes "${prefill_executions} * ${prefill_control_slot_bytes}")
 math(EXPR expected_decode_upload_bytes "${decode_uploads} * 8")
 math(EXPR expected_proposal_upload_bytes "${proposal_uploads} * 4")
@@ -151,9 +159,16 @@ if(NOT status STREQUAL "PASS" OR
    NOT deferred_prefill EQUAL EXPECTED_RESETS OR
    NOT prefill_syncs_elided EQUAL deferred_prefill OR
    NOT prefill_d2h_elided EQUAL deferred_prefill OR
+   NOT prefill_draft_executions EQUAL expected_dflash_requests OR
+   NOT prefill_draft_elided EQUAL expected_dflash_requests OR
+   NOT prefill_feature_rows EQUAL expected_prefill_feature_rows OR
+   NOT draft_executions EQUAL expected_dflash_requests OR
    NOT prefill_staging_slots EQUAL 2 OR
-   NOT prefill_control_slot_bytes EQUAL 832 OR
-   NOT prefill_staging_bytes EQUAL 1664 OR
+   NOT prefill_control_slot_bytes EQUAL 896 OR
+   NOT prefill_staging_bytes EQUAL 1792 OR
+   NOT prefill_feature_slab_bytes EQUAL 1024 OR
+   NOT prefill_feature_arena_bytes EQUAL 2112 OR
+   NOT draft_dynamic_gears EQUAL 3 OR
    NOT prefill_control_uploads EQUAL prefill_executions OR
    NOT prefill_control_upload_bytes EQUAL expected_prefill_control_bytes OR
    NOT prefill_h2d_elided EQUAL prefill_executions OR

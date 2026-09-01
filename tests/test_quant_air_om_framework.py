@@ -21,6 +21,7 @@ if str(FRAMEWORK_PYTHON) not in sys.path:
     sys.path.insert(0, str(FRAMEWORK_PYTHON))
 
 from qwen35_dflash.ascend310p.compiler import (
+    _validate_extra_args,
     _validated_custom_op_audit,
     compile_air_bundle,
 )
@@ -229,6 +230,15 @@ class _FakeTorchAir:
     def __init__(self) -> None:
         self.ge = _FakeTorchAirGe()
         self.converters: dict[object, object] = {}
+        self.dim_gear_calls: list[tuple[torch.Tensor, dict[int, list[int]]]] = []
+        self.inference = SimpleNamespace(set_dim_gears=self._set_dim_gears)
+
+    def _set_dim_gears(
+        self,
+        value: torch.Tensor,
+        gears: dict[int, list[int]],
+    ) -> None:
+        self.dim_gear_calls.append((value, gears))
 
     @property
     def converter(self):
@@ -1534,6 +1544,15 @@ def test_functional_cache_update_survives_aot_and_keeps_ge_custom_op() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "argument",
+    ["--dynamic_dims=16;64", "--input_shape=input:-1,8"],
+)
+def test_air_atc_rejects_dynamic_shape_overrides(argument: str) -> None:
+    with pytest.raises(ValueError, match="core option"):
+        _validate_extra_args([argument])
+
+
 def test_air_export_audits_retained_adn_rms_norm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1553,6 +1572,8 @@ def test_air_export_audits_retained_adn_rms_norm(
                 role="generation-recompute",
                 model=nn.Identity(),
                 example_args=(torch.ones(1),),
+                dynamic=True,
+                input_dim_gears={0: {0: (1, 2)}},
                 custom_ops=(
                     CustomOpExportSpec(
                         torch_op=ADN_RMS_NORM_TORCH_OP,
@@ -1572,6 +1593,8 @@ def test_air_export_audits_retained_adn_rms_norm(
     audit = graph["custom_op_audit"][0]
     standard_override = graph["standard_op_overrides"][0]
     assert result["schema_version"] == 3
+    assert graph["input_dim_gears"] == {"0": {"0": [1, 2]}}
+    assert torchair.dim_gear_calls[0][1] == {0: [1, 2]}
     assert result["environment"]["adn_attention_ge_prototype"] == {
         "status": "NOT_CONFIGURED",
         "ge_op_type": "AdnFusedInferAttention",

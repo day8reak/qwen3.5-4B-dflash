@@ -517,6 +517,12 @@ void WriteReport(
          << execution.prefill_control_bytes_per_slot
          << ",\"prefill_staging_pinned_host_bytes\":"
          << execution.prefill_staging_pinned_host_bytes
+         << ",\"prefill_feature_slab_bytes\":"
+         << execution.prefill_feature_slab_bytes
+         << ",\"prefill_feature_arena_bytes\":"
+         << execution.prefill_feature_arena_bytes
+         << ",\"draft_dynamic_gear_count\":"
+         << execution.draft_dynamic_gear_count
          << ",\"explicit_allocated_device_bytes_excluding_runtime\":"
          << max_work + sum_weight + execution.state_device_bytes +
                 execution.carrier_device_bytes
@@ -535,8 +541,17 @@ void WriteReport(
             "stay queued; final chunk performs the only compact D2H and "
             "stream synchronization\","
          << "\"prefill_control_policy\":\"IDs, effective length, proposal "
-            "count and EOS table share one H2D carrier with 64-byte-aligned "
-            "device subsegments per prompt chunk\","
+            "count, total prompt count and EOS table share one H2D carrier "
+            "with 64-byte-aligned device subsegments per prompt chunk\","
+         << "\"prefill_draft_policy\":\"Target feature slabs stay device-resident; "
+            "non-final prompt chunks execute no Draft OM; final prompt "
+            "completion executes one prebound dynamic-gear Draft OM\","
+         << "\"prefill_feature_arena_policy\":\"contiguous 64-row FP16 slabs "
+            "with 64-byte-aligned starts and one terminal guard; no D2D "
+            "compaction\","
+         << "\"prefill_target_lm_head_policy\":\"current target-prefill OM "
+            "still executes its LM head for every physical chunk; non-final "
+            "elimination remains pending real-profile-driven graph redesign\","
          << "\"device_suballocation_policy\":\"64-byte segment starts; "
             "ALIGN_UP(payload,32)+32 reserved span\","
          << "\"state_reset_policy\":\""
@@ -587,6 +602,12 @@ void WriteReport(
          << execution.prefill_synchronizations_elided
          << ",\"prefill_compact_downloads_elided\":"
          << execution.prefill_compact_downloads_elided
+         << ",\"prefill_draft_propose_executions\":"
+         << execution.prefill_draft_propose_executions
+         << ",\"prefill_draft_propose_executions_elided\":"
+         << execution.prefill_draft_propose_executions_elided
+         << ",\"prefill_feature_rows_batched\":"
+         << execution.prefill_feature_rows_batched
          << ",\"prefill_control_upload_operations\":"
          << execution.prefill_control_upload_operations
          << ",\"prefill_control_upload_bytes\":"
@@ -631,6 +652,12 @@ void WriteReport(
          << execution.prefill_control_bytes_per_slot
          << ",\"prefill_staging_pinned_host_bytes\":"
          << execution.prefill_staging_pinned_host_bytes
+         << ",\"prefill_feature_slab_bytes\":"
+         << execution.prefill_feature_slab_bytes
+         << ",\"prefill_feature_arena_bytes\":"
+         << execution.prefill_feature_arena_bytes
+         << ",\"draft_dynamic_gear_count\":"
+         << execution.draft_dynamic_gear_count
          << "},\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
   output << ",\"eos_token_ids\":";

@@ -112,7 +112,7 @@ std::size_t Bytes(const Spec& spec) {
   std::size_t result = TypeBytes(spec.dtype);
   for (const std::int64_t raw : spec.shape) {
     const std::size_t value =
-        raw == -1 ? kPrefillRows : static_cast<std::size_t>(raw);
+        raw == -1 ? kIncrementalSequenceLength : static_cast<std::size_t>(raw);
     result *= value;
   }
   return result;
@@ -351,6 +351,17 @@ aclError ExecuteDecode(const aclmdlDataset* input, aclmdlDataset* output) {
 }
 
 aclError ExecuteDraft(const aclmdlDataset* input, aclmdlDataset* output) {
+  if (input->dynamic_dims.dimCount < 3) {
+    return 1;
+  }
+  const auto feature_rows = input->dynamic_dims.dims[1];
+  const auto committed_input_count = Scalar<std::int32_t>(input->buffers[1]);
+  if ((feature_rows != 16 && feature_rows != 64 && feature_rows != 128) ||
+      committed_input_count <= 0 || committed_input_count > feature_rows ||
+      input->buffers[0]->size <
+          static_cast<std::size_t>(feature_rows) * 8 * sizeof(std::uint16_t)) {
+    return 1;
+  }
   const auto commit_count = Scalar<std::int32_t>(input->buffers[3]);
   const auto proposal_count = Scalar<std::int32_t>(input->buffers[4]);
   if (commit_count <= 0 || commit_count > 16 || proposal_count <= 0 ||
@@ -688,7 +699,7 @@ aclError aclmdlGetInputDynamicGearCount(
       description->role != Role::kDraftPropose) {
     return 1;
   }
-  *gear_count = 2;
+  *gear_count = 3;
   return ACL_SUCCESS;
 }
 
@@ -697,12 +708,13 @@ aclError aclmdlGetInputDynamicDims(
     std::size_t,
     aclmdlIODims* dimensions,
     std::size_t gear_count) {
-  if (description == nullptr || dimensions == nullptr || gear_count != 2 ||
+  if (description == nullptr || dimensions == nullptr || gear_count != 3 ||
       description->role != Role::kDraftPropose) {
     return 1;
   }
-  for (std::size_t gear = 0; gear < 2; ++gear) {
-    const std::int64_t rows = gear == 0 ? 16 : 64;
+  for (std::size_t gear = 0; gear < 3; ++gear) {
+    const std::array<std::int64_t, 3> rows_by_gear{16, 64, 128};
+    const std::int64_t rows = rows_by_gear[gear];
     std::memset(&dimensions[gear], 0, sizeof(aclmdlIODims));
     std::vector<std::int64_t> flat;
     const auto& inputs = Inputs(Role::kDraftPropose);

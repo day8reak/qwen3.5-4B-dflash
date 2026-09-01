@@ -110,9 +110,20 @@ void RunPolicy(
       "multi-chunk prefill did not elide one sync/D2H per intermediate chunk");
   Require(
       stats.prefill_staging_slots == 2 &&
-          stats.prefill_control_bytes_per_slot == 832 &&
-          stats.prefill_staging_pinned_host_bytes == 1664,
+          stats.prefill_control_bytes_per_slot == 896 &&
+          stats.prefill_staging_pinned_host_bytes == 1792,
       "prefill pinned-host staging ring differs");
+  Require(
+      stats.prefill_draft_propose_executions == 3 &&
+          stats.prefill_draft_propose_executions_elided == 1 &&
+          stats.prefill_feature_rows_batched == 256 &&
+          stats.draft_propose_executions == 3,
+      "prefill did not batch exactly one Draft execution per DFlash request");
+  Require(
+      stats.prefill_feature_slab_bytes == 1024 &&
+          stats.prefill_feature_arena_bytes == 2112 &&
+          stats.draft_dynamic_gear_count == 3,
+      "prefill feature arena or dynamic gear set differs");
   Require(
       stats.prefill_control_upload_operations ==
               stats.target_prefill_executions &&

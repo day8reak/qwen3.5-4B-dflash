@@ -24,6 +24,10 @@ _FORBIDDEN_ATC_PREFIXES = (
     "--output",
     "--soc_version",
     "--mode",
+    "--dynamic_dims",
+    "--dynamic_batch_size",
+    "--dynamic_image_size",
+    "--input_shape",
 )
 
 
@@ -269,6 +273,8 @@ def compile_air_bundle(
                 "role": graph["role"],
                 "input_names": list(graph.get("input_names", [])),
                 "output_names": list(graph.get("output_names", [])),
+                "dynamic": bool(graph.get("dynamic", False)),
+                "input_dim_gears": dict(graph.get("input_dim_gears", {})),
                 "custom_op_audit": custom_op_audit,
                 "air": dict(air_record),
                 "om": file_record(om_path, relative_to=root),

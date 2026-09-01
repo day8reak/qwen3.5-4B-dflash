@@ -660,7 +660,10 @@ def incremental_state_graph_specs(
         "state_owner": "C++ request context device buffers",
         "target_all_q_length_policy": "fixed kv_cache_max_len plus explicit causal mask and logical cursor",
         "target_all_q_length_evidence": "PENDING_REAL_NPU_EQUIVALENCE",
-        "draft_feature_tail": "TorchAir dynamic N, example N=16, required N range 1..64",
+        "draft_feature_tail": (
+            "TorchAir discrete dynamic N gears: verify N=16 and prompt feature "
+            "batches N=64..kv_cache_max_len in 64-row increments"
+        ),
         "claim_boundary": (
             "graph-construction candidate only; AIR/ATC, custom-node, "
             "real-model parity, complete-set memory and latency remain gated"
@@ -702,6 +705,9 @@ def incremental_state_graph_specs(
         output_embedding,
         kv_cache_max_len=kv_cache_max_len,
     ).eval()
+    draft_feature_gears = (VERIFY_ROWS,) + tuple(
+        range(PREFILL_ROWS, kv_cache_max_len + 1, PREFILL_ROWS)
+    )
 
     state_inputs = (
         target_conv,
@@ -804,6 +810,7 @@ def incremental_state_graph_specs(
                 "logical_draft_cursor",
             ),
             dynamic=True,
+            input_dim_gears={0: {1: draft_feature_gears}},
             metadata=graph_metadata(
                 "draft-propose",
                 (),

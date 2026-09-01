@@ -63,6 +63,9 @@ class AirGraphSpec:
     input_names: tuple[str, ...] = ()
     output_names: tuple[str, ...] = ()
     dynamic: bool = False
+    input_dim_gears: Mapping[int, Mapping[int, tuple[int, ...]]] = field(
+        default_factory=dict
+    )
     compiler_config: Any | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     custom_ops: tuple[CustomOpExportSpec, ...] = ()
@@ -90,6 +93,44 @@ class AirGraphSpec:
             raise ValueError("AIR input names must be unique")
         if len(set(self.output_names)) != len(self.output_names):
             raise ValueError("AIR output names must be unique")
+        if not isinstance(self.input_dim_gears, Mapping):
+            raise TypeError("AirGraphSpec.input_dim_gears must be a mapping")
+        if self.input_dim_gears and not self.dynamic:
+            raise ValueError("AIR dimension gears require dynamic=True")
+        for input_index, dimensions in self.input_dim_gears.items():
+            if (
+                isinstance(input_index, bool)
+                or not isinstance(input_index, int)
+                or input_index < 0
+                or input_index >= len(self.example_args)
+            ):
+                raise ValueError("AIR dimension gear input index is invalid")
+            value = self.example_args[input_index]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError("AIR dimension gears require a Tensor argument")
+            if not isinstance(dimensions, Mapping) or not dimensions:
+                raise TypeError("AIR dimension gear entries must be non-empty mappings")
+            for dimension, gears in dimensions.items():
+                if (
+                    isinstance(dimension, bool)
+                    or not isinstance(dimension, int)
+                    or dimension < 0
+                    or dimension >= value.dim()
+                ):
+                    raise ValueError("AIR dimension gear axis is invalid")
+                if not isinstance(gears, tuple) or not 2 <= len(gears) <= 100:
+                    raise ValueError("AIR dimension gears must contain 2..100 values")
+                if any(
+                    isinstance(gear, bool)
+                    or not isinstance(gear, int)
+                    or gear <= 0
+                    for gear in gears
+                ):
+                    raise ValueError("AIR dimension gears must be positive integers")
+                if len(set(gears)) != len(gears):
+                    raise ValueError("AIR dimension gears must be unique")
+                if int(value.shape[dimension]) not in gears:
+                    raise ValueError("AIR example shape must select one declared gear")
         if not isinstance(self.custom_ops, tuple):
             raise TypeError("AirGraphSpec.custom_ops must be a tuple")
         if not all(isinstance(item, CustomOpExportSpec) for item in self.custom_ops):

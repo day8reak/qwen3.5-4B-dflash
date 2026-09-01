@@ -700,10 +700,28 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental prefill completion policy differs")
     if protocol.get("prefill_control_policy") != (
-        "IDs, effective length, proposal count and EOS table share one H2D "
-        "carrier with 64-byte-aligned device subsegments per prompt chunk"
+        "IDs, effective length, proposal count, total prompt count and EOS "
+        "table share one H2D carrier with 64-byte-aligned device subsegments "
+        "per prompt chunk"
     ):
         raise RuntimeError("incremental prefill control policy differs")
+    if protocol.get("prefill_draft_policy") != (
+        "Target feature slabs stay device-resident; non-final prompt chunks "
+        "execute no Draft OM; final prompt completion executes one prebound "
+        "dynamic-gear Draft OM"
+    ):
+        raise RuntimeError("incremental prefill Draft policy differs")
+    if protocol.get("prefill_feature_arena_policy") != (
+        "contiguous 64-row FP16 slabs with 64-byte-aligned starts and one "
+        "terminal guard; no D2D compaction"
+    ):
+        raise RuntimeError("incremental prefill feature arena policy differs")
+    if protocol.get("prefill_target_lm_head_policy") != (
+        "current target-prefill OM still executes its LM head for every "
+        "physical chunk; non-final elimination remains pending "
+        "real-profile-driven graph redesign"
+    ):
+        raise RuntimeError("incremental prefill LM-head claim boundary differs")
     if protocol.get("device_suballocation_policy") != (
         "64-byte segment starts; ALIGN_UP(payload,32)+32 reserved span"
     ):
@@ -764,6 +782,9 @@ def validate_incremental_cpp_runner_report(
         "carrier_device_bytes",
         "prefill_control_bytes_per_slot",
         "prefill_staging_pinned_host_bytes",
+        "prefill_feature_slab_bytes",
+        "prefill_feature_arena_bytes",
+        "draft_dynamic_gear_count",
     ):
         value = memory.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -794,6 +815,7 @@ def validate_incremental_cpp_runner_report(
         4,
         4,
         2,
+        4,
     ):
         control_cursor = (control_cursor + 63) // 64 * 64
         control_cursor += (tensor_bytes + 31) // 32 * 32 + 32
@@ -808,6 +830,19 @@ def validate_incremental_cpp_runner_report(
         != expected_staging_host_bytes
     ):
         raise RuntimeError("incremental prefill pinned-host staging differs")
+    minimum_feature_arena_bytes = (
+        expected_staging_slots * int(memory["prefill_feature_slab_bytes"])
+        + 32
+        + 63
+    ) // 64 * 64
+    if (
+        int(memory["prefill_feature_slab_bytes"]) % 64
+        or int(memory["prefill_feature_arena_bytes"]) % 64
+        or memory["prefill_feature_arena_bytes"]
+        < minimum_feature_arena_bytes
+        or memory["draft_dynamic_gear_count"] != expected_staging_slots + 1
+    ):
+        raise RuntimeError("incremental prefill feature arena or gears differ")
     expected_allocated = (
         expected_max_work
         + expected_sum_weight
@@ -838,6 +873,16 @@ def validate_incremental_cpp_runner_report(
     prompt_chunks = (len(prompt_token_ids) + prefill_width - 1) // prefill_width
     expected_prefill = request_count * prompt_chunks
     expected_deferred = request_count * (prompt_chunks - 1)
+    dflash_request_count = request_count // 2
+    expected_prefill_draft = (
+        dflash_request_count if max_new_tokens > 1 else 0
+    )
+    expected_prefill_draft_elided = (
+        expected_prefill_draft * (prompt_chunks - 1)
+    )
+    expected_prefill_feature_rows = (
+        expected_prefill_draft * prompt_chunks * prefill_width
+    )
     prefill_completions = execution.get("prefill_completion_synchronizations")
     deferred_prefill = execution.get("deferred_prefill_chunks")
     if (
@@ -848,6 +893,13 @@ def validate_incremental_cpp_runner_report(
         != expected_deferred
         or execution.get("prefill_compact_downloads_elided")
         != expected_deferred
+        or execution.get("prefill_draft_propose_executions")
+        != expected_prefill_draft
+        or execution.get("prefill_draft_propose_executions_elided")
+        != expected_prefill_draft_elided
+        or execution.get("prefill_feature_rows_batched")
+        != expected_prefill_feature_rows
+        or draft < expected_prefill_draft
     ):
         raise RuntimeError("incremental prefill chunk counters differ")
     transactions = int(prefill_completions) + decode + verify
@@ -895,6 +947,12 @@ def validate_incremental_cpp_runner_report(
         != expected_control_bytes
         or execution.get("prefill_staging_pinned_host_bytes")
         != expected_staging_host_bytes
+        or execution.get("prefill_feature_slab_bytes")
+        != memory["prefill_feature_slab_bytes"]
+        or execution.get("prefill_feature_arena_bytes")
+        != memory["prefill_feature_arena_bytes"]
+        or execution.get("draft_dynamic_gear_count")
+        != memory["draft_dynamic_gear_count"]
     ):
         raise RuntimeError("incremental prefill staging reports differ")
     prefill_upload_operations = execution.get(
