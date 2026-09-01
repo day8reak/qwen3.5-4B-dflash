@@ -81,6 +81,12 @@ struct IncrementalAclExecutionStats {
   std::size_t speculative_synchronizations_elided = 0;
   std::size_t speculative_d2h_operations_elided = 0;
   std::size_t speculative_d2h_padding_bytes = 0;
+  std::size_t prefill_verify_coalesced_windows = 0;
+  std::size_t prefill_verify_synchronizations_elided = 0;
+  std::size_t prefill_verify_d2h_operations_elided = 0;
+  std::size_t prefill_verify_d2h_padding_bytes = 0;
+  std::size_t prefill_verify_prefill_slot0_windows = 0;
+  std::size_t prefill_verify_prefill_slot1_windows = 0;
   std::size_t prefill_completion_synchronizations = 0;
   std::size_t deferred_prefill_chunks = 0;
   std::size_t prefill_synchronizations_elided = 0;
@@ -214,6 +220,10 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
       std::size_t logical_proposal_count) override;
   StatefulStep DecodeOne(std::int64_t input_token_id) override;
   StatefulStep SpeculativeStep(
+      std::size_t logical_proposal_count) override;
+  bool supports_prefill_verify_coalescing() const noexcept override;
+  std::vector<StatefulStep> PrefillChunkAndSpeculative(
+      const std::vector<std::int64_t>& token_ids,
       std::size_t logical_proposal_count) override;
   std::size_t max_speculative_sync_window() const noexcept override;
   std::vector<StatefulStep> SpeculativeWindow(

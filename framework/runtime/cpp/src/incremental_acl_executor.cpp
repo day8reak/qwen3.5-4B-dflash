@@ -710,7 +710,7 @@ class AclIncrementalExecutor::Impl {
       bool prepare_draft,
       std::size_t logical_proposal_count) {
     return PrefillChunkImpl(
-        token_ids, prepare_draft, logical_proposal_count, true);
+        token_ids, prepare_draft, logical_proposal_count, true, false);
   }
 
   std::size_t PrefillChunkDeferred(
@@ -718,7 +718,7 @@ class AclIncrementalExecutor::Impl {
       bool prepare_draft,
       std::size_t logical_proposal_count) {
     return PrefillChunkImpl(
-        token_ids, prepare_draft, logical_proposal_count, false)
+        token_ids, prepare_draft, logical_proposal_count, false, false)
         .model_executions;
   }
 
@@ -726,7 +726,8 @@ class AclIncrementalExecutor::Impl {
       const std::vector<std::int64_t>& token_ids,
       bool prepare_draft,
       std::size_t logical_proposal_count,
-      bool complete) {
+      bool complete,
+      bool defer_completion) {
     RequireReset();
     if (token_ids.empty() || token_ids.size() > prefill_width_) {
       throw std::invalid_argument("prefill chunk is outside the fixed 64-row gear");
@@ -740,6 +741,10 @@ class AclIncrementalExecutor::Impl {
       RequireProposalCount(logical_proposal_count);
     } else if (logical_proposal_count != 0) {
       throw std::invalid_argument("proposal count supplied without Draft execution");
+    }
+    if (defer_completion && (!complete || !prepare_draft)) {
+      throw std::invalid_argument(
+          "deferred completion requires a final prefill with Draft");
     }
     if (prefill_staging_index_ >= stats_.prefill_staging_slots) {
       throw std::length_error("prefill staging ring capacity was exceeded");
@@ -804,13 +809,47 @@ class AclIncrementalExecutor::Impl {
       deferred.model_executions = executions;
       return deferred;
     }
-    DownloadCompact(false, target_state_index_);
-    Synchronize();
-    ++stats_.prefill_completion_synchronizations;
     deferred_prefill_pending_ = false;
     prefill_staging_index_ = 0;
     prefill_total_token_count_ = 0;
+    if (defer_completion) {
+      StatefulStep deferred;
+      deferred.model_executions = executions;
+      return deferred;
+    }
+    DownloadCompact(false, target_state_index_);
+    Synchronize();
+    ++stats_.prefill_completion_synchronizations;
     return ReadCompactAndTrackCarrier(false, executions, target_state_index_);
+  }
+
+  bool supports_prefill_verify_coalescing() const noexcept { return true; }
+
+  std::vector<StatefulStep> PrefillChunkAndSpeculative(
+      const std::vector<std::int64_t>& token_ids,
+      std::size_t logical_proposal_count) {
+    StatefulStep prefill = PrefillChunkImpl(
+        token_ids, true, logical_proposal_count, true, true);
+    const std::size_t prefill_state_index = target_state_index_;
+    const auto verify = EnqueueSpeculative(
+        logical_proposal_count, true);
+    if (prefill_state_index == verify.compact_state_index) {
+      throw std::logic_error(
+          "prefill/verify window did not alternate compact output arenas");
+    }
+    DownloadPrefillVerifyPair(
+        prefill_state_index, verify.compact_state_index);
+    Synchronize();
+    ++stats_.prefill_completion_synchronizations;
+    ++stats_.prefill_verify_coalesced_windows;
+    ++stats_.prefill_verify_synchronizations_elided;
+    std::vector<StatefulStep> result;
+    result.reserve(2);
+    result.push_back(ReadCompactAndTrackCarrier(
+        false, prefill.model_executions, prefill_state_index));
+    result.push_back(ReadCompactAndTrackCarrier(
+        true, verify.model_executions, verify.compact_state_index));
+    return result;
   }
 
   StatefulStep DecodeOne(std::int64_t input_token_id) {
@@ -2354,6 +2393,47 @@ class AclIncrementalExecutor::Impl {
         compact_slot_bytes_ - compact_verify_bytes_;
   }
 
+  void DownloadPrefillVerifyPair(
+      std::size_t prefill_state_index,
+      std::size_t verify_state_index) {
+    if (prefill_state_index >= kCompactSlotCount ||
+        verify_state_index >= kCompactSlotCount ||
+        prefill_state_index == verify_state_index) {
+      throw std::out_of_range(
+          "prefill/verify compact pair state indices are invalid");
+    }
+    const std::size_t prefill_end =
+        prefill_state_index * compact_slot_bytes_ + compact_ordinary_bytes_;
+    const std::size_t verify_end =
+        verify_state_index * compact_slot_bytes_ + compact_verify_bytes_;
+    const std::size_t bytes = std::max(prefill_end, verify_end);
+    if (bytes > compact_.bytes ||
+        bytes < compact_ordinary_bytes_ + compact_verify_bytes_) {
+      throw std::logic_error(
+          "prefill/verify compact pair span is invalid");
+    }
+    Check(
+        aclrtMemcpyAsync(
+            compact_.host,
+            compact_.bytes,
+            compact_.device.data,
+            bytes,
+            ACL_MEMCPY_DEVICE_TO_HOST,
+            stream_),
+        "aclrtMemcpyAsync(prefill/verify compact pair device-to-host)");
+    stream_work_pending_ = true;
+    ++stats_.device_to_host_operations;
+    stats_.device_to_host_bytes += bytes;
+    ++stats_.prefill_verify_d2h_operations_elided;
+    stats_.prefill_verify_d2h_padding_bytes +=
+        bytes - compact_ordinary_bytes_ - compact_verify_bytes_;
+    if (prefill_state_index == 0) {
+      ++stats_.prefill_verify_prefill_slot0_windows;
+    } else {
+      ++stats_.prefill_verify_prefill_slot1_windows;
+    }
+  }
+
   void Synchronize() {
     Check(aclrtSynchronizeStream(stream_), "aclrtSynchronizeStream");
     stream_work_pending_ = false;
@@ -2729,6 +2809,19 @@ StatefulStep AclIncrementalExecutor::DecodeOne(
 StatefulStep AclIncrementalExecutor::SpeculativeStep(
     std::size_t logical_proposal_count) {
   return impl_->SpeculativeStep(logical_proposal_count);
+}
+
+bool AclIncrementalExecutor::supports_prefill_verify_coalescing()
+    const noexcept {
+  return impl_->supports_prefill_verify_coalescing();
+}
+
+std::vector<StatefulStep>
+AclIncrementalExecutor::PrefillChunkAndSpeculative(
+    const std::vector<std::int64_t>& token_ids,
+    std::size_t logical_proposal_count) {
+  return impl_->PrefillChunkAndSpeculative(
+      token_ids, logical_proposal_count);
 }
 
 std::size_t AclIncrementalExecutor::max_speculative_sync_window()

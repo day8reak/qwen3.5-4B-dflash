@@ -206,6 +206,18 @@ const char* ModeName(GenerationMode mode) noexcept {
                                             : "dflash-strict-greedy";
 }
 
+bool StatefulGraphExecutor::supports_prefill_verify_coalescing()
+    const noexcept {
+  return false;
+}
+
+std::vector<StatefulStep> StatefulGraphExecutor::PrefillChunkAndSpeculative(
+    const std::vector<std::int64_t>&,
+    std::size_t) {
+  throw std::logic_error(
+      "stateful executor does not support prefill/verify coalescing");
+}
+
 std::size_t StatefulGraphExecutor::max_speculative_sync_window()
     const noexcept {
   return 1;
@@ -469,6 +481,11 @@ void ValidateStatefulInputs(
     throw std::invalid_argument(
         "DFlash sync window exceeds executor capability");
   }
+  if (options.coalesce_prefill_with_first_verify &&
+      !executor.supports_prefill_verify_coalescing()) {
+    throw std::invalid_argument(
+        "prefill/verify coalescing exceeds executor capability");
+  }
   if (prompt.size() + options.max_new_tokens - 1 >
       executor.sequence_length()) {
     throw std::invalid_argument(
@@ -556,6 +573,9 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
   const auto prefill_start = Clock::now();
 
   StatefulStep final_prefill;
+  StatefulStep coalesced_first_verify;
+  bool has_coalesced_first_verify = false;
+  std::size_t coalesced_first_proposal_count = 0;
   std::size_t prompt_offset = 0;
   std::vector<std::int64_t> chunk;
   chunk.reserve(executor.prefill_width());
@@ -564,14 +584,17 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
         executor.prefill_width(), prompt_token_ids.size() - prompt_offset);
     const bool last_chunk =
         prompt_offset + chunk_size == prompt_token_ids.size();
+    // Prefill itself commits one token. A prepared speculative transaction
+    // additionally commits at most K+1, so it is useful and budget-safe only
+    // when at least two generation slots remain after the prefill token.
     const bool prepare_draft =
-        mode == GenerationMode::kDFlash && options.max_new_tokens > 1;
+        mode == GenerationMode::kDFlash && options.max_new_tokens > 2;
     const std::size_t proposal_count = prepare_draft
         ? (last_chunk
                ? std::min(
                      {options.max_draft_tokens,
                       executor.proposal_width(),
-                      options.max_new_tokens - 1})
+                      options.max_new_tokens - 2})
                : std::min(
                      options.max_draft_tokens,
                      executor.proposal_width()))
@@ -581,11 +604,30 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
         prompt_token_ids.begin() +
             static_cast<std::ptrdiff_t>(prompt_offset + chunk_size));
     if (last_chunk) {
-      StatefulStep step = executor.PrefillChunk(
-          chunk, prepare_draft, proposal_count);
-      ValidateStatefulStep(step, eos, false, 0);
-      result.counters.graph_calls += step.model_executions;
-      final_prefill = std::move(step);
+      if (prepare_draft &&
+          options.coalesce_prefill_with_first_verify) {
+        std::vector<StatefulStep> steps =
+            executor.PrefillChunkAndSpeculative(chunk, proposal_count);
+        if (steps.size() != 2) {
+          throw std::runtime_error(
+              "stateful executor returned an invalid prefill/verify window");
+        }
+        ValidateStatefulStep(steps[0], eos, false, 0);
+        result.counters.graph_calls +=
+            steps[0].model_executions + steps[1].model_executions;
+        final_prefill = std::move(steps[0]);
+        coalesced_first_verify = std::move(steps[1]);
+        has_coalesced_first_verify = true;
+        coalesced_first_proposal_count = proposal_count;
+        ++result.counters.speculative_transactions;
+        ++result.counters.prefill_speculative_windows;
+      } else {
+        StatefulStep step = executor.PrefillChunk(
+            chunk, prepare_draft, proposal_count);
+        ValidateStatefulStep(step, eos, false, 0);
+        result.counters.graph_calls += step.model_executions;
+        final_prefill = std::move(step);
+      }
     } else {
       const std::size_t model_executions = executor.PrefillChunkDeferred(
           chunk, prepare_draft, proposal_count);
@@ -606,6 +648,26 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
       &generated,
       &prefix,
       &finished);
+  if (has_coalesced_first_verify && !finished) {
+    ValidateStatefulStep(
+        coalesced_first_verify, eos, true,
+        coalesced_first_proposal_count);
+    result.counters.drafted_tokens +=
+        coalesced_first_verify.drafted_tokens;
+    result.counters.accepted_draft_tokens +=
+        coalesced_first_verify.accepted_draft_tokens;
+    result.counters.rejected_draft_tokens +=
+        coalesced_first_verify.rejected_draft_tokens;
+    const std::size_t remaining =
+        options.max_new_tokens - generated.size();
+    AppendCommitted(
+        coalesced_first_verify.token_ids,
+        remaining,
+        eos,
+        &generated,
+        &prefix,
+        &finished);
+  }
   const auto prefill_end = Clock::now();
   result.prefill_ms = Milliseconds(prefill_start, prefill_end);
   EmitProgress(

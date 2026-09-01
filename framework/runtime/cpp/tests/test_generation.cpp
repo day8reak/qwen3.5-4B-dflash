@@ -71,6 +71,7 @@ class FakeStatefulExecutor final
     prepared_ = false;
     prepared_count_ = 0;
     speculative_windows_.clear();
+    prefill_verify_windows_.clear();
   }
 
   qwen35::dflash::StatefulStep PrefillChunk(
@@ -148,6 +149,23 @@ class FakeStatefulExecutor final
     };
   }
 
+  bool supports_prefill_verify_coalescing() const noexcept override {
+    return true;
+  }
+
+  std::vector<qwen35::dflash::StatefulStep>
+  PrefillChunkAndSpeculative(
+      const std::vector<std::int64_t>& token_ids,
+      std::size_t logical_proposal_count) override {
+    prefill_verify_windows_.push_back(logical_proposal_count);
+    std::vector<qwen35::dflash::StatefulStep> result;
+    result.reserve(2);
+    result.push_back(PrefillChunk(
+        token_ids, true, logical_proposal_count));
+    result.push_back(SpeculativeStep(logical_proposal_count));
+    return result;
+  }
+
   std::size_t max_speculative_sync_window() const noexcept override {
     return 2;
   }
@@ -170,6 +188,10 @@ class FakeStatefulExecutor final
   const std::vector<std::vector<std::size_t>>& speculative_windows()
       const noexcept {
     return speculative_windows_;
+  }
+
+  const std::vector<std::size_t>& prefill_verify_windows() const noexcept {
+    return prefill_verify_windows_;
   }
 
  private:
@@ -205,6 +227,7 @@ class FakeStatefulExecutor final
   std::size_t prepared_count_ = 0;
   std::vector<std::int64_t> prepared_proposals_;
   std::vector<std::vector<std::size_t>> speculative_windows_;
+  std::vector<std::size_t> prefill_verify_windows_;
 };
 
 void Require(bool condition, const std::string& message) {
@@ -441,6 +464,90 @@ void TestTwoTransactionWindowStopsAtFirstTransactionEos() {
       "EOS case did not account for the queued second transaction");
 }
 
+void TestSmallGenerationBudgetsPrepareOnlyBudgetSafeDraft() {
+  FakeStatefulExecutor executor;
+  auto options = Options();
+  options.max_draft_tokens = 15;
+
+  options.max_new_tokens = 2;
+  const auto two = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(
+      two.generated_token_ids == std::vector<std::int64_t>({11, 12}),
+      "two-token budget changed authoritative output");
+  Require(
+      two.counters.speculative_transactions == 0 &&
+          two.counters.drafted_tokens == 0,
+      "two-token budget executed an unusable Draft");
+
+  options.max_new_tokens = 3;
+  const auto three = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(
+      three.generated_token_ids ==
+          std::vector<std::int64_t>({11, 12, 13}),
+      "three-token budget changed authoritative output");
+  Require(
+      three.counters.speculative_transactions == 1 &&
+          three.counters.drafted_tokens == 1,
+      "three-token budget did not use exact K=1");
+
+  options.max_new_tokens = 4;
+  const auto four = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(
+      four.generated_token_ids ==
+          std::vector<std::int64_t>({11, 12, 13, 14}),
+      "four-token budget changed authoritative output");
+  Require(
+      four.counters.speculative_transactions == 1 &&
+          four.counters.drafted_tokens == 2,
+      "four-token budget did not use exact K=2");
+}
+
+void TestPrefillFirstVerifyCoalescingIsExactAndAccounted() {
+  FakeStatefulExecutor executor;
+  auto options = Options();
+  options.max_new_tokens = 9;
+  options.max_draft_tokens = 3;
+  options.coalesce_prefill_with_first_verify = true;
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kOrdinary, options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(
+      ordinary.generated_token_ids == dflash.generated_token_ids,
+      "prefill/verify coalescing changed authoritative output");
+  Require(
+      executor.prefill_verify_windows() == std::vector<std::size_t>({3}),
+      "prefill/verify coalescing did not use the prepared K=3");
+  Require(
+      dflash.counters.prefill_speculative_windows == 1 &&
+          dflash.counters.speculative_transactions == 2 &&
+          dflash.counters.decode_iterations == 1,
+      "prefill/verify coalescing counters differ");
+}
+
+void TestPrefillFirstVerifyCoalescingDoesNotCommitAfterPrefillEos() {
+  FakeStatefulExecutor executor;
+  auto options = Options();
+  options.max_new_tokens = 8;
+  options.max_draft_tokens = 3;
+  options.coalesce_prefill_with_first_verify = true;
+  options.eos_token_ids = {11};
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(
+      dflash.generated_token_ids == std::vector<std::int64_t>({11}) &&
+          dflash.stop_reason == "eos",
+      "prefill/verify coalescing committed output after prefill EOS");
+  Require(
+      dflash.counters.prefill_speculative_windows == 1 &&
+          dflash.counters.speculative_transactions == 1 &&
+          dflash.counters.decode_iterations == 0,
+      "prefill EOS did not account for the queued verify transaction");
+}
+
 void TestSha256KnownVector() {
   Require(
       qwen35::dflash::Sha256("abc") ==
@@ -463,6 +570,9 @@ int main() {
     TestStatefulPairedBenchmarkAndProgress();
     TestTwoTransactionWindowUsesBudgetSafeSecondProposalCount();
     TestTwoTransactionWindowStopsAtFirstTransactionEos();
+    TestSmallGenerationBudgetsPrepareOnlyBudgetSafeDraft();
+    TestPrefillFirstVerifyCoalescingIsExactAndAccounted();
+    TestPrefillFirstVerifyCoalescingDoesNotCommitAfterPrefillEos();
     TestSha256KnownVector();
     std::cout << "PASS: recompute/stateful C++ schedulers, parity, EOS, "
                  "capacity and SHA-256\n";

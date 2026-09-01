@@ -103,6 +103,15 @@ class StatefulGraphExecutor {
   virtual StatefulStep SpeculativeStep(
       std::size_t logical_proposal_count) = 0;
 
+  // A concrete executor may keep the final prefill completion and the first
+  // Target verify in one ordered stream window. The returned steps are the
+  // final prefill result followed by the speculative result. This changes
+  // host visibility (and therefore TTFT attribution), but not token semantics.
+  virtual bool supports_prefill_verify_coalescing() const noexcept;
+  virtual std::vector<StatefulStep> PrefillChunkAndSpeculative(
+      const std::vector<std::int64_t>& token_ids,
+      std::size_t logical_proposal_count);
+
   // A concrete executor may enqueue more than one complete speculative
   // transaction before exposing a host barrier. The default preserves the
   // synchronous contract and stops before launching work after a reported
@@ -117,6 +126,7 @@ struct GenerationOptions {
   std::size_t max_new_tokens = 32;
   std::size_t max_draft_tokens = 15;
   std::size_t dflash_sync_window = 1;
+  bool coalesce_prefill_with_first_verify = false;
   std::vector<std::int64_t> eos_token_ids;
 };
 
@@ -126,6 +136,9 @@ struct GenerationCounters {
   std::size_t accepted_draft_tokens = 0;
   std::size_t rejected_draft_tokens = 0;
   std::size_t speculative_transactions = 0;
+  // Physical speculative transactions completed inside the prefill timer.
+  // They are not host-visible decode iterations.
+  std::size_t prefill_speculative_windows = 0;
   // Host-visible decode windows. With dflash_sync_window=1 this is also the
   // transaction count; a larger exact window may contain multiple rounds.
   std::size_t decode_iterations = 0;

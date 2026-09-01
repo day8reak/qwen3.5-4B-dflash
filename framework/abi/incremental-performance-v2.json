@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
   "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
   "approval": {
@@ -9,7 +9,7 @@
     "scope": "explicit multi-OM device-state graph boundaries and exact device-side accept/commit",
     "approximation_approved": false
   },
-  "objective": "strict-greedy batch-1 generation with persistent device state, no historical-prefix recompute, and a measured one- or two-transaction host synchronization window",
+  "objective": "strict-greedy batch-1 generation with persistent device state, no historical-prefix recompute, a measured one- or two-transaction decode synchronization window, and an optional final-prefill/first-verify completion window",
   "non_negotiable_correctness": {
     "ordinary_target_is_authoritative": true,
     "allowed_token_id_mismatches": 0,
@@ -333,7 +333,16 @@
     },
     "decode_carrier_selection_gate": "compare both policies with the same runner binary, OM hashes, prompt/token limits, reset policy, device identity and alternating order; require zero token/EOS mismatch and unprofiled 3 warmups plus 10 measurements, then select last-token-d2d only when its median and p90 improve measurably; retain one-token-h2d when the result is a tie or within measurement noise; msprof is diagnostic only",
     "rejected_unaligned_multi_row_binding": "compact token rows 1 through 15 begin at 8-byte strides and cannot be bound directly as model inputs under the 64-byte AscendCL input-address rule; Fake ACL must reject that plan, so later rows use the aligned scalar D2D route",
-    "synchronization": "default window 1 exposes one host-visible synchronization after each verify/commit; exact candidate window 2 queues two complete dependent Draft-to-verify transactions, coalesces their adjacent compact slots into one contiguous D2H, and performs one stream synchronization",
+    "synchronization": "default window 1 exposes one host-visible synchronization after each verify/commit; exact candidate window 2 queues two complete dependent Draft-to-verify transactions; an independent exact prefill completion candidate queues final prefill plus first verify before one contiguous D2H and one stream synchronization",
+    "prefill_completion_policies": {
+      "separate": "default rollback baseline; final prefill compact result is downloaded and synchronized before the first verify",
+      "coalesce-first-verify": "inactive exact candidate; when max_new_tokens is greater than two, final prefill and the already-prepared first verify share one contiguous compact D2H and one stream synchronization"
+    },
+    "prefill_first_verify_budget_guard": "prefill commits one token and verify may commit K+1, so Draft is prepared only when max_new_tokens>2 and its K is min(max_draft,15,max_new_tokens-2); max_new_tokens=2 executes ordinary decode without a wasted Draft",
+    "prefill_first_verify_compact_download": "the alternating compact slots share one contiguous arena; prefill slot 0 downloads slot_bytes+verify_bytes and pays slot_bytes-ordinary_bytes padding, while prefill slot 1 downloads slot_bytes+ordinary_bytes and pays slot_bytes-verify_bytes padding",
+    "prefill_first_verify_timing_scope": "coalesce-first-verify delays first-token host visibility until verify completes, so prefill_ms/TTFT includes the first verify; compare model_total median/p90 and TTFT separately",
+    "prefill_first_verify_eos_policy": "the first verify may already be queued when the prefill result is EOS; host commit stops at prefill EOS and ignores the verify result, preserving exact tokens with bounded useless device work",
+    "prefill_first_verify_selection_gate": "hold runner binary, OM hashes, prompt, token limits and all other policies fixed; require zero token/EOS mismatch and closed counters, then select coalesce-first-verify only when real 310P unprofiled 3+10 model_total median/p90 improves and the delayed TTFT is acceptable; otherwise retain separate",
     "dflash_sync_window_policies": {
       "1": "default and rollback baseline; one speculative transaction per host-visible synchronization",
       "2": "inactive performance candidate; at most two complete speculative transactions use the existing compact ping-pong arenas and one host-visible synchronization"
@@ -357,11 +366,15 @@
       "decode_id_device_compaction_operations == decode_id_multi_token_carrier_hits",
       "decode_id_device_compaction_bytes == 8 * decode_id_device_compaction_operations",
       "decode_id_upload_bytes == 8 * decode_id_upload_operations",
-      "speculative_sync_windows + speculative_synchronizations_elided == target_verify_commit_executions",
+      "speculative_sync_windows + speculative_synchronizations_elided + prefill_verify_coalesced_windows == target_verify_commit_executions",
       "stream_synchronizations == prefill_completion_synchronizations + target_decode1_executions + speculative_sync_windows",
-      "device_to_host_operations + speculative_d2h_operations_elided == prefill_completion_synchronizations + target_decode1_executions + target_verify_commit_executions",
+      "device_to_host_operations + speculative_d2h_operations_elided + prefill_verify_d2h_operations_elided == prefill_completion_synchronizations + target_decode1_executions + target_verify_commit_executions",
       "speculative_d2h_operations_elided == speculative_synchronizations_elided",
       "speculative_d2h_padding_bytes == speculative_d2h_operations_elided * (compact_slot_bytes - compact_verify_result_bytes)",
+      "prefill_verify_synchronizations_elided == prefill_verify_coalesced_windows",
+      "prefill_verify_d2h_operations_elided == prefill_verify_coalesced_windows",
+      "prefill_verify_prefill_slot0_windows + prefill_verify_prefill_slot1_windows == prefill_verify_coalesced_windows",
+      "prefill_verify_d2h_padding_bytes == prefill_verify_prefill_slot0_windows * (compact_slot_bytes - compact_ordinary_result_bytes) + prefill_verify_prefill_slot1_windows * (compact_slot_bytes - compact_verify_result_bytes)",
       "draft_verify_fixed_width_executions + draft_verify_committed_prefix_executions + draft_verify_pending_upper_bound_executions == draft_propose_executions - prefill_draft_propose_executions",
       "draft_verify_feature_input_rows + draft_verify_feature_rows_elided == draft_verify_full_width_equivalent_rows",
       "draft_verify_full_width_equivalent_rows == 16 * (draft_propose_executions - prefill_draft_propose_executions)",
@@ -404,6 +417,33 @@
       "additional_compact_device_bytes_vs_previous_runner": 512,
       "device_to_host_operations_unchanged": 117,
       "device_to_host_bytes_unchanged": 32604
+    },
+    "fake_acl_prefill_first_verify_70_token_paired_3_plus_10": {
+      "classification": "matched host structural evidence only; Fake ACL timing is not Ascend310P latency",
+      "max_new_tokens": 6,
+      "maximum_draft_tokens": 3,
+      "stable_generated_token_ids_both": [11, 12, 13, 14, 15, 16],
+      "stable_stop_reason_both": "length",
+      "token_id_mismatches": 0,
+      "eos_mismatches": 0,
+      "model_executions_both": 182,
+      "separate_device_to_host_operations": 117,
+      "coalesced_device_to_host_operations": 104,
+      "separate_device_to_host_bytes": 32604,
+      "coalesced_device_to_host_bytes": 35919,
+      "separate_stream_synchronizations": 117,
+      "coalesced_stream_synchronizations": 104,
+      "coalesced_windows": 13,
+      "synchronizations_elided": 13,
+      "device_to_host_operations_elided": 13,
+      "device_to_host_padding_bytes": 3315,
+      "prefill_slot0_windows": 13,
+      "prefill_slot1_windows": 0,
+      "compact_slot_bytes": 512,
+      "compact_ordinary_result_bytes": 257,
+      "compact_verify_result_bytes": 452,
+      "per_dflash_measurement_prefill_speculative_windows": 1,
+      "claim_boundary": "ordering, exact tokens and one-D2H/one-barrier coalescing are proven only against Fake ACL; TTFT and speedup require physical Ascend310P evidence"
     },
     "fake_acl_unified_target_step_70_token_paired_3_plus_10": {
       "classification": "host structural and dynamic-gear routing evidence only; not Ascend310P latency",

@@ -13,7 +13,8 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
   提交 `logical_proposal_count` 指定的前缀，不再重算历史前缀；
 - proposal、KV、GDR/conv state 和 feature 全部留在 device；
 - 默认每个 speculative round 只在 accept/commit 后同步一次；同一 OM ABI 的双轮候选可把两个
-  完整 round 及两份 compact 结果排入同一 stream 后只同步一次。
+  完整 round 及两份 compact 结果排入同一 stream 后只同步一次；另一个独立候选可把最后一次
+  prefill completion 与第一次 verify 合为一次 D2H/同步。
 
 完整机器可读合同见 `framework/abi/incremental-performance-v2.json`。用户已明确批准该状态图，
 批准记录位于 `framework/abi/approvals/incremental-performance-v2.json`，当前状态是
@@ -52,15 +53,22 @@ Target 事务完成后只下载 compact 结果并同步一次，完整 state 继
 flowchart LR
   R[Reset device state] --> P[Target prefill body<br/>64-row chunks]
   P --> H[Target prefill head<br/>final chunk only]
-  H --> I[Optional initial Draft<br/>compact D2H + prefill sync]
-  I --> M{generation mode}
-  M -->|ordinary| T1[Target step T=1<br/>bind resident INT32 zero]
+  H --> B{DFlash and<br/>max_new_tokens > 2?}
+  B -->|no| S[Prefill compact D2H<br/>one sync]
+  B -->|yes| I[Initial Draft<br/>K=min maxDraft,15,budget-2]
+  I --> Q{prefill completion policy}
+  Q -->|separate| S
+  Q -->|coalesce-first-verify| V0[Target verify T=K+1]
+  V0 --> C0[Prefill + verify compact D2H<br/>one shared sync]
+  S --> M{generation mode / remaining}
+  C0 --> E{EOS or token limit?}
+  M -->|ordinary or one token left| T1[Target step T=1<br/>bind resident INT32 zero]
   M -->|DFlash; proposal ready| TK[Target step T=K+1]
   D[Draft propose K] --> TK
   T1 --> C[Exact commit + state slot]
   TK --> C
-  C --> O[Compact D2H + one sync]
-  O --> E{EOS or token limit?}
+  C --> O[Compact D2H + one sync/window]
+  O --> E
   E -->|ordinary continue| T1
   E -->|DFlash continue| D
   E -->|stop| X[Return tokens]
@@ -321,6 +329,11 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
 - 默认 `draft-propose -> target-verify-commit -> compact D2H -> synchronize` 每轮一个 barrier；
   `dflash_sync_window=2` 在 token budget 安全时复用现有两套 compact arena，连续排两个完整事务和
   一次合并 compact D2H 后只同步一次，不改变 AIR/OM 输入输出；
+- 默认 `prefill_completion_policy=separate` 在最后一个 prefill 后暴露首 token；精确候选
+  `coalesce-first-verify` 复用相同的两套 compact arena，把最后 prefill、已准备好的 Draft 和第一次
+  Target verify 连续排入同一 stream，再用一次连续 D2H 和一次同步同时取回 prefill/verify 结果。
+  它每个合格 DFlash 请求少一次 D2H 和一次 barrier，但会把第一次 verify 计入 `prefill_ms`，推迟
+  首 token 的 host 可见时间；
 - 多 chunk prompt 的每个 `target-prefill` 把固定 64 行 feature 直接写入连续 device arena；中间
   chunk 不执行 `target-prefill-head`、不执行 `draft-propose`、不下载 compact 结果、不同步；最后
   一个 chunk 才依次执行一次 head 和（DFlash 模式下）一次完整 prompt 对应动态 gear 的 Draft，
@@ -608,18 +621,35 @@ decode_id_device_compaction_operations
 decode_id_device_compaction_bytes   = 8 * decode_id_device_compaction_operations
 decode_id_upload_bytes              = 8 * decode_id_upload_operations
 speculative_sync_windows
- + speculative_synchronizations_elided = verify-commit
+ + speculative_synchronizations_elided
+ + prefill_verify_coalesced_windows = verify-commit
 stream_synchronizations             = R + decode1 + speculative_sync_windows
 device_to_host_operations
- + speculative_d2h_operations_elided = R + decode1 + verify-commit
+ + speculative_d2h_operations_elided
+ + prefill_verify_d2h_operations_elided = R + decode1 + verify-commit
 speculative_d2h_operations_elided   = speculative_synchronizations_elided
 speculative_d2h_padding_bytes       = speculative_d2h_operations_elided
+                                    * (compact_slot_bytes
+                                       - compact_verify_result_bytes)
+prefill_verify_synchronizations_elided = prefill_verify_coalesced_windows
+prefill_verify_d2h_operations_elided = prefill_verify_coalesced_windows
+prefill_verify_prefill_slot0_windows
+ + prefill_verify_prefill_slot1_windows = prefill_verify_coalesced_windows
+prefill_verify_d2h_padding_bytes     = slot0_windows
+                                    * (compact_slot_bytes
+                                       - compact_ordinary_result_bytes)
+                                    + slot1_windows
                                     * (compact_slot_bytes
                                        - compact_verify_result_bytes)
 host_to_device_operations           = prefill_control_upload_operations
                                     + decode_id_upload_operations
                                     + proposal_count_upload_operations
 ```
+
+上述 `prefill_draft_*` 的 `(R/2)` 前提是 `max_new_tokens>2`。Prefill 自身先提交 1 token，第一次
+verify 最多再提交 `K+1`，所以最终 prefill 准备的 K 必须是
+`min(max_draft_tokens,15,max_new_tokens-2)`；`max_new_tokens=2` 不运行无用 Draft，3 和 4 分别只能
+准备 K=1 和 K=2。这也是生成预算的硬正确性门禁，不是性能启发式。
 
 其中每个字段的 device offset 都按 64 bytes 对齐，每段物理跨度为
 `ALIGN_UP(tensor_bytes,32)+32`，最终 carrier 再按 64 bytes 对齐。默认 `eos_table_width=4` 时，五图
@@ -661,6 +691,15 @@ prefill chunk 上命中 full/base/count/proposal=`1/38/12/1`，把 payload 进�
 1,024 bytes；D2H operations/bytes 保持 117/32,604 不变。这些都只证明 Fake ACL
 下的调用结构、路由闭合和字节计数，不是 310P 时延结论；真机必须比较 8-byte H2D 与 D2D 的
 API/timeline，并以未开 msprof 的同源 3+10 median/p90 决定是否保留该候选。
+
+同一 70-token、`max_new_tokens=6,max_draft_tokens=3`、paired 3+10 Fake ACL workload 也冻结了
+prefill/first-verify 合并的结构证据：`separate` 和 `coalesce-first-verify` 都执行 182 次模型并生成
+完全相同的 `11..16`；候选将 D2H operations 和 stream synchronization 从 117 同时降到 104，
+恰好每个 DFlash 请求各省 1 次。该用例的最终 prefill 落在 compact slot 0，所以每次连续下载多
+`512-257=255` bytes padding，总 D2H bytes 从 32,604 增到 35,919。若 prefill 落在 slot 1，padding
+则是 `512-452=60` bytes；报告分别用 slot0/slot1 计数闭合。这里仍只证明执行顺序、buffer 生命周期
+和 token 精确性，不证明 310P 加速；而且候选的 `prefill_ms` 包含第一次 verify，不能把它与
+`separate` 的首 token 时间直接当作同一语义。
 
 同一 70-token、paired 3+10 Fake ACL workload 下，统一四图改造前每个 ordinary request 都把
 proposal carrier 写成 0，下一次 DFlash 又恢复正 K：prefill full/base/count/proposal 路由为
@@ -809,8 +848,9 @@ jq -s 'map({
 - `immutable-zero`：请求内 memset 为 0，启动时恰好 2 次 memset 和 1 次同步，且
   `zero_state_bytes=reset_bytes_per_request`；
 - 两者的 transaction sync 数都必须等于 `prefill_completion_synchronizations + decode1 +
-  speculative_sync_windows`，且 `speculative_sync_windows + speculative_synchronizations_elided =
-  verify`；中间 prefill chunk 的 elided sync/D2H 计数必须闭合，token/EOS 必须一致；
+  speculative_sync_windows`，且 `speculative_sync_windows + speculative_synchronizations_elided +
+  prefill_verify_coalesced_windows = verify`；中间 prefill chunk 和可选 prefill/verify 窗口的
+  elided sync/D2H 计数必须闭合，token/EOS 必须一致；
 - 只有 `immutable-zero` 的完整五 OM 集合真实 load 成功、显存峰值有余量，且未开 msprof 的
   10 次 `dflash` median/p90 明确更好时，才在部署配置中选择它；否则保留 `async-memset`。
 
@@ -1149,6 +1189,117 @@ jq -s 'map({
 N=1..16 gear、显存/workspace 增长、物理行没有收窄或结果落在测量噪声内，继续使用
 `fixed-16`。
 
+#### 5.5.3 A/B 选择 Prefill completion 策略
+
+`prefill_completion_policy` 不改变 AIR、OM、模型权重或 tensor ABI。两个精确策略是：
+
+- `separate`：默认回退基线；最后 prefill 的 compact token 先 D2H 并同步，随后才执行第一次
+  verify，首 token 较早对 host 可见；
+- `coalesce-first-verify`：当 `max_new_tokens>2` 时，把最后 prefill、已准备 Draft、第一次 Target
+  verify 和两份 compact 结果排入一个 stream window，只做一次连续 D2H 和一次同步。它少一个
+  host boundary，但 `prefill_ms`/TTFT 会包含第一次 verify。
+
+先生成两份只差该字段的配置；其他策略全部固定：
+
+```bash
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-prefill-separate.json"
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-prefill-coalesced.json"
+
+jq '.prefill_completion_policy = "separate"' \
+  "$AI_RUN_DIR/runner-prefill-separate.json" > \
+  "$AI_RUN_DIR/runner-prefill-separate.tmp.json"
+mv "$AI_RUN_DIR/runner-prefill-separate.tmp.json" \
+  "$AI_RUN_DIR/runner-prefill-separate.json"
+jq '.prefill_completion_policy = "coalesce-first-verify"' \
+  "$AI_RUN_DIR/runner-prefill-coalesced.json" > \
+  "$AI_RUN_DIR/runner-prefill-coalesced.tmp.json"
+mv "$AI_RUN_DIR/runner-prefill-coalesced.tmp.json" \
+  "$AI_RUN_DIR/runner-prefill-coalesced.json"
+```
+
+按 separate→coalesced 跑完，再按 coalesced→separate 反向重复。必须让生成预算大于 2；下面的
+32/15 同时覆盖真实第一次 verify：
+
+```bash
+for PREFILL_POLICY in separate coalesced; do
+  "$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
+    --deployment-manifest "$INCREMENTAL_BUNDLE/deployment-manifest.json" \
+    --runner \
+      "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+    --runner-config "$AI_RUN_DIR/runner-prefill-${PREFILL_POLICY}.json" \
+    --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
+    --prompt '请用一句话解释为什么天空是蓝色的。' \
+    --chat \
+    --max-new-tokens 32 \
+    --max-draft-tokens 15 \
+    --device-id 0 \
+    --output "$AI_RUN_DIR/reports/prefill-${PREFILL_POLICY}.json"
+done
+```
+
+先验证 token/EOS、事务、slot 和 padding 闭合：
+
+```bash
+jq -e -s '
+  (length == 2) and
+  (.[0].ordinary.stable_generated_token_ids ==
+   .[1].ordinary.stable_generated_token_ids) and
+  (.[0].dflash.stable_generated_token_ids ==
+   .[1].dflash.stable_generated_token_ids) and
+  (all(.ordinary_parity.status == "PASS" and
+       .ordinary_parity.token_id_mismatches == 0 and
+       .ordinary_parity.eos_mismatches == 0)) and
+  all(
+    .execution_io_counters as $io |
+    (($io.speculative_sync_windows +
+      $io.speculative_synchronizations_elided +
+      $io.prefill_verify_coalesced_windows) ==
+     $io.target_verify_commit_executions) and
+    (($io.device_to_host_operations +
+      $io.speculative_d2h_operations_elided +
+      $io.prefill_verify_d2h_operations_elided) ==
+     ($io.prefill_completion_synchronizations +
+      $io.target_decode1_executions +
+      $io.target_verify_commit_executions)) and
+    ($io.prefill_verify_synchronizations_elided ==
+     $io.prefill_verify_coalesced_windows) and
+    ($io.prefill_verify_d2h_operations_elided ==
+     $io.prefill_verify_coalesced_windows) and
+    (($io.prefill_verify_prefill_slot0_windows +
+      $io.prefill_verify_prefill_slot1_windows) ==
+     $io.prefill_verify_coalesced_windows) and
+    ($io.prefill_verify_d2h_padding_bytes ==
+     ($io.prefill_verify_prefill_slot0_windows *
+      ($io.compact_slot_bytes - $io.compact_ordinary_result_bytes) +
+      $io.prefill_verify_prefill_slot1_windows *
+      ($io.compact_slot_bytes - $io.compact_verify_result_bytes)))
+  )
+' "$AI_RUN_DIR/reports/prefill-separate.json" \
+  "$AI_RUN_DIR/reports/prefill-coalesced.json"
+
+jq -s 'map({
+  policy: .protocol.prefill_completion_policy,
+  prefill_ms: .dflash.latency_ms.prefill,
+  model_total_ms: .dflash.latency_ms.model_total,
+  coalesced_windows:
+    .execution_io_counters.prefill_verify_coalesced_windows,
+  stream_syncs: .execution_io_counters.stream_synchronizations,
+  d2h_operations: .execution_io_counters.device_to_host_operations,
+  d2h_bytes: .execution_io_counters.device_to_host_bytes,
+  d2h_padding:
+    .execution_io_counters.prefill_verify_d2h_padding_bytes,
+  per_measurement_prefill_windows:
+    ([.dflash.measurements[].counters.prefill_speculative_windows] | unique)
+})' "$AI_RUN_DIR/reports/prefill-separate.json" \
+  "$AI_RUN_DIR/reports/prefill-coalesced.json"
+```
+
+只有同机正反顺序、未开 msprof 的 3+10 都保持零差异，候选每个合格 DFlash 请求恰好少一次 D2H
+和同步，且 `model_total` median/p90 稳定改善、业务又能接受更晚的首 token，才启用
+`coalesce-first-verify`。流式输出优先或 EOS 经常出现在首 token 时，默认保留 `separate`。
+
 ### 5.6 直接运行二进制
 
 控制面是推荐路径。需要排除 Python 控制面时，可直接执行同一个 runner：
@@ -1186,6 +1337,7 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
   --state-reset-policy async-memset \
   --decode-carrier-policy last-token-d2d \
   --dflash-sync-window 1 \
+  --prefill-completion-policy separate \
   --draft-feature-policy fixed-16 \
   --progress true
 ```
@@ -1194,6 +1346,8 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
 文件或 token 输入。把 `--decode-carrier-policy` 换成 `one-token-h2d` 可运行第 5.5 节的同二进制
 carrier 基线。`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，不能保留
 文字占位符。把 `--dflash-sync-window` 改成 `2` 可运行第 5.5.1 节候选；正式默认仍是 `1`。
+把 `--prefill-completion-policy` 改成 `coalesce-first-verify` 可运行第 5.5.3 节候选；它会推迟
+首 token 的 host 可见时间，正式默认仍是 `separate`。
 把 `--draft-feature-policy` 改成 `committed-prefix` 可运行第 5.5.2 节候选；完成真机 A/B 前默认仍是
 `fixed-16`。
 
@@ -1231,6 +1385,7 @@ export UNIFIED_TARGET_STEP_OM="$UNIFIED_BUNDLE/om/target-verify-commit.om"
   --state-reset-policy async-memset \
   --decode-carrier-policy last-token-d2d \
   --dflash-sync-window 1 \
+  --prefill-completion-policy separate \
   --draft-feature-policy fixed-16 \
   --progress true
 ```
@@ -1252,10 +1407,11 @@ export RESET_POLICY=async-memset
 export DECODE_CARRIER_POLICY=last-token-d2d
 export DFLASH_SYNC_WINDOW=1
 export DRAFT_FEATURE_POLICY=fixed-16
+export PREFILL_COMPLETION_POLICY=separate
 mkdir -p "$PROFILE_ROOT"
 
 for AIC_METRIC in PipeUtilization Memory MemoryUB; do
-  LABEL="five-om-stateful-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${AIC_METRIC}"
+  LABEL="five-om-stateful-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${PREFILL_COMPLETION_POLICY}-${AIC_METRIC}"
   CASE_ROOT="$PROFILE_ROOT/$LABEL"
   "$DFLASH_SOURCE/tools/run_msprof.sh" \
     --label "$LABEL" \
@@ -1289,6 +1445,7 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
       --state-reset-policy "$RESET_POLICY" \
       --decode-carrier-policy "$DECODE_CARRIER_POLICY" \
       --dflash-sync-window "$DFLASH_SYNC_WINDOW" \
+      --prefill-completion-policy "$PREFILL_COMPLETION_POLICY" \
       --draft-feature-policy "$DRAFT_FEATURE_POLICY" \
       --progress false
 done
@@ -1296,10 +1453,12 @@ done
 
 上面默认 profile window 1 和固定 16 行 Draft verify 输入。分析双轮候选时设
 `DFLASH_SYNC_WINDOW=2`；分析有效前缀候选时设
-`DRAFT_FEATURE_POLICY=committed-prefix`。每个候选都要换一个新的
+`DRAFT_FEATURE_POLICY=committed-prefix`；分析 prefill 合并候选时设
+`PREFILL_COMPLETION_POLICY=coalesce-first-verify`。每个候选都要换一个新的
 `PROFILE_ROOT`/`UNIFIED_PROFILE_ROOT` 后完整重跑，不能把两个窗口的 CSV 合并到同一 analysis
 目录。分析器会要求 `aclmdlExecuteAsync` 按 transaction 闭合、实际 D2H 加
-`speculative_d2h_operations_elided` 后按 transaction 闭合，而 `aclrtSynchronizeStream` 按
+`speculative_d2h_operations_elided` 和 `prefill_verify_d2h_operations_elided` 后按 transaction
+闭合，而 `aclrtSynchronizeStream` 按
 `speculative_sync_windows` 闭合；window 2 不应伪装成少执行了 verify。
 
 统一 Target-step 必须单独采一组 profile，仍然不带 `target-decode1`；三组 metric 不要塞进同一
@@ -1310,7 +1469,7 @@ export UNIFIED_PROFILE_ROOT=/ABSOLUTE/PATH/qwen35-unified-target-step-msprof
 mkdir -p "$UNIFIED_PROFILE_ROOT"
 
 for AIC_METRIC in PipeUtilization Memory MemoryUB; do
-  LABEL="unified-target-step-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${AIC_METRIC}"
+  LABEL="unified-target-step-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${PREFILL_COMPLETION_POLICY}-${AIC_METRIC}"
   CASE_ROOT="$UNIFIED_PROFILE_ROOT/$LABEL"
   "$DFLASH_SOURCE/tools/run_msprof.sh" \
     --label "$LABEL" \
@@ -1345,6 +1504,7 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
       --state-reset-policy "$RESET_POLICY" \
       --decode-carrier-policy "$DECODE_CARRIER_POLICY" \
       --dflash-sync-window "$DFLASH_SYNC_WINDOW" \
+      --prefill-completion-policy "$PREFILL_COMPLETION_POLICY" \
       --draft-feature-policy "$DRAFT_FEATURE_POLICY" \
       --progress false
 done

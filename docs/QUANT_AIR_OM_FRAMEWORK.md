@@ -634,7 +634,9 @@ report 门禁、同二进制 `one-token-h2d`/`last-token-d2d` A/B 和 msprof 命
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5 节。runner 配置中的 `decode_carrier_policy` 只改变
 C++ buffer/copy 路由，不要求重新生成 AIR 或 OM；`dflash_sync_window=1|2` 同样不改 AIR/OM ABI，
 候选 2 可把两个完整 speculative transaction 合并到一个 host-visible barrier，并在第二轮按剩余
-token budget 自适应缩小 K。prefill control 按 base/count/proposal/full 四档
+token budget 自适应缩小 K。独立的 `prefill_completion_policy=separate|coalesce-first-verify`
+也不改 AIR/OM ABI；候选策略把最后 prefill 与第一次 verify 合为一次 D2H/同步，但会延迟首 token
+host 可见时间，必须分别比较 TTFT 与总时延。prefill control 按 base/count/proposal/full 四档
 live prefix 复制：五图 slot 为 896 bytes；统一四图在 EOS count 后追加一个 64-byte 对齐的常驻
 INT32 零值，slot 为 960 bytes，ordinary T=1 直接绑定该零值，不再把正 proposal carrier 写成 0。
 前三档仍为 578/644/708 bytes；这些内部 carrier 变化不改 tensor 名、shape 或 AIR/OM ABI。
@@ -848,10 +850,11 @@ token 末行做一次 8-byte D2D 到对齐 scalar。report 必须满足
 `decode_id_device_compaction_operations == decode_id_multi_token_carrier_hits`；真机必须用相同
 runner/OM/input 做未 profile 的 3+10 A/B，msprof API timeline 仅用于解释新增 D2D 与被替换 H2D。
 同步窗口 1/2 也必须使用相同 runner/OM/input 做正反顺序 3+10；实际 D2H 加
-`speculative_d2h_operations_elided` 后按 transaction 闭合，stream synchronization 按
+`speculative_d2h_operations_elided` 与 `prefill_verify_d2h_operations_elided` 后按 transaction
+闭合，stream synchronization 按
 `speculative_sync_windows` 闭合，完整命令见增量性能文档第 5.5.1 节。
 
-多 OM profile 必须使用报告 schema 6 中的运行时 model ID、逐次执行 trace、Draft feature
+多 OM profile 必须使用报告 schema 7 中的运行时 model ID、逐次执行 trace、Draft feature
 策略与逐次物理行数做严格归因，
 不能靠文件顺序猜测 OM 角色。采集完成后运行
 `python -m qwen35_dflash.ascend310p analyze-msprof`；完整命令、输入约束和判定规则见

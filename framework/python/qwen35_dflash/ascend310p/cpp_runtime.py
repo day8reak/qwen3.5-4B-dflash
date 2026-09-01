@@ -44,6 +44,12 @@ _INCREMENTAL_DRAFT_FEATURE_POLICIES = {
     FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
 }
+SEPARATE_PREFILL_COMPLETION_POLICY = "separate"
+COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY = "coalesce-first-verify"
+_INCREMENTAL_PREFILL_COMPLETION_POLICIES = {
+    SEPARATE_PREFILL_COMPLETION_POLICY,
+    COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY,
+}
 _INCREMENTAL_ABI_ID = (
     "qwen35-4b-dflash-ascend310p-incremental-performance-v2"
 )
@@ -252,6 +258,18 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
     dflash_sync_window = int(options.get("dflash_sync_window", 1))
     if dflash_sync_window not in {1, 2}:
         raise ValueError("C++ runner dflash_sync_window must be 1 or 2")
+    prefill_completion_policy = str(
+        options.get(
+            "prefill_completion_policy",
+            SEPARATE_PREFILL_COMPLETION_POLICY,
+        )
+    ).strip()
+    if prefill_completion_policy not in _INCREMENTAL_PREFILL_COMPLETION_POLICIES:
+        raise ValueError(
+            "C++ runner prefill_completion_policy must be "
+            f"{SEPARATE_PREFILL_COMPLETION_POLICY!r} or "
+            f"{COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY!r}"
+        )
     return {
         "cpu_fallback": False,
         "device": {
@@ -269,6 +287,7 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
         "decode_carrier_policy": decode_carrier_policy,
         "draft_feature_policy": draft_feature_policy,
         "dflash_sync_window": dflash_sync_window,
+        "prefill_completion_policy": prefill_completion_policy,
         "pad_token_id": pad_token_id,
     }
 
@@ -728,10 +747,11 @@ def validate_incremental_cpp_runner_report(
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
     draft_feature_policy: str = FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     dflash_sync_window: int = 1,
+    prefill_completion_policy: str = SEPARATE_PREFILL_COMPLETION_POLICY,
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
-    if report.get("schema_version") != 6:
+    if report.get("schema_version") != 7:
         raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
@@ -858,11 +878,24 @@ def validate_incremental_cpp_runner_report(
         "state_zero_initialization_included_in_startup"
     ) is not immutable_zero:
         raise RuntimeError("incremental zero initialization timing scope differs")
-    if protocol.get("prefill_completion_policy") != (
-        "intermediate prompt chunks stay queued; final chunk performs the "
-        "only compact D2H and stream synchronization"
-    ):
+    if prefill_completion_policy not in _INCREMENTAL_PREFILL_COMPLETION_POLICIES:
+        raise ValueError("expected incremental prefill completion policy is invalid")
+    if protocol.get("prefill_completion_policy") != prefill_completion_policy:
         raise RuntimeError("incremental prefill completion policy differs")
+    expected_prefill_completion_description = (
+        "intermediate prompt chunks stay queued; on eligible DFlash requests "
+        "the final prefill and first verify share one compact D2H and stream "
+        "synchronization; first-token host visibility is delayed until that "
+        "verify completes"
+        if prefill_completion_policy
+        == COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
+        else "intermediate prompt chunks stay queued; final chunk performs "
+        "the only prefill compact D2H and stream synchronization before decode"
+    )
+    if protocol.get("prefill_completion_policy_description") != (
+        expected_prefill_completion_description
+    ):
+        raise RuntimeError("incremental prefill completion description differs")
     if protocol.get("prefill_control_policy") != (
         "each chunk uploads one prefix ending after IDs/effective length, "
         "final-Draft total count, a changed proposal count, or a changed "
@@ -1139,7 +1172,7 @@ def validate_incremental_cpp_runner_report(
     expected_deferred = request_count * (prompt_chunks - 1)
     dflash_request_count = request_count // 2
     expected_prefill_draft = (
-        dflash_request_count if max_new_tokens > 1 else 0
+        dflash_request_count if max_new_tokens > 2 else 0
     )
     expected_prefill_draft_elided = (
         expected_prefill_draft * (prompt_chunks - 1)
@@ -1237,6 +1270,51 @@ def validate_incremental_cpp_runner_report(
     speculative_d2h_padding = execution.get(
         "speculative_d2h_padding_bytes"
     )
+    prefill_verify_fields = (
+        "prefill_verify_coalesced_windows",
+        "prefill_verify_synchronizations_elided",
+        "prefill_verify_d2h_operations_elided",
+        "prefill_verify_d2h_padding_bytes",
+        "prefill_verify_prefill_slot0_windows",
+        "prefill_verify_prefill_slot1_windows",
+    )
+    prefill_verify_values = [
+        execution.get(field) for field in prefill_verify_fields
+    ]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for value in prefill_verify_values
+    ):
+        raise RuntimeError("incremental prefill/verify counters are invalid")
+    (
+        prefill_verify_windows,
+        prefill_verify_syncs_elided,
+        prefill_verify_d2h_elided,
+        prefill_verify_d2h_padding,
+        prefill_verify_slot0,
+        prefill_verify_slot1,
+    ) = (int(value) for value in prefill_verify_values)
+    expected_prefill_verify_windows = (
+        dflash_request_count
+        if prefill_completion_policy
+        == COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
+        and max_new_tokens > 2
+        else 0
+    )
+    expected_prefill_verify_padding = (
+        prefill_verify_slot0
+        * (
+            memory["compact_slot_bytes"]
+            - memory["compact_ordinary_result_bytes"]
+        )
+        + prefill_verify_slot1
+        * (
+            memory["compact_slot_bytes"]
+            - memory["compact_verify_result_bytes"]
+        )
+    )
     if (
         isinstance(speculative_windows, bool)
         or not isinstance(speculative_windows, int)
@@ -1250,7 +1328,16 @@ def validate_incremental_cpp_runner_report(
         or isinstance(speculative_d2h_padding, bool)
         or not isinstance(speculative_d2h_padding, int)
         or speculative_d2h_padding < 0
-        or speculative_windows + speculative_syncs_elided != verify
+        or prefill_verify_windows != expected_prefill_verify_windows
+        or prefill_verify_syncs_elided != prefill_verify_windows
+        or prefill_verify_d2h_elided != prefill_verify_windows
+        or prefill_verify_slot0 + prefill_verify_slot1
+        != prefill_verify_windows
+        or prefill_verify_d2h_padding != expected_prefill_verify_padding
+        or speculative_windows
+        + speculative_syncs_elided
+        + prefill_verify_windows
+        != verify
         or speculative_d2h_elided != speculative_syncs_elided
         or speculative_d2h_padding
         != speculative_d2h_elided
@@ -1262,6 +1349,7 @@ def validate_incremental_cpp_runner_report(
         != int(prefill_completions) + decode + speculative_windows
         or execution.get("device_to_host_operations")
         + speculative_d2h_elided
+        + prefill_verify_d2h_elided
         != transactions
     ):
         raise RuntimeError("incremental transaction synchronization policy differs")
@@ -1432,8 +1520,8 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental prefill control counters are invalid")
     expected_full_upload_operations = 1
     expected_proposal_count = (
-        min(max_draft_tokens, proposal_width, max_new_tokens - 1)
-        if max_new_tokens > 1
+        min(max_draft_tokens, proposal_width, max_new_tokens - 2)
+        if max_new_tokens > 2
         else 0
     )
     expected_proposal_upload_operations = (
@@ -1512,6 +1600,27 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental runner omitted paired mode reports")
     _validate_mode_report("ordinary", ordinary, generation_mode="ordinary-greedy")
     _validate_mode_report("DFlash", dflash, generation_mode="dflash-strict-greedy")
+    expected_measured_prefill_window = (
+        1
+        if prefill_completion_policy
+        == COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
+        and max_new_tokens > 2
+        else 0
+    )
+    for mode_name, mode_report, expected_window in (
+        ("ordinary", ordinary, 0),
+        ("DFlash", dflash, expected_measured_prefill_window),
+    ):
+        for measurement in mode_report["measurements"]:
+            counters = measurement.get("counters", {})
+            if counters.get("prefill_speculative_windows") != expected_window:
+                raise RuntimeError(
+                    f"incremental {mode_name} prefill/verify measurement differs"
+                )
+            if int(counters.get("speculative_transactions", -1)) < expected_window:
+                raise RuntimeError(
+                    f"incremental {mode_name} speculative accounting underflowed"
+                )
     if ordinary.get("stable_generated_token_ids") != dflash.get(
         "stable_generated_token_ids"
     ):
@@ -1636,6 +1745,8 @@ def run_cpp_pair(
                 identity["draft_feature_policy"],
                 "--dflash-sync-window",
                 str(identity["dflash_sync_window"]),
+                "--prefill-completion-policy",
+                identity["prefill_completion_policy"],
             ]
         )
     command.extend(["--progress", "true" if progress else "false"])
@@ -1685,6 +1796,9 @@ def run_cpp_pair(
             decode_carrier_policy=identity["decode_carrier_policy"],
             draft_feature_policy=identity["draft_feature_policy"],
             dflash_sync_window=identity["dflash_sync_window"],
+            prefill_completion_policy=identity[
+                "prefill_completion_policy"
+            ],
         )
     else:
         assert om_record is not None

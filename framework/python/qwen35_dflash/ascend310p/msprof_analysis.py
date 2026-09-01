@@ -211,6 +211,7 @@ def _validate_runner_report(
             "speculative_d2h_padding_bytes"
         )
         compact_slot_bytes = counters.get("compact_slot_bytes")
+        compact_ordinary_bytes = counters.get("compact_ordinary_result_bytes")
         compact_verify_bytes = counters.get("compact_verify_result_bytes")
         prefill_completions = counters.get(
             "prefill_completion_synchronizations"
@@ -218,6 +219,39 @@ def _validate_runner_report(
         decode_transactions = counters.get("target_decode1_executions")
         stream_synchronizations = counters.get("stream_synchronizations")
         device_to_host_operations = counters.get("device_to_host_operations")
+        if int(report.get("schema_version", 0)) >= 7:
+            if protocol.get("prefill_completion_policy") not in {
+                "separate",
+                "coalesce-first-verify",
+            }:
+                raise MsprofAnalysisError(
+                    "runner prefill completion policy is invalid"
+                )
+            prefill_verify_windows = counters.get(
+                "prefill_verify_coalesced_windows"
+            )
+            prefill_verify_syncs_elided = counters.get(
+                "prefill_verify_synchronizations_elided"
+            )
+            prefill_verify_d2h_elided = counters.get(
+                "prefill_verify_d2h_operations_elided"
+            )
+            prefill_verify_padding = counters.get(
+                "prefill_verify_d2h_padding_bytes"
+            )
+            prefill_verify_slot0 = counters.get(
+                "prefill_verify_prefill_slot0_windows"
+            )
+            prefill_verify_slot1 = counters.get(
+                "prefill_verify_prefill_slot1_windows"
+            )
+        else:
+            prefill_verify_windows = 0
+            prefill_verify_syncs_elided = 0
+            prefill_verify_d2h_elided = 0
+            prefill_verify_padding = 0
+            prefill_verify_slot0 = 0
+            prefill_verify_slot1 = 0
         values = (
             verify_transactions,
             speculative_windows,
@@ -225,11 +259,18 @@ def _validate_runner_report(
             speculative_d2h_elided,
             speculative_d2h_padding,
             compact_slot_bytes,
+            compact_ordinary_bytes,
             compact_verify_bytes,
             prefill_completions,
             decode_transactions,
             stream_synchronizations,
             device_to_host_operations,
+            prefill_verify_windows,
+            prefill_verify_syncs_elided,
+            prefill_verify_d2h_elided,
+            prefill_verify_padding,
+            prefill_verify_slot0,
+            prefill_verify_slot1,
         )
         if any(
             isinstance(value, bool)
@@ -241,7 +282,9 @@ def _validate_runner_report(
                 "runner speculative synchronization counters are invalid"
             )
         if (
-            speculative_windows + speculative_elided
+            speculative_windows
+            + speculative_elided
+            + prefill_verify_windows
             != verify_transactions
             or stream_synchronizations
             != prefill_completions
@@ -249,13 +292,24 @@ def _validate_runner_report(
             + speculative_windows
             or device_to_host_operations
             + speculative_d2h_elided
+            + prefill_verify_d2h_elided
             != prefill_completions
             + decode_transactions
             + verify_transactions
             or speculative_d2h_elided != speculative_elided
-            or compact_slot_bytes < compact_verify_bytes
+            or prefill_verify_syncs_elided != prefill_verify_windows
+            or prefill_verify_d2h_elided != prefill_verify_windows
+            or prefill_verify_slot0 + prefill_verify_slot1
+            != prefill_verify_windows
+            or compact_slot_bytes
+            < max(compact_ordinary_bytes, compact_verify_bytes)
             or speculative_d2h_padding
             != speculative_d2h_elided
+            * (compact_slot_bytes - compact_verify_bytes)
+            or prefill_verify_padding
+            != prefill_verify_slot0
+            * (compact_slot_bytes - compact_ordinary_bytes)
+            + prefill_verify_slot1
             * (compact_slot_bytes - compact_verify_bytes)
         ):
             raise MsprofAnalysisError(
@@ -792,6 +846,18 @@ def analyze_incremental_msprof(
     speculative_d2h_padding = int(
         counters.get("speculative_d2h_padding_bytes", 0)
     )
+    prefill_verify_windows = int(
+        counters.get("prefill_verify_coalesced_windows", 0)
+    )
+    prefill_verify_syncs_elided = int(
+        counters.get("prefill_verify_synchronizations_elided", 0)
+    )
+    prefill_verify_d2h_elided = int(
+        counters.get("prefill_verify_d2h_operations_elided", 0)
+    )
+    prefill_verify_d2h_padding = int(
+        counters.get("prefill_verify_d2h_padding_bytes", 0)
+    )
     expected_api_counts = {
         "aclmdlExecuteAsync": int(counters["model_executions"]),
         "aclrtMemcpyAsync": (
@@ -927,20 +993,35 @@ def analyze_incremental_msprof(
             else {"status": "NOT_AVAILABLE_LEGACY_REPORT"}
         ),
         "expected_synchronization_signature": {
+            "prefill_completion_policy": report["protocol"].get(
+                "prefill_completion_policy", "legacy-separate"
+            ),
             "stream_synchronizations": counters["stream_synchronizations"],
             "speculative_transactions": verify_transactions,
             "speculative_sync_windows": speculative_windows,
             "speculative_synchronizations_elided": speculative_elided,
             "speculative_d2h_operations_elided": speculative_d2h_elided,
             "speculative_d2h_padding_bytes": speculative_d2h_padding,
+            "prefill_verify_coalesced_windows": prefill_verify_windows,
+            "prefill_verify_synchronizations_elided": (
+                prefill_verify_syncs_elided
+            ),
+            "prefill_verify_d2h_operations_elided": (
+                prefill_verify_d2h_elided
+            ),
+            "prefill_verify_d2h_padding_bytes": (
+                prefill_verify_d2h_padding
+            ),
             "closure": (
                 "speculative_sync_windows + "
-                "speculative_synchronizations_elided == "
+                "speculative_synchronizations_elided + "
+                "prefill_verify_coalesced_windows == "
                 "speculative_transactions"
             ),
             "device_to_host_closure": (
                 "device_to_host_operations + "
-                "speculative_d2h_operations_elided == "
+                "speculative_d2h_operations_elided + "
+                "prefill_verify_d2h_operations_elided == "
                 "prefill_completion_synchronizations + "
                 "target_decode1_executions + speculative_transactions"
             ),

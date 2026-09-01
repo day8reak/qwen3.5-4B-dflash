@@ -522,6 +522,71 @@ void TestCommittedDraftFeaturePrefix(
   }
 }
 
+void TestPrefillVerifyCoalescing(
+    const std::array<std::filesystem::path, 5>& model_paths) {
+  qwen35::dflash::IncrementalOmPaths paths{
+      model_paths[0], model_paths[1], model_paths[2], model_paths[3],
+      model_paths[4]};
+  qwen35::dflash::AclIncrementalExecutor executor(std::move(paths));
+  Require(
+      executor.supports_prefill_verify_coalescing(),
+      "ACL executor did not advertise prefill/verify coalescing");
+
+  qwen35::dflash::GenerationOptions options;
+  options.max_new_tokens = 6;
+  options.max_draft_tokens = 3;
+  options.coalesce_prefill_with_first_verify = true;
+  const auto generated = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kDFlash,
+      options);
+  Require(
+      generated.generated_token_ids ==
+          std::vector<std::int64_t>({11, 12, 13, 14, 15, 16}),
+      "prefill/verify coalescing changed exact generated tokens");
+  Require(
+      generated.counters.prefill_speculative_windows == 1 &&
+          generated.counters.speculative_transactions == 1 &&
+          generated.counters.decode_iterations == 1,
+      "prefill/verify generation counters differ");
+
+  const auto& stats = executor.execution_stats();
+  Require(
+      stats.prefill_verify_coalesced_windows == 1 &&
+          stats.prefill_verify_synchronizations_elided == 1 &&
+          stats.prefill_verify_d2h_operations_elided == 1 &&
+          stats.prefill_verify_prefill_slot0_windows == 0 &&
+          stats.prefill_verify_prefill_slot1_windows == 1,
+      "prefill/verify coalescing event counters differ");
+  Require(
+      stats.prefill_verify_d2h_padding_bytes ==
+          stats.compact_slot_bytes - stats.compact_verify_result_bytes,
+      "prefill/verify coalesced D2H span differs");
+  Require(
+      stats.stream_synchronizations ==
+          stats.prefill_completion_synchronizations +
+              stats.target_decode1_executions +
+              stats.speculative_sync_windows,
+      "prefill/verify coalescing did not remove exactly one barrier");
+  Require(
+      stats.stream_synchronizations +
+              stats.speculative_synchronizations_elided +
+              stats.prefill_verify_synchronizations_elided ==
+          stats.prefill_completion_synchronizations +
+              stats.target_decode1_executions +
+              stats.target_verify_commit_executions,
+      "prefill/verify synchronization accounting does not close");
+  Require(
+      stats.device_to_host_operations +
+              stats.speculative_d2h_operations_elided +
+              stats.prefill_verify_d2h_operations_elided ==
+          stats.prefill_completion_synchronizations +
+              stats.target_decode1_executions +
+              stats.target_verify_commit_executions,
+      "prefill/verify D2H accounting does not close");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -559,6 +624,7 @@ int main(int argc, char** argv) {
     TestExplicitDecodeOverride(paths);
     TestCommittedDraftFeaturePrefix(paths, 1);
     TestCommittedDraftFeaturePrefix(paths, 2);
+    TestPrefillVerifyCoalescing(paths);
     TestUnifiedTargetStep(
         {paths[0], paths[1], paths[3], std::filesystem::path(argv[6])});
     std::cout << "PASS: reset, decode carrier and committed-prefix Draft "

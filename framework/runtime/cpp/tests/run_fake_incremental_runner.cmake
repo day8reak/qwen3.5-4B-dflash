@@ -36,6 +36,9 @@ endif()
 if(NOT DEFINED DFLASH_SYNC_WINDOW)
   set(DFLASH_SYNC_WINDOW 1)
 endif()
+if(NOT DEFINED PREFILL_COMPLETION_POLICY)
+  set(PREFILL_COMPLETION_POLICY "separate")
+endif()
 if(NOT DEFINED MAX_NEW_TOKENS)
   set(MAX_NEW_TOKENS 6)
 endif()
@@ -79,6 +82,7 @@ execute_process(
     --max-new-tokens "${MAX_NEW_TOKENS}"
     --max-draft-tokens "${MAX_DRAFT_TOKENS}"
     --dflash-sync-window "${DFLASH_SYNC_WINDOW}"
+    --prefill-completion-policy "${PREFILL_COMPLETION_POLICY}"
     --warmup "${WARMUP}"
     --repetitions "${REPETITIONS}"
     --device-id 0
@@ -130,8 +134,15 @@ string(JSON speculative_windows GET "${report}" execution_io_counters speculativ
 string(JSON speculative_syncs_elided GET "${report}" execution_io_counters speculative_synchronizations_elided)
 string(JSON speculative_d2h_elided GET "${report}" execution_io_counters speculative_d2h_operations_elided)
 string(JSON speculative_d2h_padding GET "${report}" execution_io_counters speculative_d2h_padding_bytes)
+string(JSON prefill_verify_windows GET "${report}" execution_io_counters prefill_verify_coalesced_windows)
+string(JSON prefill_verify_syncs_elided GET "${report}" execution_io_counters prefill_verify_synchronizations_elided)
+string(JSON prefill_verify_d2h_elided GET "${report}" execution_io_counters prefill_verify_d2h_operations_elided)
+string(JSON prefill_verify_d2h_padding GET "${report}" execution_io_counters prefill_verify_d2h_padding_bytes)
+string(JSON prefill_verify_slot0 GET "${report}" execution_io_counters prefill_verify_prefill_slot0_windows)
+string(JSON prefill_verify_slot1 GET "${report}" execution_io_counters prefill_verify_prefill_slot1_windows)
 string(JSON resets GET "${report}" execution_io_counters state_resets)
 string(JSON report_dflash_sync_window GET "${report}" protocol dflash_sync_window)
+string(JSON report_prefill_completion_policy GET "${report}" protocol prefill_completion_policy)
 string(JSON maximum_dflash_sync_window GET "${report}" protocol maximum_supported_dflash_sync_window)
 string(JSON report_reset_policy GET "${report}" protocol state_reset_policy)
 string(JSON report_decode_carrier_policy GET "${report}" protocol decode_carrier_policy)
@@ -215,9 +226,13 @@ string(JSON draft_executions GET "${report}" execution_io_counters draft_propose
 string(JSON verify_executions GET "${report}" execution_io_counters target_verify_commit_executions)
 math(EXPR transactions "${prefill_completions} + ${decode_executions} + ${verify_executions}")
 math(EXPR expected_synchronizations "${prefill_completions} + ${decode_executions} + ${speculative_windows}")
-math(EXPR closed_speculative_transactions "${speculative_windows} + ${speculative_syncs_elided}")
-math(EXPR closed_d2h_transactions "${d2h_operations} + ${speculative_d2h_elided}")
+math(EXPR closed_speculative_transactions "${speculative_windows} + ${speculative_syncs_elided} + ${prefill_verify_windows}")
+math(EXPR closed_d2h_transactions "${d2h_operations} + ${speculative_d2h_elided} + ${prefill_verify_d2h_elided}")
 math(EXPR expected_speculative_d2h_padding "${speculative_d2h_elided} * (${compact_slot_bytes} - ${compact_verify_bytes})")
+math(EXPR closed_prefill_verify_slots "${prefill_verify_slot0} + ${prefill_verify_slot1}")
+math(EXPR expected_prefill_verify_padding
+  "${prefill_verify_slot0} * (${compact_slot_bytes} - ${compact_ordinary_bytes}) + ${prefill_verify_slot1} * (${compact_slot_bytes} - ${compact_verify_bytes})"
+)
 math(EXPR role_total
   "${prefill_executions} + ${prefill_head_executions} + ${decode_executions} + ${draft_executions} + ${verify_executions}"
 )
@@ -227,6 +242,17 @@ math(EXPR target_step_closed_rows "${target_step_input_rows} + ${target_step_eli
 math(EXPR closed_state_bytes "${working_state_bytes} + ${zero_state_bytes}")
 math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
 math(EXPR expected_dflash_requests "${EXPECTED_RESETS} / 2")
+if(PREFILL_COMPLETION_POLICY STREQUAL "coalesce-first-verify")
+  if(MAX_NEW_TOKENS GREATER 2)
+    set(expected_prefill_verify_windows "${expected_dflash_requests}")
+  else()
+    set(expected_prefill_verify_windows 0)
+  endif()
+elseif(PREFILL_COMPLETION_POLICY STREQUAL "separate")
+  set(expected_prefill_verify_windows 0)
+else()
+  message(FATAL_ERROR "invalid PREFILL_COMPLETION_POLICY/MAX_NEW_TOKENS combination")
+endif()
 math(EXPR expected_prefill_feature_rows "${expected_dflash_requests} * 128")
 math(EXPR expected_prefill_control_full_uploads "1")
 if(ADAPTIVE_PROPOSAL_COUNTS)
@@ -383,18 +409,24 @@ if(ADAPTIVE_PROPOSAL_COUNTS AND
    NOT proposal_uploads EQUAL expected_dflash_requests)
   message(FATAL_ERROR "adaptive-K proposal uploads differ: ${report}")
 endif()
-if(NOT schema_version EQUAL 6 OR
+if(NOT schema_version EQUAL 7 OR
    NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR
    NOT repetitions EQUAL REPETITIONS OR NOT model_count EQUAL EXPECTED_MODEL_COUNT OR
    NOT report_protocol STREQUAL MEASUREMENT_PROTOCOL OR
    NOT report_dflash_sync_window EQUAL DFLASH_SYNC_WINDOW OR
+   NOT report_prefill_completion_policy STREQUAL PREFILL_COMPLETION_POLICY OR
    NOT maximum_dflash_sync_window EQUAL 2 OR
    NOT model_executions EQUAL role_total OR
    NOT closed_speculative_transactions EQUAL verify_executions OR
    NOT speculative_d2h_elided EQUAL speculative_syncs_elided OR
    NOT speculative_d2h_padding EQUAL expected_speculative_d2h_padding OR
+   NOT prefill_verify_windows EQUAL expected_prefill_verify_windows OR
+   NOT prefill_verify_syncs_elided EQUAL prefill_verify_windows OR
+   NOT prefill_verify_d2h_elided EQUAL prefill_verify_windows OR
+   NOT closed_prefill_verify_slots EQUAL prefill_verify_windows OR
+   NOT prefill_verify_d2h_padding EQUAL expected_prefill_verify_padding OR
    NOT synchronizations EQUAL expected_synchronizations OR
    NOT closed_d2h_transactions EQUAL transactions OR
    NOT resets EQUAL EXPECTED_RESETS OR

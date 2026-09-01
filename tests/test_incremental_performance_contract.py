@@ -224,6 +224,13 @@ def test_hot_loop_keeps_large_state_and_proposals_on_device() -> None:
     assert "K1 may be smaller" in contract["hot_loop"][
         "dflash_sync_window_budget_guard"
     ]
+    assert set(contract["hot_loop"]["prefill_completion_policies"]) == {
+        "separate",
+        "coalesce-first-verify",
+    }
+    assert "max_new_tokens>2" in contract["hot_loop"][
+        "prefill_first_verify_budget_guard"
+    ]
     transaction = contract["strict_greedy_transaction"]
     assert transaction["selected_target_state_slot"].startswith("a because")
     assert transaction["committed_target_input_rows"] == "1 + a"
@@ -294,6 +301,7 @@ def test_document_contains_memory_inspector_and_claim_boundary() -> None:
     assert "last-token-d2d" in document
     assert "--dflash-sync-window" in document
     assert "--draft-feature-policy" in document
+    assert "--prefill-completion-policy" in document
     assert "committed-prefix" in document
     assert "1,006,632,960" in document
     assert "K0=15,K1=14" in document
@@ -305,7 +313,7 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 18
+    assert framework_lock["schema_version"] == 19
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -326,6 +334,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
         "incremental_profile_attribution"
     ]
     assert "N=1..16" in runtime["incremental_draft_feature_prefix"]
+    assert "coalesce-first-verify" in runtime[
+        "incremental_prefill_completion"
+    ]
 
     cpp_runtime = deployment["cpp_runtime"]
     assert "changed contiguous range" in cpp_runtime["memory"]
@@ -351,6 +362,47 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert "draft_verify_feature_input_rows" in runner[
         "required_io_counters"
     ]
+    assert "coalesce-first-verify" in runner[
+        "required_prefill_completion_policy"
+    ]
+
+
+def test_prefill_first_verify_fake_acl_evidence_closes() -> None:
+    evidence = _contract()["hot_loop"][
+        "fake_acl_prefill_first_verify_70_token_paired_3_plus_10"
+    ]
+    assert evidence["token_id_mismatches"] == 0
+    assert evidence["eos_mismatches"] == 0
+    assert evidence["model_executions_both"] == 182
+    assert (
+        evidence["separate_device_to_host_operations"]
+        - evidence["coalesced_device_to_host_operations"]
+        == evidence["device_to_host_operations_elided"]
+        == evidence["coalesced_windows"]
+    )
+    assert (
+        evidence["separate_stream_synchronizations"]
+        - evidence["coalesced_stream_synchronizations"]
+        == evidence["synchronizations_elided"]
+        == evidence["coalesced_windows"]
+    )
+    assert (
+        evidence["coalesced_device_to_host_bytes"]
+        - evidence["separate_device_to_host_bytes"]
+        == evidence["device_to_host_padding_bytes"]
+    )
+    assert evidence["device_to_host_padding_bytes"] == (
+        evidence["prefill_slot0_windows"]
+        * (
+            evidence["compact_slot_bytes"]
+            - evidence["compact_ordinary_result_bytes"]
+        )
+        + evidence["prefill_slot1_windows"]
+        * (
+            evidence["compact_slot_bytes"]
+            - evidence["compact_verify_result_bytes"]
+        )
+    )
 
 
 def test_decode_device_carrier_contract_closes_frozen_fake_acl_work() -> None:

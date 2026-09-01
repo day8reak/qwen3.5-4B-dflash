@@ -37,10 +37,10 @@ def _runner_report() -> dict[str, object]:
         {"ordinal": 7, "model_id": 4, "physical_rows": 1},
     ]
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "status": "PASS",
         "runner_id": "qwen35-dflash-ascendcl-cpp-incremental-v3",
-        "runner_version": "1.14.0",
+        "runner_version": "1.15.0",
         "cpu_fallback": False,
         "device_id": 0,
         "models": models,
@@ -57,6 +57,7 @@ def _runner_report() -> dict[str, object]:
             "profile_model_execution_trace_enabled": True,
             "dflash_sync_window": 1,
             "draft_feature_policy": "committed-prefix",
+            "prefill_completion_policy": "separate",
         },
         "execution_io_counters": {
             "model_executions": 8,
@@ -90,7 +91,14 @@ def _runner_report() -> dict[str, object]:
             "speculative_d2h_operations_elided": 0,
             "speculative_d2h_padding_bytes": 0,
             "compact_slot_bytes": 512,
+            "compact_ordinary_result_bytes": 257,
             "compact_verify_result_bytes": 452,
+            "prefill_verify_coalesced_windows": 0,
+            "prefill_verify_synchronizations_elided": 0,
+            "prefill_verify_d2h_operations_elided": 0,
+            "prefill_verify_d2h_padding_bytes": 0,
+            "prefill_verify_prefill_slot0_windows": 0,
+            "prefill_verify_prefill_slot1_windows": 0,
             "prefill_completion_synchronizations": 1,
             "state_initialization_stream_synchronizations": 0,
         },
@@ -147,7 +155,13 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def _write_api_csv(path: Path, *, execute_count: int = 8) -> None:
+def _write_api_csv(
+    path: Path,
+    *,
+    execute_count: int = 8,
+    memcpy_count: int = 8,
+    synchronize_count: int = 4,
+) -> None:
     rows = [
         {
             "Device_id": "host",
@@ -161,7 +175,7 @@ def _write_api_csv(path: Path, *, execute_count: int = 8) -> None:
             "Level": "AscendCL",
             "API Name": "aclrtMemcpyAsync",
             "Time(us)": 40.0,
-            "Count": 8,
+            "Count": memcpy_count,
         },
         {
             "Device_id": "host",
@@ -175,7 +189,7 @@ def _write_api_csv(path: Path, *, execute_count: int = 8) -> None:
             "Level": "AscendCL",
             "API Name": "aclrtSynchronizeStream",
             "Time(us)": 200.0,
-            "Count": 4,
+            "Count": synchronize_count,
         },
     ]
     _write_csv(path, rows)
@@ -241,20 +255,27 @@ def test_msprof_analysis_attributes_every_role_and_dynamic_gear(
         "bytes": 1024,
     }
     assert payload["expected_synchronization_signature"] == {
+        "prefill_completion_policy": "separate",
         "stream_synchronizations": 4,
         "speculative_transactions": 1,
         "speculative_sync_windows": 1,
         "speculative_synchronizations_elided": 0,
         "speculative_d2h_operations_elided": 0,
         "speculative_d2h_padding_bytes": 0,
+        "prefill_verify_coalesced_windows": 0,
+        "prefill_verify_synchronizations_elided": 0,
+        "prefill_verify_d2h_operations_elided": 0,
+        "prefill_verify_d2h_padding_bytes": 0,
         "closure": (
             "speculative_sync_windows + "
-            "speculative_synchronizations_elided == "
+            "speculative_synchronizations_elided + "
+            "prefill_verify_coalesced_windows == "
             "speculative_transactions"
         ),
         "device_to_host_closure": (
             "device_to_host_operations + "
-            "speculative_d2h_operations_elided == "
+            "speculative_d2h_operations_elided + "
+            "prefill_verify_d2h_operations_elided == "
             "prefill_completion_synchronizations + "
             "target_decode1_executions + speculative_transactions"
         ),
@@ -331,6 +352,37 @@ def test_msprof_analysis_rejects_sync_window_counter_drift(
             profile_dir=profile,
             runner_report=report_path,
         )
+
+
+def test_msprof_analysis_accepts_prefill_first_verify_coalescing(
+    tmp_path: Path,
+) -> None:
+    report_path, profile = _case(tmp_path)
+    report = _runner_report()
+    report["protocol"]["prefill_completion_policy"] = (
+        "coalesce-first-verify"
+    )
+    counters = report["execution_io_counters"]
+    counters["speculative_sync_windows"] = 0
+    counters["stream_synchronizations"] = 3
+    counters["device_to_host_operations"] = 3
+    counters["prefill_verify_coalesced_windows"] = 1
+    counters["prefill_verify_synchronizations_elided"] = 1
+    counters["prefill_verify_d2h_operations_elided"] = 1
+    counters["prefill_verify_d2h_padding_bytes"] = 255
+    counters["prefill_verify_prefill_slot0_windows"] = 1
+    _write_json(report_path, report)
+    api_path = next(profile.rglob("api_statistic_*.csv"))
+    _write_api_csv(api_path, memcpy_count=7, synchronize_count=3)
+
+    payload = analyze_incremental_msprof(
+        profile_dir=profile,
+        runner_report=report_path,
+    )
+    signature = payload["expected_synchronization_signature"]
+    assert signature["prefill_completion_policy"] == "coalesce-first-verify"
+    assert signature["prefill_verify_coalesced_windows"] == 1
+    assert signature["prefill_verify_d2h_operations_elided"] == 1
 
 
 def test_msprof_analysis_rejects_coalesced_d2h_padding_drift(

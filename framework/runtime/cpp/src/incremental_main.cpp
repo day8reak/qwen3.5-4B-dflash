@@ -62,6 +62,7 @@ struct Arguments {
   std::size_t max_new_tokens = 32;
   std::size_t max_draft_tokens = 15;
   std::size_t dflash_sync_window = 1;
+  bool coalesce_prefill_with_first_verify = false;
   std::size_t warmup = 3;
   std::size_t repetitions = 10;
   int device_id = 0;
@@ -95,6 +96,7 @@ void Usage(std::ostream& stream) {
       << "  --max-new-tokens N                       default 32\n"
       << "  --max-draft-tokens N                     default 15\n"
       << "  --dflash-sync-window N                   1 (default) or exact two-round window\n"
+      << "  --prefill-completion-policy POLICY       separate (default) or coalesce-first-verify\n"
       << "  --warmup N                               evidence=3, profile=1\n"
       << "  --repetitions N                          evidence=10, profile=1\n"
       << "  --device-id N                            default 0\n"
@@ -292,6 +294,16 @@ Arguments ParseArguments(int argc, char** argv) {
   if (result.dflash_sync_window > 2) {
     throw std::invalid_argument("dflash-sync-window must be 1 or 2");
   }
+  const std::string prefill_completion_policy = TakeOptional(
+      &values, "prefill-completion-policy", "separate");
+  if (prefill_completion_policy == "separate") {
+    result.coalesce_prefill_with_first_verify = false;
+  } else if (prefill_completion_policy == "coalesce-first-verify") {
+    result.coalesce_prefill_with_first_verify = true;
+  } else {
+    throw std::invalid_argument(
+        "prefill-completion-policy must be separate or coalesce-first-verify");
+  }
   result.warmup = ParseSize(TakeOptional(&values, "warmup", "3"), "warmup");
   result.repetitions = ParseSize(
       TakeOptional(&values, "repetitions", "10"), "repetitions");
@@ -456,6 +468,8 @@ void WriteMeasurement(
          << value.counters.rejected_draft_tokens
          << ",\"speculative_transactions\":"
          << value.counters.speculative_transactions
+         << ",\"prefill_speculative_windows\":"
+         << value.counters.prefill_speculative_windows
          << ",\"decode_iterations\":" << value.counters.decode_iterations
          << "},\"latency_ms\":{\"prefill\":" << value.prefill_ms
          << ",\"decode\":" << value.decode_ms
@@ -547,22 +561,46 @@ void WriteReport(
         "profile model execution trace does not close");
   }
   if (execution.speculative_sync_windows +
-              execution.speculative_synchronizations_elided !=
+              execution.speculative_synchronizations_elided +
+              execution.prefill_verify_coalesced_windows !=
           execution.target_verify_commit_executions ||
       execution.speculative_d2h_operations_elided !=
           execution.speculative_synchronizations_elided ||
+      execution.prefill_verify_synchronizations_elided !=
+          execution.prefill_verify_coalesced_windows ||
+      execution.prefill_verify_d2h_operations_elided !=
+          execution.prefill_verify_coalesced_windows ||
+      execution.prefill_verify_prefill_slot0_windows +
+              execution.prefill_verify_prefill_slot1_windows !=
+          execution.prefill_verify_coalesced_windows ||
       execution.compact_slot_bytes <
-          execution.compact_verify_result_bytes ||
+          std::max(
+              execution.compact_ordinary_result_bytes,
+              execution.compact_verify_result_bytes) ||
       execution.speculative_d2h_padding_bytes !=
           execution.speculative_d2h_operations_elided *
               (execution.compact_slot_bytes -
                execution.compact_verify_result_bytes) ||
+      execution.prefill_verify_d2h_padding_bytes !=
+          execution.prefill_verify_prefill_slot0_windows *
+                  (execution.compact_slot_bytes -
+                   execution.compact_ordinary_result_bytes) +
+              execution.prefill_verify_prefill_slot1_windows *
+                  (execution.compact_slot_bytes -
+                   execution.compact_verify_result_bytes) ||
       execution.stream_synchronizations !=
           execution.prefill_completion_synchronizations +
               execution.target_decode1_executions +
               execution.speculative_sync_windows ||
+      execution.stream_synchronizations +
+              execution.speculative_synchronizations_elided +
+              execution.prefill_verify_synchronizations_elided !=
+          execution.prefill_completion_synchronizations +
+              execution.target_decode1_executions +
+              execution.target_verify_commit_executions ||
       execution.device_to_host_operations +
-              execution.speculative_d2h_operations_elided !=
+              execution.speculative_d2h_operations_elided +
+              execution.prefill_verify_d2h_operations_elided !=
           execution.prefill_completion_synchronizations +
               execution.target_decode1_executions +
               execution.target_verify_commit_executions) {
@@ -619,7 +657,7 @@ void WriteReport(
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":6,\"status\":\"PASS\","
+         << "{\"schema_version\":7,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
          << (executor.unified_target_step() ? "four" : "five")
          << "-resident-OM paired model loop\","
@@ -728,9 +766,20 @@ void WriteReport(
          << (executor.unified_target_step() ? "four" : "five")
          << "-model process\","
          << "\"model_load_excluded_from_latency\":true,"
-         << "\"prefill_completion_policy\":\"intermediate prompt chunks "
-            "stay queued; final chunk performs the only compact D2H and "
-            "stream synchronization\","
+         << "\"prefill_completion_policy\":\""
+         << (arguments.coalesce_prefill_with_first_verify
+                 ? "coalesce-first-verify"
+                 : "separate")
+         << "\",\"prefill_completion_policy_description\":\""
+         << (arguments.coalesce_prefill_with_first_verify
+                 ? "intermediate prompt chunks stay queued; on eligible "
+                   "DFlash requests the final prefill and first verify share "
+                   "one compact D2H and stream synchronization; first-token "
+                   "host visibility is delayed until that verify completes"
+                 : "intermediate prompt chunks stay queued; final chunk "
+                   "performs the only prefill compact D2H and stream "
+                   "synchronization before decode")
+         << "\","
          << "\"prefill_control_policy\":\"each chunk uploads one prefix "
             "ending after IDs/effective length, final-Draft total count, a "
             "changed proposal count, or a changed process-resident EOS "
@@ -807,8 +856,9 @@ void WriteReport(
          << "\"proposal_policy\":\"Draft-to-verify device carrier; no proposal D2H/H2D\","
          << "\"result_policy\":\"one logical compact result per complete "
             "transaction; an exact two-transaction DFlash window coalesces "
-            "adjacent compact slots into one D2H; one barrier per prompt/decode "
-            "transaction or DFlash synchronization window; no host-visible "
+            "adjacent compact slots into one D2H; an eligible final prefill "
+            "and first verify may independently share one contiguous D2H; "
+            "one barrier per completed prompt/decode window; no host-visible "
             "result for intermediate prefill chunks\","
          << "\"model_executions\":" << model_executions
          << ",\"target_prefill_executions\":"
@@ -843,6 +893,18 @@ void WriteReport(
          << execution.speculative_d2h_operations_elided
          << ",\"speculative_d2h_padding_bytes\":"
          << execution.speculative_d2h_padding_bytes
+         << ",\"prefill_verify_coalesced_windows\":"
+         << execution.prefill_verify_coalesced_windows
+         << ",\"prefill_verify_synchronizations_elided\":"
+         << execution.prefill_verify_synchronizations_elided
+         << ",\"prefill_verify_d2h_operations_elided\":"
+         << execution.prefill_verify_d2h_operations_elided
+         << ",\"prefill_verify_d2h_padding_bytes\":"
+         << execution.prefill_verify_d2h_padding_bytes
+         << ",\"prefill_verify_prefill_slot0_windows\":"
+         << execution.prefill_verify_prefill_slot0_windows
+         << ",\"prefill_verify_prefill_slot1_windows\":"
+         << execution.prefill_verify_prefill_slot1_windows
          << ",\"prefill_completion_synchronizations\":"
          << execution.prefill_completion_synchronizations
          << ",\"deferred_prefill_chunks\":"
@@ -1102,6 +1164,8 @@ int main(int argc, char** argv) {
     options.max_new_tokens = arguments.max_new_tokens;
     options.max_draft_tokens = arguments.max_draft_tokens;
     options.dflash_sync_window = arguments.dflash_sync_window;
+    options.coalesce_prefill_with_first_verify =
+        arguments.coalesce_prefill_with_first_verify;
     options.eos_token_ids = arguments.eos_token_ids;
     PrintProgress(
         arguments.progress,

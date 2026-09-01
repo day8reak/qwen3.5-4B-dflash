@@ -17,6 +17,7 @@ if str(FRAMEWORK_PYTHON) not in sys.path:
 
 from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     ASYNC_MEMSET_STATE_RESET_POLICY,
+    COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY,
     COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
     FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     IMMUTABLE_ZERO_STATE_RESET_POLICY,
@@ -24,6 +25,7 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     INCREMENTAL_STATE_POLICY,
     LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
     ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
+    SEPARATE_PREFILL_COMPLETION_POLICY,
     _INCREMENTAL_GRAPH_ABI,
     _UNIFIED_TARGET_STEP_GRAPH_ABI,
     _resolve_incremental_oms,
@@ -33,10 +35,18 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
 from qwen35_dflash.ascend310p import cpp_runtime  # noqa: E402
 
 
-def _mode(generation_mode: str) -> dict[str, object]:
+def _mode(
+    generation_mode: str,
+    *,
+    prefill_speculative_windows: int = 0,
+) -> dict[str, object]:
     measurement = {
         "generated_token_ids": [11, 12, 13, 14, 15, 16],
         "stop_reason": "length",
+        "counters": {
+            "speculative_transactions": prefill_speculative_windows,
+            "prefill_speculative_windows": prefill_speculative_windows,
+        },
     }
     return {
         "status": "PASS",
@@ -62,6 +72,7 @@ def _report(
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
     draft_feature_policy: str = FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     dflash_sync_window: int = 1,
+    prefill_completion_policy: str = SEPARATE_PREFILL_COMPLETION_POLICY,
 ) -> dict[str, object]:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
     request_count = 26
@@ -123,8 +134,21 @@ def _report(
         - prefill_control_upload_bytes
     )
     decode_executions = 65
-    speculative_windows = 26 if dflash_sync_window == 1 else 13
-    speculative_syncs_elided = 26 - speculative_windows
+    prefill_verify_windows = (
+        dflash_request_count
+        if prefill_completion_policy
+        == COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
+        else 0
+    )
+    remaining_verify_transactions = 26 - prefill_verify_windows
+    speculative_windows = (
+        remaining_verify_transactions
+        if dflash_sync_window == 1
+        else (remaining_verify_transactions + 1) // 2
+    )
+    speculative_syncs_elided = (
+        remaining_verify_transactions - speculative_windows
+    )
     last_token_d2d = (
         decode_carrier_policy == LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
     )
@@ -152,7 +176,7 @@ def _report(
         for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -173,9 +197,16 @@ def _report(
                 "one host-visible synchronization window; a DFlash window "
                 "may contain one or two complete speculative transactions"
             ),
-            "prefill_completion_policy": (
-                "intermediate prompt chunks stay queued; final chunk performs "
-                "the only compact D2H and stream synchronization"
+            "prefill_completion_policy": prefill_completion_policy,
+            "prefill_completion_policy_description": (
+                "intermediate prompt chunks stay queued; on eligible DFlash "
+                "requests the final prefill and first verify share one compact "
+                "D2H and stream synchronization; first-token host visibility "
+                "is delayed until that verify completes"
+                if prefill_verify_windows
+                else "intermediate prompt chunks stay queued; final chunk "
+                "performs the only prefill compact D2H and stream "
+                "synchronization before decode"
             ),
             "prefill_control_policy": (
                 "each chunk uploads one prefix ending after IDs/effective "
@@ -314,6 +345,12 @@ def _report(
             "speculative_d2h_padding_bytes": (
                 speculative_syncs_elided * 60
             ),
+            "prefill_verify_coalesced_windows": prefill_verify_windows,
+            "prefill_verify_synchronizations_elided": prefill_verify_windows,
+            "prefill_verify_d2h_operations_elided": prefill_verify_windows,
+            "prefill_verify_d2h_padding_bytes": prefill_verify_windows * 255,
+            "prefill_verify_prefill_slot0_windows": prefill_verify_windows,
+            "prefill_verify_prefill_slot1_windows": 0,
             "prefill_completion_synchronizations": request_count,
             "deferred_prefill_chunks": deferred_prefill,
             "prefill_synchronizations_elided": deferred_prefill,
@@ -390,7 +427,7 @@ def _report(
                 + proposal_upload_operations * 4
             ),
             "device_to_host_operations": (
-                117 - speculative_syncs_elided
+                117 - speculative_syncs_elided - prefill_verify_windows
             ),
             "device_to_host_bytes": (
                 8192 + speculative_syncs_elided * 60
@@ -429,7 +466,10 @@ def _report(
             "target_step_zero_count_bindings": 0,
         },
         "ordinary": _mode("ordinary-greedy"),
-        "dflash": _mode("dflash-strict-greedy"),
+        "dflash": _mode(
+            "dflash-strict-greedy",
+            prefill_speculative_windows=(1 if prefill_verify_windows else 0),
+        ),
         "profile_model_execution_trace": [],
         "ordinary_parity": {
             "status": "PASS",
@@ -525,6 +565,7 @@ def _validate(
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
     draft_feature_policy: str = FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     dflash_sync_window: int = 1,
+    prefill_completion_policy: str = SEPARATE_PREFILL_COMPLETION_POLICY,
     unified_target_step: bool = False,
 ) -> None:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
@@ -545,6 +586,7 @@ def _validate(
         decode_carrier_policy=decode_carrier_policy,
         draft_feature_policy=draft_feature_policy,
         dflash_sync_window=dflash_sync_window,
+        prefill_completion_policy=prefill_completion_policy,
     )
 
 
@@ -622,6 +664,26 @@ def test_incremental_runner_rejects_draft_feature_policy_mismatch() -> None:
         _validate(report)
 
 
+def test_incremental_runner_accepts_prefill_first_verify_coalescing() -> None:
+    policy = COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
+    report = _report(prefill_completion_policy=policy)
+    _validate(report, prefill_completion_policy=policy)
+    counters = report["execution_io_counters"]
+    assert counters["prefill_verify_coalesced_windows"] == 13
+    assert counters["prefill_verify_synchronizations_elided"] == 13
+    assert counters["prefill_verify_d2h_operations_elided"] == 13
+
+
+def test_incremental_runner_rejects_prefill_completion_policy_mismatch() -> None:
+    report = _report(
+        prefill_completion_policy=(
+            COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
+        )
+    )
+    with pytest.raises(RuntimeError, match="prefill completion policy"):
+        _validate(report)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -630,6 +692,12 @@ def test_incremental_runner_rejects_draft_feature_policy_mismatch() -> None:
         ("speculative_synchronizations_elided", 1),
         ("speculative_d2h_operations_elided", 1),
         ("speculative_d2h_padding_bytes", 1),
+        ("prefill_verify_coalesced_windows", 1),
+        ("prefill_verify_synchronizations_elided", 1),
+        ("prefill_verify_d2h_operations_elided", 1),
+        ("prefill_verify_d2h_padding_bytes", 1),
+        ("prefill_verify_prefill_slot0_windows", 1),
+        ("prefill_verify_prefill_slot1_windows", 1),
         ("device_to_host_operations", 118),
         ("state_resets", 25),
         ("model_executions", 157),
@@ -705,6 +773,9 @@ def test_incremental_runner_config_is_explicit() -> None:
             "decode_carrier_policy": ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
             "draft_feature_policy": COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
             "dflash_sync_window": 2,
+            "prefill_completion_policy": (
+                COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
+            ),
             "pad_token_id": 0,
         },
         0,
@@ -719,6 +790,9 @@ def test_incremental_runner_config_is_explicit() -> None:
         == ONE_TOKEN_H2D_DECODE_CARRIER_POLICY
     )
     assert identity["dflash_sync_window"] == 2
+    assert identity["prefill_completion_policy"] == (
+        COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
+    )
     assert (
         identity["draft_feature_policy"]
         == COMMITTED_PREFIX_DRAFT_FEATURE_POLICY
@@ -784,6 +858,22 @@ def test_incremental_runner_rejects_unknown_dflash_sync_window() -> None:
                 "runtime": "AscendCL",
                 "state_policy": INCREMENTAL_STATE_POLICY,
                 "dflash_sync_window": 3,
+            },
+            0,
+        )
+
+
+def test_incremental_runner_rejects_unknown_prefill_completion_policy() -> None:
+    with pytest.raises(ValueError, match="prefill_completion_policy"):
+        validate_cpp_runner_options(
+            {
+                "device_model": "Ascend310P3",
+                "cann": "test-cann",
+                "driver": "test-driver",
+                "firmware": "test-firmware",
+                "runtime": "AscendCL",
+                "state_policy": INCREMENTAL_STATE_POLICY,
+                "prefill_completion_policy": "unknown",
             },
             0,
         )
@@ -1011,6 +1101,9 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
         FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY
     )
     assert command[command.index("--dflash-sync-window") + 1] == "1"
+    assert command[command.index("--prefill-completion-policy") + 1] == (
+        SEPARATE_PREFILL_COMPLETION_POLICY
+    )
     assert command[command.index("--measurement-protocol") + 1] == "evidence"
     assert payload["backend_metadata"]["state_policy"] == (
         INCREMENTAL_STATE_POLICY
