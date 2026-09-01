@@ -69,6 +69,32 @@ def _report(
     prefill_draft_elided = dflash_request_count * (prompt_chunks - 1)
     prefill_feature_rows = dflash_request_count * prompt_chunks * 64
     prefill_control_bytes = 896
+    prefill_base_control_bytes = 578
+    prefill_count_control_bytes = 644
+    prefill_proposal_control_bytes = 708
+    prefill_persistent_control_tail_bytes = (
+        prefill_control_bytes - prefill_proposal_control_bytes
+    )
+    prefill_control_full_uploads = 1
+    prefill_control_proposal_uploads = 1
+    prefill_control_count_uploads = dflash_request_count - 1
+    prefill_control_base_uploads = (
+        target_prefill_executions
+        - prefill_control_full_uploads
+        - prefill_control_count_uploads
+        - prefill_control_proposal_uploads
+    )
+    prefill_control_upload_bytes = (
+        prefill_control_full_uploads * prefill_control_bytes
+        + prefill_control_base_uploads * prefill_base_control_bytes
+        + prefill_control_count_uploads * prefill_count_control_bytes
+        + prefill_control_proposal_uploads
+        * prefill_proposal_control_bytes
+    )
+    prefill_control_h2d_bytes_elided = (
+        target_prefill_executions * prefill_control_bytes
+        - prefill_control_upload_bytes
+    )
     decode_executions = 65
     last_token_d2d = (
         decode_carrier_policy == LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
@@ -114,9 +140,10 @@ def _report(
                 "the only compact D2H and stream synchronization"
             ),
             "prefill_control_policy": (
-                "IDs, effective length, proposal count, total prompt count "
-                "and EOS table share one H2D carrier with 64-byte-aligned "
-                "device subsegments per prompt chunk"
+                "each chunk uploads one prefix ending after IDs/effective "
+                "length, final-Draft total count, a changed proposal count, "
+                "or a changed process-resident EOS table/count; all device "
+                "subsegments start at 64-byte boundaries"
             ),
             "prefill_draft_policy": (
                 "Target feature slabs stay device-resident; non-final prompt "
@@ -176,6 +203,18 @@ def _report(
             "carrier_device_bytes": 4096,
             "compact_ping_pong_device_bytes": 1024,
             "prefill_control_bytes_per_slot": prefill_control_bytes,
+            "prefill_base_control_bytes_per_slot": (
+                prefill_base_control_bytes
+            ),
+            "prefill_count_control_bytes_per_slot": (
+                prefill_count_control_bytes
+            ),
+            "prefill_proposal_control_bytes_per_slot": (
+                prefill_proposal_control_bytes
+            ),
+            "prefill_persistent_control_tail_bytes_per_slot": (
+                prefill_persistent_control_tail_bytes
+            ),
             "prefill_staging_pinned_host_bytes": 1792,
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
@@ -212,8 +251,21 @@ def _report(
             "prefill_draft_propose_executions_elided": prefill_draft_elided,
             "prefill_feature_rows_batched": prefill_feature_rows,
             "prefill_control_upload_operations": target_prefill_executions,
-            "prefill_control_upload_bytes": (
-                target_prefill_executions * prefill_control_bytes
+            "prefill_control_upload_bytes": prefill_control_upload_bytes,
+            "prefill_control_full_upload_operations": (
+                prefill_control_full_uploads
+            ),
+            "prefill_control_base_upload_operations": (
+                prefill_control_base_uploads
+            ),
+            "prefill_control_count_upload_operations": (
+                prefill_control_count_uploads
+            ),
+            "prefill_control_proposal_upload_operations": (
+                prefill_control_proposal_uploads
+            ),
+            "prefill_control_h2d_bytes_elided": (
+                prefill_control_h2d_bytes_elided
             ),
             "prefill_h2d_operations_elided": target_prefill_executions,
             "decode_id_upload_operations": decode_upload_operations,
@@ -245,7 +297,7 @@ def _report(
                 + proposal_upload_operations
             ),
             "host_to_device_bytes": (
-                target_prefill_executions * prefill_control_bytes
+                prefill_control_upload_bytes
                 + decode_upload_operations * 8
                 + proposal_upload_operations * 4
             ),
@@ -259,6 +311,18 @@ def _report(
             "compact_ping_pong_device_bytes": 1024,
             "prefill_staging_slots": 2,
             "prefill_control_bytes_per_slot": prefill_control_bytes,
+            "prefill_base_control_bytes_per_slot": (
+                prefill_base_control_bytes
+            ),
+            "prefill_count_control_bytes_per_slot": (
+                prefill_count_control_bytes
+            ),
+            "prefill_proposal_control_bytes_per_slot": (
+                prefill_proposal_control_bytes
+            ),
+            "prefill_persistent_control_tail_bytes_per_slot": (
+                prefill_persistent_control_tail_bytes
+            ),
             "prefill_staging_pinned_host_bytes": 1792,
             "prefill_feature_slab_bytes": 1024,
             "prefill_feature_arena_bytes": 2112,
@@ -343,6 +407,15 @@ def test_incremental_runner_rejects_decode_carrier_policy_mismatch() -> None:
         ("model_executions", 157),
         ("prefill_control_upload_operations", 25),
         ("prefill_control_upload_bytes", 1),
+        ("prefill_control_full_upload_operations", 2),
+        ("prefill_control_base_upload_operations", 1),
+        ("prefill_control_count_upload_operations", 1),
+        ("prefill_control_proposal_upload_operations", 2),
+        ("prefill_control_h2d_bytes_elided", 1),
+        ("prefill_base_control_bytes_per_slot", 1),
+        ("prefill_count_control_bytes_per_slot", 1),
+        ("prefill_proposal_control_bytes_per_slot", 1),
+        ("prefill_persistent_control_tail_bytes_per_slot", 1),
         ("host_to_device_operations", 1),
         ("decode_id_device_carrier_hits", 1),
         ("decode_id_multi_token_carrier_hits", 66),

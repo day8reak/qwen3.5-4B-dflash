@@ -539,6 +539,14 @@ void WriteReport(
          << execution.compact_ping_pong_device_bytes
          << ",\"prefill_control_bytes_per_slot\":"
          << execution.prefill_control_bytes_per_slot
+         << ",\"prefill_base_control_bytes_per_slot\":"
+         << execution.prefill_base_control_bytes_per_slot
+         << ",\"prefill_count_control_bytes_per_slot\":"
+         << execution.prefill_count_control_bytes_per_slot
+         << ",\"prefill_proposal_control_bytes_per_slot\":"
+         << execution.prefill_proposal_control_bytes_per_slot
+         << ",\"prefill_persistent_control_tail_bytes_per_slot\":"
+         << execution.prefill_persistent_control_tail_bytes_per_slot
          << ",\"prefill_staging_pinned_host_bytes\":"
          << execution.prefill_staging_pinned_host_bytes
          << ",\"prefill_feature_slab_bytes\":"
@@ -564,9 +572,11 @@ void WriteReport(
          << "\"prefill_completion_policy\":\"intermediate prompt chunks "
             "stay queued; final chunk performs the only compact D2H and "
             "stream synchronization\","
-         << "\"prefill_control_policy\":\"IDs, effective length, proposal "
-            "count, total prompt count and EOS table share one H2D carrier "
-            "with 64-byte-aligned device subsegments per prompt chunk\","
+         << "\"prefill_control_policy\":\"each chunk uploads one prefix "
+            "ending after IDs/effective length, final-Draft total count, a "
+            "changed proposal count, or a changed process-resident EOS "
+            "table/count; all device subsegments start at 64-byte "
+            "boundaries\","
          << "\"prefill_draft_policy\":\"Target feature slabs stay device-resident; "
             "non-final prompt chunks execute no Draft OM; final prompt "
             "completion executes one prebound dynamic-gear Draft OM\","
@@ -654,6 +664,16 @@ void WriteReport(
          << execution.prefill_control_upload_operations
          << ",\"prefill_control_upload_bytes\":"
          << execution.prefill_control_upload_bytes
+         << ",\"prefill_control_full_upload_operations\":"
+         << execution.prefill_control_full_upload_operations
+         << ",\"prefill_control_base_upload_operations\":"
+         << execution.prefill_control_base_upload_operations
+         << ",\"prefill_control_count_upload_operations\":"
+         << execution.prefill_control_count_upload_operations
+         << ",\"prefill_control_proposal_upload_operations\":"
+         << execution.prefill_control_proposal_upload_operations
+         << ",\"prefill_control_h2d_bytes_elided\":"
+         << execution.prefill_control_h2d_bytes_elided
          << ",\"prefill_h2d_operations_elided\":"
          << execution.prefill_h2d_operations_elided
          << ",\"decode_id_upload_operations\":"
@@ -704,6 +724,14 @@ void WriteReport(
          << execution.prefill_staging_slots
          << ",\"prefill_control_bytes_per_slot\":"
          << execution.prefill_control_bytes_per_slot
+         << ",\"prefill_base_control_bytes_per_slot\":"
+         << execution.prefill_base_control_bytes_per_slot
+         << ",\"prefill_count_control_bytes_per_slot\":"
+         << execution.prefill_count_control_bytes_per_slot
+         << ",\"prefill_proposal_control_bytes_per_slot\":"
+         << execution.prefill_proposal_control_bytes_per_slot
+         << ",\"prefill_persistent_control_tail_bytes_per_slot\":"
+         << execution.prefill_persistent_control_tail_bytes_per_slot
          << ",\"prefill_staging_pinned_host_bytes\":"
          << execution.prefill_staging_pinned_host_bytes
          << ",\"prefill_feature_slab_bytes\":"

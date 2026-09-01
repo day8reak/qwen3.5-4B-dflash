@@ -733,9 +733,10 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental prefill completion policy differs")
     if protocol.get("prefill_control_policy") != (
-        "IDs, effective length, proposal count, total prompt count and EOS "
-        "table share one H2D carrier with 64-byte-aligned device subsegments "
-        "per prompt chunk"
+        "each chunk uploads one prefix ending after IDs/effective length, "
+        "final-Draft total count, a changed proposal count, or a changed "
+        "process-resident EOS table/count; all device subsegments start at "
+        "64-byte boundaries"
     ):
         raise RuntimeError("incremental prefill control policy differs")
     if protocol.get("prefill_draft_policy") != (
@@ -828,6 +829,10 @@ def validate_incremental_cpp_runner_report(
         "carrier_device_bytes",
         "compact_ping_pong_device_bytes",
         "prefill_control_bytes_per_slot",
+        "prefill_base_control_bytes_per_slot",
+        "prefill_count_control_bytes_per_slot",
+        "prefill_proposal_control_bytes_per_slot",
+        "prefill_persistent_control_tail_bytes_per_slot",
         "prefill_staging_pinned_host_bytes",
         "prefill_feature_slab_bytes",
         "prefill_feature_arena_bytes",
@@ -856,23 +861,40 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental state allocation does not close")
     expected_staging_slots = sequence_capacity // prefill_width
     control_cursor = 0
-    for tensor_bytes in (
-        prefill_width * 8,
-        eos_table_width * 8,
-        4,
-        4,
-        2,
-        4,
-    ):
-        control_cursor = (control_cursor + 63) // 64 * 64
-        control_cursor += (tensor_bytes + 31) // 32 * 32 + 32
+
+    def reserve_control(tensor_bytes: int) -> int:
+        nonlocal control_cursor
+        offset = (control_cursor + 63) // 64 * 64
+        control_cursor = offset + (tensor_bytes + 31) // 32 * 32 + 32
+        return offset
+
+    reserve_control(prefill_width * 8)
+    effective_length_offset = reserve_control(2)
+    expected_base_control_bytes = effective_length_offset + 2
+    total_count_offset = reserve_control(4)
+    expected_count_control_bytes = total_count_offset + 4
+    proposal_count_offset = reserve_control(4)
+    expected_proposal_control_bytes = proposal_count_offset + 4
+    reserve_control(eos_table_width * 8)
+    reserve_control(4)
     expected_control_bytes = (control_cursor + 63) // 64 * 64
+    expected_persistent_control_tail_bytes = (
+        expected_control_bytes - expected_proposal_control_bytes
+    )
     expected_staging_host_bytes = (
         expected_staging_slots * expected_control_bytes
     )
     if (
         memory["prefill_control_bytes_per_slot"]
         != expected_control_bytes
+        or memory["prefill_base_control_bytes_per_slot"]
+        != expected_base_control_bytes
+        or memory["prefill_count_control_bytes_per_slot"]
+        != expected_count_control_bytes
+        or memory["prefill_proposal_control_bytes_per_slot"]
+        != expected_proposal_control_bytes
+        or memory["prefill_persistent_control_tail_bytes_per_slot"]
+        != expected_persistent_control_tail_bytes
         or memory["prefill_staging_pinned_host_bytes"]
         != expected_staging_host_bytes
     ):
@@ -1004,6 +1026,14 @@ def validate_incremental_cpp_runner_report(
         execution.get("prefill_staging_slots") != expected_staging_slots
         or execution.get("prefill_control_bytes_per_slot")
         != expected_control_bytes
+        or execution.get("prefill_base_control_bytes_per_slot")
+        != expected_base_control_bytes
+        or execution.get("prefill_count_control_bytes_per_slot")
+        != expected_count_control_bytes
+        or execution.get("prefill_proposal_control_bytes_per_slot")
+        != expected_proposal_control_bytes
+        or execution.get("prefill_persistent_control_tail_bytes_per_slot")
+        != expected_persistent_control_tail_bytes
         or execution.get("prefill_staging_pinned_host_bytes")
         != expected_staging_host_bytes
         or execution.get("prefill_feature_slab_bytes")
@@ -1016,6 +1046,21 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental prefill staging reports differ")
     prefill_upload_operations = execution.get(
         "prefill_control_upload_operations"
+    )
+    prefill_full_upload_operations = execution.get(
+        "prefill_control_full_upload_operations"
+    )
+    prefill_base_upload_operations = execution.get(
+        "prefill_control_base_upload_operations"
+    )
+    prefill_count_upload_operations = execution.get(
+        "prefill_control_count_upload_operations"
+    )
+    prefill_proposal_upload_operations = execution.get(
+        "prefill_control_proposal_upload_operations"
+    )
+    prefill_control_bytes_elided = execution.get(
+        "prefill_control_h2d_bytes_elided"
     )
     decode_upload_operations = execution.get("decode_id_upload_operations")
     decode_carrier_hits = execution.get("decode_id_device_carrier_hits")
@@ -1067,10 +1112,68 @@ def validate_incremental_cpp_runner_report(
         or decode_device_compaction_bytes != 0
     ):
         raise RuntimeError("incremental one-token H2D counters differ")
+    prefill_route_values = (
+        prefill_upload_operations,
+        prefill_full_upload_operations,
+        prefill_base_upload_operations,
+        prefill_count_upload_operations,
+        prefill_proposal_upload_operations,
+        prefill_control_bytes_elided,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in prefill_route_values
+    ):
+        raise RuntimeError("incremental prefill control counters are invalid")
+    expected_full_upload_operations = 1
+    expected_proposal_count = (
+        min(max_draft_tokens, proposal_width, max_new_tokens - 1)
+        if max_new_tokens > 1
+        else 0
+    )
+    expected_proposal_upload_operations = (
+        1
+        if expected_prefill_draft > 0 and expected_proposal_count != 1
+        else 0
+    )
+    expected_count_upload_operations = (
+        expected_prefill_draft - expected_proposal_upload_operations
+    )
+    expected_base_upload_operations = (
+        prefill
+        - expected_full_upload_operations
+        - expected_count_upload_operations
+        - expected_proposal_upload_operations
+    )
+    expected_prefill_upload_bytes = (
+        expected_control_bytes * expected_full_upload_operations
+        + expected_base_control_bytes * expected_base_upload_operations
+        + expected_count_control_bytes * expected_count_upload_operations
+        + expected_proposal_control_bytes
+        * expected_proposal_upload_operations
+    )
+    expected_control_bytes_elided = (
+        prefill * expected_control_bytes - expected_prefill_upload_bytes
+    )
     if (
         prefill_upload_operations != prefill
+        or prefill_full_upload_operations
+        != expected_full_upload_operations
+        or prefill_base_upload_operations
+        != expected_base_upload_operations
+        or prefill_count_upload_operations
+        != expected_count_upload_operations
+        or prefill_proposal_upload_operations
+        != expected_proposal_upload_operations
+        or prefill_full_upload_operations
+        + prefill_base_upload_operations
+        + prefill_count_upload_operations
+        + prefill_proposal_upload_operations
+        != prefill_upload_operations
         or execution.get("prefill_control_upload_bytes")
-        != prefill * expected_control_bytes
+        != expected_prefill_upload_bytes
+        or prefill_control_bytes_elided
+        != expected_control_bytes_elided
         or execution.get("prefill_h2d_operations_elided") != prefill
         or isinstance(proposal_upload_operations, bool)
         or not isinstance(proposal_upload_operations, int)

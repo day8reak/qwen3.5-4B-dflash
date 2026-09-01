@@ -124,6 +124,10 @@ void RunPolicy(
   Require(
       stats.prefill_staging_slots == 2 &&
           stats.prefill_control_bytes_per_slot == 896 &&
+          stats.prefill_base_control_bytes_per_slot == 578 &&
+          stats.prefill_count_control_bytes_per_slot == 644 &&
+          stats.prefill_proposal_control_bytes_per_slot == 708 &&
+          stats.prefill_persistent_control_tail_bytes_per_slot == 188 &&
           stats.prefill_staging_pinned_host_bytes == 1792,
       "prefill pinned-host staging ring differs");
   Require(
@@ -140,12 +144,31 @@ void RunPolicy(
   Require(
       stats.prefill_control_upload_operations ==
               stats.target_prefill_executions &&
+          stats.prefill_control_full_upload_operations == 3 &&
+          stats.prefill_control_base_upload_operations == 2 &&
+          stats.prefill_control_count_upload_operations == 1 &&
+          stats.prefill_control_proposal_upload_operations == 1 &&
+          stats.prefill_control_full_upload_operations +
+                  stats.prefill_control_base_upload_operations +
+                  stats.prefill_control_count_upload_operations +
+                  stats.prefill_control_proposal_upload_operations ==
+              stats.prefill_control_upload_operations &&
           stats.prefill_h2d_operations_elided ==
               stats.target_prefill_executions &&
           stats.prefill_control_upload_bytes ==
+              stats.prefill_control_full_upload_operations *
+                      stats.prefill_control_bytes_per_slot +
+                  stats.prefill_control_base_upload_operations *
+                      stats.prefill_base_control_bytes_per_slot +
+                  stats.prefill_control_count_upload_operations *
+                      stats.prefill_count_control_bytes_per_slot +
+                  stats.prefill_control_proposal_upload_operations *
+                      stats.prefill_proposal_control_bytes_per_slot &&
+          stats.prefill_control_h2d_bytes_elided ==
               stats.prefill_control_upload_operations *
-                  stats.prefill_control_bytes_per_slot,
-      "prefill controls were not packed into one H2D per chunk");
+                      stats.prefill_control_bytes_per_slot -
+                  stats.prefill_control_upload_bytes,
+      "prefill variable/persistent control upload counters do not close");
   Require(
       stats.decode_id_upload_operations +
                   stats.decode_id_device_carrier_hits ==

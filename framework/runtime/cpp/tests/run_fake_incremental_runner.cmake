@@ -107,12 +107,21 @@ string(JSON prefill_draft_elided GET "${report}" execution_io_counters prefill_d
 string(JSON prefill_feature_rows GET "${report}" execution_io_counters prefill_feature_rows_batched)
 string(JSON prefill_staging_slots GET "${report}" execution_io_counters prefill_staging_slots)
 string(JSON prefill_control_slot_bytes GET "${report}" execution_io_counters prefill_control_bytes_per_slot)
+string(JSON prefill_base_control_slot_bytes GET "${report}" execution_io_counters prefill_base_control_bytes_per_slot)
+string(JSON prefill_count_control_slot_bytes GET "${report}" execution_io_counters prefill_count_control_bytes_per_slot)
+string(JSON prefill_proposal_control_slot_bytes GET "${report}" execution_io_counters prefill_proposal_control_bytes_per_slot)
+string(JSON prefill_persistent_control_tail_bytes GET "${report}" execution_io_counters prefill_persistent_control_tail_bytes_per_slot)
 string(JSON prefill_staging_bytes GET "${report}" execution_io_counters prefill_staging_pinned_host_bytes)
 string(JSON prefill_feature_slab_bytes GET "${report}" execution_io_counters prefill_feature_slab_bytes)
 string(JSON prefill_feature_arena_bytes GET "${report}" execution_io_counters prefill_feature_arena_bytes)
 string(JSON draft_dynamic_gears GET "${report}" execution_io_counters draft_dynamic_gear_count)
 string(JSON prefill_control_uploads GET "${report}" execution_io_counters prefill_control_upload_operations)
 string(JSON prefill_control_upload_bytes GET "${report}" execution_io_counters prefill_control_upload_bytes)
+string(JSON prefill_control_full_uploads GET "${report}" execution_io_counters prefill_control_full_upload_operations)
+string(JSON prefill_control_base_uploads GET "${report}" execution_io_counters prefill_control_base_upload_operations)
+string(JSON prefill_control_count_uploads GET "${report}" execution_io_counters prefill_control_count_upload_operations)
+string(JSON prefill_control_proposal_uploads GET "${report}" execution_io_counters prefill_control_proposal_upload_operations)
+string(JSON prefill_control_h2d_bytes_elided GET "${report}" execution_io_counters prefill_control_h2d_bytes_elided)
 string(JSON prefill_h2d_elided GET "${report}" execution_io_counters prefill_h2d_operations_elided)
 string(JSON decode_uploads GET "${report}" execution_io_counters decode_id_upload_operations)
 string(JSON decode_upload_bytes GET "${report}" execution_io_counters decode_id_upload_bytes)
@@ -137,7 +146,18 @@ math(EXPR closed_state_bytes "${working_state_bytes} + ${zero_state_bytes}")
 math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
 math(EXPR expected_dflash_requests "${EXPECTED_RESETS} / 2")
 math(EXPR expected_prefill_feature_rows "${expected_dflash_requests} * 128")
-math(EXPR expected_prefill_control_bytes "${prefill_executions} * ${prefill_control_slot_bytes}")
+math(EXPR expected_prefill_control_full_uploads "1")
+math(EXPR expected_prefill_control_proposal_uploads "1")
+math(EXPR expected_prefill_control_count_uploads "${expected_dflash_requests} - 1")
+math(EXPR expected_prefill_control_base_uploads
+  "${prefill_executions} - ${expected_prefill_control_full_uploads} - ${expected_prefill_control_proposal_uploads} - ${expected_prefill_control_count_uploads}"
+)
+math(EXPR expected_prefill_control_bytes
+  "${expected_prefill_control_full_uploads} * ${prefill_control_slot_bytes} + ${expected_prefill_control_base_uploads} * ${prefill_base_control_slot_bytes} + ${expected_prefill_control_count_uploads} * ${prefill_count_control_slot_bytes} + ${expected_prefill_control_proposal_uploads} * ${prefill_proposal_control_slot_bytes}"
+)
+math(EXPR expected_prefill_control_h2d_bytes_elided
+  "${prefill_executions} * ${prefill_control_slot_bytes} - ${expected_prefill_control_bytes}"
+)
 math(EXPR expected_decode_upload_bytes "${decode_uploads} * 8")
 math(EXPR expected_decode_device_compaction_bytes "${decode_device_compactions} * 8")
 math(EXPR closed_decode_routes "${decode_uploads} + ${decode_carrier_hits}")
@@ -205,12 +225,21 @@ if(NOT status STREQUAL "PASS" OR
    NOT draft_executions EQUAL expected_dflash_requests OR
    NOT prefill_staging_slots EQUAL 2 OR
    NOT prefill_control_slot_bytes EQUAL 896 OR
+   NOT prefill_base_control_slot_bytes EQUAL 578 OR
+   NOT prefill_count_control_slot_bytes EQUAL 644 OR
+   NOT prefill_proposal_control_slot_bytes EQUAL 708 OR
+   NOT prefill_persistent_control_tail_bytes EQUAL 188 OR
    NOT prefill_staging_bytes EQUAL 1792 OR
    NOT prefill_feature_slab_bytes EQUAL 1024 OR
    NOT prefill_feature_arena_bytes EQUAL 2112 OR
    NOT draft_dynamic_gears EQUAL 3 OR
    NOT prefill_control_uploads EQUAL prefill_executions OR
+   NOT prefill_control_full_uploads EQUAL expected_prefill_control_full_uploads OR
+   NOT prefill_control_base_uploads EQUAL expected_prefill_control_base_uploads OR
+   NOT prefill_control_count_uploads EQUAL expected_prefill_control_count_uploads OR
+   NOT prefill_control_proposal_uploads EQUAL expected_prefill_control_proposal_uploads OR
    NOT prefill_control_upload_bytes EQUAL expected_prefill_control_bytes OR
+   NOT prefill_control_h2d_bytes_elided EQUAL expected_prefill_control_h2d_bytes_elided OR
    NOT prefill_h2d_elided EQUAL prefill_executions OR
    NOT closed_decode_routes EQUAL decode_executions OR
    NOT decode_carrier_hits GREATER 0 OR

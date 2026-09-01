@@ -67,6 +67,11 @@ struct IncrementalAclExecutionStats {
   std::size_t prefill_feature_rows_batched = 0;
   std::size_t prefill_control_upload_operations = 0;
   std::size_t prefill_control_upload_bytes = 0;
+  std::size_t prefill_control_full_upload_operations = 0;
+  std::size_t prefill_control_base_upload_operations = 0;
+  std::size_t prefill_control_count_upload_operations = 0;
+  std::size_t prefill_control_proposal_upload_operations = 0;
+  std::size_t prefill_control_h2d_bytes_elided = 0;
   std::size_t prefill_h2d_operations_elided = 0;
   std::size_t decode_id_upload_operations = 0;
   std::size_t decode_id_upload_bytes = 0;
@@ -95,6 +100,10 @@ struct IncrementalAclExecutionStats {
   std::size_t compact_ping_pong_device_bytes = 0;
   std::size_t prefill_staging_slots = 0;
   std::size_t prefill_control_bytes_per_slot = 0;
+  std::size_t prefill_base_control_bytes_per_slot = 0;
+  std::size_t prefill_count_control_bytes_per_slot = 0;
+  std::size_t prefill_proposal_control_bytes_per_slot = 0;
+  std::size_t prefill_persistent_control_tail_bytes_per_slot = 0;
   std::size_t prefill_staging_pinned_host_bytes = 0;
   std::size_t prefill_feature_slab_bytes = 0;
   std::size_t prefill_feature_arena_bytes = 0;
@@ -116,6 +125,10 @@ using IncrementalModelProgress = std::function<void(
 // back to H2D after multi-token commits, or retains every last committed token,
 // binding row zero directly and compacting later rows D2D into the aligned
 // input. An explicit caller override retains the original H2D fallback.
+// Per-chunk control uploads stop after the last field consumed by that chunk:
+// base IDs/effective length, final-Draft count, changed proposal, or the full
+// EOS tail. The EOS table/count stay resident and are refreshed only when
+// Reset changes their identity, without adding a separate H2D operation.
 // Proposal IDs, Target features and cursors never cross the host boundary. A speculative
 // method enqueues Draft -> Target verify/commit and performs one stream sync
 // only after a compact transaction result has been queued for D2H. The first

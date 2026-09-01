@@ -273,9 +273,11 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   `immutable-zero` 在进程启动时建立只读零状态，使每次请求不再清零大状态。二者都没有
   reset-only barrier，后者以额外一套 Target+Draft 状态显存换 TTFT；
 - 每个 prompt chunk 的 64 个 ID、有效长度、累计 prompt token 数、proposal count 和 EOS 表共用
-  一个 896-byte
-  host/device control carrier，只下发一次 H2D；每个 device 子段按 64 bytes 对齐并保留 AscendCL
-  要求的分段 padding，prefill 后只有 proposal count 真正变化时才单独下发 4-byte H2D；
+  一个 896-byte host/device control carrier，仍只下发一次 H2D；但复制长度按本次图真正消费的
+  live prefix 收窄为 base/count/proposal/full 四档（默认宽度分别为 578/644/708/896 bytes）。中间
+  Target chunk 只复制 ID 与有效长度，最终 Draft 才复制累计 token 数，proposal 变化时延伸到 proposal，
+  EOS 表仅在进程首次使用或 Reset 改变 EOS 身份时刷新；每个 device 子段仍按 64 bytes 对齐并保留
+  AscendCL 要求的分段 padding，prefill 后只有 proposal count 真正变化时才单独下发 4-byte H2D；
 - Target/Draft state arena 与 compact result arena 也使用同一条 64-byte 起始地址、
   `ALIGN_UP(payload,32)+32` 分段规则；Fake ACL 会拒绝任何未对齐的模型输入/输出绑定；
 - compact result 使用与 Target state 同步翻转的两套 device arena；上一事务最后提交的 token
@@ -459,7 +461,18 @@ prefill_draft_propose_executions_elided = (R / 2) * (C - 1)
 prefill_feature_rows_batched        = (R / 2) * C * 64
 prefill_control_upload_operations   = target_prefill_executions
 prefill_h2d_operations_elided       = target_prefill_executions
-prefill_control_upload_bytes        = target_prefill_executions * control_bytes
+prefill_control_full_upload_operations
+ + prefill_control_base_upload_operations
+ + prefill_control_count_upload_operations
+ + prefill_control_proposal_upload_operations
+                                    = prefill_control_upload_operations
+prefill_control_upload_bytes        = full_ops * full_bytes
+                                    + base_ops * base_bytes
+                                    + count_ops * count_bytes
+                                    + proposal_ops * proposal_bytes
+prefill_control_upload_bytes
+ + prefill_control_h2d_bytes_elided = prefill_control_upload_operations
+                                    * prefill_control_bytes_per_slot
 decode_id_device_carrier_hits       + decode_id_upload_operations
                                     = target_decode1_executions
 decode_id_h2d_operations_elided     = decode_id_device_carrier_hits
@@ -475,9 +488,12 @@ host_to_device_operations           = prefill_control_upload_operations
 ```
 
 其中每个字段的 device offset 都按 64 bytes 对齐，每段物理跨度为
-`ALIGN_UP(tensor_bytes,32)+32`，最终 carrier 再按 64 bytes 对齐；默认 `eos_table_width=4` 时为
-896 bytes。最后三个加数分别代表 packed prefill、仅供显式调用者覆盖使用的 decode ID 回退，
-以及 prefill 后 proposal count 改值；三类 operation/byte 分项之和必须严格等于总 H2D 计数。
+`ALIGN_UP(tensor_bytes,32)+32`，最终 carrier 再按 64 bytes 对齐；默认 `eos_table_width=4` 时完整
+carrier 为 896 bytes，base/count/proposal prefix 分别为 578/644/708 bytes，持久 EOS tail 为
+188 bytes。四条 prefill 路径仍各自只有一次 H2D，operation 之和必须等于 prefill 总数，实际
+byte 与相对全量复制省掉的 byte 之和必须等于 `operations*896`。总 H2D 的最后三个加数分别代表
+prefill control prefix、仅供显式调用者覆盖使用的 decode ID 回退，以及 prefill 后 proposal count
+改值；三类 operation/byte 分项之和必须严格等于总 H2D 计数。
 每次 `target-decode1` 必须恰好落入 device carrier 或 host upload 两条路径之一；选择
 `last-token-d2d` 时，多 token carrier 还必须以一条 8-byte D2D compaction 闭合；选择
 `one-token-h2d` 时，这两个 multi-token/D2D 计数必须都为 0。这个布局遵守
@@ -487,9 +503,10 @@ host_to_device_operations           = prefill_control_upload_operations
 LM head 从 32 次降为 1 次；整个
 paired 报告应消除 `26*31=806` 次 stream sync 和 compact D2H。它不减少 Target prefill 的
 device 执行次数，但会消除 `13*31=403` 次中间 Draft 执行。为保证异步 H2D 源不在
-最终同步前被覆盖，runner 会常驻 `2048/64=32` 个 pinned-host staging slot；每个 slot 为 896
-字节，总计 28,672 字节，device 侧只需同一个 896-byte packed
-control buffer。相对于每 chunk 分别上传 ID 和有效长度，2048-token paired 报告至少再消除
+最终同步前被覆盖，runner 会常驻 `2048/64=32` 个 pinned-host staging slot；每个 slot 仍按完整
+896 字节分配，总计 28,672 字节，device 侧也仍只需同一个 896-byte packed control buffer；
+prefix liveness 只收窄每次 DMA 的复制范围，不改变 buffer/OM ABI。相对于每 chunk 分别上传 ID
+和有效长度，2048-token paired 报告至少再消除
 `26*32=832` 次小 H2D API 调用。
 
 70-token/two-chunk Fake ACL 的第一阶段冻结调用证据是 H2D operations 从 185 降为 130（减少
@@ -498,9 +515,12 @@ payload 从 27,392 增至 47,216 bytes（其中本轮累计 prompt count 使每�
 896）。在此基础上，第一版 one-token device carrier 命中 65 次、回退上传 13 次，使 H2D
 operations 从 130 降到 65，payload 从 47,216 降到 46,696 bytes。当前 last-token carrier 把
 这 13 次多 token 回退改成 13 次、共 104 bytes 的 D2D，使 78 次 decode 全部命中 device
-carrier，H2D operations 再降到 52，payload 降到 46,592 bytes。它没有减少 memcpy API 总数：
-one-token 版本的 65 次 H2D，变成当前 52 次 H2D + 13 次 D2D，仍为 65 次。compact device arena
-仍为两套共 1,024 bytes；D2H operations/bytes 保持 117/32,604 不变。这些都只证明 Fake ACL
+carrier，H2D operations 再降到 52，payload 降到 46,592 bytes。prefix liveness 在同一 52 个
+prefill chunk 上命中 full/base/count/proposal=`1/38/12/1`，把 payload 进一步降到 31,296 bytes，
+相对每次全量 896-byte carrier 省 15,296 bytes（32.829670%）；`one-token-h2d` 同样使用这四档，
+总 H2D 为 65 operations/31,400 bytes。last-token 路由没有减少 memcpy API 总数：one-token 版本
+的 65 次 H2D，变成 52 次 H2D + 13 次 D2D，仍为 65 次。compact device arena仍为两套共
+1,024 bytes；D2H operations/bytes 保持 117/32,604 不变。这些都只证明 Fake ACL
 下的调用结构、路由闭合和字节计数，不是 310P 时延结论；真机必须比较 8-byte H2D 与 D2D 的
 API/timeline，并以未开 msprof 的同源 3+10 median/p90 决定是否保留该候选。
 
@@ -822,7 +842,9 @@ draft-propose/target-verify-commit` 映射，再按 model ID 汇总 duration。`
 必须重新关闭 profiling，以 `--measurement-protocol evidence --warmup 3 --repetitions 10` 跑上面
 的正式命令。profile report 会明确写入 `formal_latency_evidence=false`，不能混入候选提升依据。
 
-另外必须把 `api_statistic`/timeline 中的 memcpy 与 report 对齐：carrier hit 都不得出现
+另外必须把 `api_statistic`/timeline 中的 memcpy 与 report 对齐：每个 prefill chunk 必须恰好
+出现一次 control H2D，其长度只能是 report 声明的 base/count/proposal/full 四档；连续请求中
+896-byte full 路径只应在首次使用或 Reset 改变 EOS 表身份时出现。carrier hit 都不得出现
 8-byte decode-ID H2D。`last-token-d2d` 的多 token 尾槽必须恰好出现一次 8-byte D2D；
 `one-token-h2d` 的 multi-token/D2D 计数必须为 0，multi-token commit 改走 8-byte H2D。以下门禁
 先验证 report 自闭合，再人工用时间线定位对应 memcpy：
@@ -830,6 +852,24 @@ draft-propose/target-verify-commit` 映射，再按 model ID 汇总 duration。`
 ```bash
 jq -e '
   .execution_io_counters as $io |
+  (($io.prefill_control_full_upload_operations +
+     $io.prefill_control_base_upload_operations +
+     $io.prefill_control_count_upload_operations +
+     $io.prefill_control_proposal_upload_operations) ==
+    $io.prefill_control_upload_operations) and
+  (($io.prefill_control_upload_bytes +
+     $io.prefill_control_h2d_bytes_elided) ==
+    ($io.prefill_control_upload_operations *
+     $io.prefill_control_bytes_per_slot)) and
+  ($io.prefill_control_upload_bytes ==
+   (($io.prefill_control_full_upload_operations *
+      $io.prefill_control_bytes_per_slot) +
+    ($io.prefill_control_base_upload_operations *
+      $io.prefill_base_control_bytes_per_slot) +
+    ($io.prefill_control_count_upload_operations *
+      $io.prefill_count_control_bytes_per_slot) +
+    ($io.prefill_control_proposal_upload_operations *
+      $io.prefill_proposal_control_bytes_per_slot))) and
   (($io.decode_id_device_carrier_hits +
      $io.decode_id_upload_operations) ==
     $io.target_decode1_executions) and

@@ -632,7 +632,8 @@ $AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner
 候选。`build-cpp` 会同时构建并 host-test 两者。五图的导出 factory、runner 配置、直接运行、
 report 门禁、同二进制 `one-token-h2d`/`last-token-d2d` A/B 和 msprof 命令见
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5 节。runner 配置中的 `decode_carrier_policy` 只改变
-C++ buffer/copy 路由，不要求重新生成 AIR 或 OM。
+C++ buffer/copy 路由，不要求重新生成 AIR 或 OM。prefill control 也在同一 896-byte carrier 内按
+base/count/proposal/full 四档 live prefix 复制；它不改 tensor 名、shape、offset 或五个 OM 的 ABI。
 
 不要把 build 目录或二进制提交进源码仓库。
 
@@ -825,9 +826,12 @@ msprof 只能回答重计算基线 OM 中每个算子、device task 和 AscendCL
 后，应使用 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节的完整状态机 msprof 命令，并按
 model ID/role 分组；两类 profile 不得混成同一份时延基线。该 runner 会把长 prompt 的中间
 64-row chunk 留在同一 stream，仅最后一个 chunk 下载 compact 结果并同步；报告中的 elided
-prefill 计数必须与 `ceil(prompt_tokens/64)-1` 按请求数闭合。每个 chunk 的 ID、有效长度、
-proposal count 和 EOS 表还会合并为一次 packed H2D；`prefill_control_upload_operations` 必须等于
-`target_prefill_executions`，各分项 operation/byte 必须与总 H2D 严格闭合。普通连续 decode 可由
+prefill 计数必须与 `ceil(prompt_tokens/64)-1` 按请求数闭合。每个 chunk 的 ID、有效长度、累计
+token 数、proposal count 和 EOS 表仍合并为一次 H2D，但复制长度按消费活性收窄为
+base/count/proposal/full 四档；默认 `eos_table_width=4` 时分别为 578/644/708/896 bytes，EOS tail
+只在首次使用或 Reset 改变 EOS 身份时刷新。`prefill_control_upload_operations` 必须等于
+`target_prefill_executions`，四条路径 operation 之和必须等于该总数，实际 byte 加 elided byte
+必须等于全量 carrier 等价 byte。普通连续 decode 可由
 同一二进制选择两种精确策略：`one-token-h2d` 仅把一行 compact 结果直接绑定，多 token commit
 走 8-byte H2D；`last-token-d2d` 把最后提交的 compact token 留在 device，第 0 行直接绑定，多
 token 末行做一次 8-byte D2D 到对齐 scalar。report 必须满足

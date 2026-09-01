@@ -256,7 +256,7 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 16
+    assert framework_lock["schema_version"] == 17
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -289,6 +289,10 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     ]
     assert "D2D" in runner["incremental_five_om_io"]
     assert "same-binary" in runner["required_decode_carrier_policy"]
+    assert any(
+        "full/base/count/proposal" in item
+        for item in runner["required_io_counters"]
+    )
     assert "maximum_target_elements_per_call" in runner["required_io_counters"]
 
 
@@ -309,6 +313,9 @@ def test_decode_device_carrier_contract_closes_frozen_fake_acl_work() -> None:
     assert "zero token/EOS mismatch" in selection_gate
     assert "measurement noise" in selection_gate
     assert "64-byte" in hot_loop["rejected_unaligned_multi_row_binding"]
+    assert "exactly one H2D per chunk" in hot_loop[
+        "prefill_control_prefix_policy"
+    ]
     assert evidence["target_decode1_executions"] == (
         evidence["decode_id_device_carrier_hits"]
         + evidence["decode_id_upload_operations"]
@@ -327,7 +334,21 @@ def test_decode_device_carrier_contract_closes_frozen_fake_acl_work() -> None:
     assert evidence["total_h2d_operations_current"] == 52
     assert evidence["total_h2d_bytes_packed_prefill_baseline"] == 47216
     assert evidence["total_h2d_bytes_one_token_carrier"] == 46696
-    assert evidence["total_h2d_bytes_current"] == 46592
+    assert evidence["total_h2d_bytes_last_token_before_prefix_liveness"] == 46592
+    assert evidence["total_h2d_bytes_one_token_current"] == 31400
+    assert evidence["total_h2d_bytes_current"] == 31296
+    assert evidence["prefill_control_upload_operations"] == 52
+    assert evidence["prefill_control_full_upload_operations"] == 1
+    assert evidence["prefill_control_base_upload_operations"] == 38
+    assert evidence["prefill_control_count_upload_operations"] == 12
+    assert evidence["prefill_control_proposal_upload_operations"] == 1
+    assert evidence["prefill_control_full_bytes"] == 896
+    assert evidence["prefill_control_base_bytes"] == 578
+    assert evidence["prefill_control_count_bytes"] == 644
+    assert evidence["prefill_control_proposal_bytes"] == 708
+    assert evidence[
+        "prefill_control_h2d_bytes_elided_vs_full_uploads"
+    ] == 15296
     assert evidence["copy_api_operations_one_token_carrier"] == 65
     assert evidence["copy_api_operations_current_h2d_plus_d2d"] == 65
     assert evidence["compact_ping_pong_device_bytes"] == 1024
