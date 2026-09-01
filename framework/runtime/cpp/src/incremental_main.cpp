@@ -46,8 +46,9 @@ struct ModelArgument {
 };
 
 struct Arguments {
-  std::array<ModelArgument, 4> models{{
+  std::array<ModelArgument, 5> models{{
       {"target-prefill", {}, {}},
+      {"target-prefill-head", {}, {}},
       {"target-decode1", {}, {}},
       {"draft-propose", {}, {}},
       {"target-verify-commit", {}, {}},
@@ -72,6 +73,8 @@ void Usage(std::ostream& stream) {
       << "Usage: qwen35_dflash_incremental_acl_runner [options]\n"
       << "  --target-prefill PATH                    hash-locked prefill OM\n"
       << "  --target-prefill-sha256 HEX              expected prefill SHA-256\n"
+      << "  --target-prefill-head PATH               final-chunk QLinear head OM\n"
+      << "  --target-prefill-head-sha256 HEX         expected head SHA-256\n"
       << "  --target-decode1 PATH                    hash-locked decode-one OM\n"
       << "  --target-decode1-sha256 HEX              expected decode SHA-256\n"
       << "  --draft-propose PATH                     hash-locked Draft OM\n"
@@ -465,6 +468,7 @@ void WriteReport(
       arguments.measurement_protocol == MeasurementProtocol::kEvidence;
   const std::size_t model_executions =
       execution.target_prefill_executions +
+      execution.target_prefill_head_executions +
       execution.target_decode1_executions +
       execution.draft_propose_executions +
       execution.target_verify_commit_executions;
@@ -474,9 +478,9 @@ void WriteReport(
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":2,\"status\":\"PASS\","
-         << "\"scope\":\"AscendCL C++ four-resident-OM paired model loop\","
-         << "\"runner_id\":\"qwen35-dflash-ascendcl-cpp-incremental-v2\","
+         << "{\"schema_version\":3,\"status\":\"PASS\","
+         << "\"scope\":\"AscendCL C++ five-resident-OM paired model loop\","
+         << "\"runner_id\":\"qwen35-dflash-ascendcl-cpp-incremental-v3\","
          << "\"runner_version\":\"" << JsonEscape(QWEN35_DFLASH_RUNNER_VERSION)
          << "\",\"candidate_status\":\"APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE\","
          << "\"cpu_fallback\":false,\"device_id\":" << arguments.device_id
@@ -495,6 +499,7 @@ void WriteReport(
   }
   output << "],\"abi\":{"
          << "\"id\":\"qwen35-4b-dflash-ascend310p-incremental-performance-v2\","
+         << "\"physical_topology\":\"split-prefill-head-five-resident-v1\","
          << "\"state_policy\":\"explicit device-resident ping-pong\","
          << "\"sequence_capacity\":" << executor.sequence_length()
          << ",\"prefill_width\":" << executor.prefill_width()
@@ -526,7 +531,7 @@ void WriteReport(
          << ",\"explicit_allocated_device_bytes_excluding_runtime\":"
          << max_work + sum_weight + execution.state_device_bytes +
                 execution.carrier_device_bytes
-         << ",\"load_policy\":\"four aclmdlLoadFromFileWithMem sessions; "
+         << ",\"load_policy\":\"five aclmdlLoadFromFileWithMem sessions; "
             "one max-sized serial workspace; separate per-artifact weights; "
             "no cross-OM weight sharing assumed\"},"
          << "\"protocol\":{\"warmup\":" << arguments.warmup
@@ -535,7 +540,7 @@ void WriteReport(
          << (formal_latency_evidence ? "evidence" : "profile")
          << "\",\"formal_latency_evidence\":"
          << (formal_latency_evidence ? "true" : "false")
-         << ",\"order\":\"alternating ordinary/DFlash in one four-model process\","
+         << ",\"order\":\"alternating ordinary/DFlash in one five-model process\","
          << "\"model_load_excluded_from_latency\":true,"
          << "\"prefill_completion_policy\":\"intermediate prompt chunks "
             "stay queued; final chunk performs the only compact D2H and "
@@ -549,9 +554,9 @@ void WriteReport(
          << "\"prefill_feature_arena_policy\":\"contiguous 64-row FP16 slabs "
             "with 64-byte-aligned starts and one terminal guard; no D2D "
             "compaction\","
-         << "\"prefill_target_lm_head_policy\":\"current target-prefill OM "
-            "still executes its LM head for every physical chunk; non-final "
-            "elimination remains pending real-profile-driven graph redesign\","
+         << "\"prefill_target_lm_head_policy\":\"target-prefill body contains "
+            "no LM head; target-prefill-head executes exactly once after the "
+            "final physical prompt chunk\","
          << "\"device_suballocation_policy\":\"64-byte segment starts; "
             "ALIGN_UP(payload,32)+32 reserved span\","
          << "\"state_reset_policy\":\""
@@ -586,6 +591,10 @@ void WriteReport(
          << "\"model_executions\":" << model_executions
          << ",\"target_prefill_executions\":"
          << execution.target_prefill_executions
+         << ",\"target_prefill_head_executions\":"
+         << execution.target_prefill_head_executions
+         << ",\"target_prefill_head_executions_elided\":"
+         << execution.target_prefill_head_executions_elided
          << ",\"target_decode1_executions\":"
          << execution.target_decode1_executions
          << ",\"draft_propose_executions\":"
@@ -665,7 +674,7 @@ void WriteReport(
   output << ",\"limits\":{\"max_new_tokens\":"
          << arguments.max_new_tokens << ",\"max_draft_tokens\":"
          << arguments.max_draft_tokens << "},\"startup_ms\":{"
-         << "\"acl_and_four_model_load\":" << load_ms
+         << "\"acl_and_five_model_load\":" << load_ms
          << ",\"paired_benchmark_wall\":" << benchmark_wall_ms
          << "},\"ordinary\":";
   WriteBenchmark(output, result.ordinary);
@@ -714,7 +723,7 @@ void AtomicWrite(const std::filesystem::path& path, const std::string& payload) 
 int main(int argc, char** argv) {
   try {
     const Arguments arguments = ParseArguments(argc, argv);
-    PrintProgress(arguments.progress, "stage=validate-four-om-start");
+    PrintProgress(arguments.progress, "stage=validate-five-om-start");
     for (const auto& model : arguments.models) {
       if (!std::filesystem::is_regular_file(model.path)) {
         throw std::runtime_error(
@@ -729,13 +738,14 @@ int main(int argc, char** argv) {
           arguments.progress,
           std::string("stage=validate-om-done role=") + model.role);
     }
-    PrintProgress(arguments.progress, "stage=load-four-om-start");
+    PrintProgress(arguments.progress, "stage=load-five-om-start");
     const auto load_start = std::chrono::steady_clock::now();
     qwen35::dflash::IncrementalOmPaths paths{
         arguments.models[0].path,
         arguments.models[1].path,
         arguments.models[2].path,
         arguments.models[3].path,
+        arguments.models[4].path,
     };
     qwen35::dflash::AclIncrementalExecutor executor(
         std::move(paths),
@@ -754,7 +764,7 @@ int main(int argc, char** argv) {
         load_end - load_start).count();
     {
       std::ostringstream message;
-      message << "stage=load-four-om-done sequence_capacity="
+      message << "stage=load-five-om-done sequence_capacity="
               << executor.sequence_length() << " prefill_width="
               << executor.prefill_width() << " proposal_width="
               << executor.proposal_width() << " elapsed_ms=" << std::fixed

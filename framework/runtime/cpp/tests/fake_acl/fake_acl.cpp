@@ -25,6 +25,7 @@ namespace {
 enum class Role {
   kIntegrated,
   kTargetPrefill,
+  kTargetPrefillHead,
   kTargetDecode,
   kDraftPropose,
   kTargetVerify,
@@ -43,6 +44,7 @@ constexpr std::size_t kPrefillRows = 64;
 constexpr std::size_t kVerifyRows = 16;
 constexpr std::size_t kModelWorkBytes = 64;
 constexpr std::size_t kModelWeightBytes = 256;
+constexpr std::size_t kPrefillHeadWeightBytes = 64;
 
 const Spec kTargetConv{ACL_FLOAT16, {2, 1, 8, 4}, "target_conv_state"};
 const Spec kTargetRecurrent{
@@ -70,6 +72,9 @@ std::vector<const void*> g_pending_h2d_sources;
 
 Role RoleFromPath(const char* path) {
   const std::string value = path == nullptr ? "" : path;
+  if (value.find("target-prefill-head") != std::string::npos) {
+    return Role::kTargetPrefillHead;
+  }
   if (value.find("target-prefill") != std::string::npos) {
     return Role::kTargetPrefill;
   }
@@ -126,13 +131,16 @@ const std::vector<Spec>& Inputs(Role role) {
   static const std::vector<Spec> prefill{
       {ACL_INT64, {1, 64}, "input_ids"},
       {ACL_INT16, {1}, "effective_length"},
-      {ACL_INT64, {4}, "eos_token_ids"},
-      {ACL_INT32, {1}, "eos_token_count"},
       kTargetConv,
       kTargetRecurrent,
       kTargetKey,
       kTargetValue,
       kTargetCursor,
+  };
+  static const std::vector<Spec> prefill_head{
+      {ACL_FLOAT16, {1, 1, 4}, "last_hidden"},
+      {ACL_INT64, {4}, "eos_token_ids"},
+      {ACL_INT32, {1}, "eos_token_count"},
   };
   static const std::vector<Spec> decode{
       {ACL_INT64, {1, 1}, "input_ids"},
@@ -169,6 +177,8 @@ const std::vector<Spec>& Inputs(Role role) {
   switch (role) {
     case Role::kTargetPrefill:
       return prefill;
+    case Role::kTargetPrefillHead:
+      return prefill_head;
     case Role::kTargetDecode:
       return decode;
     case Role::kDraftPropose:
@@ -187,9 +197,7 @@ const std::vector<Spec>& Outputs(Role role) {
       {ACL_INT64, {1, 15}, "draft_top1"},
   };
   static const std::vector<Spec> prefill{
-      {ACL_INT64, {1, 16}, "committed_token_ids"},
-      {ACL_INT32, {1}, "commit_count"},
-      {ACL_BOOL, {1}, "finished"},
+      {ACL_FLOAT16, {1, 1, 4}, "last_hidden"},
       {ACL_FLOAT16, {1, 64, 8}, "target_feature_tail"},
       {ACL_INT32, {1}, "committed_input_count"},
       kTargetConv,
@@ -197,6 +205,11 @@ const std::vector<Spec>& Outputs(Role role) {
       kTargetKey,
       kTargetValue,
       kTargetCursor,
+  };
+  static const std::vector<Spec> prefill_head{
+      {ACL_INT64, {1, 16}, "committed_token_ids"},
+      {ACL_INT32, {1}, "commit_count"},
+      {ACL_BOOL, {1}, "finished"},
   };
   static const std::vector<Spec> decode{
       {ACL_INT64, {1, 16}, "committed_token_ids"},
@@ -232,6 +245,8 @@ const std::vector<Spec>& Outputs(Role role) {
   switch (role) {
     case Role::kTargetPrefill:
       return prefill;
+    case Role::kTargetPrefillHead:
+      return prefill_head;
     case Role::kTargetDecode:
       return decode;
     case Role::kDraftPropose:
@@ -320,19 +335,27 @@ aclError ExecutePrefill(const aclmdlDataset* input, aclmdlDataset* output) {
     return 1;
   }
   const auto* ids = static_cast<const std::int64_t*>(input->buffers[0]->data);
-  const std::int64_t token = ids[length - 1] + 1;
+  SetScalar<std::uint16_t>(
+      output->buffers[0], static_cast<std::uint16_t>(ids[length - 1] + 1));
+  std::memset(output->buffers[1]->data, 0, output->buffers[1]->size);
+  SetScalar<std::int32_t>(output->buffers[2], length);
+  for (std::size_t index = 0; index < 4; ++index) {
+    Copy(output->buffers[3 + index], input->buffers[2 + index]);
+  }
+  SetScalar<std::int64_t>(
+      output->buffers[7],
+      Scalar<std::int64_t>(input->buffers[6]) + length);
+  return ACL_SUCCESS;
+}
+
+aclError ExecutePrefillHead(
+    const aclmdlDataset* input,
+    aclmdlDataset* output) {
+  const std::int64_t token = Scalar<std::uint16_t>(input->buffers[0]);
   FillCommitted(output->buffers[0], {token});
   SetScalar<std::int32_t>(output->buffers[1], 1);
   SetScalar<std::uint8_t>(
-      output->buffers[2], IsEos(token, input->buffers[2], input->buffers[3]));
-  std::memset(output->buffers[3]->data, 0, output->buffers[3]->size);
-  SetScalar<std::int32_t>(output->buffers[4], length);
-  for (std::size_t index = 0; index < 4; ++index) {
-    Copy(output->buffers[5 + index], input->buffers[4 + index]);
-  }
-  SetScalar<std::int64_t>(
-      output->buffers[9],
-      Scalar<std::int64_t>(input->buffers[8]) + length);
+      output->buffers[2], IsEos(token, input->buffers[1], input->buffers[2]));
   return ACL_SUCCESS;
 }
 
@@ -559,8 +582,12 @@ aclError aclmdlLoadFromFileWithMem(
     std::size_t work_size,
     void* weight_ptr,
     std::size_t weight_size) {
+  const std::size_t required_weight =
+      RoleFromPath(path) == Role::kTargetPrefillHead
+      ? kPrefillHeadWeightBytes
+      : kModelWeightBytes;
   if (work_ptr == nullptr || work_size < kModelWorkBytes ||
-      weight_ptr == nullptr || weight_size < kModelWeightBytes) {
+      weight_ptr == nullptr || weight_size < required_weight) {
     return 1;
   }
   if (g_incremental_shared_work == nullptr) {
@@ -584,12 +611,14 @@ aclError aclmdlLoadFromFileWithMem(
 }
 
 aclError aclmdlQuerySize(
-    const char*, std::size_t* work_size, std::size_t* weight_size) {
+    const char* path, std::size_t* work_size, std::size_t* weight_size) {
   if (work_size == nullptr || weight_size == nullptr) {
     return 1;
   }
   *work_size = kModelWorkBytes;
-  *weight_size = kModelWeightBytes;
+  *weight_size = RoleFromPath(path) == Role::kTargetPrefillHead
+      ? kPrefillHeadWeightBytes
+      : kModelWeightBytes;
   return ACL_SUCCESS;
 }
 
@@ -795,6 +824,8 @@ aclError aclmdlExecuteAsync(
       return ExecuteIntegrated(input, output);
     case Role::kTargetPrefill:
       return ExecutePrefill(input, output);
+    case Role::kTargetPrefillHead:
+      return ExecutePrefillHead(input, output);
     case Role::kTargetDecode:
       return ExecuteDecode(input, output);
     case Role::kDraftPropose:

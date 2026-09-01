@@ -58,7 +58,7 @@ from .incremental_graphs import incremental_state_graph_specs
 QUANT_BASE_REVISION = "28f93e784a2beed87020a80bd93c8788754eab1c"
 QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v4"
 QUANT_INCREMENTAL_GRAPH_FACTORY_ID = (
-    "qwen3.5-4b-quant-w8a8-dflash-incremental-state-v2"
+    "qwen3.5-4b-quant-w8a8-dflash-incremental-state-v3"
 )
 _TARGET_GDN_CHUNK = 64
 _GDR_EFFECTIVE_LENGTH_MAX = torch.iinfo(torch.int16).max
@@ -700,7 +700,7 @@ def create_quant_recompute_graph(
 def create_quant_incremental_state_graphs(
     config: Mapping[str, Any],
 ) -> tuple[AirGraphSpec, ...]:
-    """Build the four approved explicit-state logical AIR roles.
+    """Build the approved state ABI as five physical AIR graphs.
 
     This is an implementation candidate, not the default factory.  Export,
     ATC, real-model parity, complete resident-set memory and latency all remain
@@ -785,6 +785,18 @@ def create_quant_incremental_state_graphs(
         "approval_status": "APPROVED",
         "activation_status": "NOT_ACTIVE",
     }
+    ordinary_custom_ops = _target_custom_op_exports(config, mtp=False)
+    head_op_names = {
+        NPU_DYNAMIC_QUANT_TORCH_OP,
+        FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
+    }
+    head_custom_ops = tuple(
+        item for item in ordinary_custom_ops if item.torch_op in head_op_names
+    )
+    if len(head_custom_ops) != len(head_op_names):
+        raise RuntimeError(
+            "prefill-head export requires dynamic-quant and quant-matmul contracts"
+        )
     return incremental_state_graph_specs(
         target,
         draft,
@@ -792,7 +804,8 @@ def create_quant_incremental_state_graphs(
         device=device,
         dtype=dtype,
         eos_table_width=eos_table_width,
-        ordinary_custom_ops=_target_custom_op_exports(config, mtp=False),
+        ordinary_custom_ops=ordinary_custom_ops,
+        head_custom_ops=head_custom_ops,
         verify_custom_ops=_target_custom_op_exports(config, mtp=True),
         metadata=metadata,
     )

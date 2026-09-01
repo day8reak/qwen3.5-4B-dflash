@@ -12,6 +12,7 @@ from .incremental import ExactAcceptCommitStateGraph
 from .incremental_graphs import (
     DraftProposeStateGraph,
     TargetDecodeOneStateGraph,
+    TargetPrefillHeadGraph,
     TargetPrefillStateGraph,
     TargetVerifyCommitStateGraph,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "IntegratedDFlashRecomputeGraph",
     "RecomputeDFlashOmBackend",
     "TargetDecodeOneStateGraph",
+    "TargetPrefillHeadGraph",
     "TargetPrefillStateGraph",
     "TargetVerifyCommitStateGraph",
     "benchmark_prompt",

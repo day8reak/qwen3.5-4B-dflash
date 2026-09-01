@@ -23,7 +23,7 @@ from .utils import (
 
 
 CPP_RUNNER_ID = "qwen35-dflash-ascendcl-cpp-v1"
-INCREMENTAL_CPP_RUNNER_ID = "qwen35-dflash-ascendcl-cpp-incremental-v2"
+INCREMENTAL_CPP_RUNNER_ID = "qwen35-dflash-ascendcl-cpp-incremental-v3"
 RECOMPUTE_STATE_POLICY = "recompute-committed-prefixes"
 INCREMENTAL_STATE_POLICY = "incremental-explicit-state-v2"
 ASYNC_MEMSET_STATE_RESET_POLICY = "async-memset"
@@ -38,18 +38,20 @@ _INCREMENTAL_ABI_ID = (
 _INCREMENTAL_GRAPH_ABI: dict[str, tuple[list[str], list[str]]] = {
     "target-prefill": (
         [
-            "input_ids", "effective_length", "eos_token_ids",
-            "eos_token_count", "target_conv_state",
+            "input_ids", "effective_length", "target_conv_state",
             "target_recurrent_state", "target_key_cache",
             "target_value_cache", "logical_target_cursor",
         ],
         [
-            "committed_token_ids", "commit_count", "finished",
-            "target_feature_tail", "committed_input_count",
+            "last_hidden", "target_feature_tail", "committed_input_count",
             "target_conv_state", "target_recurrent_state",
             "target_key_cache", "target_value_cache",
             "logical_target_cursor",
         ],
+    ),
+    "target-prefill-head": (
+        ["last_hidden", "eos_token_ids", "eos_token_count"],
+        ["committed_token_ids", "commit_count", "finished"],
     ),
     "target-decode1": (
         [
@@ -421,7 +423,7 @@ def _resolve_incremental_oms(
     dict[str, tuple[Path, dict[str, Any], dict[str, Any]]],
     dict[str, Any],
 ]:
-    """Resolve and hash-check the exact four-role v2 deployment ABI."""
+    """Resolve and hash-check the five-graph physical v2 deployment ABI."""
 
     manifest_path = Path(deployment_manifest).expanduser().resolve()
     manifest = load_json_object(manifest_path)
@@ -629,7 +631,7 @@ def validate_incremental_cpp_runner_report(
     max_draft_tokens: int,
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
 ) -> None:
-    """Validate four resident models, device state routing and paired parity."""
+    """Validate five resident graphs, device state routing and paired parity."""
 
     if (
         report.get("status") != "PASS"
@@ -664,6 +666,14 @@ def validate_incremental_cpp_runner_report(
                 or (value < 0 if field == "work_bytes" else value <= 0)
             ):
                 raise RuntimeError(f"incremental {role} {field} is invalid")
+    model_by_role = {str(item["role"]): item for item in models}
+    if int(model_by_role["target-prefill-head"]["weight_bytes"]) >= int(
+        model_by_role["target-prefill"]["weight_bytes"]
+    ):
+        raise RuntimeError(
+            "incremental prefill-head weight is not smaller than the "
+            "head-free prefill body"
+        )
     if list(report.get("prompt_token_ids", [])) != [int(item) for item in prompt_token_ids]:
         raise RuntimeError("incremental C++ prompt token IDs differ")
     limits = report.get("limits", {})
@@ -717,9 +727,8 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental prefill feature arena policy differs")
     if protocol.get("prefill_target_lm_head_policy") != (
-        "current target-prefill OM still executes its LM head for every "
-        "physical chunk; non-final elimination remains pending "
-        "real-profile-driven graph redesign"
+        "target-prefill body contains no LM head; target-prefill-head "
+        "executes exactly once after the final physical prompt chunk"
     ):
         raise RuntimeError("incremental prefill LM-head claim boundary differs")
     if protocol.get("device_suballocation_policy") != (
@@ -729,6 +738,8 @@ def validate_incremental_cpp_runner_report(
     abi = report.get("abi", {})
     if abi.get("id") != _INCREMENTAL_ABI_ID:
         raise RuntimeError("incremental runner ABI identity differs")
+    if abi.get("physical_topology") != "split-prefill-head-five-resident-v1":
+        raise RuntimeError("incremental runner physical topology differs")
     if abi.get("state_policy") != "explicit device-resident ping-pong":
         raise RuntimeError("incremental state is not device resident")
     proposal_width = abi.get("proposal_width")
@@ -761,7 +772,7 @@ def validate_incremental_cpp_runner_report(
     if memory.get("source") != "aclmdlQuerySize":
         raise RuntimeError("incremental runner omitted model memory queries")
     if memory.get("load_policy") != (
-        "four aclmdlLoadFromFileWithMem sessions; one max-sized serial "
+        "five aclmdlLoadFromFileWithMem sessions; one max-sized serial "
         "workspace; separate per-artifact weights; no cross-OM weight sharing "
         "assumed"
     ):
@@ -857,6 +868,7 @@ def validate_incremental_cpp_runner_report(
     execution = report.get("execution_io_counters", {})
     role_counts = [
         execution.get("target_prefill_executions"),
+        execution.get("target_prefill_head_executions"),
         execution.get("target_decode1_executions"),
         execution.get("draft_propose_executions"),
         execution.get("target_verify_commit_executions"),
@@ -866,7 +878,9 @@ def validate_incremental_cpp_runner_report(
         for value in role_counts
     ) or int(role_counts[0]) <= 0:
         raise RuntimeError("incremental runner returned invalid OM role counters")
-    prefill, decode, draft, verify = (int(value) for value in role_counts)
+    prefill, prefill_head, decode, draft, verify = (
+        int(value) for value in role_counts
+    )
     if execution.get("model_executions") != sum(role_counts):
         raise RuntimeError("incremental model execution counters do not close")
     request_count = 2 * (3 + 10)
@@ -887,6 +901,9 @@ def validate_incremental_cpp_runner_report(
     deferred_prefill = execution.get("deferred_prefill_chunks")
     if (
         prefill != expected_prefill
+        or prefill_head != request_count
+        or execution.get("target_prefill_head_executions_elided")
+        != expected_deferred
         or prefill_completions != request_count
         or deferred_prefill != expected_deferred
         or execution.get("prefill_synchronizations_elided")
@@ -1248,7 +1265,7 @@ def write_cpp_prompt_report(
     }
     if result.get("runner_id") == INCREMENTAL_CPP_RUNNER_ID:
         result["claim_boundary"] = (
-            "The four-OM C++ candidate keeps Target/Draft state and proposal carriers "
+            "The five-graph C++ candidate keeps Target/Draft state and proposal carriers "
             "on device. Promotion still requires real Ascend310P zero-mismatch, "
             "complete-set memory and unprofiled same-device latency evidence."
         )

@@ -1251,6 +1251,59 @@ def test_qlinear_helper_captures_private_v4444_frontend(
     assert "npu.npu_quant_matmul.default" not in targets
 
 
+def test_qlinear_export_mode_captures_private_frontend_only_while_compiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dynamic_quant = _ensure_target_test_schema("npu_dynamic_quant")
+    _ensure_target_test_schema("npu_quant_matmul")
+    torchair = _FakeTorchAir()
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            NPU_DYNAMIC_QUANT_TORCH_OP,
+            NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
+        ),
+        torchair,
+    )
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
+            NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+        ),
+        torchair,
+    )
+    fake_torch_npu = ModuleType("torch_npu")
+    fake_torch_npu.__spec__ = importlib.machinery.ModuleSpec(
+        "torch_npu",
+        loader=None,
+    )
+
+    def unexpected_eager_call(*args: object, **kwargs: object) -> torch.Tensor:
+        del args, kwargs
+        raise AssertionError("AIR capture entered the eager QuantMatmul ABI")
+
+    fake_torch_npu.npu_dynamic_quant = dynamic_quant
+    fake_torch_npu.npu_trans_quant_param = unexpected_eager_call
+    fake_torch_npu.npu_quant_matmul = unexpected_eager_call
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+    modeling = importlib.import_module("models.modeling_qwen3_5_hiai_nd")
+    monkeypatch.setattr(modeling, "torch_npu", fake_torch_npu)
+
+    layer = modeling.QLinear(
+        W_q=torch.ones((4, 3), dtype=torch.int8),
+        scale=torch.tensor([0.25, 0.5, 0.75], dtype=torch.float32),
+        idx=0,
+    ).set_quant_matmul_export_mode(True)
+    exported = torch.export.export(
+        layer,
+        (torch.ones((2, 4), dtype=torch.float16),),
+        strict=True,
+    )
+    targets = [str(node.target) for node in exported.graph.nodes]
+    assert "npu.npu_dynamic_quant.default" in targets
+    assert "qwen35_dflash.npu_quant_matmul_v4444.default" in targets
+    assert "npu.npu_quant_matmul.default" not in targets
+
+
 def test_qlinear_eager_encodes_and_caches_scale_outside_air(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1308,7 +1361,7 @@ def test_qlinear_eager_encodes_and_caches_scale_outside_air(
         W_q=torch.ones((4, 3), dtype=torch.int8),
         scale=torch.tensor([0.25, 0.5, 0.75], dtype=torch.float32),
         idx=0,
-    )
+    ).set_quant_matmul_export_mode(True)
     value = torch.ones((2, 4), dtype=torch.float16)
     first = layer(value)
     second = layer(value)
@@ -1320,6 +1373,59 @@ def test_qlinear_eager_encodes_and_caches_scale_outside_air(
     assert layer.scale.dtype == torch.float32
     assert layer._eager_encoded_scale is observed_scales[0]
     assert observed_scales[0] is observed_scales[1]
+
+
+def test_quant_matmul_helper_encodes_float_scale_at_eager_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch_npu = ModuleType("torch_npu")
+    fake_torch_npu.__spec__ = importlib.machinery.ModuleSpec(
+        "torch_npu",
+        loader=None,
+    )
+    converted: list[torch.Tensor] = []
+    observed_scales: list[torch.Tensor] = []
+
+    def trans_quant_param(scale: torch.Tensor) -> torch.Tensor:
+        converted.append(scale)
+        return torch.zeros_like(scale, dtype=torch.int64)
+
+    def quant_matmul(
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        pertoken_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        del pertoken_scale
+        observed_scales.append(scale)
+        return torch.zeros(
+            (*x1.shape[:-1], x2.shape[-1]),
+            dtype=output_dtype,
+            device=x1.device,
+        )
+
+    fake_torch_npu.npu_trans_quant_param = trans_quant_param
+    fake_torch_npu.npu_quant_matmul = quant_matmul
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+    modeling = importlib.import_module("models.modeling_qwen3_5_hiai_nd")
+    monkeypatch.setattr(modeling, "torch_npu", fake_torch_npu)
+
+    result = modeling._npu_quant_matmul_with_export_frontend(
+        torch.ones((2, 4), dtype=torch.int8),
+        torch.ones((4, 3), dtype=torch.int8),
+        torch.tensor([0.25, 0.5, 0.75], dtype=torch.float32),
+        pertoken_scale=torch.ones(2, dtype=torch.float32),
+        output_dtype=torch.float16,
+        export_flag=False,
+    )
+
+    assert result.shape == (2, 3)
+    assert len(converted) == 1
+    assert converted[0].dtype == torch.float32
+    assert len(observed_scales) == 1
+    assert observed_scales[0].dtype == torch.int64
 
 
 def test_air_factory_enables_private_quant_frontend_on_every_qlinear() -> None:

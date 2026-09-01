@@ -81,7 +81,7 @@ def _report(
             "role": role,
             "sha256": hashes[role],
             "work_bytes": 64,
-            "weight_bytes": 256,
+            "weight_bytes": 64 if role == "target-prefill-head" else 256,
         }
         for role in _INCREMENTAL_GRAPH_ABI
     ]
@@ -118,9 +118,8 @@ def _report(
                 "one terminal guard; no D2D compaction"
             ),
             "prefill_target_lm_head_policy": (
-                "current target-prefill OM still executes its LM head for "
-                "every physical chunk; non-final elimination remains pending "
-                "real-profile-driven graph redesign"
+                "target-prefill body contains no LM head; target-prefill-head "
+                "executes exactly once after the final physical prompt chunk"
             ),
             "device_suballocation_policy": (
                 "64-byte segment starts; ALIGN_UP(payload,32)+32 reserved span"
@@ -136,6 +135,7 @@ def _report(
             "id": (
                 "qwen35-4b-dflash-ascend310p-incremental-performance-v2"
             ),
+            "physical_topology": "split-prefill-head-five-resident-v1",
             "state_policy": "explicit device-resident ping-pong",
             "sequence_capacity": 128,
             "prefill_width": 64,
@@ -145,9 +145,9 @@ def _report(
         },
         "model_memory_query": {
             "source": "aclmdlQuerySize",
-            "sum_work_bytes": 256,
+            "sum_work_bytes": 320,
             "max_work_bytes": 64,
-            "sum_weight_bytes": 1024,
+            "sum_weight_bytes": 1088,
             "state_device_bytes": state_bytes,
             "working_state_device_bytes": working_state_bytes,
             "immutable_zero_state_device_bytes": zero_state_bytes,
@@ -159,10 +159,10 @@ def _report(
             "prefill_feature_arena_bytes": 2112,
             "draft_dynamic_gear_count": 3,
             "explicit_allocated_device_bytes_excluding_runtime": (
-                64 + 1024 + state_bytes + 4096
+                64 + 1088 + state_bytes + 4096
             ),
             "load_policy": (
-                "four aclmdlLoadFromFileWithMem sessions; one max-sized serial "
+                "five aclmdlLoadFromFileWithMem sessions; one max-sized serial "
                 "workspace; separate per-artifact weights; no cross-OM weight "
                 "sharing assumed"
             ),
@@ -170,11 +170,14 @@ def _report(
         "execution_io_counters": {
             "model_executions": (
                 target_prefill_executions
+                + request_count
                 + decode_executions
                 + draft_propose_executions
                 + 26
             ),
             "target_prefill_executions": target_prefill_executions,
+            "target_prefill_head_executions": request_count,
+            "target_prefill_head_executions_elided": deferred_prefill,
             "target_decode1_executions": decode_executions,
             "draft_propose_executions": draft_propose_executions,
             "target_verify_commit_executions": 26,
@@ -303,6 +306,16 @@ def test_incremental_runner_rejects_profile_timing_as_formal_evidence() -> None:
         _validate(report)
 
 
+def test_incremental_runner_rejects_a_full_target_prefill_head_copy() -> None:
+    report = _report()
+    models = {item["role"]: item for item in report["models"]}
+    models["target-prefill-head"]["weight_bytes"] = models[
+        "target-prefill"
+    ]["weight_bytes"]
+    with pytest.raises(RuntimeError, match="prefill-head weight"):
+        _validate(report)
+
+
 def test_incremental_runner_config_is_explicit() -> None:
     identity = validate_cpp_runner_options(
         {
@@ -340,7 +353,7 @@ def test_incremental_runner_rejects_unknown_state_reset_policy() -> None:
         )
 
 
-def test_resolve_incremental_oms_locks_all_four_abis_and_hashes(
+def test_resolve_incremental_oms_locks_all_five_abis_and_hashes(
     tmp_path: Path,
 ) -> None:
     graphs = []
@@ -384,7 +397,7 @@ def test_resolve_incremental_oms_locks_all_four_abis_and_hashes(
         _resolve_incremental_oms(manifest_path)
 
 
-def test_run_cpp_pair_routes_all_four_hash_locked_oms(
+def test_run_cpp_pair_routes_all_five_hash_locked_oms(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

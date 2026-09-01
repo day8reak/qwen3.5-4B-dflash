@@ -22,7 +22,13 @@ PREFILL_ROWS = 64
 
 
 class _ExplicitTargetGraph(nn.Module):
-    def __init__(self, target: nn.Module, *, kv_cache_max_len: int) -> None:
+    def __init__(
+        self,
+        target: nn.Module,
+        *,
+        kv_cache_max_len: int,
+        include_lm_head: bool = True,
+    ) -> None:
         super().__init__()
         execution = getattr(target, "dflash_execution_model", None)
         embedding = getattr(target, "_target_quantized_embedding", None)
@@ -45,7 +51,12 @@ class _ExplicitTargetGraph(nn.Module):
             raise ValueError("Target config has an invalid layer_types layout")
         if kv_cache_max_len <= 0 or kv_cache_max_len % 64:
             raise ValueError("kv_cache_max_len must be positive and divisible by 64")
-        self.execution = execution
+        # Register only the modules this physical graph executes.  In
+        # particular, target-prefill deliberately excludes lm_head so its AIR
+        # and OM cannot retain a dead full-vocabulary weight.  The final
+        # prompt chunk is completed by TargetPrefillHeadGraph.
+        self.language_model = language_model
+        self.lm_head = lm_head if include_lm_head else None
         self.quantized_embedding = embedding
         self.layer_types = layer_types
         self.linear_layers = layer_types.count("linear_attention")
@@ -152,7 +163,7 @@ class _ExplicitTargetGraph(nn.Module):
             if verify
             else None
         )
-        text_output = self.execution.language_model(
+        text_output = self.language_model(
             input_ids=input_ids,
             attention_mask=self._attention_mask(positions),
             position_ids=positions.unsqueeze(0),
@@ -179,18 +190,25 @@ class _ExplicitTargetGraph(nn.Module):
         return hidden, features, next_conv, next_recurrent, next_key, next_value
 
     def _top1(self, hidden: Tensor) -> Tensor:
-        return torch.argmax(self.execution.lm_head(hidden), dim=-1)
+        if self.lm_head is None:
+            raise RuntimeError("this Target graph has no LM head")
+        return torch.argmax(self.lm_head(hidden), dim=-1)
 
 
 class TargetPrefillStateGraph(_ExplicitTargetGraph):
-    """Consume one physical 64-row prompt chunk and return scalar state."""
+    """Consume one physical prompt chunk without a full-vocabulary head."""
+
+    def __init__(self, target: nn.Module, *, kv_cache_max_len: int) -> None:
+        super().__init__(
+            target,
+            kv_cache_max_len=kv_cache_max_len,
+            include_lm_head=False,
+        )
 
     def forward(
         self,
         input_ids: Tensor,
         effective_length: Tensor,
-        eos_token_ids: Tensor,
-        eos_token_count: Tensor,
         conv_state: Tensor,
         recurrent_state: Tensor,
         key_cache: Tensor,
@@ -216,7 +234,50 @@ class TargetPrefillStateGraph(_ExplicitTargetGraph):
             1,
             last_index.expand(batch_size, 1, hidden.shape[-1]),
         )
-        first_token = self._top1(last_hidden)
+        rows = torch.arange(
+            input_ids.shape[1], dtype=effective_length.dtype, device=input_ids.device
+        ).reshape(1, -1, 1)
+        masked_features = features * (
+            rows < effective_length.reshape(batch_size, 1, 1)
+        ).to(features.dtype)
+        next_cursor = (
+            logical_target_cursor.to(torch.int64)
+            + effective_length.to(torch.int64)
+        )
+        return (
+            last_hidden,
+            masked_features,
+            effective_length.to(torch.int32),
+            conv,
+            recurrent,
+            key,
+            value,
+            next_cursor,
+        )
+
+
+class TargetPrefillHeadGraph(nn.Module):
+    """Run QLinear Top1/EOS only after the final physical prompt chunk."""
+
+    def __init__(self, target: nn.Module) -> None:
+        super().__init__()
+        execution = getattr(target, "dflash_execution_model", None)
+        lm_head = getattr(execution, "lm_head", None)
+        if not isinstance(lm_head, nn.Module):
+            raise TypeError("incremental Target prefill head requires lm_head")
+        # Do not retain Target body modules in this physical graph.  Together
+        # with TargetPrefillStateGraph excluding lm_head, this moves (rather
+        # than duplicates) the prefill QLinear weight across the two OMs.
+        self.lm_head = lm_head
+
+    def forward(
+        self,
+        last_hidden: Tensor,
+        eos_token_ids: Tensor,
+        eos_token_count: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        first_token = torch.argmax(self.lm_head(last_hidden), dim=-1)
+        batch_size = last_hidden.shape[0]
         committed = torch.cat(
             (
                 first_token,
@@ -229,35 +290,14 @@ class TargetPrefillStateGraph(_ExplicitTargetGraph):
             dim=1,
         )
         commit_count = torch.ones(
-            (batch_size,), dtype=torch.int32, device=input_ids.device
+            (batch_size,), dtype=torch.int32, device=last_hidden.device
         )
         finished = _valid_eos_matches(
             first_token,
             eos_token_ids,
             eos_token_count,
         ).squeeze(1)
-        rows = torch.arange(
-            input_ids.shape[1], dtype=effective_length.dtype, device=input_ids.device
-        ).reshape(1, -1, 1)
-        masked_features = features * (
-            rows < effective_length.reshape(batch_size, 1, 1)
-        ).to(features.dtype)
-        next_cursor = (
-            logical_target_cursor.to(torch.int64)
-            + effective_length.to(torch.int64)
-        )
-        return (
-            committed,
-            commit_count,
-            finished,
-            masked_features,
-            effective_length.to(torch.int32),
-            conv,
-            recurrent,
-            key,
-            value,
-            next_cursor,
-        )
+        return committed, commit_count, finished
 
 
 class TargetDecodeOneStateGraph(_ExplicitTargetGraph):
@@ -584,10 +624,11 @@ def incremental_state_graph_specs(
     dtype: torch.dtype,
     eos_table_width: int,
     ordinary_custom_ops: tuple[CustomOpExportSpec, ...],
+    head_custom_ops: tuple[CustomOpExportSpec, ...],
     verify_custom_ops: tuple[CustomOpExportSpec, ...],
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[AirGraphSpec, ...]:
-    """Create four logical role specs with one shared explicit-state ABI."""
+    """Create five physical graphs for four approved logical state roles."""
 
     if dtype is not torch.float16:
         raise ValueError("incremental state graphs currently require float16")
@@ -693,6 +734,7 @@ def incremental_state_graph_specs(
     prefill = TargetPrefillStateGraph(
         target, kv_cache_max_len=kv_cache_max_len
     ).eval()
+    prefill_head = TargetPrefillHeadGraph(target).eval()
     decode = TargetDecodeOneStateGraph(
         target, kv_cache_max_len=kv_cache_max_len
     ).eval()
@@ -724,19 +766,15 @@ def incremental_state_graph_specs(
             example_args=(
                 torch.zeros((1, PREFILL_ROWS), dtype=torch.long, device=target_device),
                 torch.full((1,), PREFILL_ROWS, dtype=torch.int16, device=target_device),
-                eos_ids,
-                eos_count,
                 *state_inputs,
             ),
             input_names=(
-                "input_ids", "effective_length", "eos_token_ids",
-                "eos_token_count", "target_conv_state",
+                "input_ids", "effective_length", "target_conv_state",
                 "target_recurrent_state", "target_key_cache",
                 "target_value_cache", "logical_target_cursor",
             ),
             output_names=(
-                "committed_token_ids", "commit_count", "finished",
-                "target_feature_tail", "committed_input_count",
+                "last_hidden", "target_feature_tail", "committed_input_count",
                 "target_conv_state", "target_recurrent_state",
                 "target_key_cache", "target_value_cache",
                 "logical_target_cursor",
@@ -751,6 +789,32 @@ def incremental_state_graph_specs(
                 ],
             ),
             custom_ops=ordinary_custom_ops,
+        ),
+        AirGraphSpec(
+            name="target-prefill-head",
+            role="target-prefill-head",
+            model=prefill_head,
+            example_args=(
+                torch.zeros(
+                    (1, 1, int(getattr(config, "hidden_size"))),
+                    dtype=dtype,
+                    device=target_device,
+                ),
+                eos_ids,
+                eos_count,
+            ),
+            input_names=(
+                "last_hidden", "eos_token_ids", "eos_token_count",
+            ),
+            output_names=(
+                "committed_token_ids", "commit_count", "finished",
+            ),
+            metadata=graph_metadata(
+                "target-prefill-head",
+                head_custom_ops,
+                ["last_hidden"],
+            ),
+            custom_ops=head_custom_ops,
         ),
         AirGraphSpec(
             name="target-decode1",
@@ -861,6 +925,7 @@ __all__ = [
     "PREFILL_ROWS",
     "PROPOSAL_ROWS",
     "TargetDecodeOneStateGraph",
+    "TargetPrefillHeadGraph",
     "TargetPrefillStateGraph",
     "TargetVerifyCommitStateGraph",
     "VERIFY_ROWS",

@@ -1,5 +1,5 @@
 set(required_values
-  RUNNER PREFILL PREFILL_SHA DECODE DECODE_SHA DRAFT DRAFT_SHA
+  RUNNER PREFILL PREFILL_SHA PREFILL_HEAD PREFILL_HEAD_SHA DECODE DECODE_SHA DRAFT DRAFT_SHA
   VERIFY VERIFY_SHA OUTPUT
 )
 foreach(required ${required_values})
@@ -33,6 +33,8 @@ execute_process(
   COMMAND "${RUNNER}"
     --target-prefill "${PREFILL}"
     --target-prefill-sha256 "${PREFILL_SHA}"
+    --target-prefill-head "${PREFILL_HEAD}"
+    --target-prefill-head-sha256 "${PREFILL_HEAD_SHA}"
     --target-decode1 "${DECODE}"
     --target-decode1-sha256 "${DECODE_SHA}"
     --draft-propose "${DRAFT}"
@@ -57,7 +59,7 @@ execute_process(
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "fake incremental runner failed: ${result}\n${stdout}\n${stderr}")
 endif()
-if(NOT stderr MATCHES "stage=validate-four-om-start" OR
+if(NOT stderr MATCHES "stage=validate-five-om-start" OR
    NOT stderr MATCHES "stage=model-load-done role=target-prefill" OR
    NOT stderr MATCHES "phase=warmup" OR
    NOT stderr MATCHES "stage=decode-done" OR
@@ -89,6 +91,8 @@ string(JSON zero_state_bytes GET "${report}" execution_io_counters immutable_zer
 string(JSON reset_bytes GET "${report}" execution_io_counters state_reset_bytes_per_request)
 string(JSON d2h_operations GET "${report}" execution_io_counters device_to_host_operations)
 string(JSON prefill_executions GET "${report}" execution_io_counters target_prefill_executions)
+string(JSON prefill_head_executions GET "${report}" execution_io_counters target_prefill_head_executions)
+string(JSON prefill_head_elided GET "${report}" execution_io_counters target_prefill_head_executions_elided)
 string(JSON prefill_completions GET "${report}" execution_io_counters prefill_completion_synchronizations)
 string(JSON deferred_prefill GET "${report}" execution_io_counters deferred_prefill_chunks)
 string(JSON prefill_syncs_elided GET "${report}" execution_io_counters prefill_synchronizations_elided)
@@ -116,7 +120,7 @@ string(JSON draft_executions GET "${report}" execution_io_counters draft_propose
 string(JSON verify_executions GET "${report}" execution_io_counters target_verify_commit_executions)
 math(EXPR transactions "${prefill_completions} + ${decode_executions} + ${verify_executions}")
 math(EXPR role_total
-  "${prefill_executions} + ${decode_executions} + ${draft_executions} + ${verify_executions}"
+  "${prefill_executions} + ${prefill_head_executions} + ${decode_executions} + ${draft_executions} + ${verify_executions}"
 )
 math(EXPR closed_state_bytes "${working_state_bytes} + ${zero_state_bytes}")
 math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
@@ -146,15 +150,17 @@ else()
   message(FATAL_ERROR "unknown RESET_POLICY=${RESET_POLICY}")
 endif()
 if(NOT status STREQUAL "PASS" OR
-   NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v2" OR
+   NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR
-   NOT repetitions EQUAL REPETITIONS OR NOT model_count EQUAL 4 OR
+   NOT repetitions EQUAL REPETITIONS OR NOT model_count EQUAL 5 OR
    NOT report_protocol STREQUAL MEASUREMENT_PROTOCOL OR
    NOT model_executions EQUAL role_total OR
    NOT synchronizations EQUAL transactions OR
    NOT d2h_operations EQUAL transactions OR
    NOT resets EQUAL EXPECTED_RESETS OR
    NOT prefill_executions EQUAL expected_prefill_executions OR
+   NOT prefill_head_executions EQUAL EXPECTED_RESETS OR
+   NOT prefill_head_elided EQUAL deferred_prefill OR
    NOT prefill_completions EQUAL EXPECTED_RESETS OR
    NOT deferred_prefill EQUAL EXPECTED_RESETS OR
    NOT prefill_syncs_elided EQUAL deferred_prefill OR

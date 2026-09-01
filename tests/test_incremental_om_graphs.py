@@ -8,6 +8,7 @@ from torch import nn
 from qwen35_dflash.ascend310p.incremental_graphs import (
     DraftProposeStateGraph,
     TargetDecodeOneStateGraph,
+    TargetPrefillHeadGraph,
     TargetPrefillStateGraph,
     TargetVerifyCommitStateGraph,
     incremental_state_graph_specs,
@@ -21,8 +22,12 @@ class _TokenEmbedding(nn.Module):
 
 
 class _TokenHead(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(()), requires_grad=False)
+
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        token = hidden[..., 0].to(torch.long).clamp(0, 127)
+        token = (hidden[..., 0] * self.scale).to(torch.long).clamp(0, 127)
         return torch.nn.functional.one_hot(token, num_classes=128).to(torch.float32)
 
 
@@ -71,6 +76,7 @@ class _FakeExecution(nn.Module):
             linear_conv_kernel_dim=2,
             num_key_value_heads=1,
             head_dim=16,
+            hidden_size=4,
         )
 
 
@@ -119,33 +125,35 @@ def test_target_prefill_decode_and_verify_have_explicit_scalar_state() -> None:
     prefill_output = prefill(
         prompt,
         torch.tensor([3], dtype=torch.int16),
-        eos_ids,
-        eos_count,
         conv,
         recurrent,
         key,
         value,
         cursor,
     )
-    assert prefill_output[0][0, 0].item() == 4
-    assert prefill_output[1].tolist() == [1]
-    assert prefill_output[2].tolist() == [False]
-    assert torch.count_nonzero(prefill_output[3][:, 3:]) == 0
-    assert prefill_output[4].tolist() == [3]
-    assert prefill_output[9].tolist() == [3]
-    assert prefill_output[5].shape == conv.shape
-    assert prefill_output[6].dtype == torch.float32
+    assert prefill_output[0][0, 0, 0].item() == 4
+    assert torch.count_nonzero(prefill_output[1][:, 3:]) == 0
+    assert prefill_output[2].tolist() == [3]
+    assert prefill_output[7].tolist() == [3]
+    assert prefill_output[3].shape == conv.shape
+    assert prefill_output[4].dtype == torch.float32
+
+    head = TargetPrefillHeadGraph(target).eval()
+    head_output = head(prefill_output[0], eos_ids, eos_count)
+    assert head_output[0][0, 0].item() == 4
+    assert head_output[1].tolist() == [1]
+    assert head_output[2].tolist() == [False]
 
     decode = TargetDecodeOneStateGraph(target, kv_cache_max_len=64).eval()
     decoded = decode(
         torch.tensor([[4]]),
         eos_ids,
         eos_count,
+        prefill_output[3],
+        prefill_output[4],
         prefill_output[5],
         prefill_output[6],
         prefill_output[7],
-        prefill_output[8],
-        prefill_output[9],
     )
     assert decoded[0][0, 0].item() == 5
     assert decoded[7].tolist() == [4]
@@ -157,11 +165,11 @@ def test_target_prefill_decode_and_verify_have_explicit_scalar_state() -> None:
         torch.tensor([15], dtype=torch.int32),
         eos_ids,
         eos_count,
+        prefill_output[3],
+        prefill_output[4],
         prefill_output[5],
         prefill_output[6],
         prefill_output[7],
-        prefill_output[8],
-        prefill_output[9],
     )
     # Fake Target predicts input+1, so all 15 proposals match and a bonus is
     # emitted. Only scalar slot 15 leaves the graph.
@@ -197,6 +205,44 @@ def test_target_graphs_are_torch_export_capture_safe() -> None:
     assert len(eager) == len(captured) == 13
     for actual, expected in zip(captured, eager):
         torch.testing.assert_close(actual, expected)
+
+
+def test_prefill_body_and_head_export_without_cross_retaining_weights() -> None:
+    target = _FakeTarget().eval()
+    conv, recurrent, key, value, cursor = _target_state()
+    eos_ids, eos_count = _eos()
+    body = TargetPrefillStateGraph(target, kv_cache_max_len=64).eval()
+    body_args = (
+        torch.zeros((1, 64), dtype=torch.long),
+        torch.tensor([3], dtype=torch.int16),
+        conv,
+        recurrent,
+        key,
+        value,
+        cursor,
+    )
+    body_export = torch.export.export(body, body_args, strict=True)
+    body_targets = {
+        str(item.target)
+        for item in body_export.graph_signature.input_specs
+        if item.target is not None
+    }
+    assert not any("lm_head" in item for item in body_targets)
+
+    body_output = body(*body_args)
+    head = TargetPrefillHeadGraph(target).eval()
+    head_export = torch.export.export(
+        head,
+        (body_output[0], eos_ids, eos_count),
+        strict=True,
+    )
+    head_targets = {
+        str(item.target)
+        for item in head_export.graph_signature.input_specs
+        if item.target is not None
+    }
+    assert head_targets
+    assert all("lm_head" in item for item in head_targets)
 
 
 class _FakeDraftOps:
@@ -347,7 +393,7 @@ def test_draft_graph_batched_prompt_features_match_sequential_chunk_state() -> N
         torch.testing.assert_close(actual, expected)
 
 
-def test_four_role_specs_freeze_binding_order_and_reuse_state_examples() -> None:
+def test_five_physical_specs_freeze_binding_order_and_reuse_state_examples() -> None:
     target = _FakeTarget().eval()
     draft = _FakeDraft().eval()
     specs = incremental_state_graph_specs(
@@ -358,26 +404,28 @@ def test_four_role_specs_freeze_binding_order_and_reuse_state_examples() -> None
         dtype=torch.float16,
         eos_table_width=4,
         ordinary_custom_ops=(),
+        head_custom_ops=(),
         verify_custom_ops=(),
         metadata={"test_identity": "reduced"},
     )
     assert [item.name for item in specs] == [
         "target-prefill",
+        "target-prefill-head",
         "target-decode1",
         "draft-propose",
         "target-verify-commit",
     ]
     assert [item.role for item in specs] == [item.name for item in specs]
-    assert specs[2].dynamic is True
-    assert specs[2].input_dim_gears == {0: {1: (16, 64)}}
-    assert specs[0].example_args[5].dtype == torch.float32
-    assert specs[0].example_args[7].shape == (1, 1, 1, 64, 16)
-    assert specs[2].example_args[5].shape == (2, 1, 1, 64, 2)
-    assert specs[3].input_names[0:2] == (
+    assert specs[3].dynamic is True
+    assert specs[3].input_dim_gears == {0: {1: (16, 64)}}
+    assert specs[0].example_args[3].dtype == torch.float32
+    assert specs[0].example_args[4].shape == (1, 1, 1, 64, 16)
+    assert specs[3].example_args[5].shape == (2, 1, 1, 64, 2)
+    assert specs[4].input_names[0:2] == (
         "verify_input_ids",
         "logical_proposal_count",
     )
-    assert specs[3].output_names[0:5] == (
+    assert specs[4].output_names[0:5] == (
         "committed_token_ids",
         "commit_count",
         "drafted_count",
@@ -399,8 +447,9 @@ def test_draft_air_gears_cover_every_prompt_batch_capacity() -> None:
         dtype=torch.float16,
         eos_table_width=4,
         ordinary_custom_ops=(),
+        head_custom_ops=(),
         verify_custom_ops=(),
     )
-    assert specs[2].input_dim_gears == {
+    assert specs[3].input_dim_gears == {
         0: {1: (16, 64, 128, 192, 256)}
     }

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(qwen35_dflash_acl_runner VERSION 1.4.0 LANGUAGES CXX)
+project(qwen35_dflash_acl_runner VERSION 1.5.0 LANGUAGES CXX)
 
 option(QWEN35_DFLASH_BUILD_ACL_RUNNER "Build the AscendCL executable" ON)
 option(QWEN35_DFLASH_BUILD_TESTS "Build host-only scheduler tests" ON)
@@ -163,11 +163,13 @@ if(QWEN35_DFLASH_BUILD_TESTS)
 
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/fake.om" "fake-om")
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om" "fake-prefill")
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om" "fake-prefill-head")
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om" "fake-decode")
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om" "fake-draft")
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om" "fake-verify")
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/fake.om" _fake_om_sha256)
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om" _prefill_om_sha256)
+  file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om" _prefill_head_om_sha256)
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om" _decode_om_sha256)
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om" _draft_om_sha256)
   file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om" _verify_om_sha256)
@@ -175,6 +177,7 @@ if(QWEN35_DFLASH_BUILD_TESTS)
     NAME qwen35_dflash_incremental_acl_tests
     COMMAND qwen35_dflash_incremental_acl_tests
       ${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      ${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
       ${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
       ${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
       ${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om
@@ -194,6 +197,8 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
       -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
       -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
       -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
       -DDECODE_SHA=${_decode_om_sha256}
       -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
@@ -209,6 +214,8 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
       -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
       -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
       -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
       -DDECODE_SHA=${_decode_om_sha256}
       -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
@@ -225,6 +232,8 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
       -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
       -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
       -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
       -DDECODE_SHA=${_decode_om_sha256}
       -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om

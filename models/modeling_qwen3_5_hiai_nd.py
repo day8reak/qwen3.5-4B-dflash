@@ -64,7 +64,14 @@ def _npu_quant_matmul_with_export_frontend(
     output_dtype: torch.dtype,
     export_flag: bool,
 ) -> torch.Tensor:
-    """Keep eager ACLNN and AIR V4444 scale ABIs strictly separated."""
+    """Keep eager ACLNN and AIR V4444 scale ABIs strictly separated.
+
+    The private export frontend must retain the checkpoint's FP32 scale so its
+    TorchAir converter can lower the V4444 contract.  The eager ACLNN route on
+    the receiver accepts only the encoded INT64/UINT64 representation.  Keep
+    this conversion at the final eager boundary as well as in ``QLinear`` so a
+    direct helper caller cannot accidentally forward an FP32 scale to ACLNN.
+    """
 
     if export_flag:
         namespace = getattr(torch.ops, "qwen35_dflash", None)
@@ -86,10 +93,11 @@ def _npu_quant_matmul_with_export_frontend(
             pertoken_scale=pertoken_scale,
             output_dtype=output_dtype,
         )
+    eager_scale = _encode_eager_npu_quant_scale(scale)
     return torch_npu.npu_quant_matmul(
         x1,
         x2,
-        scale,
+        eager_scale,
         pertoken_scale=pertoken_scale,
         output_dtype=output_dtype,
     )
@@ -210,6 +218,13 @@ class QLinear(nn.Module):
         self._quant_matmul_export_mode = enabled
         return self
 
+    def _use_quant_matmul_export_frontend(self) -> bool:
+        """Limit the mutable factory flag to an active Dynamo capture."""
+
+        return bool(
+            self._quant_matmul_export_mode and torch.compiler.is_compiling()
+        )
+
     def _eager_scale(self, device: torch.device) -> torch.Tensor:
         scale = self.scale.to(device).contiguous()
         if scale.dtype == torch.int64 or str(scale.dtype) == "torch.uint64":
@@ -230,9 +245,10 @@ class QLinear(nn.Module):
     def forward(self, x):
         x_quant, pertoken_scale = torch_npu.npu_dynamic_quant(x)
         pertoken_scale = pertoken_scale.reshape(-1).to(torch.float32)
+        export_frontend = self._use_quant_matmul_export_frontend()
         scale = (
             self.scale.to(x.device)
-            if self._quant_matmul_export_mode
+            if export_frontend
             else self._eager_scale(x.device)
         )
         npu_out = _npu_quant_matmul_with_export_frontend(
@@ -241,7 +257,7 @@ class QLinear(nn.Module):
             scale,
             pertoken_scale=pertoken_scale,
             output_dtype=torch.float16,
-            export_flag=self._quant_matmul_export_mode,
+            export_flag=export_frontend,
         )
         return npu_out.to(torch.float16)
 

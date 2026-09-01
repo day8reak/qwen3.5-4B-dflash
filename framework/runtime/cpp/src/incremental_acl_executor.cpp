@@ -503,26 +503,38 @@ class AclIncrementalExecutor::Impl {
       Check(aclrtCreateStream(&stream_), "aclrtCreateStream");
 
       prefill_.Query(paths.target_prefill, "target-prefill", progress);
+      prefill_head_.Query(
+          paths.target_prefill_head, "target-prefill-head", progress);
       decode_.Query(paths.target_decode1, "target-decode1", progress);
       draft_.Query(paths.draft_propose, "draft-propose", progress);
       verify_.Query(
           paths.target_verify_commit, "target-verify-commit", progress);
+      if (prefill_head_.weight_bytes >= prefill_.weight_bytes) {
+        throw std::runtime_error(
+            "target-prefill-head weightSize must be smaller than the "
+            "head-free target-prefill body; refusing a duplicated Target");
+      }
       memory_ = {
           {prefill_.role, prefill_.work_bytes, prefill_.weight_bytes},
+          {prefill_head_.role,
+           prefill_head_.work_bytes,
+           prefill_head_.weight_bytes},
           {decode_.role, decode_.work_bytes, decode_.weight_bytes},
           {draft_.role, draft_.work_bytes, draft_.weight_bytes},
           {verify_.role, verify_.work_bytes, verify_.weight_bytes},
       };
       const std::size_t shared_work_bytes = std::max(
           {prefill_.work_bytes,
+           prefill_head_.work_bytes,
            decode_.work_bytes,
            draft_.work_bytes,
            verify_.work_bytes});
       if (shared_work_bytes != 0) {
         shared_model_work_.Allocate(shared_work_bytes);
       }
-      const std::array<std::size_t, 4> weight_bytes{
+      const std::array<std::size_t, 5> weight_bytes{
           prefill_.weight_bytes,
+          prefill_head_.weight_bytes,
           decode_.weight_bytes,
           draft_.weight_bytes,
           verify_.weight_bytes,
@@ -545,9 +557,10 @@ class AclIncrementalExecutor::Impl {
             progress);
       };
       load(prefill_, model_weights_[0], false);
-      load(decode_, model_weights_[1], false);
-      load(draft_, model_weights_[2], true);
-      load(verify_, model_weights_[3], false);
+      load(prefill_head_, model_weights_[1], false);
+      load(decode_, model_weights_[2], false);
+      load(draft_, model_weights_[3], true);
+      load(verify_, model_weights_[4], false);
       ValidateAbi();
       AllocateBuffers();
       InitializeImmutableZeroState();
@@ -667,6 +680,13 @@ class AclIncrementalExecutor::Impl {
     ++stats_.target_prefill_executions;
     feature_source_ = FeatureSource::kPrefill;
     std::size_t executions = 1;
+    if (complete) {
+      Execute(prefill_head_, prefill_head_plan_);
+      ++stats_.target_prefill_head_executions;
+      ++executions;
+    } else {
+      ++stats_.target_prefill_head_executions_elided;
+    }
     if (prepare_draft && complete) {
       const std::size_t feature_rows =
           (staging_index + 1) * prefill_width_;
@@ -780,8 +800,10 @@ class AclIncrementalExecutor::Impl {
   }
 
   void ValidateAbi() {
-    if (prefill_.public_input_indices.size() != 9 ||
-        prefill_.outputs.size() != 10 ||
+    if (prefill_.public_input_indices.size() != 7 ||
+        prefill_.outputs.size() != 8 ||
+        prefill_head_.public_input_indices.size() != 3 ||
+        prefill_head_.outputs.size() != 3 ||
         decode_.public_input_indices.size() != 8 ||
         decode_.outputs.size() != 8 ||
         draft_.public_input_indices.size() != 8 ||
@@ -798,21 +820,35 @@ class AclIncrementalExecutor::Impl {
     prefill_width_ = 64;
     RequireTensor(
         prefill_.PublicInput(1), ACL_INT16, {1}, "prefill effective_length");
-    if (prefill_.PublicInput(2).dtype != ACL_INT64 ||
-        prefill_.PublicInput(2).shape.size() != 1 ||
-        prefill_.PublicInput(2).shape[0] <= 0) {
-      throw std::runtime_error("prefill EOS table ABI differs");
+    RequireSameTensor(
+        prefill_.outputs[0], prefill_head_.PublicInput(0),
+        "prefill last hidden");
+    if (prefill_.outputs[0].dtype != ACL_FLOAT16 ||
+        prefill_.outputs[0].shape.size() != 3 ||
+        prefill_.outputs[0].shape[0] != 1 ||
+        prefill_.outputs[0].shape[1] != 1 ||
+        prefill_.outputs[0].shape[2] <= 0) {
+      throw std::runtime_error(
+          "prefill last hidden must be FP16[1,1,H]");
+    }
+    if (prefill_head_.PublicInput(1).dtype != ACL_INT64 ||
+        prefill_head_.PublicInput(1).shape.size() != 1 ||
+        prefill_head_.PublicInput(1).shape[0] <= 0) {
+      throw std::runtime_error("prefill-head EOS table ABI differs");
     }
     eos_table_width_ =
-        static_cast<std::size_t>(prefill_.PublicInput(2).shape[0]);
+        static_cast<std::size_t>(prefill_head_.PublicInput(1).shape[0]);
     RequireTensor(
-        prefill_.PublicInput(3), ACL_INT32, {1}, "prefill eos_token_count");
+        prefill_head_.PublicInput(2), ACL_INT32, {1},
+        "prefill-head eos_token_count");
 
     RequireTensor(decode_.PublicInput(0), ACL_INT64, {1, 1}, "decode input_ids");
     RequireSameTensor(
-        prefill_.PublicInput(2), decode_.PublicInput(1), "decode EOS table");
+        prefill_head_.PublicInput(1), decode_.PublicInput(1),
+        "decode EOS table");
     RequireSameTensor(
-        prefill_.PublicInput(3), decode_.PublicInput(2), "decode EOS count");
+        prefill_head_.PublicInput(2), decode_.PublicInput(2),
+        "decode EOS count");
 
     const auto& verify_ids = verify_.PublicInput(0);
     if (verify_ids.dtype != ACL_INT64 || verify_ids.shape.size() != 2 ||
@@ -824,15 +860,17 @@ class AclIncrementalExecutor::Impl {
     RequireTensor(
         verify_.PublicInput(1), ACL_INT32, {1}, "verify proposal count");
     RequireSameTensor(
-        prefill_.PublicInput(2), verify_.PublicInput(2), "verify EOS table");
+        prefill_head_.PublicInput(1), verify_.PublicInput(2),
+        "verify EOS table");
     RequireSameTensor(
-        prefill_.PublicInput(3), verify_.PublicInput(3), "verify EOS count");
+        prefill_head_.PublicInput(2), verify_.PublicInput(3),
+        "verify EOS count");
 
     target_state_specs_ = SelectSpecs(
         prefill_.inputs,
-        {prefill_.public_input_indices[4], prefill_.public_input_indices[5],
-         prefill_.public_input_indices[6], prefill_.public_input_indices[7],
-         prefill_.public_input_indices[8]});
+        {prefill_.public_input_indices[2], prefill_.public_input_indices[3],
+         prefill_.public_input_indices[4], prefill_.public_input_indices[5],
+         prefill_.public_input_indices[6]});
     RequireStateSet(
         target_state_specs_,
         SelectSpecs(
@@ -851,7 +889,7 @@ class AclIncrementalExecutor::Impl {
         "verify Target");
     RequireStateSet(
         target_state_specs_,
-        SelectSpecs(prefill_.outputs, {5, 6, 7, 8, 9}),
+        SelectSpecs(prefill_.outputs, {3, 4, 5, 6, 7}),
         "prefill Target outputs");
     RequireStateSet(
         target_state_specs_,
@@ -889,23 +927,36 @@ class AclIncrementalExecutor::Impl {
     RequireSameTensor(target_state_specs_[2], target_state_specs_[3], "Target K/V");
     RequireTensor(target_state_specs_[4], ACL_INT64, {1}, "Target cursor");
 
-    RequireTensor(prefill_.outputs[0], ACL_INT64, {1, 16}, "prefill committed IDs");
-    RequireTensor(prefill_.outputs[1], ACL_INT32, {1}, "prefill commit count");
-    RequireTensor(prefill_.outputs[2], ACL_BOOL, {1}, "prefill finished");
-    if (prefill_.outputs[3].dtype != ACL_FLOAT16 ||
-        prefill_.outputs[3].shape.size() != 3 ||
-        prefill_.outputs[3].shape[0] != 1 ||
-        prefill_.outputs[3].shape[1] != 64 ||
-        prefill_.outputs[3].shape[2] <= 0) {
+    RequireTensor(
+        prefill_head_.outputs[0], ACL_INT64, {1, 16},
+        "prefill-head committed IDs");
+    RequireTensor(
+        prefill_head_.outputs[1], ACL_INT32, {1},
+        "prefill-head commit count");
+    RequireTensor(
+        prefill_head_.outputs[2], ACL_BOOL, {1},
+        "prefill-head finished");
+    if (prefill_.outputs[1].dtype != ACL_FLOAT16 ||
+        prefill_.outputs[1].shape.size() != 3 ||
+        prefill_.outputs[1].shape[0] != 1 ||
+        prefill_.outputs[1].shape[1] != 64 ||
+        prefill_.outputs[1].shape[2] <= 0) {
       throw std::runtime_error("prefill Target feature carrier ABI differs");
     }
-    feature_width_ = static_cast<std::size_t>(prefill_.outputs[3].shape[2]);
-    RequireTensor(prefill_.outputs[4], ACL_INT32, {1}, "prefill feature count");
-    RequireSameTensor(prefill_.outputs[0], decode_.outputs[0], "decode committed IDs");
-    RequireSameTensor(prefill_.outputs[1], decode_.outputs[1], "decode commit count");
-    RequireSameTensor(prefill_.outputs[2], decode_.outputs[2], "decode finished");
+    feature_width_ = static_cast<std::size_t>(prefill_.outputs[1].shape[2]);
+    RequireTensor(prefill_.outputs[2], ACL_INT32, {1}, "prefill feature count");
+    RequireSameTensor(
+        prefill_head_.outputs[0], decode_.outputs[0],
+        "decode committed IDs");
+    RequireSameTensor(
+        prefill_head_.outputs[1], decode_.outputs[1],
+        "decode commit count");
+    RequireSameTensor(
+        prefill_head_.outputs[2], decode_.outputs[2], "decode finished");
 
-    RequireSameTensor(prefill_.outputs[0], verify_.outputs[0], "verify committed IDs");
+    RequireSameTensor(
+        prefill_head_.outputs[0], verify_.outputs[0],
+        "verify committed IDs");
     for (std::size_t index = 1; index <= 4; ++index) {
       RequireTensor(
           verify_.outputs[index], ACL_INT32, {1}, "verify compact counter");
@@ -916,7 +967,7 @@ class AclIncrementalExecutor::Impl {
             std::vector<std::int64_t>{1, 16, static_cast<std::int64_t>(feature_width_)}) {
       throw std::runtime_error("verify Target feature carrier ABI differs");
     }
-    RequireSameTensor(prefill_.outputs[4], verify_.outputs[8], "feature count");
+    RequireSameTensor(prefill_.outputs[2], verify_.outputs[8], "feature count");
 
     const auto& draft_feature = draft_.PublicInput(0);
     if (draft_feature.dtype != ACL_FLOAT16 || draft_feature.shape.size() != 3 ||
@@ -925,9 +976,13 @@ class AclIncrementalExecutor::Impl {
       throw std::runtime_error(
           "Draft feature input must be FP16[1,-1,feature_width]");
     }
-    RequireSameTensor(prefill_.outputs[4], draft_.PublicInput(1), "Draft feature count");
-    RequireSameTensor(prefill_.outputs[0], draft_.PublicInput(2), "Draft previous IDs");
-    RequireSameTensor(prefill_.outputs[1], draft_.PublicInput(3), "Draft previous count");
+    RequireSameTensor(prefill_.outputs[2], draft_.PublicInput(1), "Draft feature count");
+    RequireSameTensor(
+        prefill_head_.outputs[0], draft_.PublicInput(2),
+        "Draft previous IDs");
+    RequireSameTensor(
+        prefill_head_.outputs[1], draft_.PublicInput(3),
+        "Draft previous count");
     RequireSameTensor(verify_.PublicInput(1), draft_.PublicInput(4), "Draft proposal count");
     RequireSameTensor(verify_.PublicInput(0), draft_.outputs[0], "Draft verify IDs");
     ResolveDraftGears();
@@ -1021,15 +1076,15 @@ class AclIncrementalExecutor::Impl {
     prefill_ids_offset_ = ReserveDeviceSegment(
         &control_cursor, prefill_.PublicInput(0).bytes);
     eos_ids_offset_ = ReserveDeviceSegment(
-        &control_cursor, prefill_.PublicInput(2).bytes);
+        &control_cursor, prefill_head_.PublicInput(1).bytes);
     proposal_count_offset_ = ReserveDeviceSegment(
         &control_cursor, verify_.PublicInput(1).bytes);
     eos_count_offset_ = ReserveDeviceSegment(
-        &control_cursor, prefill_.PublicInput(3).bytes);
+        &control_cursor, prefill_head_.PublicInput(2).bytes);
     effective_length_offset_ = ReserveDeviceSegment(
         &control_cursor, prefill_.PublicInput(1).bytes);
     prefill_total_count_offset_ = ReserveDeviceSegment(
-        &control_cursor, prefill_.outputs[4].bytes);
+        &control_cursor, prefill_.outputs[2].bytes);
     prefill_control_.Allocate(Align(control_cursor, kBufferAlignment));
     decode_id_.Allocate(decode_.PublicInput(0).bytes);
     stats_.prefill_staging_slots =
@@ -1053,11 +1108,11 @@ class AclIncrementalExecutor::Impl {
 
     std::size_t compact_cursor = 0;
     compact_token_offset_ = ReserveDeviceSegment(
-        &compact_cursor, prefill_.outputs[0].bytes);
+        &compact_cursor, prefill_head_.outputs[0].bytes);
     compact_commit_offset_ = ReserveDeviceSegment(
-        &compact_cursor, prefill_.outputs[1].bytes);
+        &compact_cursor, prefill_head_.outputs[1].bytes);
     compact_finished_offset_ = ReserveDeviceSegment(
-        &compact_cursor, prefill_.outputs[2].bytes);
+        &compact_cursor, prefill_head_.outputs[2].bytes);
     compact_drafted_offset_ = ReserveDeviceSegment(
         &compact_cursor, verify_.outputs[2].bytes);
     compact_accepted_offset_ = ReserveDeviceSegment(
@@ -1065,12 +1120,12 @@ class AclIncrementalExecutor::Impl {
     compact_rejected_offset_ = ReserveDeviceSegment(
         &compact_cursor, verify_.outputs[4].bytes);
     compact_ordinary_bytes_ =
-        compact_finished_offset_ + prefill_.outputs[2].bytes;
+        compact_finished_offset_ + prefill_head_.outputs[2].bytes;
     compact_verify_bytes_ =
         compact_rejected_offset_ + verify_.outputs[4].bytes;
     compact_.Allocate(Align(compact_cursor, kBufferAlignment));
 
-    const std::size_t prefill_feature_payload = prefill_.outputs[3].bytes;
+    const std::size_t prefill_feature_payload = prefill_.outputs[1].bytes;
     if (prefill_feature_payload % kBufferAlignment != 0) {
       throw std::runtime_error(
           "prefill feature slab does not preserve 64-byte alignment");
@@ -1094,7 +1149,8 @@ class AclIncrementalExecutor::Impl {
         Align(feature_payload + 32, kBufferAlignment));
     stats_.prefill_feature_slab_bytes = prefill_feature_payload;
     stats_.prefill_feature_arena_bytes = prefill_features_.bytes;
-    committed_input_count_.Allocate(prefill_.outputs[4].bytes);
+    prefill_last_hidden_.Allocate(prefill_.outputs[0].bytes);
+    committed_input_count_.Allocate(prefill_.outputs[2].bytes);
     verify_ids_.Allocate(verify_.PublicInput(0).bytes);
     prefill_dynamic_controls_.resize(stats_.prefill_staging_slots);
     for (auto& control : prefill_dynamic_controls_) {
@@ -1112,7 +1168,8 @@ class AclIncrementalExecutor::Impl {
     stats_.carrier_device_bytes =
         prefill_control_.device.bytes + decode_id_.device.bytes +
         compact_.device.bytes + prefill_features_.bytes +
-        committed_input_count_.bytes + verify_ids_.bytes +
+        prefill_last_hidden_.bytes + committed_input_count_.bytes +
+        verify_ids_.bytes +
         verify_dynamic_control_.bytes;
     for (const auto& control : prefill_dynamic_controls_) {
       stats_.carrier_device_bytes += control.bytes;
@@ -1184,11 +1241,13 @@ class AclIncrementalExecutor::Impl {
   }
 
   BufferView EosIdsView() const {
-    return PrefillControlView(eos_ids_offset_, prefill_.PublicInput(2).bytes);
+    return PrefillControlView(
+        eos_ids_offset_, prefill_head_.PublicInput(1).bytes);
   }
 
   BufferView EosCountView() const {
-    return PrefillControlView(eos_count_offset_, prefill_.PublicInput(3).bytes);
+    return PrefillControlView(
+        eos_count_offset_, prefill_head_.PublicInput(2).bytes);
   }
 
   BufferView ProposalCountView() const {
@@ -1198,7 +1257,7 @@ class AclIncrementalExecutor::Impl {
 
   BufferView PrefillTotalCountView() const {
     return PrefillControlView(
-        prefill_total_count_offset_, prefill_.outputs[4].bytes);
+        prefill_total_count_offset_, prefill_.outputs[2].bytes);
   }
 
   BufferView PrefillFeatureSlabView(std::size_t index) const {
@@ -1361,12 +1420,9 @@ class AclIncrementalExecutor::Impl {
         prefill_plans_[slot][current].Build(
             prefill_,
             TargetInputs(
-                {PrefillIdsView(), EffectiveLengthView(), EosIdsView(),
-                 EosCountView()},
+                {PrefillIdsView(), EffectiveLengthView()},
                 current),
-            {CompactView(compact_token_offset_, prefill_.outputs[0].bytes),
-             CompactView(compact_commit_offset_, prefill_.outputs[1].bytes),
-             CompactView(compact_finished_offset_, prefill_.outputs[2].bytes),
+            {prefill_last_hidden_.View(),
              PrefillFeatureSlabView(slot),
              committed_input_count_.View(),
              target_states_[next].tensors[0],
@@ -1429,23 +1485,29 @@ class AclIncrementalExecutor::Impl {
             "prefill batch prebind");
       }
     }
+    prefill_head_plan_.Build(
+        prefill_head_,
+        {prefill_last_hidden_.View(), EosIdsView(), EosCountView()},
+        {CompactView(
+             compact_token_offset_, prefill_head_.outputs[0].bytes),
+         CompactView(
+             compact_commit_offset_, prefill_head_.outputs[1].bytes),
+         CompactView(
+             compact_finished_offset_, prefill_head_.outputs[2].bytes)});
     if (state_reset_policy_ ==
         IncrementalStateResetPolicy::kImmutableZero) {
       initial_prefill_plan_.Build(
           prefill_,
           [&]() {
             std::vector<BufferView> inputs{
-                PrefillIdsView(), EffectiveLengthView(), EosIdsView(),
-                EosCountView()};
+                PrefillIdsView(), EffectiveLengthView()};
             inputs.insert(
                 inputs.end(),
                 target_zero_state_.tensors.begin(),
                 target_zero_state_.tensors.end());
             return inputs;
           }(),
-          {CompactView(compact_token_offset_, prefill_.outputs[0].bytes),
-           CompactView(compact_commit_offset_, prefill_.outputs[1].bytes),
-           CompactView(compact_finished_offset_, prefill_.outputs[2].bytes),
+          {prefill_last_hidden_.View(),
            PrefillFeatureSlabView(0),
            committed_input_count_.View(),
            target_states_[0].tensors[0],
@@ -1696,6 +1758,7 @@ class AclIncrementalExecutor::Impl {
       plan.Release();
     }
     initial_draft_plans_.clear();
+    prefill_head_plan_.Release();
     initial_prefill_plan_.Release();
     for (auto& by_gear : prefill_draft_plans_) {
       for (auto& plan : by_gear) {
@@ -1726,6 +1789,7 @@ class AclIncrementalExecutor::Impl {
     prefill_dynamic_controls_.clear();
     verify_ids_.Release();
     committed_input_count_.Release();
+    prefill_last_hidden_.Release();
     prefill_features_.Release();
     compact_.Release();
     for (auto& host : extra_prefill_control_host_) {
@@ -1746,6 +1810,7 @@ class AclIncrementalExecutor::Impl {
     verify_.Release();
     draft_.Release();
     decode_.Release();
+    prefill_head_.Release();
     prefill_.Release();
     for (auto& weight : model_weights_) {
       weight.Release();
@@ -1779,12 +1844,13 @@ class AclIncrementalExecutor::Impl {
   aclrtStream stream_ = nullptr;
 
   ModelSession prefill_;
+  ModelSession prefill_head_;
   ModelSession decode_;
   ModelSession draft_;
   ModelSession verify_;
   std::vector<IncrementalModelMemory> memory_;
   DeviceAllocation shared_model_work_;
-  std::array<DeviceAllocation, 4> model_weights_;
+  std::array<DeviceAllocation, 5> model_weights_;
 
   std::size_t sequence_length_ = 0;
   std::size_t prefill_width_ = 0;
@@ -1806,6 +1872,7 @@ class AclIncrementalExecutor::Impl {
   std::vector<HostAllocation> extra_prefill_control_host_;
   MirrorBuffer compact_;
   DeviceAllocation prefill_features_;
+  DeviceAllocation prefill_last_hidden_;
   DeviceAllocation committed_input_count_;
   DeviceAllocation verify_ids_;
   std::vector<DeviceAllocation> prefill_dynamic_controls_;
@@ -1832,6 +1899,7 @@ class AclIncrementalExecutor::Impl {
   std::vector<std::array<DatasetPlan, 2>> prefill_draft_plans_;
   std::array<DatasetPlan, 2> verify_draft_plans_;
   DatasetPlan initial_prefill_plan_;
+  DatasetPlan prefill_head_plan_;
   std::vector<DatasetPlan> initial_draft_plans_;
 
   std::size_t target_state_index_ = 0;

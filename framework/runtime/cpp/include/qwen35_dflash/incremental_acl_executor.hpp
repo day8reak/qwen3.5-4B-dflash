@@ -14,6 +14,7 @@ namespace qwen35::dflash {
 
 struct IncrementalOmPaths {
   std::filesystem::path target_prefill;
+  std::filesystem::path target_prefill_head;
   std::filesystem::path target_decode1;
   std::filesystem::path draft_propose;
   std::filesystem::path target_verify_commit;
@@ -39,6 +40,8 @@ const char* IncrementalStateResetPolicyName(
 
 struct IncrementalAclExecutionStats {
   std::size_t target_prefill_executions = 0;
+  std::size_t target_prefill_head_executions = 0;
+  std::size_t target_prefill_head_executions_elided = 0;
   std::size_t target_decode1_executions = 0;
   std::size_t draft_propose_executions = 0;
   std::size_t target_verify_commit_executions = 0;
@@ -86,7 +89,10 @@ using IncrementalModelProgress = std::function<void(
     std::size_t work_bytes,
     std::size_t weight_bytes)>;
 
-// Four resident OM sessions implementing the approved exact state graph.
+// Five resident OM sessions implementing the approved exact state graph.
+// The prefill body excludes its QLinear LM head; a small head-only OM runs
+// once after the final physical prompt chunk. This moves the prefill head
+// weight instead of retaining a dead copy in the body artifact.
 // Target and Draft states are ping-ponged in device arenas.  Proposal IDs,
 // Target features and cursors never cross the host boundary.  A speculative
 // method enqueues Draft -> Target verify/commit and performs one stream sync

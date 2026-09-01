@@ -19,10 +19,11 @@ void Require(bool condition, const std::string& message) {
 }
 
 void RunPolicy(
-    const std::array<std::filesystem::path, 4>& model_paths,
+    const std::array<std::filesystem::path, 5>& model_paths,
     qwen35::dflash::IncrementalStateResetPolicy reset_policy) {
   qwen35::dflash::IncrementalOmPaths paths{
-      model_paths[0], model_paths[1], model_paths[2], model_paths[3]};
+      model_paths[0], model_paths[1], model_paths[2], model_paths[3],
+      model_paths[4]};
   std::vector<std::string> loaded_roles;
   qwen35::dflash::AclIncrementalExecutor executor(
       std::move(paths),
@@ -33,7 +34,7 @@ void RunPolicy(
         }
       },
       reset_policy);
-  Require(loaded_roles.size() == 4, "not all fake OMs were loaded");
+  Require(loaded_roles.size() == 5, "not all fake OMs were loaded");
   Require(executor.sequence_length() == 128, "fake state capacity differs");
   Require(executor.prefill_width() == 64, "fake prefill gear differs");
   Require(executor.proposal_width() == 15, "fake proposal width differs");
@@ -91,6 +92,13 @@ void RunPolicy(
 
   const auto& stats = executor.execution_stats();
   Require(stats.target_prefill_executions > 0, "prefill OM was not executed");
+  Require(
+      stats.target_prefill_head_executions == stats.state_resets,
+      "prefill head did not execute exactly once per request");
+  Require(
+      stats.target_prefill_head_executions_elided ==
+          stats.deferred_prefill_chunks,
+      "prefill head was not elided for every intermediate chunk");
   Require(stats.target_decode1_executions > 0, "decode OM was not executed");
   Require(stats.draft_propose_executions > 0, "Draft OM was not executed");
   Require(
@@ -198,25 +206,27 @@ void RunPolicy(
   Require(
       stats.device_to_host_operations <
           stats.target_prefill_executions +
+              stats.target_prefill_head_executions +
               stats.target_decode1_executions +
               stats.draft_propose_executions +
               stats.target_verify_commit_executions,
       "Draft introduced an extra host-visible result copy");
-  Require(executor.model_memory().size() == 4, "model memory set differs");
+  Require(executor.model_memory().size() == 5, "model memory set differs");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 5) {
-      throw std::invalid_argument("expected four fake OM paths");
+    if (argc != 6) {
+      throw std::invalid_argument("expected five fake OM paths");
     }
-    const std::array<std::filesystem::path, 4> paths{
+    const std::array<std::filesystem::path, 5> paths{
         std::filesystem::path(argv[1]),
         std::filesystem::path(argv[2]),
         std::filesystem::path(argv[3]),
         std::filesystem::path(argv[4]),
+        std::filesystem::path(argv[5]),
     };
     RunPolicy(
         paths,
@@ -224,7 +234,7 @@ int main(int argc, char** argv) {
     RunPolicy(
         paths,
         qwen35::dflash::IncrementalStateResetPolicy::kImmutableZero);
-    std::cout << "PASS: both reset policies preserve exact four-OM tokens, "
+    std::cout << "PASS: both reset policies preserve exact five-OM tokens, "
                  "device state routing and compact synchronization\n";
     return 0;
   } catch (const std::exception& error) {

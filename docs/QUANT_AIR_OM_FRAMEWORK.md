@@ -48,11 +48,13 @@ Draft KV cache 变成显式 OM 输入/输出。因此：
 | 阶段 | 逻辑图 | 物理 OM 数 | 当前状态 |
 | --- | --- | ---: | --- |
 | 当前可验证基线 | Target 全前缀 + Draft proposal 整图 | 每个静态 `S` gear 1 个 | 已接入 AIR/ATC/C++ |
-| 低时延目标 | `target_prefill_64`、`target_decode_1`、`target_verify_16`、`draft_16` | 至少 4 个；多 cache/shape gear 时更多 | 需要显式状态 ABI 与真机门禁 |
+| 低时延候选 | 四个逻辑角色：prefill、decode、verify、draft；当前把 prefill 再物理拆成 body/head | 当前 5 个 | 已实现代码/Fake-ACL；仍需真实 AIR/ATC、显存、零差异和时延门禁 |
 
 `verify` 不能与 ordinary `decode` 共用一个含糊的状态合同：前者一次计算最多 16 个 provisional
 row，并只按接受数提交一个 GDN/conv state-bank 槽；后者固定提交单个 row。用户口头所说的
-“prefill、decode、draft 三类”在物理部署中因此通常落为上述四个 OM 角色。
+“prefill、decode、draft 三类”在逻辑上因此落为上述四个角色。当前为满足“非末 prompt chunk
+不执行完整 LM head”的热路径约束，`target-prefill` body 输出 device-resident `last_hidden`，只在
+最后一个 chunk 调用 `target-prefill-head`，所以物理产物为五个 OM。
 
 ## 2. 冻结 ABI
 
@@ -136,13 +138,17 @@ W8A8 matmul 不再把 `npu.npu_quant_matmul.default` 直接交给项目 converte
 项目 converter 不一定能替换 registry 实际使用的旧项。AIR 导出因此改用项目私有、无冲突的
 `qwen35_dflash.npu_quant_matmul_v4444.default` 前端。普通 `torch_npu` eager 与 AIR 不再根据
 “私有 op 是否已经注册”隐式选路：每个 `QLinear` 默认固定走 eager，AIR factory 加载量化 Target
-后才显式打开 export mode，并核对打开的 QLinear 数量与量化审计中的 `qlinear_count` 完全一致。
+后才显式打开 export mode，并核对打开的 QLinear 数量与量化审计中的 `qlinear_count` 完全一致；
+该 mode 还必须同时处于 active Dynamo capture 才能选中私有前端，因此一次导出后同一对象再做
+普通 eager 调用也不会把 FP32 scale 误送进 ACLNN。
 
 量化文件中的权重 scale 继续保留为 FP32，这是 AIR/`QuantBatchMatmulV4444` 需要的输入；普通
 Ascend310P ACLNN V4 eager 路径则在第一次调用每个 QLinear 时使用
-`torch_npu.npu_trans_quant_param` 生成 INT64/UINT64 编码 scale，并缓存为 non-persistent buffer。
-后续 token 不会重复转换，FP32 原值也不会被覆盖。因此同一份权重同时满足直接 `torch_npu`
-推理和 AIR/OM 导出，且在同一 Python 进程中先导出再 eager 也不会串路。310P3 receiver 安装的是
+`torch_npu.npu_trans_quant_param` 生成 INT64/UINT64 编码 scale，并缓存为 non-persistent buffer；
+最终 eager helper 会再次检查 dtype，使绕过 `QLinear._eager_scale()` 的调用也不能把 FP32 直传
+ACLNN。后续 token 不会重复转换，FP32 原值也不会被覆盖。因此同一份权重同时满足直接
+`torch_npu` 推理和 AIR/OM 导出，且在同一 Python 进程中先导出再 eager 也不会串路。310P3
+receiver 安装的是
 `QuantBatchMatmulV4444`，其 GE 输入顺序
 `x1,x2,scale,offset,bias,pertoken_scale` 与 PyTorch 前端的
 `x1,x2,scale,offset,pertoken_scale,bias` 不同，因此框架按名称绑定六个输入，并显式写入：
@@ -622,8 +628,8 @@ $AI_RUN_DIR/build/cpp-release/qwen35_dflash_acl_runner
 $AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner
 ```
 
-第一个二进制运行单一重计算 OM 基线；第二个二进制运行已批准、尚待真机提升的四常驻 OM
-候选。`build-cpp` 会同时构建并 host-test 两者。四 OM 的导出 factory、runner 配置、直接运行、
+第一个二进制运行单一重计算 OM 基线；第二个二进制运行已批准、尚待真机提升的五图常驻 OM
+候选。`build-cpp` 会同时构建并 host-test 两者。五图的导出 factory、runner 配置、直接运行、
 report 门禁和 msprof 命令见 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5 节。
 
 不要把 build 目录或二进制提交进源码仓库。
@@ -813,7 +819,7 @@ jq '.execution_io_counters | {
 msprof 只能回答重计算基线 OM 中每个算子、device task 和 AscendCL API 的耗时，不能从这张
 集成图强行拆出 prefill/decode/verify/draft 的模型级时延。
 
-分支同时提供 `create_quant_incremental_state_graphs` 和四常驻 OM C++ runner。生成四个独立 OM
+分支同时提供 `create_quant_incremental_state_graphs` 和五图常驻 OM C++ runner。生成五个独立 OM
 后，应使用 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.6 节的完整状态机 msprof 命令，并按
 model ID/role 分组；两类 profile 不得混成同一份时延基线。该 runner 会把长 prompt 的中间
 64-row chunk 留在同一 stream，仅最后一个 chunk 下载 compact 结果并同步；报告中的 elided
@@ -957,12 +963,12 @@ rg --files "$PROF_DIR" | \
 6. 若整张静态图的物理工作量才是主导，则进入第 13 节的增量状态 ABI，继续优化
    C++ 控制面不会消除全前缀重算。
 
-未来生成 `target_prefill_64.om`、`target_decode_1.om`、`target_verify_16.om` 和
-`draft_16.om` 后，每个角色应用独立 label 重复同样的三组 metrics 采集。但当前
-`qwen35_dflash_acl_runner` 只接受集成图的 2 input/2 output ABI，不能通过改文件名
-来运行四个增量 OM。必须先提供匹配每个 OM 状态 ABI 的通用 ACL micro-runner，
-并从正式生成 trace 捕获有效 KV/GDR/conv/Draft state 输入；随机零 state 不能作为
-状态 OM 的性能或正确性证据。
+当前五图增量候选应使用 `qwen35_dflash_incremental_acl_runner` 运行完整状态机，并按
+`target-prefill`、`target-prefill-head`、`target-decode1`、`draft-propose`、
+`target-verify-commit` 的 model ID 分组；完整命令见
+`docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.6 节。不要拿只接受集成图 2 input/2 output ABI 的
+`qwen35_dflash_acl_runner` 改文件名运行这些状态 OM，也不要用随机零 state 作为性能或正确性
+证据。
 
 ## 12. 常见失败定位
 
@@ -976,7 +982,7 @@ rg --files "$PROF_DIR" | \
 | `schema drifted from the locked export contract` | torch-npu/receiver 算子签名与当前锁不一致 | 记录 dispatcher schema；按真实版本更新 schema、Fake、converter 和测试，不能跳过校验 |
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
 | `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
-| `aclnnQuantMatmulV4 failed, error code is 161002`，并提示 `Scale dtype should be UINT64 or INT64, actual dtype is DT_FLOAT` | 普通 eager 把量化文件中的 FP32 scale 直接交给当前 310P ACLNN V4；这不是权重文件损坏，远程 quant 加载器本来也会保留 FP32 | 更新本分支；普通 eager 会一次性调用 `npu_trans_quant_param` 并缓存编码 scale，AIR 仍保留 FP32 scale。不要用 `.to(torch.int64)` 做数值截断，也不要把 AIR 图改成 encoded-scale ABI |
+| `aclnnQuantMatmulV4 failed, error code is 161002`，并提示 `Scale dtype should be UINT64 or INT64, actual dtype is DT_FLOAT` | 普通 eager 把量化文件中的 FP32 scale 直接交给当前 310P ACLNN V4；这不是权重文件损坏，远程 quant 加载器本来也会保留 FP32 | 确认当前提交包含 eager helper 的 `npu_trans_quant_param` 防线和 active-Dynamo export gate；普通 eager 会一次性编码并缓存 scale，AIR 仍保留 FP32。不要用 `.to(torch.int64)` 做数值截断，也不要把 AIR 图改成 encoded-scale ABI |
 | `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 旧版 AIR 路径把 `Tensor(a!) -> Tensor(a!)` 直接交给 AOTAutograd；Fake 正确也无法 functionalize | 更新本分支；确认 FX target 为 `qwen35_dflash.npu_cache_update.default`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
 | `ERR03005 GRAPH internal error`，`Original traceback` 指向 `qwen35_dflash.npu_cache_update.default`，Meta 单测通过 | 旧 converter 把前端 snake_case 参数按 positional 传入，但 GE `CacheUpdate` 原型要求 `x/updates/targetBlock/offsetInBlock -> x` | 更新本分支；确认 AIR manifest 中该算子的 `converter_mode` 为 `named-cache-update-x-v1` |
 | `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |
@@ -1002,23 +1008,25 @@ rg --files "$PROF_DIR" | \
 同步。若真实 profile 显示 OM 计算主导，下一步应基于 `quant` 已有 rollback 语义拆分四个**逻辑
 角色**：
 
-1. `target_prefill_64.om`：分块 prompt prefill；
-2. `target_decode_1.om`：ordinary 单 token decode；
-3. `target_verify_16.om`：anchor + 最多 15 proposals；
-4. `draft_16.om`：增量 Draft KV；
+1. `target-prefill.om`：分块 prompt body，不含 LM head；
+2. `target-prefill-head.om`：只在最后一个 prompt chunk 后运行量化 LM head/Top1/EOS；
+3. `target-decode1.om`：ordinary 单 token decode；
+4. `target-verify-commit.om`：anchor + 最多 15 proposals；
+5. `draft-propose.om`：增量 Draft KV；
 5. C++ request context 持有 Target/Draft state 的 persistent device buffer；
 6. proposal 直接在 device 上从 Draft 传给 Target verify；
 7. verify graph 尾部精确计算 accepted count 并选择 state slot，只把 compact commit result 搬回
    host；
 8. 对每一个 state 分支做 ordinary token/EOS 零差异门禁。
 
-四个 OM 更快的原因不是“文件数量更多”，而是它们允许把已经计算过的状态留在
+多 OM 可能更快的原因不是“文件数量更多”，而是它们允许把已经计算过的状态留在
 NPU，后续调用只处理新增 token：
 
 | 路径 | 每次物理工作 | 性能含义 |
 | --- | --- | --- |
 | 当前集成重算 OM | 对静态 `S` 重算 Target 全前缀，并同时计算 Draft | 生成 1 个 token 也会重做历史行；不需要 Draft 时也付出 Draft 代价 |
 | `target_prefill_64.om` | prompt 分块只执行一次，产生 Target KV/GDR/conv state | 历史 prompt 不再在每个 decode 轮次重算 |
+| `target-prefill-head.om` | 只消费最后一个 `[1,1,H]` hidden | 非末 64-row chunk 不再计算完整词表投影 |
 | `target_decode_1.om` | 处理 1 个新 token，读写常驻 Target state | ordinary/correction 路径的 query 长度从 `S` 降为 1 |
 | `draft_16.om` | 复用 Draft KV/feature state 生成一块 proposals | 不再为每轮 proposal 重算 Draft 全前缀 |
 | `target_verify_16.om` | 一次验证 anchor + 最多 15 个 proposals | 接受多个 token 时，一次 Target 调用被多个输出 token 分摊 |
@@ -1028,7 +1036,7 @@ NPU，后续调用只处理新增 token：
 可与 verify 合并成 3 OM；若多 gear、自定义算子和分支均通过，可测试 2 个动态 OM。要得到端到端
 收益，必须同时满足：
 
-- 四个 OM 只加载一次，device buffer 复用；
+- 五个当前物理 OM 只加载一次，device buffer 复用；
 - KV/GDR/conv/Draft state 常驻 device，不在每轮整体 H2D/D2H；
 - verify 的 candidate bank 留在 graph workspace，尾部只持久化 accepted slot，拒绝时不重建全部
   历史；
@@ -1041,7 +1049,7 @@ NPU，后续调用只处理新增 token：
 `aclmdlQuerySize(workSize, weightSize)`，按 `sum(weights) + max(serial workspace) + state + margin`
 计算候选集；当前 C++ runner 的 JSON 也会记录单 OM 的查询值。
 
-完整状态字节公式、2/3/4 OM 候选、inspector 构建/执行命令、一次同步热循环和审批门禁见
+完整状态字节公式、不同物理拓扑候选、当前五图 inspector 构建/执行命令、一次同步热循环和审批门禁见
 [增量 OM 与 C++ 高性能路线](INCREMENTAL_OM_PERFORMANCE.md)。门禁顺序必须是：先做单 OM
 msprof、候选集合内存/load 和状态搬运审计，再做未 profiling 的端到端 3+10，最后与同身份闭源
 基线比较。
