@@ -132,7 +132,7 @@
     "runner_file": "models/dflash_v1/benchmark_npu.py",
     "runner_sha256": "a244545da5e748d596f3319c40c33441e635cb50c3e19f9272a78575731ce3c6",
     "msprof_wrapper_file": "tools/run_msprof.sh",
-    "msprof_wrapper_sha256": "a6e8e9f82ecab0c7c9cadf7d0d5713e25d449feb6a6c49a60a71300881392a69",
+    "msprof_wrapper_sha256": "341f5c387a749f574f635b1c25772ae8e1c4dbd1d81ba2c7c455374a561e46c7",
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "b5fdd64b1eaea44b3f53452bc260cf62de53ca38b1fcd8699bf4f9e358d99c76",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",

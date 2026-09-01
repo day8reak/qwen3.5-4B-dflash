@@ -10,6 +10,7 @@ import unittest
 REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY / "tools" / "run_msprof.sh"
 RUN_DOCUMENT = REPOSITORY / "docs" / "DFLASH_RUN_AND_VALIDATE.md"
+QUANT_DOCUMENT = REPOSITORY / "docs" / "QUANT_AIR_OM_FRAMEWORK.md"
 
 
 class MsprofScriptTests(unittest.TestCase):
@@ -44,6 +45,34 @@ class MsprofScriptTests(unittest.TestCase):
                 self.assertNotIn(fragment, source)
         self.assertIn("content_hash_without_vcs_metadata", source)
         self.assertIn("copied source tree", source)
+        self.assertIn('root / "framework"', source)
+        self.assertIn(
+            'root / "docs" / "QUANT_AIR_OM_FRAMEWORK.md"', source
+        )
+
+    def test_quant_om_profile_workflow_is_documented(self) -> None:
+        document = QUANT_DOCUMENT.read_text(encoding="utf-8")
+        section = document.split(
+            "### 11.4 用 msprof 单独分析当前 OM", 1
+        )[1].split("## 12. 常见失败定位", 1)[0]
+
+        self.assertIn("quant_dflash_recompute.om", section)
+        self.assertIn('"$DFLASH_SOURCE/tools/run_msprof.sh"', section)
+        self.assertIn("--max-new-tokens 1", section)
+        self.assertIn("--warmup 3", section)
+        self.assertIn("--repetitions 10", section)
+        self.assertIn("2 × (3 + 10) = 26", section)
+        self.assertIn("PipeUtilization Memory MemoryUB", section)
+        self.assertIn("msprof --query=on", section)
+        self.assertIn("msprof --export=on", section)
+        for report in (
+            "op_summary_*.csv",
+            "op_statistic_*.csv",
+            "api_statistic_*.csv",
+            "task_time_*.csv",
+        ):
+            self.assertIn(report, section)
+        self.assertIn("2 input/2 output ABI", section)
 
     def test_mstx_is_compatibility_opt_in(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

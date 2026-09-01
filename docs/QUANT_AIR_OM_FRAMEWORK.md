@@ -763,6 +763,157 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 
 阈值必须在看结果前确定。即使 C++ 更快，只要 token/EOS 或运行身份不一致仍然 FAIL。
 
+### 11.4 用 msprof 单独分析当前 OM
+
+先明确采样边界：当前分支每个静态 gear 只生成一个
+`quant_dflash_recompute.om`，Target 全前缀和 Draft proposal 在同一张图里。因此
+msprof 可以回答这个 OM 中每个算子、device task 和 AscendCL API 的耗时，但现在
+没有四个独立 OM 可供比较，也不能从这张集成图直接声称得到了独立
+prefill/decode/verify/draft 的模型级时延。
+
+正式时延基线仍然使用 11.3 中未开 profiling 的 3 次 warmup + 10 次
+measurement 报告。下面的 msprof 命令只做瓶颈定位，采集器引入的开销不能算入
+闭源框架对比值。
+
+在真实 310P 环境先准备路径。`PROFILE_ROOT` 必须在拷贝的源码树之外；
+`MODEL_PYTHON` 必须能导入当前 CANN 匹配的 `torch_npu`。`TOKEN_IDS` 不是随机数，
+必须换成正式 workload 的真实 token ID：
+
+```bash
+export DFLASH_SOURCE=/ABSOLUTE/PATH/qwen3.5-4B-dflash
+export PROFILE_ROOT=/ABSOLUTE/PATH/quant-air-om-msprof
+export MODEL_PYTHON=/ABSOLUTE/PATH/python
+export RUNNER=/ABSOLUTE/PATH/qwen35_dflash_acl_runner
+export OM=/ABSOLUTE/PATH/quant_dflash_recompute.om
+export OM_SHA256="$(sha256sum "$OM" | awk '{print $1}')"
+export PAD_TOKEN_ID=0
+export TOKEN_IDS='151644,8948,198,2610,525'
+export CASE_KIND=prefill
+
+mkdir -p "$PROFILE_ROOT"
+```
+
+上面的 token 只是格式示例，不得作为正确性或性能证据。`PAD_TOKEN_ID` 也要与
+`runner.json` 和 tokenizer 一致。先确认 OM hash 和 runner 接口：
+
+```bash
+sha256sum "$OM"
+"$RUNNER" --help
+```
+
+下面对同一个 OM 分别采集 `PipeUtilization`、`Memory` 和 `MemoryUB`。一个
+profile 只收集一组 AI Core metrics，每组使用独立 label 和输出目录：
+
+```bash
+for AIC_METRIC in PipeUtilization Memory MemoryUB; do
+  LABEL="quant-recompute-${CASE_KIND}-${AIC_METRIC}"
+  CASE_ROOT="$PROFILE_ROOT/$LABEL"
+
+  "$DFLASH_SOURCE/tools/run_msprof.sh" \
+    --label "$LABEL" \
+    --output-dir "$CASE_ROOT" \
+    --python "$MODEL_PYTHON" \
+    --aic-metrics "$AIC_METRIC" \
+    --no-msproftx \
+    -- \
+    "$RUNNER" \
+      --model "$OM" \
+      --model-sha256 "$OM_SHA256" \
+      --output "$CASE_ROOT/cpp-report.json" \
+      --prompt-token-ids "$TOKEN_IDS" \
+      --pad-token-id "$PAD_TOKEN_ID" \
+      --max-new-tokens 1 \
+      --max-draft-tokens 15 \
+      --warmup 3 \
+      --repetitions 10 \
+      --device-id 0 \
+      --progress true
+done
+```
+
+runner 的真机证据合同固定为 paired 3+10，不允许改成 1+1。这里把
+`max-new-tokens` 设为 1，所以 ordinary 和 DFlash 每轮都只执行一次相同的集成
+OM，合计为 `2 × (3 + 10) = 26` 次单 OM 重复采样。这个 profile 不包含
+decode 循环，不用于计算 acceptance rate；它的目的是让同一输入的 OM 任务重复出现，
+便于排除单次抖动。
+
+要比较当前集成 OM 在三种逻辑位置上的成本，只修改输入和 `CASE_KIND`，
+然后重跑上面的循环：
+
+| `CASE_KIND` | `TOKEN_IDS` | 采样含义 |
+| --- | --- | --- |
+| `prefill` | 完整真实 prompt | 首次 Target + Draft 集成图调用 |
+| `proposal` | 某轮开始时的已提交前缀 | 生成 proposal 时的集成图输入 |
+| `verify` | 同一已提交前缀 + 该轮真实 Draft proposals | Target verify 时的扩展前缀 |
+
+例如，从一轮真实 DFlash trace 中拿到前缀和 proposal 后：
+
+```bash
+export CASE_KIND=proposal
+export TOKEN_IDS='REAL_COMMITTED_PREFIX_TOKEN_IDS'
+# 重跑上面三个 AIC_METRIC 的 for 循环
+
+export CASE_KIND=verify
+export TOKEN_IDS='REAL_COMMITTED_PREFIX_PLUS_REAL_PROPOSAL_TOKEN_IDS'
+# 再重跑上面三个 AIC_METRIC 的 for 循环
+```
+
+这种方法只改变同一静态 OM 的有效前缀和 mask。如果 proposal/verify 的逻辑长度
+增加，但 device task 耗时基本不变，这是静态全前缀重算成本主导的直接证据之一。
+因为 Target 和 Draft 仍在一张图中，不能把两者的高层 wall time 从这个数字中
+强行分开。
+
+每次采集完后，先找到该 label 下 msprof 生成的 `PROF_*` 目录，再执行
+query 和 CSV export。下面以 prefill/PipeUtilization 为例：
+
+```bash
+export LABEL=quant-recompute-prefill-PipeUtilization
+export CASE_ROOT="$PROFILE_ROOT/$LABEL"
+
+find "$CASE_ROOT/profile/msprof/$LABEL" \
+  -maxdepth 2 -type d -name 'PROF_*' -print
+
+export PROF_DIR=/ABSOLUTE/PATH/TO/PROF_DIRECTORY
+msprof --query=on --output="$PROF_DIR"
+msprof --export=on --output="$PROF_DIR" --summary-format=csv
+
+rg --files "$PROF_DIR" | \
+  rg '/(op_summary|op_statistic|api_statistic|task_time)_[^/]*\.csv$'
+```
+
+不同 CANN 版本的子目录层级可能不同，所以先用 `find` 确认唯一的
+`PROF_*` 目录，不要猜路径。优先保留和分析：
+
+| 文件 | 用途 |
+| --- | --- |
+| `op_summary_*.csv` | 每个算子/task 的执行时间、输入 shape 和核心利用率 |
+| `op_statistic_*.csv` | 按算子类型聚合的调用次数和总时间，适合找 Top 瓶颈 |
+| `api_statistic_*.csv` | H2D/D2H、`aclmdlExecuteAsync` 和 stream synchronize 等 host API 成本 |
+| `task_time_*.csv` | device task 调度与执行时间，用于区分 host 等待和 NPU 计算 |
+| `manifest/<label>.json` | 本次 msprof 命令、framework/C++ 与模型适配源码内容 hash、设备和采集参数 |
+| `cpp-report.json` | 输入/输出稳定性、OM 调用数和 runner 计时边界 |
+
+发回问题时，上述四类 CSV、manifest、`cpp-report.json` 以及
+`log/msprof-<label>.log` 通常就是第一轮分析最需要的小文件，无需先上传完整时间线。
+
+分析时遵循以下规则：
+
+1. 先用 `cpp-report.json` 确认确实是 26 次单图调用且 token 稳定；
+2. 只对执行次数与采样协议匹配的算子做单次均值，不要把模型加载任务除以 26；
+3. `aclmdlExecuteAsync` 是 host 侧下发时间，不是完整 device 时延；需要结合
+   `aclrtSynchronizeStream`、`task_time` 和时间线；
+4. 不要把并行或重叠的 AI Core task 耗时直接相加当作 OM wall time；
+5. 若少数自定义算子占主导，再根据精确节点、shape 和 metrics 做有界优化；
+6. 若整张静态图的物理工作量才是主导，则进入第 13 节的增量状态 ABI，继续优化
+   C++ 控制面不会消除全前缀重算。
+
+未来生成 `target_prefill_64.om`、`target_decode_1.om`、`target_verify_16.om` 和
+`draft_16.om` 后，每个角色应用独立 label 重复同样的三组 metrics 采集。但当前
+`qwen35_dflash_acl_runner` 只接受集成图的 2 input/2 output ABI，不能通过改文件名
+来运行四个增量 OM。必须先提供匹配每个 OM 状态 ABI 的通用 ACL micro-runner，
+并从正式生成 trace 捕获有效 KV/GDR/conv/Draft state 输入；随机零 state 不能作为
+状态 OM 的性能或正确性证据。
+
 ## 12. 常见失败定位
 
 | 失败 | 含义 | 处理 |
@@ -807,6 +958,31 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 6. C++ 负责同一 accepted count 下的原子 commit/abort；
 7. 对每一个 state 分支做 ordinary token/EOS 零差异门禁。
 
+四个 OM 更快的原因不是“文件数量更多”，而是它们允许把已经计算过的状态留在
+NPU，后续调用只处理新增 token：
+
+| 路径 | 每次物理工作 | 性能含义 |
+| --- | --- | --- |
+| 当前集成重算 OM | 对静态 `S` 重算 Target 全前缀，并同时计算 Draft | 生成 1 个 token 也会重做历史行；不需要 Draft 时也付出 Draft 代价 |
+| `target_prefill_64.om` | prompt 分块只执行一次，产生 Target KV/GDR/conv state | 历史 prompt 不再在每个 decode 轮次重算 |
+| `target_decode_1.om` | 处理 1 个新 token，读写常驻 Target state | ordinary/correction 路径的 query 长度从 `S` 降为 1 |
+| `draft_16.om` | 复用 Draft KV/feature state 生成一块 proposals | 不再为每轮 proposal 重算 Draft 全前缀 |
+| `target_verify_16.om` | 一次验证 anchor + 最多 15 个 proposals | 接受多个 token 时，一次 Target 调用被多个输出 token 分摊 |
+
+拆分后 ATC 还可以针对 `S=1`、`S=16` 和 `S=64` 分别选择内核、tiling 和工作区，
+避免用一个大的静态 shape 覆盖所有阶段。但这不是无条件的加速保证。要得到端到端收益，
+必须同时满足：
+
+- 四个 OM 只加载一次，device buffer 复用；
+- KV/GDR/conv/Draft state 常驻 device，不在每轮整体 H2D/D2H；
+- verify 的 candidate state 只提交 accepted 部分，拒绝时不重建全部历史；
+- C++ 尽量使用同一 stream 上的异步执行，不在每个小操作后同步；
+- Draft 接受率和每轮接受 token 数足以摊薄 `draft + verify` 两次调度开销。
+
+如果巨大 state 每轮搬回 CPU、新增了过多 stream synchronize、小 shape 的启动开销占主导，
+或 Draft 几乎全被拒绝，四 OM 路径可能反而更慢。所以门禁顺序必须是：先做单 OM
+msprof 和状态搬运审计，再做未 profiling 的端到端 3+10，最后与同身份闭源基线比较。
+
 这一步是新的状态 ABI，不能在没有真实 baseline 和 state-branch 测试时悄悄替换当前功能基线。
 
 ## 14. 官方接口依据
@@ -818,3 +994,6 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 - [AscendCL `aclmdlExecuteAsync`](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha002/apiref/appdevgapi/aclcppdevg_03_0299.html)：异步模型执行接口；
 - [AscendCL `aclrtMemcpyAsync`](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha002/apiref/appdevgapi/aclcppdevg_03_0106.html)：stream 上的异步输入输出复制；
 - [AscendCL `aclmdlLoadFromFile`](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0283.html)：从 OM 文件加载模型。
+- [msprof 采集命令](https://www.hiascend.com/document/detail/zh/canncommercial/900/devaids/Profiling/atlasprofiling_16_0011.html)：进程级 profiling 的采集参数；
+- [msprof query/export](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/devaids/Profiling/atlasprofiling_16_0021.html)：查询和导出采集数据；
+- [msprof 数据文件](https://www.hiascend.com/document/detail/zh/canncommercial/900/devaids/Profiling/atlasprofiling_16_0035.html)：各类 summary CSV 的字段和含义。

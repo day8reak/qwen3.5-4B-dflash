@@ -286,12 +286,14 @@ root = Path(source_root)
 source_hasher = hashlib.sha256()
 source_files = 0
 source_paths = [
+    root / "framework",
     root / "models" / "dflash_v1",
     root / "models" / "internal_dflash_bridge.py",
     root / "models" / "modeling_qwen3_5_hiai_nd_dflash_rollback.py",
     root / "models" / "export_model_wrapper_qwen3_5_dflash_rollback.py",
     root / "tools" / "run_msprof.sh",
     root / "docs" / "DFLASH_RUN_AND_VALIDATE.md",
+    root / "docs" / "QUANT_AIR_OM_FRAMEWORK.md",
     root / "config" / "npu_benchmark_v1.json",
 ]
 expanded = []
