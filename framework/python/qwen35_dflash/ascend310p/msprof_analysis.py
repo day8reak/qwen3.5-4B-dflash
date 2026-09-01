@@ -182,6 +182,12 @@ def _validate_runner_report(
         or not 1 <= requested_sync_window <= 8
     ):
         raise MsprofAnalysisError("runner DFlash sync window is invalid")
+    if int(report.get("schema_version", 0)) >= 11 and protocol.get(
+        "zero_accept_fallback_policy"
+    ) not in {"disabled", "request-target-only"}:
+        raise MsprofAnalysisError(
+            "runner zero-accept fallback policy is invalid"
+        )
     models = report.get("models")
     if not isinstance(models, list) or not models:
         raise MsprofAnalysisError("runner report omitted resident models")
@@ -1100,6 +1106,9 @@ def analyze_incremental_msprof(
         "expected_synchronization_signature": {
             "prefill_completion_policy": report["protocol"].get(
                 "prefill_completion_policy", "legacy-separate"
+            ),
+            "zero_accept_fallback_policy": report["protocol"].get(
+                "zero_accept_fallback_policy", "legacy-disabled"
             ),
             "stream_synchronizations": counters["stream_synchronizations"],
             "speculative_transactions": verify_transactions,

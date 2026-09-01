@@ -58,6 +58,7 @@ def _runner_report() -> dict[str, object]:
             "dflash_sync_window": 1,
             "draft_feature_policy": "committed-prefix",
             "prefill_completion_policy": "separate",
+            "zero_accept_fallback_policy": "disabled",
         },
         "execution_io_counters": {
             "model_executions": 8,
@@ -123,8 +124,8 @@ def _schema_nine_runner_report() -> dict[str, object]:
 
 def _schema_ten_runner_report() -> dict[str, object]:
     report = _schema_nine_runner_report()
-    report["schema_version"] = 10
-    report["runner_version"] = "1.18.0"
+    report["schema_version"] = 11
+    report["runner_version"] = "1.19.0"
     counters = report["execution_io_counters"]
     counters["speculative_window_direct_output_bindings"] = 0
     counters["speculative_window_direct_output_bytes"] = 0
@@ -288,6 +289,7 @@ def test_msprof_analysis_attributes_every_role_and_dynamic_gear(
     }
     assert payload["expected_synchronization_signature"] == {
         "prefill_completion_policy": "separate",
+        "zero_accept_fallback_policy": "disabled",
         "stream_synchronizations": 4,
         "speculative_transactions": 1,
         "speculative_sync_windows": 1,
@@ -510,6 +512,21 @@ def test_msprof_analysis_rejects_staging_for_window_one(
     _write_json(report_path, report)
 
     with pytest.raises(MsprofAnalysisError, match="do not close"):
+        analyze_incremental_msprof(
+            profile_dir=profile,
+            runner_report=report_path,
+        )
+
+
+def test_msprof_analysis_rejects_unknown_zero_accept_fallback_policy(
+    tmp_path: Path,
+) -> None:
+    report_path, profile = _case(tmp_path)
+    report = _schema_ten_runner_report()
+    report["protocol"]["zero_accept_fallback_policy"] = "unknown"
+    _write_json(report_path, report)
+
+    with pytest.raises(MsprofAnalysisError, match="zero-accept fallback"):
         analyze_incremental_msprof(
             profile_dir=profile,
             runner_report=report_path,

@@ -13,6 +13,17 @@ enum class GenerationMode {
   kDFlash,
 };
 
+// Exact low-acceptance scheduling policy.  The request-target-only candidate
+// observes a completed speculative transaction with zero accepted Draft
+// tokens, then uses the authoritative one-row Target route for the rest of
+// that request.  A multi-transaction synchronization window is always
+// consumed in full before the switch so host-visible tokens and device state
+// stay aligned.
+enum class ZeroAcceptFallbackPolicy {
+  kDisabled,
+  kRequestTargetOnly,
+};
+
 struct ProgressEvent {
   const char* phase = "single";
   GenerationMode mode = GenerationMode::kOrdinary;
@@ -127,6 +138,8 @@ struct GenerationOptions {
   std::size_t max_draft_tokens = 15;
   std::size_t dflash_sync_window = 1;
   bool coalesce_prefill_with_first_verify = false;
+  ZeroAcceptFallbackPolicy zero_accept_fallback_policy =
+      ZeroAcceptFallbackPolicy::kDisabled;
   std::vector<std::int64_t> eos_token_ids;
 };
 
@@ -139,6 +152,15 @@ struct GenerationCounters {
   // Physical speculative transactions completed inside the prefill timer.
   // They are not host-visible decode iterations.
   std::size_t prefill_speculative_windows = 0;
+  // Completed speculative transactions that accepted no Draft token.
+  std::size_t zero_accept_transactions = 0;
+  // At most one activation is possible per request.  Activation happens only
+  // when at least two generation slots remain, because a final one-row Target
+  // step would run without Draft under either policy.
+  std::size_t zero_accept_fallback_activations = 0;
+  // Authoritative one-row Target steps selected by an active fallback.  Each
+  // step replaces one otherwise eligible Draft + Verify transaction.
+  std::size_t target_only_fallback_iterations = 0;
   // Host-visible decode windows. With dflash_sync_window=1 this is also the
   // transaction count; a larger exact window may contain multiple rounds.
   std::size_t decode_iterations = 0;
@@ -178,6 +200,9 @@ struct BenchmarkResult {
   std::size_t total_drafted_tokens = 0;
   std::size_t total_accepted_draft_tokens = 0;
   std::size_t total_rejected_draft_tokens = 0;
+  std::size_t total_zero_accept_transactions = 0;
+  std::size_t total_zero_accept_fallback_activations = 0;
+  std::size_t total_target_only_fallback_iterations = 0;
   double acceptance_rate = 0.0;
   double generated_tokens_per_second = 0.0;
 };

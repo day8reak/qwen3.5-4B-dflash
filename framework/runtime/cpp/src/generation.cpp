@@ -148,6 +148,12 @@ BenchmarkResult FinalizeBenchmark(
         measurement.counters.accepted_draft_tokens;
     result.total_rejected_draft_tokens +=
         measurement.counters.rejected_draft_tokens;
+    result.total_zero_accept_transactions +=
+        measurement.counters.zero_accept_transactions;
+    result.total_zero_accept_fallback_activations +=
+        measurement.counters.zero_accept_fallback_activations;
+    result.total_target_only_fallback_iterations +=
+        measurement.counters.target_only_fallback_iterations;
   }
   result.prefill_ms = Summarize(prefill);
   result.decode_ms = Summarize(decode);
@@ -641,6 +647,7 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
   }
 
   bool finished = false;
+  bool target_only_fallback_active = false;
   AppendCommitted(
       final_prefill.token_ids,
       options.max_new_tokens,
@@ -658,6 +665,11 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
         coalesced_first_verify.accepted_draft_tokens;
     result.counters.rejected_draft_tokens +=
         coalesced_first_verify.rejected_draft_tokens;
+    const bool zero_accept =
+        coalesced_first_verify.accepted_draft_tokens == 0;
+    if (zero_accept) {
+      ++result.counters.zero_accept_transactions;
+    }
     const std::size_t remaining =
         options.max_new_tokens - generated.size();
     AppendCommitted(
@@ -667,6 +679,13 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
         &generated,
         &prefix,
         &finished);
+    if (zero_accept && !finished &&
+        options.zero_accept_fallback_policy ==
+            ZeroAcceptFallbackPolicy::kRequestTargetOnly &&
+        options.max_new_tokens - generated.size() > 1) {
+      target_only_fallback_active = true;
+      ++result.counters.zero_accept_fallback_activations;
+    }
   }
   const auto prefill_end = Clock::now();
   result.prefill_ms = Milliseconds(prefill_start, prefill_end);
@@ -688,8 +707,15 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
     std::vector<StatefulStep> steps;
     bool speculative = false;
     std::vector<std::size_t> proposal_counts;
-    if (mode == GenerationMode::kOrdinary || remaining == 1) {
+    const bool target_only_fallback_iteration =
+        mode == GenerationMode::kDFlash &&
+        target_only_fallback_active && remaining > 1;
+    if (mode == GenerationMode::kOrdinary || remaining == 1 ||
+        target_only_fallback_iteration) {
       steps.push_back(executor.DecodeOne(prefix.back()));
+      if (target_only_fallback_iteration) {
+        ++result.counters.target_only_fallback_iterations;
+      }
     } else {
       speculative = true;
       std::size_t worst_case_remaining = remaining;
@@ -717,6 +743,7 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
     if (speculative) {
       result.counters.speculative_transactions += steps.size();
     }
+    bool zero_accept_observed = false;
     for (std::size_t step_index = 0;
          step_index < steps.size(); ++step_index) {
       const auto& step = steps[step_index];
@@ -734,6 +761,10 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
             step.accepted_draft_tokens;
         result.counters.rejected_draft_tokens +=
             step.rejected_draft_tokens;
+        if (step.accepted_draft_tokens == 0) {
+          ++result.counters.zero_accept_transactions;
+          zero_accept_observed = true;
+        }
       }
       const std::size_t current_remaining =
           options.max_new_tokens - generated.size();
@@ -744,6 +775,17 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
           &generated,
           &prefix,
           &finished);
+    }
+    if (zero_accept_observed && !target_only_fallback_active && !finished &&
+        options.zero_accept_fallback_policy ==
+            ZeroAcceptFallbackPolicy::kRequestTargetOnly &&
+        options.max_new_tokens - generated.size() > 1) {
+      // The executor has already committed every transaction in this
+      // synchronized window.  Switch only after consuming the full returned
+      // window so the next one-row Target input observes the matching device
+      // state and host token prefix.
+      target_only_fallback_active = true;
+      ++result.counters.zero_accept_fallback_activations;
     }
 
     const auto decode_end = Clock::now();

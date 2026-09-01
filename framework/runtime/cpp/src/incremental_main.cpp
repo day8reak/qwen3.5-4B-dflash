@@ -37,6 +37,7 @@ using qwen35::dflash::IncrementalStateResetPolicy;
 using qwen35::dflash::PairedBenchmarkResult;
 using qwen35::dflash::ProgressCallback;
 using qwen35::dflash::ProgressEvent;
+using qwen35::dflash::ZeroAcceptFallbackPolicy;
 
 enum class MeasurementProtocol {
   kEvidence,
@@ -65,6 +66,8 @@ struct Arguments {
   std::size_t max_draft_tokens = 15;
   std::size_t dflash_sync_window = 1;
   bool coalesce_prefill_with_first_verify = false;
+  ZeroAcceptFallbackPolicy zero_accept_fallback_policy =
+      ZeroAcceptFallbackPolicy::kDisabled;
   std::size_t warmup = 3;
   std::size_t repetitions = 10;
   int device_id = 0;
@@ -99,6 +102,7 @@ void Usage(std::ostream& stream) {
       << "  --max-draft-tokens N                     default 15\n"
       << "  --dflash-sync-window N                   exact window in 1..8 (default 1)\n"
       << "  --prefill-completion-policy POLICY       separate (default) or coalesce-first-verify\n"
+      << "  --zero-accept-fallback-policy POLICY    disabled (default) or request-target-only\n"
       << "  --warmup N                               evidence=3, profile=1\n"
       << "  --repetitions N                          evidence=10, profile=1\n"
       << "  --device-id N                            default 0\n"
@@ -306,6 +310,18 @@ Arguments ParseArguments(int argc, char** argv) {
     throw std::invalid_argument(
         "prefill-completion-policy must be separate or coalesce-first-verify");
   }
+  const std::string zero_accept_fallback_policy = TakeOptional(
+      &values, "zero-accept-fallback-policy", "disabled");
+  if (zero_accept_fallback_policy == "disabled") {
+    result.zero_accept_fallback_policy =
+        ZeroAcceptFallbackPolicy::kDisabled;
+  } else if (zero_accept_fallback_policy == "request-target-only") {
+    result.zero_accept_fallback_policy =
+        ZeroAcceptFallbackPolicy::kRequestTargetOnly;
+  } else {
+    throw std::invalid_argument(
+        "zero-accept-fallback-policy must be disabled or request-target-only");
+  }
   result.warmup = ParseSize(TakeOptional(&values, "warmup", "3"), "warmup");
   result.repetitions = ParseSize(
       TakeOptional(&values, "repetitions", "10"), "repetitions");
@@ -472,6 +488,12 @@ void WriteMeasurement(
          << value.counters.speculative_transactions
          << ",\"prefill_speculative_windows\":"
          << value.counters.prefill_speculative_windows
+         << ",\"zero_accept_transactions\":"
+         << value.counters.zero_accept_transactions
+         << ",\"zero_accept_fallback_activations\":"
+         << value.counters.zero_accept_fallback_activations
+         << ",\"target_only_fallback_iterations\":"
+         << value.counters.target_only_fallback_iterations
          << ",\"decode_iterations\":" << value.counters.decode_iterations
          << "},\"latency_ms\":{\"prefill\":" << value.prefill_ms
          << ",\"decode\":" << value.decode_ms
@@ -501,6 +523,12 @@ void WriteBenchmark(std::ostream& output, const BenchmarkResult& value) {
          << value.total_accepted_draft_tokens
          << ",\"rejected_draft_tokens\":"
          << value.total_rejected_draft_tokens
+         << ",\"zero_accept_transactions\":"
+         << value.total_zero_accept_transactions
+         << ",\"zero_accept_fallback_activations\":"
+         << value.total_zero_accept_fallback_activations
+         << ",\"target_only_fallback_iterations\":"
+         << value.total_target_only_fallback_iterations
          << "},\"acceptance_rate\":" << value.acceptance_rate
          << ",\"generated_tokens_per_second\":"
          << value.generated_tokens_per_second << ",\"measurements\":[";
@@ -546,6 +574,21 @@ void WriteReport(
   const auto& execution = executor.execution_stats();
   const bool formal_latency_evidence =
       arguments.measurement_protocol == MeasurementProtocol::kEvidence;
+  if (result.ordinary.total_zero_accept_transactions != 0 ||
+      result.ordinary.total_zero_accept_fallback_activations != 0 ||
+      result.ordinary.total_target_only_fallback_iterations != 0 ||
+      result.dflash.total_zero_accept_fallback_activations >
+          result.dflash.total_zero_accept_transactions ||
+      (result.dflash.total_zero_accept_fallback_activations != 0 &&
+       result.dflash.total_target_only_fallback_iterations <
+           result.dflash.total_zero_accept_fallback_activations) ||
+      (arguments.zero_accept_fallback_policy ==
+           ZeroAcceptFallbackPolicy::kDisabled &&
+       (result.dflash.total_zero_accept_fallback_activations != 0 ||
+        result.dflash.total_target_only_fallback_iterations != 0))) {
+    throw std::runtime_error(
+        "zero-accept Target-only scheduler counters do not close");
+  }
   const std::size_t model_executions =
       execution.target_prefill_executions +
       execution.target_prefill_head_executions +
@@ -675,7 +718,7 @@ void WriteReport(
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":10,\"status\":\"PASS\","
+         << "{\"schema_version\":11,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
          << (executor.unified_target_step() ? "four" : "five")
          << "-resident-OM paired model loop\","
@@ -781,6 +824,17 @@ void WriteReport(
          << arguments.dflash_sync_window
          << ",\"maximum_supported_dflash_sync_window\":"
          << executor.max_speculative_sync_window()
+         << ",\"zero_accept_fallback_policy\":\""
+         << (arguments.zero_accept_fallback_policy ==
+                     ZeroAcceptFallbackPolicy::kRequestTargetOnly
+                 ? "request-target-only"
+                 : "disabled")
+         << "\",\"zero_accept_fallback_policy_description\":\""
+         << (arguments.zero_accept_fallback_policy ==
+                     ZeroAcceptFallbackPolicy::kRequestTargetOnly
+                 ? "after the first completed zero-accept transaction, consume the full synchronized window and use authoritative one-row Target steps for the rest of that request"
+                 : "every eligible DFlash iteration continues to execute Draft and Target verify regardless of observed acceptance")
+         << "\""
          << ",\"decode_iteration_scope\":\"one host-visible "
             "synchronization window; a DFlash window may contain one to "
             "eight complete speculative transactions\""
@@ -1206,6 +1260,8 @@ int main(int argc, char** argv) {
     options.dflash_sync_window = arguments.dflash_sync_window;
     options.coalesce_prefill_with_first_verify =
         arguments.coalesce_prefill_with_first_verify;
+    options.zero_accept_fallback_policy =
+        arguments.zero_accept_fallback_policy;
     options.eos_token_ids = arguments.eos_token_ids;
     PrintProgress(
         arguments.progress,

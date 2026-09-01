@@ -33,7 +33,7 @@ def _batched_cache_update_proposal() -> dict[str, object]:
 def test_incremental_contract_has_exact_approval_but_is_not_active() -> None:
     contract = _contract()
     approval = json.loads(APPROVAL_PATH.read_text(encoding="utf-8"))
-    assert contract["schema_version"] == 7
+    assert contract["schema_version"] == 8
     assert contract["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
     assert approval["status"] == "APPROVED"
     assert approval["approval_statement"] == "批准多OM状态图"
@@ -230,6 +230,16 @@ def test_hot_loop_keeps_large_state_and_proposals_on_device() -> None:
         "separate",
         "coalesce-first-verify",
     }
+    assert set(contract["hot_loop"]["zero_accept_fallback_policies"]) == {
+        "disabled",
+        "request-target-only",
+    }
+    assert "full synchronized window" in contract["hot_loop"][
+        "zero_accept_fallback_window_policy"
+    ]
+    assert "zero token/EOS mismatch" in contract["hot_loop"][
+        "zero_accept_fallback_selection_gate"
+    ]
     assert set(contract["hot_loop"]["device_memory_allocation_policies"]) == {
         "normal-only",
         "huge-first",
@@ -325,12 +335,12 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 22
+    assert framework_lock["schema_version"] == 23
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v22"
+        "qwen3.5-4b-quant-air-om-ascendcl-v23"
     )
     assert deployment["schema_version"] == 2
-    assert performance["schema_version"] == 4
+    assert performance["schema_version"] == 5
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -384,6 +394,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     ]
     assert "coalesce-first-verify" in runner[
         "required_prefill_completion_policy"
+    ]
+    assert "request-target-only" in runner[
+        "required_zero_accept_fallback_policy"
     ]
     assert "normal-only" in runner[
         "required_device_memory_allocation_policy"

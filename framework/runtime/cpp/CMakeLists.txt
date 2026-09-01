@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(qwen35_dflash_acl_runner VERSION 1.18.0 LANGUAGES CXX)
+project(qwen35_dflash_acl_runner VERSION 1.19.0 LANGUAGES CXX)
 
 option(QWEN35_DFLASH_BUILD_ACL_RUNNER "Build the AscendCL executable" ON)
 option(QWEN35_DFLASH_BUILD_TESTS "Build host-only scheduler tests" ON)
@@ -265,6 +265,44 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DDFLASH_SYNC_WINDOW=2
       -DMAX_NEW_TOKENS=10
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_incremental_acl_runner_zero_accept_fallback
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
+      -DDECODE_SHA=${_decode_om_sha256}
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DDRAFT_SHA=${_draft_om_sha256}
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om
+      -DVERIFY_SHA=${_verify_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-incremental-zero-accept-fallback-report.json
+      -DFAKE_ZERO_ACCEPT=ON
+      -DZERO_ACCEPT_FALLBACK_POLICY=request-target-only
+      -DMAX_NEW_TOKENS=10
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_incremental_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_incremental_acl_runner_zero_accept_comparison
+    COMMAND "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
+      -DDECODE_SHA=${_decode_om_sha256}
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DDRAFT_SHA=${_draft_om_sha256}
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om
+      -DVERIFY_SHA=${_verify_om_sha256}
+      -DOUTPUT_BASE=${CMAKE_CURRENT_BINARY_DIR}/fake-zero-accept-disabled.json
+      -DOUTPUT_FALLBACK=${CMAKE_CURRENT_BINARY_DIR}/fake-zero-accept-target-only.json
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_zero_accept_comparison.cmake
   )
   add_test(
     NAME qwen35_dflash_fake_incremental_acl_runner_window8

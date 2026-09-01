@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "abi_id": "qwen35-4b-ascend310p-performance-v1",
   "scope": "text-only batch-1 strict-greedy ordinary versus quant DFlash C++ OM timing",
   "prerequisites": {
@@ -20,7 +20,8 @@
     "compiled C++ device memory allocation policy",
     "decode carrier policy",
     "DFlash synchronization window",
-    "prefill completion policy"
+    "prefill completion policy",
+    "zero-accept fallback policy"
   ],
   "runner_contract": {
     "modes": ["ordinary", "dflash"],
@@ -29,6 +30,7 @@
     "required_decode_carrier_policy": "one-token-h2d or last-token-d2d; same-binary comparisons must hold every other case-identity field fixed",
     "required_draft_feature_policy": "fixed-16 is the rollback baseline; committed-prefix is an inactive exact candidate; same-binary and same-OM-hash comparisons must hold every other case-identity field fixed",
     "required_prefill_completion_policy": "separate is the rollback baseline; coalesce-first-verify is an inactive exact candidate that delays first-token visibility; same-binary and same-OM-hash comparisons must report TTFT and model-total separately",
+    "required_zero_accept_fallback_policy": "disabled is the rollback baseline; request-target-only is an inactive exact candidate that switches a request to authoritative one-row Target after the first completed zero-accept transaction and only after consuming the full synchronized window",
     "required_device_memory_allocation_policy": "runner reports must contain normal-only or huge-first; normal-only is the rollback default, huge-first requires separate same-source binaries and forward/reverse-order same-device unprofiled 3+10 evidence with identical OM hashes and zero token/EOS mismatch",
     "required_backend_hook": "synchronize()",
     "optional_state_reset_hooks_in_priority_order": [
@@ -48,6 +50,7 @@
       "speculative_window_direct_output_bindings and bytes",
       "prefill_verify_coalesced_windows and prefill_verify_synchronizations_elided",
       "prefill_verify_d2h_operations_elided, slot counts and padding bytes",
+      "per-measurement and total zero_accept_transactions, zero_accept_fallback_activations and target_only_fallback_iterations",
       "compact_slot_bytes, compact_ordinary_result_bytes and compact_verify_result_bytes",
       "proposal_count_staging_pinned_host_bytes",
       "host_to_device_bytes and full_host_to_device_bytes",

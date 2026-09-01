@@ -1,5 +1,5 @@
 {
-  "schema_version": 7,
+  "schema_version": 8,
   "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
   "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
   "approval": {
@@ -345,6 +345,13 @@
       "separate": "default rollback baseline; final prefill compact result is downloaded and synchronized before the first verify",
       "coalesce-first-verify": "inactive exact candidate; when max_new_tokens is greater than two, final prefill and the already-prepared first verify share one contiguous compact D2H and one stream synchronization"
     },
+    "zero_accept_fallback_policies": {
+      "disabled": "default matched baseline; every eligible DFlash iteration continues Draft plus Target verify regardless of prior acceptance",
+      "request-target-only": "inactive exact low-acceptance candidate; after the first completed transaction with accepted_count=0, consume the complete synchronized window and route every remaining eligible iteration in that request through authoritative one-row Target without Draft"
+    },
+    "zero_accept_fallback_exactness": "a zero-accept verify has already committed its authoritative correction token and selected the matching Target state slot; after the complete synchronized window is consumed, one-row Target continuation therefore produces the same strict-greedy suffix while omitting future Draft calls; no AIR/OM input, output, weight or custom-operator ABI changes",
+    "zero_accept_fallback_window_policy": "window 1 switches immediately after its zero-accept result; windows 2..8 must consume every already-enqueued transaction in order before switching because device state has advanced through the full synchronized window; later queued results are never discarded solely because the fallback triggered",
+    "zero_accept_fallback_selection_gate": "hold runner binary, OM hashes, prompt/token limits, reset, decode carrier, Draft feature, prefill completion, sync window and device identity fixed; run disabled versus request-target-only in forward and reverse order on representative low-acceptance and high-acceptance cases; require zero token/EOS mismatch and closed zero_accept_transactions, zero_accept_fallback_activations and target_only_fallback_iterations counters; select request-target-only only when real Ascend310P unprofiled 3+10 median and p90 improve without a high-acceptance regression outside measurement noise",
     "prefill_first_verify_budget_guard": "prefill commits one token and verify may commit K+1, so Draft is prepared only when max_new_tokens>2 and its K is min(max_draft,15,max_new_tokens-2); max_new_tokens=2 executes ordinary decode without a wasted Draft",
     "prefill_first_verify_compact_download": "the alternating compact slots share one contiguous arena; prefill slot 0 downloads slot_bytes+verify_bytes and pays slot_bytes-ordinary_bytes padding, while prefill slot 1 downloads slot_bytes+ordinary_bytes and pays slot_bytes-verify_bytes padding",
     "prefill_first_verify_timing_scope": "coalesce-first-verify delays first-token host visibility until verify completes, so prefill_ms/TTFT includes the first verify; compare model_total median/p90 and TTFT separately",
@@ -374,6 +381,9 @@
       "decode_id_device_compaction_operations == decode_id_multi_token_carrier_hits",
       "decode_id_device_compaction_bytes == 8 * decode_id_device_compaction_operations",
       "decode_id_upload_bytes == 8 * decode_id_upload_operations",
+      "ordinary zero_accept_transactions == zero_accept_fallback_activations == target_only_fallback_iterations == 0",
+      "zero_accept_fallback_activations <= zero_accept_transactions and at most one activation per DFlash request",
+      "disabled implies zero_accept_fallback_activations == target_only_fallback_iterations == 0",
       "speculative_sync_windows + speculative_synchronizations_elided + prefill_verify_coalesced_windows == target_verify_commit_executions",
       "stream_synchronizations == prefill_completion_synchronizations + target_decode1_executions + speculative_sync_windows",
       "device_to_host_operations + speculative_d2h_operations_elided + prefill_verify_d2h_operations_elided == prefill_completion_synchronizations + target_decode1_executions + target_verify_commit_executions",
@@ -429,6 +439,31 @@
       "additional_compact_device_bytes_vs_previous_runner": 512,
       "device_to_host_operations_unchanged": 117,
       "device_to_host_bytes_unchanged": 32604
+    },
+    "fake_acl_zero_accept_target_only_70_token_10_output_paired_3_plus_10": {
+      "classification": "matched host structural evidence only; Fake ACL timing is not Ascend310P latency",
+      "maximum_draft_tokens": 3,
+      "dflash_sync_window": 1,
+      "stable_generated_token_ids_both": [11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+      "stable_stop_reason_both": "length",
+      "token_id_mismatches": 0,
+      "eos_mismatches": 0,
+      "disabled_dflash_measurement_graph_calls": 200,
+      "request_target_only_dflash_measurement_graph_calls": 130,
+      "dflash_measurement_graph_call_reduction_percent": 35.0,
+      "disabled_zero_accept_transactions": 80,
+      "request_target_only_zero_accept_transactions": 10,
+      "request_target_only_fallback_activations": 10,
+      "request_target_only_target_steps": 70,
+      "paired_warmup_and_measurement_model_executions_disabled": 416,
+      "paired_warmup_and_measurement_model_executions_request_target_only": 325,
+      "draft_executions_disabled": 104,
+      "draft_executions_request_target_only": 13,
+      "verify_executions_disabled": 104,
+      "verify_executions_request_target_only": 13,
+      "target_decode_executions_disabled": 130,
+      "target_decode_executions_request_target_only": 221,
+      "claim_boundary": "the exact scheduler preserves authoritative tokens and replaces seven later Draft-plus-Verify pairs per measured low-acceptance request with seven one-row Target calls in this deterministic Fake ACL case; physical Ascend310P latency remains unmeasured and disabled remains default"
     },
     "fake_acl_prefill_first_verify_70_token_paired_3_plus_10": {
       "classification": "matched host structural evidence only; Fake ACL timing is not Ascend310P latency",
@@ -610,6 +645,7 @@
       "ordinary and DFlash zero token/EOS mismatch",
       "fixed-16 versus committed-prefix zero token/EOS mismatch with visible Draft KV equality below logical_draft_cursor",
       "DFlash sync windows 1,2,4,8 zero token/EOS mismatch on representative full-accept, rejection and early-EOS cases",
+      "disabled versus request-target-only zero-accept fallback forward/reverse 3+10 on representative low- and high-acceptance cases with closed activation/Target-only counters",
       "fixed-T16 causal scratch-suffix tests for logical K=1/3/5/7/15",
       "state rejection tests across positions 62/63/64/65",
       "full candidate-set memory/load report",

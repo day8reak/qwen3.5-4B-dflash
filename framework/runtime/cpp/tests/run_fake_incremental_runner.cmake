@@ -39,6 +39,9 @@ endif()
 if(NOT DEFINED PREFILL_COMPLETION_POLICY)
   set(PREFILL_COMPLETION_POLICY "separate")
 endif()
+if(NOT DEFINED ZERO_ACCEPT_FALLBACK_POLICY)
+  set(ZERO_ACCEPT_FALLBACK_POLICY "disabled")
+endif()
 if(NOT DEFINED MAX_NEW_TOKENS)
   set(MAX_NEW_TOKENS 6)
 endif()
@@ -64,6 +67,9 @@ string(REPEAT "1," 69 PROMPT_PREFIX)
 set(PROMPT_IDS "${PROMPT_PREFIX}10")
 
 file(REMOVE "${OUTPUT}" "${OUTPUT}.tmp")
+if(FAKE_ZERO_ACCEPT)
+  set(ENV{QWEN35_DFLASH_FAKE_ZERO_ACCEPT} "1")
+endif()
 execute_process(
   COMMAND "${RUNNER}"
     --target-prefill "${PREFILL}"
@@ -83,6 +89,7 @@ execute_process(
     --max-draft-tokens "${MAX_DRAFT_TOKENS}"
     --dflash-sync-window "${DFLASH_SYNC_WINDOW}"
     --prefill-completion-policy "${PREFILL_COMPLETION_POLICY}"
+    --zero-accept-fallback-policy "${ZERO_ACCEPT_FALLBACK_POLICY}"
     --warmup "${WARMUP}"
     --repetitions "${REPETITIONS}"
     --device-id 0
@@ -94,6 +101,7 @@ execute_process(
   OUTPUT_VARIABLE stdout
   ERROR_VARIABLE stderr
 )
+unset(ENV{QWEN35_DFLASH_FAKE_ZERO_ACCEPT})
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "fake incremental runner failed: ${result}\n${stdout}\n${stderr}")
 endif()
@@ -155,6 +163,7 @@ string(JSON prefill_verify_slot1 GET "${report}" execution_io_counters prefill_v
 string(JSON resets GET "${report}" execution_io_counters state_resets)
 string(JSON report_dflash_sync_window GET "${report}" protocol dflash_sync_window)
 string(JSON report_prefill_completion_policy GET "${report}" protocol prefill_completion_policy)
+string(JSON report_zero_accept_fallback_policy GET "${report}" protocol zero_accept_fallback_policy)
 string(JSON maximum_dflash_sync_window GET "${report}" protocol maximum_supported_dflash_sync_window)
 string(JSON report_reset_policy GET "${report}" protocol state_reset_policy)
 string(JSON report_decode_carrier_policy GET "${report}" protocol decode_carrier_policy)
@@ -238,6 +247,9 @@ string(JSON h2d_bytes GET "${report}" execution_io_counters host_to_device_bytes
 string(JSON decode_executions GET "${report}" execution_io_counters target_decode1_executions)
 string(JSON draft_executions GET "${report}" execution_io_counters draft_propose_executions)
 string(JSON verify_executions GET "${report}" execution_io_counters target_verify_commit_executions)
+string(JSON dflash_zero_accept_transactions GET "${report}" dflash totals zero_accept_transactions)
+string(JSON dflash_zero_accept_fallback_activations GET "${report}" dflash totals zero_accept_fallback_activations)
+string(JSON dflash_target_only_fallback_iterations GET "${report}" dflash totals target_only_fallback_iterations)
 math(EXPR transactions "${prefill_completions} + ${decode_executions} + ${verify_executions}")
 math(EXPR expected_synchronizations "${prefill_completions} + ${decode_executions} + ${speculative_windows}")
 math(EXPR closed_speculative_transactions "${speculative_windows} + ${speculative_syncs_elided} + ${prefill_verify_windows}")
@@ -359,6 +371,30 @@ if(NOT physical_topology STREQUAL EXPECTED_TOPOLOGY OR
    NOT report_zero_count_policy STREQUAL EXPECTED_ZERO_COUNT_POLICY)
   message(FATAL_ERROR "fake topology/startup identity differs: ${report}")
 endif()
+if(NOT report_zero_accept_fallback_policy STREQUAL ZERO_ACCEPT_FALLBACK_POLICY)
+  message(FATAL_ERROR "fake zero-accept fallback policy differs: ${report}")
+endif()
+if(FAKE_ZERO_ACCEPT)
+  if(ZERO_ACCEPT_FALLBACK_POLICY STREQUAL "request-target-only")
+    if(NOT dflash_zero_accept_transactions EQUAL REPETITIONS OR
+       NOT dflash_zero_accept_fallback_activations EQUAL REPETITIONS OR
+       NOT dflash_target_only_fallback_iterations GREATER 0)
+      message(FATAL_ERROR "fake zero-accept fallback counters failed: ${report}")
+    endif()
+  elseif(ZERO_ACCEPT_FALLBACK_POLICY STREQUAL "disabled")
+    if(NOT dflash_zero_accept_transactions GREATER REPETITIONS OR
+       NOT dflash_zero_accept_fallback_activations EQUAL 0 OR
+       NOT dflash_target_only_fallback_iterations EQUAL 0)
+      message(FATAL_ERROR "fake disabled zero-accept counters failed: ${report}")
+    endif()
+  else()
+    message(FATAL_ERROR "unknown ZERO_ACCEPT_FALLBACK_POLICY=${ZERO_ACCEPT_FALLBACK_POLICY}")
+  endif()
+elseif(NOT dflash_zero_accept_transactions EQUAL 0 OR
+       NOT dflash_zero_accept_fallback_activations EQUAL 0 OR
+       NOT dflash_target_only_fallback_iterations EQUAL 0)
+  message(FATAL_ERROR "full-accept fake run reported zero-accept fallback: ${report}")
+endif()
 if(DECODE_CARRIER_POLICY STREQUAL "last-token-d2d")
   if(NOT report_decode_carrier_policy STREQUAL DECODE_CARRIER_POLICY OR
      NOT decode_uploads EQUAL 0 OR
@@ -367,7 +403,8 @@ if(DECODE_CARRIER_POLICY STREQUAL "last-token-d2d")
      NOT decode_device_compactions EQUAL decode_multi_token_carrier_hits)
     message(FATAL_ERROR "fake last-token D2D counters failed: ${report}")
   endif()
-  if(NOT ADAPTIVE_PROPOSAL_COUNTS AND DFLASH_SYNC_WINDOW LESS_EQUAL 2 AND
+  if(NOT FAKE_ZERO_ACCEPT AND NOT ADAPTIVE_PROPOSAL_COUNTS AND
+     DFLASH_SYNC_WINDOW LESS_EQUAL 2 AND
      NOT decode_multi_token_carrier_hits GREATER 0)
     message(FATAL_ERROR "fake last-token D2D route had no multi-token hit: ${report}")
   endif()
@@ -439,7 +476,7 @@ if(ADAPTIVE_PROPOSAL_COUNTS AND
    NOT proposal_uploads EQUAL expected_dflash_requests)
   message(FATAL_ERROR "adaptive-K proposal uploads differ: ${report}")
 endif()
-if(NOT schema_version EQUAL 10 OR
+if(NOT schema_version EQUAL 11 OR
    NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR

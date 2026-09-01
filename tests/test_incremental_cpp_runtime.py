@@ -19,6 +19,7 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     ASYNC_MEMSET_STATE_RESET_POLICY,
     COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY,
     COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
+    DISABLED_ZERO_ACCEPT_FALLBACK_POLICY,
     FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     HUGE_FIRST_DEVICE_MEMORY_POLICY,
     IMMUTABLE_ZERO_STATE_RESET_POLICY,
@@ -27,6 +28,7 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
     MAX_DFLASH_SYNC_WINDOW,
     ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
+    REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY,
     SEPARATE_PREFILL_COMPLETION_POLICY,
     _INCREMENTAL_GRAPH_ABI,
     _UNIFIED_TARGET_STEP_GRAPH_ABI,
@@ -42,6 +44,9 @@ def _mode(
     generation_mode: str,
     *,
     prefill_speculative_windows: int = 0,
+    zero_accept_transactions: int = 0,
+    zero_accept_fallback_activations: int = 0,
+    target_only_fallback_iterations: int = 0,
 ) -> dict[str, object]:
     measurement = {
         "generated_token_ids": [11, 12, 13, 14, 15, 16],
@@ -49,6 +54,13 @@ def _mode(
         "counters": {
             "speculative_transactions": prefill_speculative_windows,
             "prefill_speculative_windows": prefill_speculative_windows,
+            "zero_accept_transactions": zero_accept_transactions,
+            "zero_accept_fallback_activations": (
+                zero_accept_fallback_activations
+            ),
+            "target_only_fallback_iterations": (
+                target_only_fallback_iterations
+            ),
         },
     }
     return {
@@ -58,6 +70,15 @@ def _mode(
         "repetitions": 10,
         "stable_generated_token_ids": [11, 12, 13, 14, 15, 16],
         "stable_stop_reason": "length",
+        "totals": {
+            "zero_accept_transactions": zero_accept_transactions * 10,
+            "zero_accept_fallback_activations": (
+                zero_accept_fallback_activations * 10
+            ),
+            "target_only_fallback_iterations": (
+                target_only_fallback_iterations * 10
+            ),
+        },
         "measurements": [copy.deepcopy(measurement) for _ in range(10)],
     }
 
@@ -76,6 +97,9 @@ def _report(
     draft_feature_policy: str = FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     dflash_sync_window: int = 1,
     prefill_completion_policy: str = SEPARATE_PREFILL_COMPLETION_POLICY,
+    zero_accept_fallback_policy: str = (
+        DISABLED_ZERO_ACCEPT_FALLBACK_POLICY
+    ),
 ) -> dict[str, object]:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
     request_count = 26
@@ -186,7 +210,7 @@ def _report(
         for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
-        "schema_version": 10,
+        "schema_version": 11,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -204,6 +228,16 @@ def _report(
             "device_memory_allocation_policy": "normal-only",
             "dflash_sync_window": dflash_sync_window,
             "maximum_supported_dflash_sync_window": MAX_DFLASH_SYNC_WINDOW,
+            "zero_accept_fallback_policy": zero_accept_fallback_policy,
+            "zero_accept_fallback_policy_description": (
+                "after the first completed zero-accept transaction, consume "
+                "the full synchronized window and use authoritative one-row "
+                "Target steps for the rest of that request"
+                if zero_accept_fallback_policy
+                == REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY
+                else "every eligible DFlash iteration continues to execute "
+                "Draft and Target verify regardless of observed acceptance"
+            ),
             "decode_iteration_scope": (
                 "one host-visible synchronization window; a DFlash window "
                 "may contain one to eight complete speculative transactions"
@@ -590,6 +624,9 @@ def _validate(
     draft_feature_policy: str = FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     dflash_sync_window: int = 1,
     prefill_completion_policy: str = SEPARATE_PREFILL_COMPLETION_POLICY,
+    zero_accept_fallback_policy: str = (
+        DISABLED_ZERO_ACCEPT_FALLBACK_POLICY
+    ),
     unified_target_step: bool = False,
 ) -> None:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
@@ -611,6 +648,7 @@ def _validate(
         draft_feature_policy=draft_feature_policy,
         dflash_sync_window=dflash_sync_window,
         prefill_completion_policy=prefill_completion_policy,
+        zero_accept_fallback_policy=zero_accept_fallback_policy,
     )
 
 
@@ -770,6 +808,42 @@ def test_incremental_runner_accepts_prefill_first_verify_coalescing() -> None:
     assert counters["prefill_verify_d2h_operations_elided"] == 13
 
 
+def test_incremental_runner_accepts_zero_accept_target_only_policy() -> None:
+    policy = REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY
+    report = _report(zero_accept_fallback_policy=policy)
+    report["dflash"] = _mode(
+        "dflash-strict-greedy",
+        zero_accept_transactions=1,
+        zero_accept_fallback_activations=1,
+        target_only_fallback_iterations=3,
+    )
+    _validate(report, zero_accept_fallback_policy=policy)
+
+
+def test_incremental_runner_rejects_zero_accept_fallback_counter_drift() -> None:
+    policy = REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY
+    report = _report(zero_accept_fallback_policy=policy)
+    report["dflash"] = _mode(
+        "dflash-strict-greedy",
+        zero_accept_transactions=1,
+        zero_accept_fallback_activations=1,
+        target_only_fallback_iterations=3,
+    )
+    report["dflash"]["totals"]["target_only_fallback_iterations"] -= 1
+    with pytest.raises(RuntimeError, match="zero-accept totals"):
+        _validate(report, zero_accept_fallback_policy=policy)
+
+
+def test_incremental_runner_rejects_zero_accept_fallback_policy_mismatch() -> None:
+    report = _report(
+        zero_accept_fallback_policy=(
+            REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY
+        )
+    )
+    with pytest.raises(RuntimeError, match="zero-accept fallback policy"):
+        _validate(report)
+
+
 def test_incremental_runner_accepts_acceptance_dependent_proposal_routes() -> None:
     report = _report(dflash_sync_window=8)
     counters = report["execution_io_counters"]
@@ -889,6 +963,9 @@ def test_incremental_runner_config_is_explicit() -> None:
             "prefill_completion_policy": (
                 COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
             ),
+            "zero_accept_fallback_policy": (
+                REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY
+            ),
             "pad_token_id": 0,
         },
         0,
@@ -905,6 +982,9 @@ def test_incremental_runner_config_is_explicit() -> None:
     assert identity["dflash_sync_window"] == 2
     assert identity["prefill_completion_policy"] == (
         COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
+    )
+    assert identity["zero_accept_fallback_policy"] == (
+        REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY
     )
     assert (
         identity["draft_feature_policy"]
@@ -987,6 +1067,22 @@ def test_incremental_runner_rejects_unknown_prefill_completion_policy() -> None:
                 "runtime": "AscendCL",
                 "state_policy": INCREMENTAL_STATE_POLICY,
                 "prefill_completion_policy": "unknown",
+            },
+            0,
+        )
+
+
+def test_incremental_runner_rejects_unknown_zero_accept_fallback_policy() -> None:
+    with pytest.raises(ValueError, match="zero_accept_fallback_policy"):
+        validate_cpp_runner_options(
+            {
+                "device_model": "Ascend310P3",
+                "cann": "test-cann",
+                "driver": "test-driver",
+                "firmware": "test-firmware",
+                "runtime": "AscendCL",
+                "state_policy": INCREMENTAL_STATE_POLICY,
+                "zero_accept_fallback_policy": "unknown",
             },
             0,
         )

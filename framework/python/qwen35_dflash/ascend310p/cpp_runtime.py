@@ -50,6 +50,12 @@ _INCREMENTAL_PREFILL_COMPLETION_POLICIES = {
     SEPARATE_PREFILL_COMPLETION_POLICY,
     COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY,
 }
+DISABLED_ZERO_ACCEPT_FALLBACK_POLICY = "disabled"
+REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY = "request-target-only"
+_INCREMENTAL_ZERO_ACCEPT_FALLBACK_POLICIES = {
+    DISABLED_ZERO_ACCEPT_FALLBACK_POLICY,
+    REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY,
+}
 NORMAL_ONLY_DEVICE_MEMORY_POLICY = "normal-only"
 HUGE_FIRST_DEVICE_MEMORY_POLICY = "huge-first"
 DEVICE_MEMORY_ALLOCATION_POLICIES = frozenset(
@@ -279,6 +285,20 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
             f"{SEPARATE_PREFILL_COMPLETION_POLICY!r} or "
             f"{COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY!r}"
         )
+    zero_accept_fallback_policy = str(
+        options.get(
+            "zero_accept_fallback_policy",
+            DISABLED_ZERO_ACCEPT_FALLBACK_POLICY,
+        )
+    ).strip()
+    if zero_accept_fallback_policy not in (
+        _INCREMENTAL_ZERO_ACCEPT_FALLBACK_POLICIES
+    ):
+        raise ValueError(
+            "C++ runner zero_accept_fallback_policy must be "
+            f"{DISABLED_ZERO_ACCEPT_FALLBACK_POLICY!r} or "
+            f"{REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY!r}"
+        )
     return {
         "cpu_fallback": False,
         "device": {
@@ -297,6 +317,7 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
         "draft_feature_policy": draft_feature_policy,
         "dflash_sync_window": dflash_sync_window,
         "prefill_completion_policy": prefill_completion_policy,
+        "zero_accept_fallback_policy": zero_accept_fallback_policy,
         "pad_token_id": pad_token_id,
     }
 
@@ -777,10 +798,11 @@ def validate_incremental_cpp_runner_report(
     draft_feature_policy: str = FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
     dflash_sync_window: int = 1,
     prefill_completion_policy: str = SEPARATE_PREFILL_COMPLETION_POLICY,
+    zero_accept_fallback_policy: str = DISABLED_ZERO_ACCEPT_FALLBACK_POLICY,
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
-    if report.get("schema_version") != 10:
+    if report.get("schema_version") != 11:
         raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
@@ -933,6 +955,30 @@ def validate_incremental_cpp_runner_report(
         expected_prefill_completion_description
     ):
         raise RuntimeError("incremental prefill completion description differs")
+    if zero_accept_fallback_policy not in (
+        _INCREMENTAL_ZERO_ACCEPT_FALLBACK_POLICIES
+    ):
+        raise ValueError("expected zero-accept fallback policy is invalid")
+    if (
+        protocol.get("zero_accept_fallback_policy")
+        != zero_accept_fallback_policy
+    ):
+        raise RuntimeError("incremental zero-accept fallback policy differs")
+    expected_zero_accept_fallback_description = (
+        "after the first completed zero-accept transaction, consume the full "
+        "synchronized window and use authoritative one-row Target steps for "
+        "the rest of that request"
+        if zero_accept_fallback_policy
+        == REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY
+        else "every eligible DFlash iteration continues to execute Draft and "
+        "Target verify regardless of observed acceptance"
+    )
+    if protocol.get("zero_accept_fallback_policy_description") != (
+        expected_zero_accept_fallback_description
+    ):
+        raise RuntimeError(
+            "incremental zero-accept fallback description differs"
+        )
     if protocol.get("prefill_control_policy") != (
         "each chunk uploads one prefix ending after IDs/effective length, "
         "final-Draft total count, a changed proposal count, or a changed "
@@ -1692,6 +1738,23 @@ def validate_incremental_cpp_runner_report(
         ("ordinary", ordinary, 0),
         ("DFlash", dflash, expected_measured_prefill_window),
     ):
+        scheduler_fields = (
+            "zero_accept_transactions",
+            "zero_accept_fallback_activations",
+            "target_only_fallback_iterations",
+        )
+        totals = mode_report.get("totals", {})
+        scheduler_totals = [totals.get(field) for field in scheduler_fields]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in scheduler_totals
+        ):
+            raise RuntimeError(
+                f"incremental {mode_name} zero-accept totals are invalid"
+            )
+        measured_scheduler_totals = {field: 0 for field in scheduler_fields}
         for measurement in mode_report["measurements"]:
             counters = measurement.get("counters", {})
             if counters.get("prefill_speculative_windows") != expected_window:
@@ -1702,6 +1765,44 @@ def validate_incremental_cpp_runner_report(
                 raise RuntimeError(
                     f"incremental {mode_name} speculative accounting underflowed"
                 )
+            scheduler_values = [counters.get(field) for field in scheduler_fields]
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in scheduler_values
+            ):
+                raise RuntimeError(
+                    f"incremental {mode_name} zero-accept measurement is invalid"
+                )
+            zero_transactions, activations, fallback_iterations = (
+                int(value) for value in scheduler_values
+            )
+            if (
+                activations > zero_transactions
+                or activations > 1
+                or (activations != 0 and fallback_iterations < activations)
+            ):
+                raise RuntimeError(
+                    f"incremental {mode_name} zero-accept measurement does not close"
+                )
+            for field, value in zip(scheduler_fields, scheduler_values):
+                measured_scheduler_totals[field] += int(value)
+        if any(
+            totals.get(field) != measured_scheduler_totals[field]
+            for field in scheduler_fields
+        ):
+            raise RuntimeError(
+                f"incremental {mode_name} zero-accept totals do not close"
+            )
+        if mode_name == "ordinary" and any(scheduler_totals):
+            raise RuntimeError("ordinary mode reported zero-accept fallback")
+        if (
+            zero_accept_fallback_policy
+            == DISABLED_ZERO_ACCEPT_FALLBACK_POLICY
+            and (scheduler_totals[1] != 0 or scheduler_totals[2] != 0)
+        ):
+            raise RuntimeError("disabled zero-accept fallback executed Target-only")
     if ordinary.get("stable_generated_token_ids") != dflash.get(
         "stable_generated_token_ids"
     ):
@@ -1828,6 +1929,8 @@ def run_cpp_pair(
                 str(identity["dflash_sync_window"]),
                 "--prefill-completion-policy",
                 identity["prefill_completion_policy"],
+                "--zero-accept-fallback-policy",
+                identity["zero_accept_fallback_policy"],
             ]
         )
     command.extend(["--progress", "true" if progress else "false"])
@@ -1879,6 +1982,9 @@ def run_cpp_pair(
             dflash_sync_window=identity["dflash_sync_window"],
             prefill_completion_policy=identity[
                 "prefill_completion_policy"
+            ],
+            zero_accept_fallback_policy=identity[
+                "zero_accept_fallback_policy"
             ],
         )
     else:

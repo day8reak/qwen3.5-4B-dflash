@@ -336,6 +336,9 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   Target verify 连续排入同一 stream，再用一次连续 D2H 和一次同步同时取回 prefill/verify 结果。
   它每个合格 DFlash 请求少一次 D2H 和一次 barrier，但会把第一次 verify 计入 `prefill_ms`，推迟
   首 token 的 host 可见时间；
+- 默认 `zero_accept_fallback_policy=disabled` 保持旧调度；精确候选 `request-target-only` 在首次
+  完成零接受 transaction 并消费完整同步窗口后，将该请求后续 eligible 迭代切换到一行 Target，
+  从而在低接受率场景不再反复运行 Draft + Verify；
 - 多 chunk prompt 的每个 `target-prefill` 把固定 64 行 feature 直接写入连续 device arena；中间
   chunk 不执行 `target-prefill-head`、不执行 `draft-propose`、不下载 compact 结果、不同步；最后
   一个 chunk 才依次执行一次 head 和（DFlash 模式下）一次完整 prompt 对应动态 gear 的 Draft，
@@ -1123,7 +1126,120 @@ token/EOS 全部一致，且代表性的长度、接受率和早 EOS 用例里 D
 内，继续使用默认 window 1。Fake ACL 只能验证排队、预算和 buffer 生命周期，不能作为选择门禁
 的时延输入。
 
-#### 5.5.2 A/B 选择 Draft 有效 feature 前缀
+#### 5.5.2 A/B 选择零接受后的 Target-only fallback
+
+torch_npu rollback 调度在某轮 `accepted_count=0` 后会关闭该请求后续 Draft；旧 C++ 多 OM
+runner 没有这一步，低接受率时仍反复支付 `draft-propose + target-verify-commit` 两次物理执行。
+现在同一个二进制提供两个精确策略：
+
+- `disabled`：默认回退基线，行为与修改前完全相同；
+- `request-target-only`：首次完成 `accepted_count=0` 的 transaction 后，本请求余下满足
+  `remaining>1` 的迭代改走一行 authoritative Target，不再运行 Draft；最后只剩一个 token 时原本
+  就会走 Target，因此不计作 fallback 节省。
+
+这不修改 AIR、OM、权重、自定义算子或 tensor ABI。零接受的 verify 已经提交 authoritative
+correction token，并选择了对应 Target state；从该 state 继续一行 Target，严格贪心 suffix 与普通
+生成相同。若 `dflash_sync_window>1`，runner 必须先按顺序消费已提交给 stream 的整个 window，
+然后再切换；不能看到第一个零接受结果后丢掉同一 window 后面已经推进 device state 的结果。
+
+先生成只差 fallback 字段的两份配置；其余身份必须保持一致：
+
+```bash
+for ZERO_ACCEPT_POLICY in disabled request-target-only; do
+  jq --arg policy "$ZERO_ACCEPT_POLICY" \
+    '.zero_accept_fallback_policy = $policy' \
+    config/quant_air_om_incremental_runner.example.json > \
+    "$AI_RUN_DIR/runner-zero-accept-${ZERO_ACCEPT_POLICY}.json"
+done
+```
+
+在真实低接受率 prompt 上先正序、再反序跑未开启 msprof 的 3+10。下面的 `infer-cpp` 自身会在
+同一进程中交替 ordinary/DFlash，并执行 token/EOS 零差异门禁：
+
+```bash
+for ORDER in forward reverse; do
+  if [ "$ORDER" = forward ]; then
+    POLICIES='disabled request-target-only'
+  else
+    POLICIES='request-target-only disabled'
+  fi
+  for ZERO_ACCEPT_POLICY in $POLICIES; do
+    "$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
+      --deployment-manifest "$INCREMENTAL_BUNDLE/deployment-manifest.json" \
+      --runner \
+        "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+      --runner-config \
+        "$AI_RUN_DIR/runner-zero-accept-${ZERO_ACCEPT_POLICY}.json" \
+      --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
+      --prompt '请逐步分析这个低接受率测试问题。' \
+      --chat \
+      --max-new-tokens 64 \
+      --max-draft-tokens 15 \
+      --device-id 0 \
+      --output \
+        "$AI_RUN_DIR/reports/zero-accept-${ZERO_ACCEPT_POLICY}-${ORDER}.json"
+  done
+done
+```
+
+先检查策略身份、严格输出与调度计数，再比较时延：
+
+```bash
+jq -e -s '
+  (length == 2) and
+  (([.[].protocol.zero_accept_fallback_policy] | sort) ==
+   ["disabled", "request-target-only"]) and
+  ([.[].ordinary.stable_generated_token_ids] | unique | length == 1) and
+  ([.[].dflash.stable_generated_token_ids] | unique | length == 1) and
+  ([.[].dflash.stable_stop_reason] | unique | length == 1) and
+  all(.ordinary_parity.status == "PASS" and
+      .ordinary_parity.token_id_mismatches == 0 and
+      .ordinary_parity.eos_mismatches == 0) and
+  all(
+    .ordinary.totals.zero_accept_transactions == 0 and
+    .ordinary.totals.zero_accept_fallback_activations == 0 and
+    .ordinary.totals.target_only_fallback_iterations == 0 and
+    (.dflash.totals.zero_accept_fallback_activations <=
+     .dflash.totals.zero_accept_transactions) and
+    ([.dflash.measurements[].counters.zero_accept_transactions] | add) ==
+      .dflash.totals.zero_accept_transactions and
+    ([.dflash.measurements[].counters.zero_accept_fallback_activations] | add) ==
+      .dflash.totals.zero_accept_fallback_activations and
+    ([.dflash.measurements[].counters.target_only_fallback_iterations] | add) ==
+      .dflash.totals.target_only_fallback_iterations
+  ) and
+  (.[0] as $a | .[1] as $b |
+   if $a.protocol.zero_accept_fallback_policy == "disabled"
+   then ($a.dflash.totals.zero_accept_fallback_activations == 0 and
+         $a.dflash.totals.target_only_fallback_iterations == 0)
+   else ($b.dflash.totals.zero_accept_fallback_activations == 0 and
+         $b.dflash.totals.target_only_fallback_iterations == 0)
+   end)
+' \
+  "$AI_RUN_DIR/reports/zero-accept-disabled-forward.json" \
+  "$AI_RUN_DIR/reports/zero-accept-request-target-only-forward.json"
+
+jq -s 'map({
+  policy: .protocol.zero_accept_fallback_policy,
+  acceptance_rate: .dflash.acceptance_rate,
+  zero_accept_transactions: .dflash.totals.zero_accept_transactions,
+  activations: .dflash.totals.zero_accept_fallback_activations,
+  target_only_iterations: .dflash.totals.target_only_fallback_iterations,
+  graph_calls: .dflash.totals.graph_calls,
+  dflash_median_ms: .dflash.latency_ms.model_total.median,
+  dflash_p90_ms: .dflash.latency_ms.model_total.p90,
+  tokens_per_second: .dflash.generated_tokens_per_second
+})' \
+  "$AI_RUN_DIR/reports/zero-accept-disabled-forward.json" \
+  "$AI_RUN_DIR/reports/zero-accept-request-target-only-forward.json"
+```
+
+把同一检查用于 reverse 报告，并补一个高接受率 prompt：高接受率时候选应不触发，不能产生可测
+回归。只有低接受率用例中正反序 median、p90 都稳定改善，且高接受率结果在噪声内、所有输出零
+差异，才把部署配置改为 `request-target-only`。否则保留默认 `disabled`。Fake ACL 只能证明首次
+零接受后每请求恰好触发一次、窗口状态对齐和 OM 调用数减少，不能证明 310P 真机加速。
+
+#### 5.5.3 A/B 选择 Draft 有效 feature 前缀
 
 `draft_feature_policy` 只改变同一个 `draft-propose.om` 的动态 N 档位，不增加 OM、不复制权重、
 不改变输入输出顺序。两个精确策略是：
@@ -1252,7 +1368,7 @@ jq -s 'map({
 N=1..16 gear、显存/workspace 增长、物理行没有收窄或结果落在测量噪声内，继续使用
 `fixed-16`。
 
-#### 5.5.3 A/B 选择 Prefill completion 策略
+#### 5.5.4 A/B 选择 Prefill completion 策略
 
 `prefill_completion_policy` 不改变 AIR、OM、模型权重或 tensor ABI。两个精确策略是：
 
@@ -1363,7 +1479,7 @@ jq -s 'map({
 和同步，且 `model_total` median/p90 稳定改善、业务又能接受更晚的首 token，才启用
 `coalesce-first-verify`。流式输出优先或 EOS 经常出现在首 token 时，默认保留 `separate`。
 
-#### 5.5.4 A/B 选择设备内存分配策略
+#### 5.5.5 A/B 选择设备内存分配策略
 
 这是 C++ 构建策略，不改变 PyTorch、AIR、OM、权重、tensor ABI 或 token 状态机，因此同一套 OM
 可直接复用。两种二进制必须从同一源码 revision 分别构建：
@@ -1529,6 +1645,7 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
   --decode-carrier-policy last-token-d2d \
   --dflash-sync-window 1 \
   --prefill-completion-policy separate \
+  --zero-accept-fallback-policy disabled \
   --draft-feature-policy fixed-16 \
   --progress true
 ```
@@ -1538,10 +1655,12 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
 carrier 基线。`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，不能保留
 文字占位符。把 `--dflash-sync-window` 改成 `2`、`4` 或 `8` 可运行第 5.5.1 节候选；正式默认仍
 是 `1`。
-把 `--prefill-completion-policy` 改成 `coalesce-first-verify` 可运行第 5.5.3 节候选；它会推迟
+把 `--prefill-completion-policy` 改成 `coalesce-first-verify` 可运行第 5.5.4 节候选；它会推迟
 首 token 的 host 可见时间，正式默认仍是 `separate`。
-把 `--draft-feature-policy` 改成 `committed-prefix` 可运行第 5.5.2 节候选；完成真机 A/B 前默认仍是
+把 `--draft-feature-policy` 改成 `committed-prefix` 可运行第 5.5.3 节候选；完成真机 A/B 前默认仍是
 `fixed-16`。
+把 `--zero-accept-fallback-policy` 改成 `request-target-only` 可运行第 5.5.2 节低接受率候选；
+完成低/高接受率正反序真机 A/B 前默认仍是 `disabled`。
 
 统一 Target-step 使用相同二进制，只改成四个 OM，**完全删除**两项 `--target-decode1` 参数：
 
@@ -1578,6 +1697,7 @@ export UNIFIED_TARGET_STEP_OM="$UNIFIED_BUNDLE/om/target-verify-commit.om"
   --decode-carrier-policy last-token-d2d \
   --dflash-sync-window 1 \
   --prefill-completion-policy separate \
+  --zero-accept-fallback-policy disabled \
   --draft-feature-policy fixed-16 \
   --progress true
 ```
@@ -1600,10 +1720,11 @@ export DECODE_CARRIER_POLICY=last-token-d2d
 export DFLASH_SYNC_WINDOW=1
 export DRAFT_FEATURE_POLICY=fixed-16
 export PREFILL_COMPLETION_POLICY=separate
+export ZERO_ACCEPT_FALLBACK_POLICY=disabled
 mkdir -p "$PROFILE_ROOT"
 
 for AIC_METRIC in PipeUtilization Memory MemoryUB; do
-  LABEL="five-om-stateful-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${PREFILL_COMPLETION_POLICY}-${AIC_METRIC}"
+  LABEL="five-om-stateful-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${PREFILL_COMPLETION_POLICY}-${ZERO_ACCEPT_FALLBACK_POLICY}-${AIC_METRIC}"
   CASE_ROOT="$PROFILE_ROOT/$LABEL"
   "$DFLASH_SOURCE/tools/run_msprof.sh" \
     --label "$LABEL" \
@@ -1638,6 +1759,7 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
       --decode-carrier-policy "$DECODE_CARRIER_POLICY" \
       --dflash-sync-window "$DFLASH_SYNC_WINDOW" \
       --prefill-completion-policy "$PREFILL_COMPLETION_POLICY" \
+      --zero-accept-fallback-policy "$ZERO_ACCEPT_FALLBACK_POLICY" \
       --draft-feature-policy "$DRAFT_FEATURE_POLICY" \
       --progress false
 done
@@ -1646,12 +1768,13 @@ done
 上面默认 profile window 1 和固定 16 行 Draft verify 输入。分析同步窗口候选时分别设
 `DFLASH_SYNC_WINDOW=2/4/8`；分析有效前缀候选时设
 `DRAFT_FEATURE_POLICY=committed-prefix`；分析 prefill 合并候选时设
-`PREFILL_COMPLETION_POLICY=coalesce-first-verify`。每个候选都要换一个新的
+`PREFILL_COMPLETION_POLICY=coalesce-first-verify`；分析零接受 fallback 时设
+`ZERO_ACCEPT_FALLBACK_POLICY=request-target-only`。每个候选都要换一个新的
 `PROFILE_ROOT`/`UNIFIED_PROFILE_ROOT` 后完整重跑，不能把两个窗口的 CSV 合并到同一 analysis
 目录。分析器会要求 `aclmdlExecuteAsync` 按 transaction 闭合、实际 D2H 加
 `speculative_d2h_operations_elided` 和 `prefill_verify_d2h_operations_elided` 后按 transaction
 闭合，而 `aclrtSynchronizeStream` 按
-`speculative_sync_windows` 闭合。schema 10 的 window 3..8 必须报告
+`speculative_sync_windows` 闭合。schema 11 的 window 3..8 必须报告
 `speculative_window_staging_operations=0`，所以 `aclrtMemcpyAsync` 期望值不再加 compact staging；
 `speculative_window_direct_output_bindings/bytes` 则必须与 Verify 直接输出闭合，但不会作为 memcpy
 事件出现。任何候选都不应伪装成少执行了 verify。
@@ -1664,7 +1787,7 @@ export UNIFIED_PROFILE_ROOT=/ABSOLUTE/PATH/qwen35-unified-target-step-msprof
 mkdir -p "$UNIFIED_PROFILE_ROOT"
 
 for AIC_METRIC in PipeUtilization Memory MemoryUB; do
-  LABEL="unified-target-step-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${PREFILL_COMPLETION_POLICY}-${AIC_METRIC}"
+  LABEL="unified-target-step-w${DFLASH_SYNC_WINDOW}-${DRAFT_FEATURE_POLICY}-${PREFILL_COMPLETION_POLICY}-${ZERO_ACCEPT_FALLBACK_POLICY}-${AIC_METRIC}"
   CASE_ROOT="$UNIFIED_PROFILE_ROOT/$LABEL"
   "$DFLASH_SOURCE/tools/run_msprof.sh" \
     --label "$LABEL" \
@@ -1700,6 +1823,7 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
       --decode-carrier-policy "$DECODE_CARRIER_POLICY" \
       --dflash-sync-window "$DFLASH_SYNC_WINDOW" \
       --prefill-completion-policy "$PREFILL_COMPLETION_POLICY" \
+      --zero-accept-fallback-policy "$ZERO_ACCEPT_FALLBACK_POLICY" \
       --draft-feature-policy "$DRAFT_FEATURE_POLICY" \
       --progress false
 done

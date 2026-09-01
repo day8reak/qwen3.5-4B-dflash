@@ -650,9 +650,12 @@ K；默认仍为 1，必须完成同机正反顺序 1/2/4/8 A/B。独立的
 host 可见时间，必须分别比较 TTFT 与总时延。prefill control 按 base/count/proposal/full 四档
 live prefix 复制：五图 slot 为 896 bytes；统一四图在 EOS count 后追加一个 64-byte 对齐的常驻
 INT32 零值，slot 为 960 bytes，ordinary T=1 直接绑定该零值，不再把正 proposal carrier 写成 0。
+`zero_accept_fallback_policy=disabled|request-target-only` 也只改变 C++ 调度；候选在首次零接受并
+消费完整同步窗口后关闭本请求后续 Draft，低接受率 A/B、计数门禁和正反序 3+10 命令见增量性能
+文档第 5.5.2 节。
 前三档仍为 578/644/708 bytes；这些内部 carrier 变化不改 tensor 名、shape 或 AIR/OM ABI。
 `normal-only`/`huge-first` 必须构建为两个同源码二进制，并做正反顺序真机 A/B；完整命令与
-选择门槛见增量性能文档第 5.5.4 节，未完成证据前默认仍是 `normal-only`。
+选择门槛见增量性能文档第 5.5.5 节，未完成证据前默认仍是 `normal-only`。
 
 不要把 build 目录或二进制提交进源码仓库。
 

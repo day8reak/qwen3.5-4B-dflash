@@ -422,6 +422,15 @@ aclError ExecuteDraft(const aclmdlDataset* input, aclmdlDataset* output) {
   for (std::size_t index = 1; index < kVerifyRows; ++index) {
     verify[index] = anchor + static_cast<std::int64_t>(index);
   }
+  const char* force_zero_accept =
+      std::getenv("QWEN35_DFLASH_FAKE_ZERO_ACCEPT");
+  if (force_zero_accept != nullptr &&
+      std::string(force_zero_accept) == "1") {
+    // Test-only fault injection: the first proposal differs from the
+    // authoritative Target row, so every speculative transaction accepts
+    // zero Draft tokens while preserving a deterministic correction token.
+    verify[1] += 100;
+  }
   Copy(output->buffers[1], input->buffers[5]);
   Copy(output->buffers[2], input->buffers[6]);
   SetScalar<std::int64_t>(

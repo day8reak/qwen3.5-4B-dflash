@@ -52,8 +52,11 @@ class FakeExecutor final : public qwen35::dflash::GraphExecutor {
 class FakeStatefulExecutor final
     : public qwen35::dflash::StatefulGraphExecutor {
  public:
-  explicit FakeStatefulExecutor(bool corrupt_second_proposal = false)
-      : corrupt_second_proposal_(corrupt_second_proposal) {}
+  explicit FakeStatefulExecutor(
+      bool corrupt_second_proposal = false,
+      bool corrupt_first_proposal = false)
+      : corrupt_second_proposal_(corrupt_second_proposal),
+        corrupt_first_proposal_(corrupt_first_proposal) {}
 
   std::size_t sequence_length() const noexcept override { return 256; }
   std::size_t prefill_width() const noexcept override { return 4; }
@@ -208,6 +211,9 @@ class FakeStatefulExecutor final
     for (std::size_t index = 0; index < logical_proposal_count; ++index) {
       std::int64_t token =
           anchor_ + static_cast<std::int64_t>(index) + 1;
+      if (corrupt_first_proposal_ && index == 0) {
+        token += 100;
+      }
       if (corrupt_second_proposal_ && index == 1) {
         token += 100;
       }
@@ -221,6 +227,7 @@ class FakeStatefulExecutor final
   }
 
   bool corrupt_second_proposal_ = false;
+  bool corrupt_first_proposal_ = false;
   std::vector<std::int64_t> eos_;
   std::int64_t anchor_ = 0;
   bool prepared_ = false;
@@ -600,6 +607,87 @@ void TestPrefillFirstVerifyCoalescingDoesNotCommitAfterPrefillEos() {
       "prefill EOS did not account for the queued verify transaction");
 }
 
+void TestZeroAcceptFallbackSwitchesToExactTargetOnlyGeneration() {
+  auto options = Options();
+  options.max_new_tokens = 10;
+  options.max_draft_tokens = 3;
+
+  FakeStatefulExecutor ordinary_executor(false, true);
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      ordinary_executor,
+      {10},
+      qwen35::dflash::GenerationMode::kOrdinary,
+      options);
+
+  FakeStatefulExecutor disabled_executor(false, true);
+  const auto disabled = qwen35::dflash::GenerateStatefulOnce(
+      disabled_executor,
+      {10},
+      qwen35::dflash::GenerationMode::kDFlash,
+      options);
+
+  options.zero_accept_fallback_policy =
+      qwen35::dflash::ZeroAcceptFallbackPolicy::kRequestTargetOnly;
+  FakeStatefulExecutor fallback_executor(false, true);
+  const auto fallback = qwen35::dflash::GenerateStatefulOnce(
+      fallback_executor,
+      {10},
+      qwen35::dflash::GenerationMode::kDFlash,
+      options);
+
+  Require(
+      ordinary.generated_token_ids == disabled.generated_token_ids &&
+          ordinary.generated_token_ids == fallback.generated_token_ids,
+      "zero-accept fallback changed authoritative tokens");
+  Require(
+      disabled.counters.zero_accept_transactions > 1 &&
+          disabled.counters.zero_accept_fallback_activations == 0 &&
+          disabled.counters.target_only_fallback_iterations == 0,
+      "disabled zero-accept policy changed the rollback baseline");
+  Require(
+      fallback.counters.zero_accept_transactions == 1 &&
+          fallback.counters.zero_accept_fallback_activations == 1 &&
+          fallback.counters.target_only_fallback_iterations > 0,
+      "zero-accept policy did not switch the request to Target-only");
+  Require(
+      fallback.counters.graph_calls < disabled.counters.graph_calls,
+      "zero-accept Target-only route did not eliminate OM executions");
+}
+
+void TestZeroAcceptFallbackConsumesAQueuedWindowBeforeSwitching() {
+  auto options = Options();
+  options.max_new_tokens = 16;
+  options.max_draft_tokens = 3;
+  options.dflash_sync_window = 2;
+  options.zero_accept_fallback_policy =
+      qwen35::dflash::ZeroAcceptFallbackPolicy::kRequestTargetOnly;
+  FakeStatefulExecutor executor(false, true);
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kOrdinary,
+      options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kDFlash,
+      options);
+  Require(
+      ordinary.generated_token_ids == dflash.generated_token_ids,
+      "windowed zero-accept fallback changed authoritative tokens");
+  Require(
+      executor.speculative_windows().size() == 1 &&
+          executor.speculative_windows().front() ==
+              std::vector<std::size_t>({3, 3}),
+      "zero-accept fallback did not consume exactly one queued window");
+  Require(
+      dflash.counters.speculative_transactions == 2 &&
+          dflash.counters.zero_accept_transactions == 2 &&
+          dflash.counters.zero_accept_fallback_activations == 1 &&
+          dflash.counters.target_only_fallback_iterations > 0,
+      "windowed zero-accept fallback counters differ");
+}
+
 void TestSha256KnownVector() {
   Require(
       qwen35::dflash::Sha256("abc") ==
@@ -627,6 +715,8 @@ int main() {
     TestSmallGenerationBudgetsPrepareOnlyBudgetSafeDraft();
     TestPrefillFirstVerifyCoalescingIsExactAndAccounted();
     TestPrefillFirstVerifyCoalescingDoesNotCommitAfterPrefillEos();
+    TestZeroAcceptFallbackSwitchesToExactTargetOnlyGeneration();
+    TestZeroAcceptFallbackConsumesAQueuedWindowBeforeSwitching();
     TestSha256KnownVector();
     std::cout << "PASS: recompute/stateful C++ schedulers, parity, EOS, "
                  "capacity and SHA-256\n";
