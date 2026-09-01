@@ -36,13 +36,13 @@ from .custom_op_export import (
     ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
     ADN_RMS_NORM_TORCH_OP,
     FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
+    FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
     NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
     NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
     NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
     NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
     NPU_DYNAMIC_QUANT_TORCH_OP,
     NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
-    NPU_QUANT_MATMUL_TORCH_OP,
     NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
     NPU_SCATTER_ND_UPDATE_TORCH_OP,
 )
@@ -408,7 +408,7 @@ def create_quant_recompute_graph(
             ),
         ),
         CustomOpExportSpec(
-            torch_op=NPU_QUANT_MATMUL_TORCH_OP,
+            torch_op=FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
             ge_op_type=str(
                 config.get(
                     "npu_quant_matmul_ge_op_type",

@@ -1,6 +1,6 @@
 {
-  "schema_version": 6,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v6",
+  "schema_version": 7,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v7",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -49,13 +49,16 @@
         "minimum_occurrences": 1
       },
       {
-        "frontend": "npu.npu_quant_matmul.default",
-        "frontend_schema": "npu::npu_quant_matmul(Tensor x1, Tensor x2, Tensor scale, *, Tensor? offset=None, Tensor? pertoken_scale=None, Tensor? bias=None, ScalarType? output_dtype=None, SymInt[]? group_sizes=None) -> Tensor",
+        "frontend": "qwen35_dflash.npu_quant_matmul_v4444.default",
+        "frontend_schema": "qwen35_dflash::npu_quant_matmul_v4444(Tensor x1, Tensor x2, Tensor scale, *, Tensor? offset=None, Tensor? pertoken_scale=None, Tensor? bias=None, ScalarType? output_dtype=None, SymInt[]? group_sizes=None) -> Tensor",
+        "source_frontend": "npu.npu_quant_matmul.default",
+        "source_frontend_schema": "npu::npu_quant_matmul(Tensor x1, Tensor x2, Tensor scale, *, Tensor? offset=None, Tensor? pertoken_scale=None, Tensor? bias=None, ScalarType? output_dtype=None, SymInt[]? group_sizes=None) -> Tensor",
         "fake_meta_outputs": [
           "broadcast batch + [x1[-2], x2[-1]], requested output dtype, input device"
         ],
         "default_ge_op_type": "QuantBatchMatmulV4444",
-        "converter": "framework registered GE IR; named receiver ABI; FP16 dtype=DT_FLOAT16; group_size=0",
+        "constraints": "private functional AIR frontend avoids the receiver TorchAir builtin V3 converter registered on the source target; eager forwards exactly to the source op",
+        "converter": "framework registered GE IR on the private target; named receiver ABI; FP16 dtype=DT_FLOAT16; group_size=0",
         "minimum_occurrences": 1
       },
       {

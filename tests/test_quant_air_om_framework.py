@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import importlib
+import importlib.machinery
 import json
 import os
 from pathlib import Path
@@ -29,6 +31,7 @@ from qwen35_dflash.ascend310p.custom_op_export import (
     ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
     ADN_RMS_NORM_TORCH_OP,
     FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
+    FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
     NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
     NPU_CACHE_UPDATE_TORCH_OP,
     NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
@@ -36,7 +39,6 @@ from qwen35_dflash.ascend310p.custom_op_export import (
     NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
     NPU_DYNAMIC_QUANT_TORCH_OP,
     NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
-    NPU_QUANT_MATMUL_TORCH_OP,
     NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
     NPU_SCATTER_ND_UPDATE_TORCH_OP,
     _validate_npu_quant_matmul_meta,
@@ -577,7 +579,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
             NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
         ),
         CustomOpExportSpec(
-            NPU_QUANT_MATMUL_TORCH_OP,
+            FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
             NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
         ),
         CustomOpExportSpec(
@@ -604,16 +606,19 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP: "framework-registered-ge-ir",
         NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP: "framework-registered-ge-ir",
         NPU_DYNAMIC_QUANT_TORCH_OP: "torchair-builtin",
-        NPU_QUANT_MATMUL_TORCH_OP: "framework-registered-ge-ir",
+        FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP: "framework-registered-ge-ir",
         NPU_SCATTER_ND_UPDATE_TORCH_OP: "torchair-builtin",
     }
     functional_cache_update = torch.ops.qwen35_dflash.npu_cache_update.default
+    functional_quant_matmul = (
+        torch.ops.qwen35_dflash.npu_quant_matmul_v4444.default
+    )
     assert set(torchair.converters) == {
         operations["adn_fused_infer_attention"],
         operations["adn_rms_norm"],
         functional_cache_update,
         operations["npu_chunk_gated_delta_rule"],
-        operations["npu_quant_matmul"],
+        functional_quant_matmul,
     }
 
     placeholder = object()
@@ -633,7 +638,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
     quant_matmul_session = next(
         session
         for session in sessions
-        if session.spec.torch_op == NPU_QUANT_MATMUL_TORCH_OP
+        if session.spec.torch_op == FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP
     )
     torchair.converters[operations["npu_chunk_gated_delta_rule"]](
         query,
@@ -652,7 +657,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
     quant_x1, quant_x2, scale, pertoken_scale = (
         object() for _ in range(4)
     )
-    torchair.converters[operations["npu_quant_matmul"]](
+    torchair.converters[functional_quant_matmul](
         quant_x1,
         quant_x2,
         scale,
@@ -854,7 +859,7 @@ def test_fused_attention_fake_keeps_frontend_operator_in_strict_export() -> None
 
 def test_w8a8_fakes_keep_dynamic_quant_and_quant_matmul_in_export() -> None:
     dynamic_quant = _ensure_target_test_schema("npu_dynamic_quant")
-    quant_matmul = _ensure_target_test_schema("npu_quant_matmul")
+    _ensure_target_test_schema("npu_quant_matmul")
     torchair = _FakeTorchAir()
     prepare_custom_op_export(
         CustomOpExportSpec(
@@ -865,11 +870,12 @@ def test_w8a8_fakes_keep_dynamic_quant_and_quant_matmul_in_export() -> None:
     )
     prepare_custom_op_export(
         CustomOpExportSpec(
-            NPU_QUANT_MATMUL_TORCH_OP,
+            FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
             NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
         ),
         torchair,
     )
+    quant_matmul = torch.ops.qwen35_dflash.npu_quant_matmul_v4444.default
 
     class UsesW8A8Ops(nn.Module):
         def forward(
@@ -898,7 +904,86 @@ def test_w8a8_fakes_keep_dynamic_quant_and_quant_matmul_in_export() -> None:
     )
     targets = [str(node.target) for node in exported.graph.nodes]
     assert "npu.npu_dynamic_quant.default" in targets
-    assert "npu.npu_quant_matmul.default" in targets
+    assert "qwen35_dflash.npu_quant_matmul_v4444.default" in targets
+
+
+def test_v4444_frontend_does_not_overwrite_torchair_builtin_v3_converter() -> None:
+    upstream = _ensure_target_test_schema("npu_quant_matmul")
+    torchair = _FakeTorchAir()
+    builtin_v3_converter = object()
+    torchair.converters[upstream] = builtin_v3_converter
+
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
+            NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+        ),
+        torchair,
+    )
+
+    private_frontend = (
+        torch.ops.qwen35_dflash.npu_quant_matmul_v4444.default
+    )
+    assert torchair.converters[upstream] is builtin_v3_converter
+    assert callable(torchair.converters[private_frontend])
+    assert private_frontend is not upstream
+
+
+def test_qlinear_helper_captures_private_v4444_frontend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ensure_target_test_schema("npu_quant_matmul")
+    prepare_custom_op_export(
+        CustomOpExportSpec(
+            FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
+            NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+        ),
+        _FakeTorchAir(),
+    )
+    fake_torch_npu = ModuleType("torch_npu")
+    fake_torch_npu.__spec__ = importlib.machinery.ModuleSpec(
+        "torch_npu",
+        loader=None,
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+    modeling = importlib.import_module("models.modeling_qwen3_5_hiai_nd")
+
+    def unexpected_source_call(*args: object, **kwargs: object) -> torch.Tensor:
+        del args, kwargs
+        raise AssertionError("AIR capture fell back to torch_npu.npu_quant_matmul")
+
+    fake_torch_npu.npu_quant_matmul = unexpected_source_call
+    monkeypatch.setattr(modeling, "torch_npu", fake_torch_npu)
+
+    class UsesQLinearHelper(nn.Module):
+        def forward(
+            self,
+            x1: torch.Tensor,
+            x2: torch.Tensor,
+            scale: torch.Tensor,
+            pertoken_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            return modeling._npu_quant_matmul_with_export_frontend(
+                x1,
+                x2,
+                scale,
+                pertoken_scale=pertoken_scale,
+                output_dtype=torch.float16,
+            )
+
+    exported = torch.export.export(
+        UsesQLinearHelper(),
+        (
+            torch.randint(-8, 8, (3, 8), dtype=torch.int8),
+            torch.randint(-8, 8, (8, 5), dtype=torch.int8),
+            torch.randn(5, dtype=torch.float32),
+            torch.randn(3, dtype=torch.float32),
+        ),
+        strict=True,
+    )
+    targets = [str(node.target) for node in exported.graph.nodes]
+    assert "qwen35_dflash.npu_quant_matmul_v4444.default" in targets
+    assert "npu.npu_quant_matmul.default" not in targets
 
 
 @pytest.mark.parametrize(
@@ -915,15 +1000,16 @@ def test_quant_matmul_v4444_converter_rejects_unlocked_routes(
     kwargs: dict[str, object],
     message: str,
 ) -> None:
-    operation = _ensure_target_test_schema("npu_quant_matmul")
+    _ensure_target_test_schema("npu_quant_matmul")
     torchair = _FakeTorchAir()
     prepare_custom_op_export(
         CustomOpExportSpec(
-            NPU_QUANT_MATMUL_TORCH_OP,
+            FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
             NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
         ),
         torchair,
     )
+    operation = torch.ops.qwen35_dflash.npu_quant_matmul_v4444.default
     with pytest.raises(RuntimeError, match=message):
         torchair.converters[operation](object(), object(), object(), **kwargs)
 
@@ -933,7 +1019,7 @@ def test_quant_matmul_rejects_legacy_v3_ge_type() -> None:
     with pytest.raises(RuntimeError, match="Update npu_quant_matmul_ge_op_type"):
         prepare_custom_op_export(
             CustomOpExportSpec(
-                NPU_QUANT_MATMUL_TORCH_OP,
+                FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
                 "QuantBatchMatmulV3",
             ),
             _FakeTorchAir(),
@@ -975,14 +1061,15 @@ def test_quant_matmul_meta_probe_uses_the_m_dimension_for_pertoken_scale() -> No
 
 
 def test_quant_matmul_meta_rejects_flattened_batch_times_m_scale() -> None:
-    operation = _ensure_target_test_schema("npu_quant_matmul")
+    _ensure_target_test_schema("npu_quant_matmul")
     prepare_custom_op_export(
         CustomOpExportSpec(
-            NPU_QUANT_MATMUL_TORCH_OP,
+            FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
             NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
         ),
         _FakeTorchAir(),
     )
+    operation = torch.ops.qwen35_dflash.npu_quant_matmul_v4444.default
     with pytest.raises(RuntimeError, match="x1 m dim value"):
         operation(
             torch.empty((2, 3, 8), dtype=torch.int8, device="meta"),
@@ -1693,7 +1780,10 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
         for item in spec.custom_ops
     } == {
         "npu.npu_dynamic_quant.default": ("DynamicQuant", 1),
-        "npu.npu_quant_matmul.default": ("QuantBatchMatmulV4444", 1),
+        "qwen35_dflash.npu_quant_matmul_v4444.default": (
+            "QuantBatchMatmulV4444",
+            1,
+        ),
         "npu.adn_rms_norm.default": ("RmsNorm", 1),
         "npu.npu_chunk_gated_delta_rule.default": (
             "ChunkGatedDeltaRule",

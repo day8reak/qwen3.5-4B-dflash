@@ -27,6 +27,9 @@ from .utils import count_ge_ir_nodes
 ADN_FUSED_INFER_ATTENTION_TORCH_OP = "npu::adn_fused_infer_attention"
 ADN_RMS_NORM_TORCH_OP = "npu::adn_rms_norm"
 FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP = "qwen35_dflash::npu_cache_update"
+FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP = (
+    "qwen35_dflash::npu_quant_matmul_v4444"
+)
 NPU_CACHE_UPDATE_TORCH_OP = "npu::npu_cache_update_"
 NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP = "npu::npu_chunk_gated_delta_rule"
 NPU_DYNAMIC_QUANT_TORCH_OP = "npu::npu_dynamic_quant"
@@ -711,6 +714,23 @@ _ADAPTERS = {
         return_types=("Tensor",),
         fake_kernel=_fake_npu_quant_matmul,
         validate_meta=_validate_npu_quant_matmul_meta,
+        converter_policy=_TORCHAIR_BUILTIN_CONVERTER,
+    ),
+    FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP: _OperatorAdapter(
+        torch_op=FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
+        argument_names=(
+            "x1", "x2", "scale", "offset", "pertoken_scale", "bias",
+            "output_dtype", "group_sizes",
+        ),
+        argument_types=(
+            "Tensor", "Tensor", "Tensor", "Optional[Tensor]",
+            "Optional[Tensor]", "Optional[Tensor]", "Optional[int]",
+            "Optional[List[int]]",
+        ),
+        kwarg_only=(False, False, False, True, True, True, True, True),
+        return_types=("Tensor",),
+        fake_kernel=_fake_npu_quant_matmul,
+        validate_meta=_validate_npu_quant_matmul_meta,
         converter_policy=_FRAMEWORK_CONVERTER,
     ),
     NPU_SCATTER_ND_UPDATE_TORCH_OP: _OperatorAdapter(
@@ -847,6 +867,76 @@ def _ensure_functional_npu_cache_update_op() -> None:
             )
             implementation.impl(
                 "npu_cache_update", _functional_npu_cache_update_impl
+            )
+            _FUNCTIONAL_OP_LIBRARIES.append(implementation)
+
+
+def _functional_npu_quant_matmul_impl(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    offset: torch.Tensor | None = None,
+    pertoken_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+    group_sizes: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """Exact eager forwarding for the project-private AIR frontend."""
+
+    return torch.ops.npu.npu_quant_matmul.default(
+        x1,
+        x2,
+        scale,
+        offset=offset,
+        pertoken_scale=pertoken_scale,
+        bias=bias,
+        output_dtype=output_dtype,
+        group_sizes=group_sizes,
+    )
+
+
+def _ensure_functional_npu_quant_matmul_op() -> None:
+    """Install a private frontend that cannot collide with TorchAir's V3 one."""
+
+    source_adapter = _ADAPTERS[NPU_QUANT_MATMUL_TORCH_OP]
+    source_spec = CustomOpExportSpec(
+        NPU_QUANT_MATMUL_TORCH_OP,
+        NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+    )
+    source_operation = _resolve_operation(source_spec)
+    _validate_schema(source_operation, source_adapter)
+
+    with _FUNCTIONAL_OP_REGISTRATION_LOCK:
+        namespace = getattr(torch.ops, "qwen35_dflash", None)
+        packet = (
+            None
+            if namespace is None
+            else getattr(namespace, "npu_quant_matmul_v4444", None)
+        )
+        operation = None if packet is None else getattr(packet, "default", None)
+        if operation is None:
+            definition = torch.library.Library("qwen35_dflash", "FRAGMENT")
+            definition.define(
+                "npu_quant_matmul_v4444("
+                "Tensor x1, Tensor x2, Tensor scale, *, "
+                "Tensor? offset=None, Tensor? pertoken_scale=None, "
+                "Tensor? bias=None, ScalarType? output_dtype=None, "
+                "SymInt[]? group_sizes=None) -> Tensor"
+            )
+            _FUNCTIONAL_OP_LIBRARIES.append(definition)
+
+        has_composite = torch._C._dispatch_has_kernel_for_dispatch_key(
+            FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
+            "CompositeExplicitAutograd",
+        )
+        if not has_composite:
+            implementation = torch.library.Library(
+                "qwen35_dflash", "IMPL", "CompositeExplicitAutograd"
+            )
+            implementation.impl(
+                "npu_quant_matmul_v4444",
+                _functional_npu_quant_matmul_impl,
             )
             _FUNCTIONAL_OP_LIBRARIES.append(implementation)
 
@@ -1035,7 +1125,7 @@ def _register_framework_converter(
 
         converter.__name__ = "convert_npu_chunk_gated_delta_rule_default"
         session.converter_mode = "named-gdr-effective-length-v2"
-    elif adapter.torch_op == NPU_QUANT_MATMUL_TORCH_OP:
+    elif adapter.torch_op == FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP:
         if spec.ge_op_type != NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE:
             raise RuntimeError(
                 "npu_quant_matmul has an exact Ascend310P lowering only to "
@@ -1084,7 +1174,7 @@ def _register_framework_converter(
                     "scale": scale,
                     "offset": offset,
                     # The receiver GE ABI orders bias before pertoken_scale,
-                    # unlike the npu::npu_quant_matmul frontend schema.
+                    # unlike both the source and private frontend schemas.
                     "bias": bias,
                     "pertoken_scale": pertoken_scale,
                 },
@@ -1265,6 +1355,8 @@ def prepare_custom_op_export(
         )
     if spec.torch_op == FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP:
         _ensure_functional_npu_cache_update_op()
+    elif spec.torch_op == FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP:
+        _ensure_functional_npu_quant_matmul_op()
     adapter = _ADAPTERS.get(spec.torch_op)
     if adapter is None:
         raise NotImplementedError(
@@ -1363,6 +1455,7 @@ __all__ = [
     "ADN_RMS_NORM_DEFAULT_GE_OP_TYPE",
     "ADN_RMS_NORM_TORCH_OP",
     "FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP",
+    "FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP",
     "NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE",
     "NPU_CACHE_UPDATE_TORCH_OP",
     "NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE",

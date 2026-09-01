@@ -55,6 +55,40 @@ else:
 logger = logging.get_logger(__name__)
 
 
+def _npu_quant_matmul_with_export_frontend(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    pertoken_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Use the collision-free V4444 frontend when export installed it."""
+
+    namespace = getattr(torch.ops, "qwen35_dflash", None)
+    packet = (
+        None
+        if namespace is None
+        else getattr(namespace, "npu_quant_matmul_v4444", None)
+    )
+    operation = None if packet is None else getattr(packet, "default", None)
+    if operation is not None:
+        return operation(
+            x1,
+            x2,
+            scale,
+            pertoken_scale=pertoken_scale,
+            output_dtype=output_dtype,
+        )
+    return torch_npu.npu_quant_matmul(
+        x1,
+        x2,
+        scale,
+        pertoken_scale=pertoken_scale,
+        output_dtype=output_dtype,
+    )
+
+
 def _cache_update_for_export(
     input: torch.Tensor,
     updates: torch.Tensor,
@@ -131,7 +165,7 @@ class QLinear(nn.Module):
     def forward(self, x):
         x_quant, pertoken_scale = torch_npu.npu_dynamic_quant(x)
         pertoken_scale = pertoken_scale.reshape(-1).to(torch.float32)
-        npu_out = torch_npu.npu_quant_matmul(
+        npu_out = _npu_quant_matmul_with_export_frontend(
             x_quant,
             self.W_q.to(x.device),
             self.scale.to(x.device),
