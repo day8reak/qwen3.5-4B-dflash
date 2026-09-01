@@ -776,6 +776,7 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | generic `Ascend310P` rejected | SoC 身份不精确 | 从设备/ATC 支持列表填写真实 variant |
 | OM input/output count mismatch | 导出 ABI 漂移 | 必须恢复 2 input/2 output INT64 合同或版本化新 ABI |
 | C++ OM hash mismatch | OM 被替换或 manifest 错配 | 使用同一次 build 的 OM 和 deployment manifest |
+| `ValueError: invalid literal for int() with base 10: 'input_ids'` | Python tokenizer 返回 `BatchEncoding`/Mapping，旧控制面误把字段名当 token ID 遍历；此时尚未启动 C++ runner | 更新本分支后重跑同一 `infer-cpp`；无需重新生成 AIR/OM，命令中的重复 `--chat`、`--max-new-tokens` 和 `--max-draft-tokens` 各保留一次 |
 | ordinary/DFlash token mismatch | 接受、correction、pad 或图语义错误 | 停止性能测试，定位首个 token 分叉 |
 | 延迟明显慢于闭源 | 完整前缀重算成为主瓶颈 | profile 后进入增量 OM state ABI，不要只优化 Python |
 

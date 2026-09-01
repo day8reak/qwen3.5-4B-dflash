@@ -48,6 +48,35 @@ def _normalize_eos(eos_token_id: Any) -> tuple[int, ...]:
     return tuple(int(item) for item in eos_token_id)
 
 
+def _extract_input_ids(values: Any) -> list[int]:
+    """Normalize tokenizer outputs to the single supported token-id sequence."""
+
+    if isinstance(values, Mapping):
+        if "input_ids" not in values:
+            raise ValueError("tokenizer mapping output does not contain input_ids")
+        values = values["input_ids"]
+    elif hasattr(values, "input_ids"):
+        values = values.input_ids
+
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+
+    if isinstance(values, (list, tuple)) and values:
+        if isinstance(values[0], (list, tuple)):
+            if len(values) != 1:
+                raise ValueError("only batch size 1 is supported")
+            values = values[0]
+
+    if values is None:
+        raise ValueError("tokenizer returned no input_ids")
+    try:
+        return [int(token) for token in values]
+    except TypeError as error:
+        raise ValueError(
+            f"tokenizer input_ids must be an iterable of integers, got {type(values).__name__}"
+        ) from error
+
+
 def tokenize_prompt(tokenizer: Any, prompt: str, *, chat: bool) -> list[int]:
     if chat:
         values = tokenizer.apply_chat_template(
@@ -57,13 +86,7 @@ def tokenize_prompt(tokenizer: Any, prompt: str, *, chat: bool) -> list[int]:
         )
     else:
         values = tokenizer.encode(prompt, add_special_tokens=True)
-    if hasattr(values, "tolist"):
-        values = values.tolist()
-    if values and isinstance(values[0], list):
-        if len(values) != 1:
-            raise ValueError("only batch size 1 is supported")
-        values = values[0]
-    result = [int(token) for token in values]
+    result = _extract_input_ids(values)
     if not result:
         raise ValueError("the prompt tokenized to an empty sequence")
     return result
