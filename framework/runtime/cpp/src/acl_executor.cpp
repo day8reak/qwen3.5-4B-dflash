@@ -1,5 +1,7 @@
 #include "qwen35_dflash/acl_executor.hpp"
 
+#include "acl_memory_policy.hpp"
+
 #include <acl/acl.h>
 
 #include <algorithm>
@@ -131,7 +133,8 @@ Buffer AllocateBuffer(std::size_t bytes) {
   Check(aclrtMallocHost(&buffer.host, bytes), "aclrtMallocHost");
   try {
     Check(
-        aclrtMalloc(&buffer.device, bytes, ACL_MEM_MALLOC_NORMAL_ONLY),
+        aclrtMalloc(
+            &buffer.device, bytes, kDeviceMemoryAllocationPolicy),
         "aclrtMalloc");
     buffer.data = aclCreateDataBuffer(buffer.device, bytes);
     if (buffer.data == nullptr) {

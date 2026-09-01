@@ -20,6 +20,7 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY,
     COMMITTED_PREFIX_DRAFT_FEATURE_POLICY,
     FIXED_VERIFY_WIDTH_DRAFT_FEATURE_POLICY,
+    HUGE_FIRST_DEVICE_MEMORY_POLICY,
     IMMUTABLE_ZERO_STATE_RESET_POLICY,
     INCREMENTAL_CPP_RUNNER_ID,
     INCREMENTAL_STATE_POLICY,
@@ -29,6 +30,7 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     _INCREMENTAL_GRAPH_ABI,
     _UNIFIED_TARGET_STEP_GRAPH_ABI,
     _resolve_incremental_oms,
+    build_cpp_runner,
     validate_cpp_runner_options,
     validate_incremental_cpp_runner_report,
 )
@@ -176,7 +178,7 @@ def _report(
         for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -191,6 +193,7 @@ def _report(
             "kind": "evidence",
             "formal_latency_evidence": True,
             "profile_model_execution_trace_enabled": False,
+            "device_memory_allocation_policy": "normal-only",
             "dflash_sync_window": dflash_sync_window,
             "maximum_supported_dflash_sync_window": 2,
             "decode_iteration_scope": (
@@ -621,6 +624,78 @@ def test_incremental_runner_report_closes_state_and_transaction_counters(
 def test_incremental_runner_report_closes_multi_chunk_prefill() -> None:
     prompt = [1] * 69 + [10]
     _validate(_report(prompt_token_ids=prompt), prompt_token_ids=prompt)
+
+
+def test_incremental_runner_accepts_huge_first_build_identity() -> None:
+    report = _report()
+    report["protocol"]["device_memory_allocation_policy"] = (
+        HUGE_FIRST_DEVICE_MEMORY_POLICY
+    )
+    _validate(report)
+
+
+@pytest.mark.parametrize("value", [None, "unknown"])
+def test_incremental_runner_rejects_unknown_device_memory_policy(
+    value: object,
+) -> None:
+    report = _report()
+    report["protocol"]["device_memory_allocation_policy"] = value
+    with pytest.raises(RuntimeError, match="device memory policy"):
+        _validate(report)
+
+
+def test_build_cpp_runner_rejects_unknown_device_memory_policy(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="device_memory_policy"):
+        build_cpp_runner(
+            build_dir=tmp_path / "build",
+            output=tmp_path / "build.json",
+            device_memory_policy="unknown",
+        )
+
+
+def test_build_cpp_runner_keeps_policy_specific_logs_with_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build = tmp_path / "build-huge-first"
+    report = tmp_path / "reports" / "build-huge-first.json"
+    monkeypatch.setenv("AI_RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(cpp_runtime, "preflight_cpp_runner", lambda _: None)
+    captured: list[list[str]] = []
+
+    def fake_run(
+        command: list[str], **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        captured.append(command)
+        if "--build" in command:
+            for name in (
+                "qwen35_dflash_acl_runner",
+                "qwen35_dflash_incremental_acl_runner",
+            ):
+                runner = build / name
+                runner.write_text("fake runner", encoding="utf-8")
+                runner.chmod(0o755)
+        return subprocess.CompletedProcess(command, 0, stdout="PASS\n")
+
+    monkeypatch.setattr(cpp_runtime.subprocess, "run", fake_run)
+    payload = build_cpp_runner(
+        build_dir=build,
+        output=report,
+        cmake="/usr/bin/cmake",
+        device_memory_policy=HUGE_FIRST_DEVICE_MEMORY_POLICY,
+    )
+
+    assert any(
+        "-DQWEN35_DFLASH_DEVICE_MEMORY_POLICY=huge-first" in command
+        for command in captured
+    )
+    assert payload["device_memory_allocation_policy"] == "huge-first"
+    for record in payload["logs"].values():
+        assert record["path"].startswith(
+            "build-huge-first/qwen35_dflash_build_logs/"
+        )
 
 
 def test_unified_incremental_runner_report_closes_resident_zero_count() -> None:

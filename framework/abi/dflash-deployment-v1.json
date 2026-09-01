@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "abi_id": "qwen35-4b-dflash-ascend310p-deployment-v1",
   "artifact_manifest": {
     "air": "qwen35-dflash-torchair-bundle",
@@ -60,6 +60,7 @@
     "commands": ["build-cpp", "infer-cpp", "run-e2e-cpp"],
     "model_load": "once per paired benchmark process and excluded from model-loop latency",
     "memory": "aclrtMallocHost plus persistent aclrtMalloc buffers/datasets; after the first full upload, each input copies only its changed contiguous range",
+    "device_memory_allocation_policy": "build-time normal-only rollback or huge-first exact candidate; the runner report records the compiled choice and promotion requires same-source/same-OM physical-device A/B evidence",
     "execution": "one stream queues ranged H2D, aclmdlExecuteAsync, the last K+1 Target rows plus full Draft IDs D2H, followed by one aclrtSynchronizeStream per OM call",
     "execution_io_report": "actual versus full-equivalent transfer bytes, operations, skipped H2D copies, model executions and stream synchronizations",
     "memory_query": "runner report records aclmdlQuerySize work_bytes and weight_bytes before load",

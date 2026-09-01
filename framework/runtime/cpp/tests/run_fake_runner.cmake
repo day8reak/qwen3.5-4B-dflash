@@ -44,11 +44,17 @@ string(JSON full_h2d_bytes GET "${report}" execution_io_counters full_host_to_de
 string(JSON d2h_bytes GET "${report}" execution_io_counters device_to_host_bytes)
 string(JSON full_d2h_bytes GET "${report}" execution_io_counters full_device_to_host_bytes)
 string(JSON maximum_target_elements GET "${report}" execution_io_counters maximum_target_elements_per_call)
+string(JSON device_memory_policy GET "${report}" protocol device_memory_allocation_policy)
+set(device_memory_policy_valid FALSE)
+if(device_memory_policy STREQUAL "normal-only" OR
+   device_memory_policy STREQUAL "huge-first")
+  set(device_memory_policy_valid TRUE)
+endif()
 if(NOT status STREQUAL "PASS" OR NOT mismatch EQUAL 0 OR
    NOT eos_mismatch EQUAL 0 OR NOT repetitions EQUAL 10 OR
    NOT work_bytes EQUAL 64 OR NOT weight_bytes EQUAL 256 OR
    NOT executions EQUAL 117 OR NOT synchronizations EQUAL executions OR
    NOT h2d_bytes LESS full_h2d_bytes OR NOT d2h_bytes LESS full_d2h_bytes OR
-   NOT maximum_target_elements EQUAL 16)
+   NOT maximum_target_elements EQUAL 16 OR NOT device_memory_policy_valid)
   message(FATAL_ERROR "fake ACL report gates failed: ${report}")
 endif()

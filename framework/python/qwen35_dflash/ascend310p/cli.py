@@ -100,6 +100,7 @@ def command_build_cpp(args: argparse.Namespace) -> int:
         output=args.output,
         cmake=args.cmake,
         ascendcl_root=args.ascendcl_root,
+        device_memory_policy=args.device_memory_policy,
     )
     _print(payload)
     return 0
@@ -399,6 +400,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--ascendcl-root",
         type=Path,
         help="active CANN toolkit root; otherwise use declared environment variables",
+    )
+    build_cpp.add_argument(
+        "--device-memory-policy",
+        choices=("normal-only", "huge-first"),
+        default="normal-only",
+        help=(
+            "aclrtMalloc policy compiled into both runners; build separate "
+            "directories for a target-device A/B"
+        ),
     )
     build_cpp.set_defaults(handler=command_build_cpp)
 

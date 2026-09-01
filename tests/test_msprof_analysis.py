@@ -413,3 +413,17 @@ def test_msprof_analysis_rejects_formal_evidence_report(tmp_path: Path) -> None:
             profile_dir=profile,
             runner_report=report_path,
         )
+
+
+def test_msprof_analysis_requires_memory_policy_for_schema_eight(
+    tmp_path: Path,
+) -> None:
+    report_path, profile = _case(tmp_path)
+    report = _runner_report()
+    report["schema_version"] = 8
+    _write_json(report_path, report)
+    with pytest.raises(MsprofAnalysisError, match="memory allocation policy"):
+        analyze_incremental_msprof(
+            profile_dir=profile,
+            runner_report=report_path,
+        )

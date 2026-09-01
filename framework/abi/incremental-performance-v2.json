@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
   "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
   "approval": {
@@ -308,12 +308,18 @@
     "serial_workspace_budget": "maximum queried workSize when all resident models are proven to execute serially with one shared workspace",
     "weight_budget": "sum queried weightSize; cross-artifact weight sharing must not be assumed",
     "state_budget": "persistent state plus peak transient state/workspace plus I/O and a declared safety margin",
+    "device_memory_allocation_policy": "normal-only is the rollback default; huge-first is selected only by a same-source, same-OM, same-case, forward/reverse-order physical Ascend310P A/B whose runner reports record the compiled policy",
     "load_test": "load the complete candidate set together on the exact 310P product before timing",
     "profile": "unprofiled 3 warmups plus 10 measurements for promotion with execution tracing disabled; msprof profile 1+1 is diagnostic only and must pass complete model-ID/infer-ID/physical-row attribution plus exact runtime API count closure",
     "profile_analyzer": "qwen35_dflash.ascend310p analyze-msprof rejects default partial exports, duplicate model/infer groups, missing Task Duration, role/gear count drift and aclmdlExecuteAsync/aclrtMemcpyAsync/aclrtMemsetAsync/aclrtSynchronizeStream count drift",
     "winner": "lowest median end-to-end model-loop latency among zero-mismatch candidates, not the candidate with the most or fewest OM files"
   },
   "hot_loop": {
+    "device_memory_allocation_policies": {
+      "normal-only": "default rollback binary; every explicit runner aclrtMalloc uses ACL_MEM_MALLOC_NORMAL_ONLY",
+      "huge-first": "inactive exact build candidate; every explicit runner aclrtMalloc uses ACL_MEM_MALLOC_HUGE_FIRST, including per-artifact weights, the serial shared workspace, persistent state and carriers"
+    },
+    "device_memory_allocation_selection_gate": "build two separate binaries from the same source revision, keep all OM hashes, runner options, prompt/token limits and target identity fixed, use forward/reverse-order runs (normal-only then huge-first, followed by huge-first then normal-only), require both reports to name their compiled policy and preserve zero token/EOS mismatch, reject either load failure or unsafe memory headroom, and select huge-first only when physical Ascend310P unprofiled 3+10 model-total median and p90 improve outside measurement noise; otherwise retain normal-only",
     "resident_models": true,
     "resident_datasets_and_device_buffers": true,
     "stream": "one request stream unless profile proves overlap safe and beneficial",
@@ -570,7 +576,8 @@
       "fixed-T16 causal scratch-suffix tests for logical K=1/3/5/7/15",
       "state rejection tests across positions 62/63/64/65",
       "full candidate-set memory/load report",
-      "same-device unprofiled 3+10 fixed-16 versus committed-prefix performance comparison plus msprof physical-row attribution"
+      "same-device unprofiled 3+10 fixed-16 versus committed-prefix performance comparison plus msprof physical-row attribution",
+      "same-device forward/reverse normal-only versus huge-first build comparison with policy identity, memory headroom, zero mismatch and unprofiled median/p90 evidence before changing the allocation default"
     ]
   },
   "claim_boundary": "Approval authorizes implementation of this exact ABI. APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE is not evidence that any topology exports, loads, fits, is correct, or is faster on a physical Ascend310P device."

@@ -602,7 +602,8 @@ $AI_RUN_DIR/artifacts/quant-dflash/
 "$MODEL_PYTHON" -m qwen35_dflash.ascend310p build-cpp \
   --build-dir "$AI_RUN_DIR/build/cpp-release" \
   --output "$AI_RUN_DIR/reports/cpp-build.json" \
-  --ascendcl-root /ABSOLUTE/PATH/CANN
+  --ascendcl-root /ABSOLUTE/PATH/CANN \
+  --device-memory-policy normal-only
 ```
 
 生产 runner 使用：
@@ -611,6 +612,8 @@ $AI_RUN_DIR/artifacts/quant-dflash/
 - `aclmdlLoadFromFile`，进程内只加载一次 OM；
 - `aclrtMallocHost` pinned host buffer；
 - 持久化 device buffer 和 dataset；
+- 默认把所有显式 device 分配编译为 `normal-only`；可在独立目录构建 `huge-first` 精确候选，
+  两种 runner 都把策略写入报告；
 - 第一次调用完整上传两个输入；之后保留 device mirror，只上传相对上次调用变化的连续区间；
 - Target `[1,S]` 只下载当前 prefix 尾部最多 `K+1` 行，覆盖 prefill/proposal 的最后一行和
   verify 的 anchor 到最后 proposal；Draft 的 K 个 ID 仍完整下载；
@@ -640,6 +643,8 @@ host 可见时间，必须分别比较 TTFT 与总时延。prefill control 按 b
 live prefix 复制：五图 slot 为 896 bytes；统一四图在 EOS count 后追加一个 64-byte 对齐的常驻
 INT32 零值，slot 为 960 bytes，ordinary T=1 直接绑定该零值，不再把正 proposal carrier 写成 0。
 前三档仍为 578/644/708 bytes；这些内部 carrier 变化不改 tensor 名、shape 或 AIR/OM ABI。
+`normal-only`/`huge-first` 必须构建为两个同源码二进制，并做正反顺序真机 A/B；完整命令与
+选择门槛见增量性能文档第 5.5.4 节，未完成证据前默认仍是 `normal-only`。
 
 不要把 build 目录或二进制提交进源码仓库。
 
@@ -854,8 +859,8 @@ runner/OM/input 做未 profile 的 3+10 A/B，msprof API timeline 仅用于解�
 闭合，stream synchronization 按
 `speculative_sync_windows` 闭合，完整命令见增量性能文档第 5.5.1 节。
 
-多 OM profile 必须使用报告 schema 7 中的运行时 model ID、逐次执行 trace、Draft feature
-策略与逐次物理行数做严格归因，
+多 OM profile 必须使用报告 schema 8 中的运行时 model ID、逐次执行 trace、Draft feature
+策略、编译期设备内存分配策略与逐次物理行数做严格归因，
 不能靠文件顺序猜测 OM 角色。采集完成后运行
 `python -m qwen35_dflash.ascend310p analyze-msprof`；完整命令、输入约束和判定规则见
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节。分析器会拒绝只导出单个 model/iteration 的

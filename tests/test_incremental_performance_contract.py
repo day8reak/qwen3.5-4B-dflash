@@ -33,6 +33,7 @@ def _batched_cache_update_proposal() -> dict[str, object]:
 def test_incremental_contract_has_exact_approval_but_is_not_active() -> None:
     contract = _contract()
     approval = json.loads(APPROVAL_PATH.read_text(encoding="utf-8"))
+    assert contract["schema_version"] == 5
     assert contract["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
     assert approval["status"] == "APPROVED"
     assert approval["approval_statement"] == "批准多OM状态图"
@@ -228,6 +229,13 @@ def test_hot_loop_keeps_large_state_and_proposals_on_device() -> None:
         "separate",
         "coalesce-first-verify",
     }
+    assert set(contract["hot_loop"]["device_memory_allocation_policies"]) == {
+        "normal-only",
+        "huge-first",
+    }
+    assert "forward/reverse-order" in contract["hot_loop"][
+        "device_memory_allocation_selection_gate"
+    ]
     assert "max_new_tokens>2" in contract["hot_loop"][
         "prefill_first_verify_budget_guard"
     ]
@@ -302,6 +310,8 @@ def test_document_contains_memory_inspector_and_claim_boundary() -> None:
     assert "--dflash-sync-window" in document
     assert "--draft-feature-policy" in document
     assert "--prefill-completion-policy" in document
+    assert "--device-memory-policy" in document
+    assert "ACL_MEM_MALLOC_HUGE_FIRST" in document
     assert "committed-prefix" in document
     assert "1,006,632,960" in document
     assert "K0=15,K1=14" in document
@@ -313,7 +323,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 19
+    assert framework_lock["schema_version"] == 20
+    assert deployment["schema_version"] == 2
+    assert performance["schema_version"] == 2
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -337,6 +349,8 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert "coalesce-first-verify" in runtime[
         "incremental_prefill_completion"
     ]
+    assert "normal-only" in runtime["device_memory_allocation"]
+    assert "huge-first" in runtime["device_memory_allocation"]
 
     cpp_runtime = deployment["cpp_runtime"]
     assert "changed contiguous range" in cpp_runtime["memory"]
@@ -344,6 +358,7 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert "actual versus full-equivalent transfer bytes" in (
         cpp_runtime["execution_io_report"]
     )
+    assert "huge-first" in cpp_runtime["device_memory_allocation_policy"]
 
     runner = performance["runner_contract"]
     assert runner["current_integrated_om_io"].startswith(
@@ -364,6 +379,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     ]
     assert "coalesce-first-verify" in runner[
         "required_prefill_completion_policy"
+    ]
+    assert "normal-only" in runner[
+        "required_device_memory_allocation_policy"
     ]
 
 

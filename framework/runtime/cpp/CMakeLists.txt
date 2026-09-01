@@ -1,10 +1,35 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(qwen35_dflash_acl_runner VERSION 1.15.0 LANGUAGES CXX)
+project(qwen35_dflash_acl_runner VERSION 1.16.0 LANGUAGES CXX)
 
 option(QWEN35_DFLASH_BUILD_ACL_RUNNER "Build the AscendCL executable" ON)
 option(QWEN35_DFLASH_BUILD_TESTS "Build host-only scheduler tests" ON)
 set(ASCENDCL_ROOT "" CACHE PATH "Root of the active CANN/AscendCL toolkit")
+set(
+  QWEN35_DFLASH_DEVICE_MEMORY_POLICY
+  "normal-only"
+  CACHE STRING
+  "AscendCL device allocation policy: normal-only or huge-first"
+)
+set_property(
+  CACHE QWEN35_DFLASH_DEVICE_MEMORY_POLICY
+  PROPERTY STRINGS normal-only huge-first
+)
+if(QWEN35_DFLASH_DEVICE_MEMORY_POLICY STREQUAL "normal-only")
+  set(_qwen35_dflash_huge_first 0)
+elseif(QWEN35_DFLASH_DEVICE_MEMORY_POLICY STREQUAL "huge-first")
+  set(_qwen35_dflash_huge_first 1)
+else()
+  message(FATAL_ERROR
+    "QWEN35_DFLASH_DEVICE_MEMORY_POLICY must be normal-only or huge-first"
+  )
+endif()
+
+function(qwen35_dflash_apply_device_memory_policy target)
+  target_compile_definitions(${target} PRIVATE
+    QWEN35_DFLASH_DEVICE_MEMORY_POLICY_HUGE_FIRST=${_qwen35_dflash_huge_first}
+  )
+endfunction()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -80,6 +105,10 @@ if(QWEN35_DFLASH_BUILD_ACL_RUNNER)
   target_compile_definitions(qwen35_dflash_incremental_acl_runner PRIVATE
     QWEN35_DFLASH_RUNNER_VERSION="${PROJECT_VERSION}"
   )
+  qwen35_dflash_apply_device_memory_policy(qwen35_dflash_acl_runner)
+  qwen35_dflash_apply_device_memory_policy(
+    qwen35_dflash_incremental_acl_runner
+  )
   target_compile_options(qwen35_dflash_acl_runner PRIVATE
     -Wall -Wextra -Wpedantic
   )
@@ -114,6 +143,9 @@ if(QWEN35_DFLASH_BUILD_TESTS)
   target_link_libraries(qwen35_dflash_incremental_acl_tests PRIVATE
     qwen35_dflash_core
     qwen35_dflash_fake_acl
+  )
+  qwen35_dflash_apply_device_memory_policy(
+    qwen35_dflash_incremental_acl_tests
   )
   target_compile_options(qwen35_dflash_incremental_acl_tests PRIVATE
     -Wall -Wextra -Wpedantic
@@ -150,6 +182,10 @@ if(QWEN35_DFLASH_BUILD_TESTS)
   )
   target_compile_definitions(qwen35_dflash_incremental_acl_runner_fake PRIVATE
     QWEN35_DFLASH_RUNNER_VERSION="${PROJECT_VERSION}-fake-acl"
+  )
+  qwen35_dflash_apply_device_memory_policy(qwen35_dflash_acl_runner_fake)
+  qwen35_dflash_apply_device_memory_policy(
+    qwen35_dflash_incremental_acl_runner_fake
   )
   target_compile_options(qwen35_dflash_acl_runner_fake PRIVATE
     -Wall -Wextra -Wpedantic

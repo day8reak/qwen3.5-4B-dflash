@@ -2,6 +2,8 @@
 #include "qwen35_dflash/incremental_acl_executor.hpp"
 #include "qwen35_dflash/sha256.hpp"
 
+#include "acl_memory_policy.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -657,7 +659,7 @@ void WriteReport(
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":7,\"status\":\"PASS\","
+         << "{\"schema_version\":8,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
          << (executor.unified_target_step() ? "four" : "five")
          << "-resident-OM paired model loop\","
@@ -766,6 +768,8 @@ void WriteReport(
          << (executor.unified_target_step() ? "four" : "five")
          << "-model process\","
          << "\"model_load_excluded_from_latency\":true,"
+         << "\"device_memory_allocation_policy\":\""
+         << qwen35::dflash::kDeviceMemoryAllocationPolicyName << "\","
          << "\"prefill_completion_policy\":\""
          << (arguments.coalesce_prefill_with_first_verify
                  ? "coalesce-first-verify"

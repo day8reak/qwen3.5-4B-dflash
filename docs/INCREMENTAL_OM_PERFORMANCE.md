@@ -531,7 +531,8 @@ jq -e '
 "$MODEL_PYTHON" -m qwen35_dflash.ascend310p build-cpp \
   --build-dir "$AI_RUN_DIR/build/cpp-release" \
   --output "$AI_RUN_DIR/reports/cpp-build.json" \
-  --ascendcl-root /ABSOLUTE/PATH/CANN
+  --ascendcl-root /ABSOLUTE/PATH/CANN \
+  --device-memory-policy normal-only
 
 cp config/quant_air_om_incremental_runner.example.json \
   "$AI_RUN_DIR/runner-incremental.json"
@@ -1299,6 +1300,134 @@ jq -s 'map({
 只有同机正反顺序、未开 msprof 的 3+10 都保持零差异，候选每个合格 DFlash 请求恰好少一次 D2H
 和同步，且 `model_total` median/p90 稳定改善、业务又能接受更晚的首 token，才启用
 `coalesce-first-verify`。流式输出优先或 EOS 经常出现在首 token 时，默认保留 `separate`。
+
+#### 5.5.4 A/B 选择设备内存分配策略
+
+这是 C++ 构建策略，不改变 PyTorch、AIR、OM、权重、tensor ABI 或 token 状态机，因此同一套 OM
+可直接复用。两种二进制必须从同一源码 revision 分别构建：
+
+- `normal-only`：默认与回退基线，所有 runner 显式 `aclrtMalloc` 使用
+  `ACL_MEM_MALLOC_NORMAL_ONLY`；
+- `huge-first`：未激活的精确候选，所有显式分配统一使用
+  `ACL_MEM_MALLOC_HUGE_FIRST`，包括 integrated runner I/O，以及增量 runner 的各 OM weight、共享
+  serial workspace、state 和 carrier。
+
+华为的 [`aclrtMemMallocPolicy` 说明](https://www.hiascend.com/document/detail/zh/canncommercial/5046/inferapplicationdev/aclcppdevg/aclcppdevg_03_0059.html)
+指出：`HUGE_FIRST` 对大于 1 MiB 的申请优先尝试 2 MiB 大页，失败后回退普通页；不超过 1 MiB
+仍使用普通页。因此它主要可能影响大 weight/workspace/state buffer 的地址转换与访存，而不是小型
+control carrier。是否真正降低 310P 时延只能实测，不能由页策略名称推断。
+
+先构建两个独立目录；不要在同一个 build 目录里重配后覆盖原二进制：
+
+```bash
+export ASCENDCL_ROOT=/ABSOLUTE/PATH/CANN
+
+for DEVICE_MEMORY_POLICY in normal-only huge-first; do
+  "$MODEL_PYTHON" -m qwen35_dflash.ascend310p build-cpp \
+    --build-dir \
+      "$AI_RUN_DIR/build/cpp-${DEVICE_MEMORY_POLICY}" \
+    --output \
+      "$AI_RUN_DIR/reports/cpp-build-${DEVICE_MEMORY_POLICY}.json" \
+    --ascendcl-root "$ASCENDCL_ROOT" \
+    --device-memory-policy "$DEVICE_MEMORY_POLICY"
+done
+
+jq -e -s '
+  (length == 2) and
+  all(.[]; .status == "PASS") and
+  ((map(.device_memory_allocation_policy) | sort) ==
+   ["huge-first", "normal-only"])
+' "$AI_RUN_DIR/reports/cpp-build-normal-only.json" \
+  "$AI_RUN_DIR/reports/cpp-build-huge-first.json"
+```
+
+固定同一份 `runner-incremental.json`、deployment manifest、OM、prompt 和 token 上限，按
+normal→huge 跑一遍，再按 huge→normal 反向跑一遍。每次启动前记录设备状态，避免把其他进程的
+显存占用或热状态误判为页策略收益：
+
+```bash
+run_alloc_case() {
+  local DEVICE_MEMORY_POLICY="$1"
+  local ORDER_LABEL="$2"
+
+  npu-smi info > \
+    "$AI_RUN_DIR/reports/npu-smi-${ORDER_LABEL}-${DEVICE_MEMORY_POLICY}.txt"
+  "$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
+    --deployment-manifest "$INCREMENTAL_BUNDLE/deployment-manifest.json" \
+    --runner \
+      "$AI_RUN_DIR/build/cpp-${DEVICE_MEMORY_POLICY}/qwen35_dflash_incremental_acl_runner" \
+    --runner-config "$AI_RUN_DIR/runner-incremental.json" \
+    --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
+    --prompt '请用一句话解释为什么天空是蓝色的。' \
+    --chat \
+    --max-new-tokens 32 \
+    --max-draft-tokens 15 \
+    --device-id 0 \
+    --output \
+      "$AI_RUN_DIR/reports/alloc-${ORDER_LABEL}-${DEVICE_MEMORY_POLICY}.json"
+}
+
+run_alloc_case normal-only forward
+run_alloc_case huge-first forward
+run_alloc_case huge-first reverse
+run_alloc_case normal-only reverse
+```
+
+先做身份、正确性和接受率门禁；任一 load 失败、OOM、token/EOS 差异或接受统计漂移都直接淘汰
+候选：
+
+```bash
+jq -e -s '
+  (length == 4) and
+  all(.[];
+    .status == "PASS" and
+    .ordinary_parity.status == "PASS" and
+    .ordinary_parity.token_id_mismatches == 0 and
+    .ordinary_parity.eos_mismatches == 0 and
+    (.protocol.device_memory_allocation_policy == "normal-only" or
+     .protocol.device_memory_allocation_policy == "huge-first")) and
+  ((map(.protocol.device_memory_allocation_policy) | sort) ==
+   ["huge-first", "huge-first", "normal-only", "normal-only"]) and
+  ((map(.models | map(.sha256)) | unique | length) == 1) and
+  ((map(.ordinary.stable_generated_token_ids) | unique | length) == 1) and
+  ((map(.dflash.stable_generated_token_ids) | unique | length) == 1) and
+  ((map(.ordinary.stable_stop_reason) | unique | length) == 1) and
+  ((map(.dflash.stable_stop_reason) | unique | length) == 1) and
+  ((map(.dflash.acceptance_rate) | unique | length) == 1)
+' "$AI_RUN_DIR/reports/alloc-forward-normal-only.json" \
+  "$AI_RUN_DIR/reports/alloc-forward-huge-first.json" \
+  "$AI_RUN_DIR/reports/alloc-reverse-huge-first.json" \
+  "$AI_RUN_DIR/reports/alloc-reverse-normal-only.json"
+
+for REPORT in \
+  "$AI_RUN_DIR/reports/alloc-forward-normal-only.json" \
+  "$AI_RUN_DIR/reports/alloc-forward-huge-first.json" \
+  "$AI_RUN_DIR/reports/alloc-reverse-huge-first.json" \
+  "$AI_RUN_DIR/reports/alloc-reverse-normal-only.json"; do
+  jq --arg report "$REPORT" '{
+    report: $report,
+    policy: .protocol.device_memory_allocation_policy,
+    startup_ms,
+    explicit_device_bytes:
+      .model_memory_query.explicit_allocated_device_bytes_excluding_runtime,
+    ordinary_median_ms: .ordinary.latency_ms.model_total.median,
+    ordinary_p90_ms: .ordinary.latency_ms.model_total.p90,
+    dflash_median_ms: .dflash.latency_ms.model_total.median,
+    dflash_p90_ms: .dflash.latency_ms.model_total.p90,
+    acceptance_rate: .dflash.acceptance_rate
+  }' "$REPORT"
+done
+```
+
+只有 `huge-first` 在正向和反向两个配对中都保持足够显存余量，而且未开 msprof 的 ordinary 与
+DFlash `model_total` median/p90 都超过事先确定的测量噪声门槛，才考虑把构建默认值改成它；持平、
+单向改善或只改善 startup 时继续使用 `normal-only`。需要定位差异时，按第 5.7 节分别 profile
+两个二进制；分析报告会保留 `device_memory_allocation_policy`，但 msprof 数据不能替代上述 3+10
+选择结果。
+
+没有采用二维异步拷贝来合并 compact result：官方
+[`aclrtMemcpy2dAsync` 产品支持说明](https://www.hiascend.com/document/detail/zh/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0109.html)
+对相关推理产品存在支持限制，不能把它作为 Ascend310P 可移植的默认优化。
 
 ### 5.6 直接运行二进制
 

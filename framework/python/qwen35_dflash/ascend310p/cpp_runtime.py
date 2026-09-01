@@ -50,6 +50,14 @@ _INCREMENTAL_PREFILL_COMPLETION_POLICIES = {
     SEPARATE_PREFILL_COMPLETION_POLICY,
     COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY,
 }
+NORMAL_ONLY_DEVICE_MEMORY_POLICY = "normal-only"
+HUGE_FIRST_DEVICE_MEMORY_POLICY = "huge-first"
+DEVICE_MEMORY_ALLOCATION_POLICIES = frozenset(
+    {
+        NORMAL_ONLY_DEVICE_MEMORY_POLICY,
+        HUGE_FIRST_DEVICE_MEMORY_POLICY,
+    }
+)
 _INCREMENTAL_ABI_ID = (
     "qwen35-4b-dflash-ascend310p-incremental-performance-v2"
 )
@@ -304,9 +312,14 @@ def build_cpp_runner(
     output: str | Path,
     cmake: str | Path = "cmake",
     ascendcl_root: str | Path | None = None,
+    device_memory_policy: str = NORMAL_ONLY_DEVICE_MEMORY_POLICY,
 ) -> dict[str, Any]:
     """Build the production ACL binary without writing into the model repo."""
 
+    if device_memory_policy not in DEVICE_MEMORY_ALLOCATION_POLICIES:
+        raise ValueError(
+            "device_memory_policy must be normal-only or huge-first"
+        )
     explicit_source = os.environ.get("QWEN35_DFLASH_CPP_SOURCE")
     candidates: list[Path] = []
     if explicit_source:
@@ -348,7 +361,7 @@ def build_cpp_runner(
         raise RuntimeError(f"CMake executable is invalid: {cmake_path}")
     build.mkdir(parents=True, exist_ok=True)
     run_root = Path(os.environ["AI_RUN_DIR"]).expanduser().resolve()
-    log_root = run_root / "log" / "dflash-cpp-build"
+    log_root = build / "qwen35_dflash_build_logs"
     log_root.mkdir(parents=True, exist_ok=True)
     configure_command = [
         str(cmake_path),
@@ -359,6 +372,10 @@ def build_cpp_runner(
         "-DCMAKE_BUILD_TYPE=Release",
         "-DQWEN35_DFLASH_BUILD_ACL_RUNNER=ON",
         "-DQWEN35_DFLASH_BUILD_TESTS=ON",
+        (
+            "-DQWEN35_DFLASH_DEVICE_MEMORY_POLICY="
+            f"{device_memory_policy}"
+        ),
     ]
     if ascendcl_root is not None:
         configure_command.append(
@@ -422,11 +439,17 @@ def build_cpp_runner(
     preflight_cpp_runner(runner)
     preflight_cpp_runner(incremental_runner)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "PASS",
         "artifact_kind": "qwen35-dflash-ascendcl-cpp-runner",
         "source": str(source),
         "cmake": str(cmake_path),
+        "device_memory_allocation_policy": device_memory_policy,
+        "device_memory_allocation_policy_scope": (
+            "all explicit aclrtMalloc allocations in both C++ runners; "
+            "incremental model weights, shared workspace, state and carriers "
+            "are included"
+        ),
         "ascendcl_root": (
             None
             if ascendcl_root is None
@@ -637,6 +660,11 @@ def validate_cpp_runner_report(
     protocol = report.get("protocol", {})
     if protocol.get("warmup") != 3 or protocol.get("repetitions") != 10:
         raise RuntimeError("C++ runner protocol is not the locked 3+10")
+    if (
+        protocol.get("device_memory_allocation_policy")
+        not in DEVICE_MEMORY_ALLOCATION_POLICIES
+    ):
+        raise RuntimeError("C++ runner device memory policy is invalid")
     abi = report.get("abi", {})
     if abi.get("input_names") != ["input_ids", "attention_mask"]:
         raise RuntimeError("C++ runner input ABI differs")
@@ -751,7 +779,7 @@ def validate_incremental_cpp_runner_report(
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
-    if report.get("schema_version") != 7:
+    if report.get("schema_version") != 8:
         raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
@@ -821,6 +849,13 @@ def validate_incremental_cpp_runner_report(
     protocol = report.get("protocol", {})
     if protocol.get("warmup") != 3 or protocol.get("repetitions") != 10:
         raise RuntimeError("incremental runner protocol is not locked 3+10")
+    if (
+        protocol.get("device_memory_allocation_policy")
+        not in DEVICE_MEMORY_ALLOCATION_POLICIES
+    ):
+        raise RuntimeError(
+            "incremental runner device memory policy is invalid"
+        )
     if (
         protocol.get("kind") != "evidence"
         or protocol.get("formal_latency_evidence") is not True

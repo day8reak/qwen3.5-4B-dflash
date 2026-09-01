@@ -1,5 +1,7 @@
 #include "qwen35_dflash/incremental_acl_executor.hpp"
 
+#include "acl_memory_policy.hpp"
+
 #include <acl/acl.h>
 
 #include <algorithm>
@@ -271,7 +273,7 @@ struct DeviceAllocation {
     }
     bytes = requested;
     Check(
-        aclrtMalloc(&data, bytes, ACL_MEM_MALLOC_NORMAL_ONLY),
+        aclrtMalloc(&data, bytes, kDeviceMemoryAllocationPolicy),
         "aclrtMalloc");
   }
 

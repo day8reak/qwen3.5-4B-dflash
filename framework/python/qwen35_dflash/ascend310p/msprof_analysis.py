@@ -169,6 +169,12 @@ def _validate_runner_report(
         raise MsprofAnalysisError(
             "runner report must use diagnostic profile protocol with tracing"
         )
+    if int(report.get("schema_version", 0)) >= 8 and protocol.get(
+        "device_memory_allocation_policy"
+    ) not in {"normal-only", "huge-first"}:
+        raise MsprofAnalysisError(
+            "runner device memory allocation policy is invalid"
+        )
     models = report.get("models")
     if not isinstance(models, list) or not models:
         raise MsprofAnalysisError("runner report omitted resident models")
@@ -915,6 +921,9 @@ def analyze_incremental_msprof(
             "sha256": _sha256(runner_path),
             "runner_version": report.get("runner_version"),
             "device_id": report.get("device_id"),
+            "device_memory_allocation_policy": report["protocol"].get(
+                "device_memory_allocation_policy", "legacy-not-recorded"
+            ),
         },
         "profile_root": str(profile_root),
         "input_files": {

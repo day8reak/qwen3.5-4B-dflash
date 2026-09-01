@@ -1,6 +1,6 @@
 {
-  "schema_version": 19,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v19",
+  "schema_version": 20,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v20",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -165,10 +165,11 @@
   "runtime": {
     "language": "C++17",
     "api": "AscendCL",
-    "model_load": "aclmdlLoadFromFile",
+    "model_load": "integrated runner uses aclmdlLoadFromFile; incremental runner uses aclmdlLoadFromFileWithMem with separate per-artifact weights and one serial shared workspace",
     "model_memory_query": "aclmdlQuerySize is recorded for the active integrated OM; qwen35_dflash_om_inspect sums weights and uses the maximum serial workspace across a proposed multi-OM set",
     "execute": "aclmdlExecuteAsync",
     "memory": "persistent pinned host/device buffers; integrated input device mirrors upload only changed contiguous ranges after the first call and target D2H is limited to the last K+1 rows required by every current scheduler read; the multi-OM runner (five-artifact baseline or four-artifact unified Target step) uses one 64-byte-aligned prefill control carrier but uploads only the prefix through the last field consumed by each chunk, keeps the EOS tail process-resident, gives the unified topology one aligned process-resident INT32 zero-count view, accumulates contiguous Target feature slabs in one device arena, and downloads only compact scheduler-visible results",
+    "device_memory_allocation": "normal-only remains the compiled rollback default; build-cpp can produce a separate huge-first exact candidate. Both runners report the compiled policy, which covers every explicit aclrtMalloc including integrated I/O, multi-OM weights, the shared serial workspace, state and carriers; changing the default requires same-source/same-OM forward-and-reverse physical Ascend310P 3+10 zero-mismatch, memory-headroom and median/p90 evidence",
     "synchronization": "the multi-OM runner queues every non-final 64-row prompt chunk without LM-head execution, compact D2H or host synchronization, executes the head-only graph once after the final chunk, and exposes two independent exact selectors: DFlash window 2 coalesces two dependent verify transactions, while coalesce-first-verify joins final prefill completion with the already-prepared first verify in one contiguous D2H and one barrier when max_new_tokens is greater than two",
     "generation": "ordinary greedy and strict-greedy DFlash",
     "execution_io_evidence": "runner JSON records each resident aclmdl model ID, actual/full-equivalent H2D and D2H bytes, base/count/proposal/full prefill-prefix routes, packed-control/decode/proposal copy counts, Draft verify feature input/full-equivalent/elided rows and fixed/prefix/pending routes, unified Target-step resident-zero bytes and bindings, role executions, one completion per full prompt, elided intermediate-prefill D2H/synchronizations, speculative transactions, decode synchronization windows, prefill/first-verify coalesced windows, slot-dependent padding and both classes of elided D2H/barrier; actual D2H calls plus both elided classes close by transaction while stream synchronization closes by host-visible window",

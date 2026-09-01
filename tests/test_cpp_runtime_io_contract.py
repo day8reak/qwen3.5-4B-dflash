@@ -43,7 +43,11 @@ def _report() -> dict[str, object]:
         "model": {"sha256": "a" * 64},
         "prompt_token_ids": [10],
         "limits": {"max_new_tokens": 2, "max_draft_tokens": 15},
-        "protocol": {"warmup": 3, "repetitions": 10},
+        "protocol": {
+            "warmup": 3,
+            "repetitions": 10,
+            "device_memory_allocation_policy": "normal-only",
+        },
         "abi": {
             "input_names": ["input_ids", "attention_mask"],
             "output_names": ["target_top1", "draft_top1"],
@@ -97,6 +101,22 @@ def _validate(report: dict[str, object]) -> None:
 
 def test_cpp_runner_accepts_locked_ranged_io_evidence() -> None:
     _validate(_report())
+
+
+def test_cpp_runner_accepts_huge_first_build_identity() -> None:
+    report = _report()
+    report["protocol"]["device_memory_allocation_policy"] = "huge-first"
+    _validate(report)
+
+
+@pytest.mark.parametrize("value", [None, "unknown"])
+def test_cpp_runner_rejects_unknown_device_memory_policy(
+    value: object,
+) -> None:
+    report = _report()
+    report["protocol"]["device_memory_allocation_policy"] = value
+    with pytest.raises(RuntimeError, match="device memory policy"):
+        _validate(report)
 
 
 @pytest.mark.parametrize(

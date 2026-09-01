@@ -2,6 +2,8 @@
 #include "qwen35_dflash/generation.hpp"
 #include "qwen35_dflash/sha256.hpp"
 
+#include "acl_memory_policy.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -439,6 +441,8 @@ void WriteReport(
          << ",\"order\":\"alternating ordinary/DFlash in one loaded process\","
          << "\"synchronization\":\"one aclrtSynchronizeStream after queued H2D, execute, D2H\","
          << "\"model_load_excluded_from_latency\":true,"
+         << "\"device_memory_allocation_policy\":\""
+         << qwen35::dflash::kDeviceMemoryAllocationPolicyName << "\","
          << "\"live_progress_enabled\":"
          << (arguments.progress ? "true" : "false") << ','
          << "\"progress_emission_excluded_from_model_timers\":true},"

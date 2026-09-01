@@ -113,6 +113,12 @@ string(JSON mismatch GET "${report}" ordinary_parity token_id_mismatches)
 string(JSON eos_mismatch GET "${report}" ordinary_parity eos_mismatches)
 string(JSON repetitions GET "${report}" dflash repetitions)
 string(JSON report_protocol GET "${report}" protocol kind)
+string(JSON report_device_memory_policy GET "${report}" protocol device_memory_allocation_policy)
+set(device_memory_policy_valid FALSE)
+if(report_device_memory_policy STREQUAL "normal-only" OR
+   report_device_memory_policy STREQUAL "huge-first")
+  set(device_memory_policy_valid TRUE)
+endif()
 string(JSON trace_enabled GET "${report}" protocol profile_model_execution_trace_enabled)
 string(JSON trace_length LENGTH "${report}" profile_model_execution_trace)
 string(JSON model_count LENGTH "${report}" models)
@@ -409,12 +415,13 @@ if(ADAPTIVE_PROPOSAL_COUNTS AND
    NOT proposal_uploads EQUAL expected_dflash_requests)
   message(FATAL_ERROR "adaptive-K proposal uploads differ: ${report}")
 endif()
-if(NOT schema_version EQUAL 7 OR
+if(NOT schema_version EQUAL 8 OR
    NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR
    NOT repetitions EQUAL REPETITIONS OR NOT model_count EQUAL EXPECTED_MODEL_COUNT OR
    NOT report_protocol STREQUAL MEASUREMENT_PROTOCOL OR
+   NOT device_memory_policy_valid OR
    NOT report_dflash_sync_window EQUAL DFLASH_SYNC_WINDOW OR
    NOT report_prefill_completion_policy STREQUAL PREFILL_COMPLETION_POLICY OR
    NOT maximum_dflash_sync_window EQUAL 2 OR
