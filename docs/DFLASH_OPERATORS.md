@@ -169,6 +169,11 @@ next bank，CPU exact test 已冻结这一点；真实 AIR/OM 的算子数和时
 必须覆盖 round start `62/63/64/65`、T=`2/4/6/8/16`、prefix/suffix sentinel 不变，以及 rejected
 tail 下一轮不可见并被覆写。算子只做物理写入；是否提交 `1+a` 仍由 runtime cursor 决定。
 
+当前五 OM 源码已经把 `[T]` target-block/offset 向量在 verify 入口计算一次并跨 8 层 K/V 复用，
+但仍逐 row 调用 CacheUpdate：T=16 时是 `8*2*16=256` 个模型节点。把它改成显式二维 indices
+`[[block_i,offset_i], ...]` 的一次 ScatterNdUpdate/CacheUpdateMTP 可降为 `8*2=16` 个节点，属于
+新的算子/图边界，必须先取得 `batched-cache-update-v1` 的明确批准，再做 AIR/OM 实验。
+
 ### 5.2 `FusedInferAttentionMTP`
 
 先验证现有 `adn_fused_infer_attention`：

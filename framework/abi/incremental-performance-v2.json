@@ -179,7 +179,8 @@
       "target_recurrent_state_bank [24,1,16,32,128,128]"
     ],
     "bank_policy": "verify receives grouped committed scalar states, lets causal-conv consume its scalar state directly, seeds only the fixed 16-slot recurrent GDR-MTP input immediately before each linear-attention layer, gathers slot accepted_count at the exact tail, and persists only grouped scalar states",
-    "scalar_state_seed_policy": "per-linear-layer-jit-v1"
+    "scalar_state_seed_policy": "per-linear-layer-jit-v1",
+    "verify_cache_index_policy": "once-per-verify-v1"
   },
   "state_ownership": {
     "owner": "one C++ request context with persistent device buffers",
@@ -228,6 +229,14 @@
     "source_graph_seed_live_set_reduction_candidate": 796917760,
     "conv_input_bank_materialization_bytes_eliminated_per_verify": 25165824,
     "conv_input_bank_gathers_eliminated_per_verify": 24,
+    "legacy_cache_index_div_or_remainder_nodes_per_verify": 512,
+    "current_cache_index_div_or_remainder_nodes_per_verify": 2,
+    "cache_index_div_or_remainder_nodes_eliminated_per_verify": 510,
+    "legacy_cache_index_cast_nodes_per_verify": 512,
+    "current_cache_index_cast_nodes_per_verify": 2,
+    "cache_index_cast_nodes_eliminated_per_verify": 510,
+    "full_attention_mask_casts_eliminated_per_target_call": 8,
+    "cache_update_model_nodes_per_verify_unchanged": 256,
     "seed_policy": "per-linear-layer-jit-v1",
     "notes": "the JIT seed values describe source-graph input-seed tensors, not a measured OM peak; provisional output banks still exist; excludes model weights, model workspaces, I/O buffers, allocator/runtime overhead and optional feature/logit intermediates"
   },

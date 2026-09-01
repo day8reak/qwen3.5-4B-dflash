@@ -73,6 +73,7 @@ logger = logging.get_logger(__name__)
 DFLASH_BLOCK_SIZE = 16
 DFLASH_MAX_PROPOSALS = DFLASH_BLOCK_SIZE - 1
 DFLASH_MAX_VERIFY_TOKENS = DFLASH_BLOCK_SIZE
+TARGET_KV_BLOCK_SIZE = 64
 
 
 def _normalize_gdr_effective_length(
@@ -749,7 +750,14 @@ class Qwen3_5Attention(nn.Module):
         )
 
     def update_dflash(
-        self, new_k, cache_position, past_key_value, *, export_flag=False
+        self,
+        new_k,
+        cache_position,
+        past_key_value,
+        *,
+        target_blocks=None,
+        offsets_in_block=None,
+        export_flag=False,
     ):
         """Correctness fallback for a K+1 write that may cross cache blocks.
 
@@ -773,12 +781,32 @@ class Qwen3_5Attention(nn.Module):
                 f"{DFLASH_MAX_VERIFY_TOKENS} rows"
             )
 
+        if (target_blocks is None) != (offsets_in_block is None):
+            raise ValueError(
+                "DFlash cache target blocks and offsets must be supplied together"
+            )
+        if target_blocks is None:
+            target_blocks = (cache_position // self.block_size).to(torch.int32)
+            offsets_in_block = (cache_position % self.block_size).to(torch.int32)
+        if target_blocks.dtype != torch.int32 or offsets_in_block.dtype != torch.int32:
+            raise TypeError("DFlash cache block/offset vectors must use int32")
+        if tuple(target_blocks.shape) != (sequence_length,) or tuple(
+            offsets_in_block.shape
+        ) != (sequence_length,):
+            raise ValueError("DFlash cache block/offset vectors must have shape [T]")
+        if (
+            target_blocks.device != new_k.device
+            or offsets_in_block.device != new_k.device
+        ):
+            raise ValueError(
+                "DFlash cache block/offset vectors and K/V rows must share a device"
+            )
+
         flattened = new_k.reshape(batch_size, sequence_length, -1, 16)
         updated_cache = past_key_value.to(new_k.device)
         for token_index in range(sequence_length):
-            position = cache_position[token_index]
-            target_block = (position // self.block_size).reshape(1).to(torch.int32)
-            offset_in_block = (position % self.block_size).to(torch.int32)
+            target_block = target_blocks[token_index : token_index + 1]
+            offset_in_block = offsets_in_block[token_index]
             updated_cache = _cache_update_for_export(
                 updated_cache,
                 flattened[0, token_index : token_index + 1].to(torch.float16),
@@ -798,6 +826,8 @@ class Qwen3_5Attention(nn.Module):
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         accepted_tokens: Optional[torch.Tensor] = None,
+        dflash_cache_target_blocks: Optional[torch.Tensor] = None,
+        dflash_cache_offsets: Optional[torch.Tensor] = None,
         allQLen=0,
         export_flag=False,
         **kwargs: Unpack[FlashAttentionKwargs],
@@ -848,12 +878,16 @@ class Qwen3_5Attention(nn.Module):
                 key_states,
                 cache_position,
                 past_key_values[0],
+                target_blocks=dflash_cache_target_blocks,
+                offsets_in_block=dflash_cache_offsets,
                 export_flag=export_flag,
             ).to(query_states.device)
             value_states = self.update_dflash(
                 value_states,
                 cache_position,
                 past_key_values[1],
+                target_blocks=dflash_cache_target_blocks,
+                offsets_in_block=dflash_cache_offsets,
                 export_flag=export_flag,
             ).to(query_states.device)
         past_key_values = (key_states, value_states)
@@ -1349,6 +1383,8 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         export_flag=False,
         accepted_tokens: Optional[torch.Tensor] = None,
         gdr_effective_length: Optional[torch.Tensor] = None,
+        dflash_cache_target_blocks: Optional[torch.Tensor] = None,
+        dflash_cache_offsets: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Tuple]:
         residual = hidden_states
@@ -1370,6 +1406,8 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 past_key_values=past_key_values,
                 cache_position=new_kv_cache_pos,
                 accepted_tokens=accepted_tokens,
+                dflash_cache_target_blocks=dflash_cache_target_blocks,
+                dflash_cache_offsets=dflash_cache_offsets,
                 allQLen=allQLen,
                 export_flag=export_flag,
                 **kwargs,
@@ -1431,6 +1469,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
     dflash_feature_capture_point = "decoder_post_layer_pre_final_norm"
     dflash_state_contract_id = "qwen3.5-4b-dflash-target-state-bank-v1"
     dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
+    dflash_cache_index_policy = "once-per-verify-v1"
 
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__(config)
@@ -1464,6 +1503,8 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         output_dflash_features: bool = False,
         accepted_tokens: Optional[torch.Tensor] = None,
         gdr_effective_length: Optional[torch.Tensor] = None,
+        dflash_cache_target_blocks: Optional[torch.Tensor] = None,
+        dflash_cache_offsets: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if inputs_embeds is None:
@@ -1487,6 +1528,42 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 state_slots=hidden_states.shape[1],
                 device=hidden_states.device,
             )
+            if dflash_cache_target_blocks is None and dflash_cache_offsets is None:
+                if new_kv_cache_pos is None:
+                    raise ValueError("DFlash cache indices require cache positions")
+                dflash_cache_target_blocks = (
+                    new_kv_cache_pos // TARGET_KV_BLOCK_SIZE
+                ).to(torch.int32)
+                dflash_cache_offsets = (
+                    new_kv_cache_pos % TARGET_KV_BLOCK_SIZE
+                ).to(torch.int32)
+            elif (
+                dflash_cache_target_blocks is None
+                or dflash_cache_offsets is None
+            ):
+                raise ValueError(
+                    "DFlash cache target blocks and offsets must be supplied together"
+                )
+            if (
+                dflash_cache_target_blocks.dtype != torch.int32
+                or dflash_cache_offsets.dtype != torch.int32
+            ):
+                raise TypeError("DFlash cache index vectors must use int32")
+            expected_cache_index_shape = (hidden_states.shape[1],)
+            if (
+                tuple(dflash_cache_target_blocks.shape)
+                != expected_cache_index_shape
+                or tuple(dflash_cache_offsets.shape)
+                != expected_cache_index_shape
+            ):
+                raise ValueError("DFlash cache index vectors must have shape [T]")
+            if (
+                dflash_cache_target_blocks.device != hidden_states.device
+                or dflash_cache_offsets.device != hidden_states.device
+            ):
+                raise ValueError(
+                    "DFlash cache index vectors and hidden states must share a device"
+                )
         dflash_collector = None
         if output_dflash_features:
             dflash_collector = DFlashFeatureCollector(
@@ -1515,6 +1592,8 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 export_flag=export_flag,
                 accepted_tokens=accepted_tokens,
                 gdr_effective_length=gdr_effective_length,
+                dflash_cache_target_blocks=dflash_cache_target_blocks,
+                dflash_cache_offsets=dflash_cache_offsets,
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
@@ -1549,6 +1628,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
     dflash_feature_capture_point = "decoder_post_layer_pre_final_norm"
     dflash_state_contract_id = "qwen3.5-4b-dflash-target-state-bank-v1"
     dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
+    dflash_cache_index_policy = "once-per-verify-v1"
 
     def __init__(self, config):
         super().__init__(config)

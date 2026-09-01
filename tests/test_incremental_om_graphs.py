@@ -33,6 +33,7 @@ class _TokenHead(nn.Module):
 
 class _FakeLanguageModel(nn.Module):
     dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
+    dflash_cache_index_policy = "once-per-verify-v1"
 
     def forward(
         self,
@@ -44,15 +45,29 @@ class _FakeLanguageModel(nn.Module):
         accepted_tokens: torch.Tensor | None,
         **kwargs: object,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        del input_ids, kwargs
+        del input_ids
+        target_blocks = kwargs.pop("dflash_cache_target_blocks", None)
+        offsets = kwargs.pop("dflash_cache_offsets", None)
+        del kwargs
         conv, recurrent = past_key_values[0]
+        cache_index_zero: torch.Tensor | int = 0
         if accepted_tokens is None:
+            assert target_blocks is None
+            assert offsets is None
             past_key_values[0] = (conv + 1, recurrent + 1)
         else:
             # The graph boundary must pass committed scalar states.  The real
             # rollback GDN expands them one linear layer at a time.
             assert conv.ndim == 3
             assert recurrent.ndim == 4
+            assert target_blocks is not None
+            assert offsets is not None
+            assert target_blocks.dtype == torch.int32
+            assert offsets.dtype == torch.int32
+            assert target_blocks.shape == offsets.shape == (inputs_embeds.shape[1],)
+            cache_index_zero = (target_blocks.sum() + offsets.sum()).to(
+                inputs_embeds.dtype
+            ) * 0
             slots = torch.arange(
                 inputs_embeds.shape[1], dtype=conv.dtype, device=conv.device
             ).reshape(1, -1, 1, 1)
@@ -62,7 +77,10 @@ class _FakeLanguageModel(nn.Module):
                 recurrent.unsqueeze(1) + recurrent_slots,
             )
         key, value = past_key_values[1]
-        past_key_values[1] = (key + 1, value + 1)
+        past_key_values[1] = (
+            key + 1 + cache_index_zero,
+            value + 1 + cache_index_zero,
+        )
         if output_dflash_features:
             return inputs_embeds, inputs_embeds * 2
         return inputs_embeds
@@ -211,6 +229,9 @@ def test_target_graphs_are_torch_export_capture_safe() -> None:
     assert len(eager) == len(captured) == 13
     for actual, expected in zip(captured, eager):
         torch.testing.assert_close(actual, expected)
+    targets = [str(node.target) for node in exported.graph.nodes]
+    assert sum("floor_divide" in target for target in targets) == 1
+    assert sum("remainder" in target for target in targets) == 1
 
 
 def test_prefill_body_and_head_export_without_cross_retaining_weights() -> None:
@@ -440,6 +461,10 @@ def test_five_physical_specs_freeze_binding_order_and_reuse_state_examples() -> 
     )
     assert all(
         item.metadata["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
+        for item in specs
+    )
+    assert all(
+        item.metadata["verify_cache_index_policy"] == "once-per-verify-v1"
         for item in specs
     )
 

@@ -20,6 +20,7 @@ VERIFY_ROWS = 16
 PROPOSAL_ROWS = VERIFY_ROWS - 1
 PREFILL_ROWS = 64
 SCALAR_STATE_SEED_POLICY = "per-linear-layer-jit-v1"
+CACHE_INDEX_POLICY = "once-per-verify-v1"
 
 
 class _ExplicitTargetGraph(nn.Module):
@@ -50,6 +51,14 @@ class _ExplicitTargetGraph(nn.Module):
             raise RuntimeError(
                 "incremental Target requires rollback modeling with "
                 f"{SCALAR_STATE_SEED_POLICY} scalar-state seeding"
+            )
+        if (
+            getattr(language_model, "dflash_cache_index_policy", None)
+            != CACHE_INDEX_POLICY
+        ):
+            raise RuntimeError(
+                "incremental Target requires rollback modeling with "
+                f"{CACHE_INDEX_POLICY} cache-index reuse"
             )
         config = getattr(execution, "config", None)
         layer_types = tuple(getattr(config, "layer_types", ()))
@@ -138,9 +147,12 @@ class _ExplicitTargetGraph(nn.Module):
             device=positions.device,
         )
         visible = columns.reshape(1, -1) <= positions.reshape(-1, 1)
-        zero = torch.zeros((), dtype=torch.float32, device=positions.device)
+        # ADN consumes FP16 masks.  Construct the exact 0/-inf values in that
+        # dtype once instead of inserting the same FP32->FP16 cast in every
+        # full-attention layer.
+        zero = torch.zeros((), dtype=torch.float16, device=positions.device)
         negative = torch.full(
-            (), float("-inf"), dtype=torch.float32, device=positions.device
+            (), float("-inf"), dtype=torch.float16, device=positions.device
         )
         return torch.where(visible, zero, negative).unsqueeze(0).unsqueeze(0)
 
@@ -172,6 +184,12 @@ class _ExplicitTargetGraph(nn.Module):
             if verify
             else None
         )
+        cache_target_blocks = (
+            (positions // 64).to(torch.int32) if verify else None
+        )
+        cache_offsets = (
+            (positions % 64).to(torch.int32) if verify else None
+        )
         text_output = self.language_model(
             input_ids=input_ids,
             attention_mask=self._attention_mask(positions),
@@ -189,6 +207,8 @@ class _ExplicitTargetGraph(nn.Module):
             output_dflash_features=output_features,
             accepted_tokens=accepted,
             gdr_effective_length=gdr_effective_length,
+            dflash_cache_target_blocks=cache_target_blocks,
+            dflash_cache_offsets=cache_offsets,
         )
         if output_features:
             hidden, features = text_output
@@ -716,6 +736,12 @@ def incremental_state_graph_specs(
             "consumes scalar state directly and recurrent state is seeded one "
             "linear-attention layer at a time; AIR/ATC peak memory remains a "
             "real-toolchain gate"
+        ),
+        "verify_cache_index_policy": CACHE_INDEX_POLICY,
+        "verify_cache_index_evidence": (
+            "target block and in-block offset vectors are derived once from "
+            "the logical cursor and reused by both K/V updates in all eight "
+            "full-attention layers"
         ),
         "draft_feature_tail": (
             "TorchAir discrete dynamic N gears: verify N=16 and prompt feature "

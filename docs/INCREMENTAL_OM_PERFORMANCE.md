@@ -160,6 +160,14 @@ materialization 和 24 次 bank-slot gather；recurrent 输入 seed 的源码图
 `target-verify-commit.work_bytes` 并以 msprof 结果为准。输出 provisional bank 仍然存在，不能把
 这项改动误报成已消除全部 792 MiB verify bank。
 
+`once-per-verify-v1` 还把固定 T=16 的 block/offset 向量从 logical cursor 只计算一次，并让 8 个
+full-attention layer 的 K/V 更新共同复用。旧源码按 `8 layers * 2(K/V) * 16 rows` 分别构造
+256 个 floor-div、256 个 remainder 以及对应 512 个 cast；当前源码只保留一个向量 floor-div、
+一个向量 remainder 和两个 cast，即显式少构造 510 个 div/remainder 与 510 个 cast。attention
+mask 也直接以 ADN 需要的 FP16 `0/-inf` 创建，删除每个 Target call 中 8 个重复 mask cast。
+这些优化不改数值、公开 OM binding 或 CacheUpdate 自定义算子边界；当前 verify 仍有
+`8*2*16=256` 个单 row CacheUpdate 节点，不能把 index hoist 误报成已经完成 batched cache update。
+
 持久 recurrent 统一用 FP32：普通 GDR 仍保留 receiver 现有的 FP16 输出边界，再把该结果无损
 扩宽到 FP32；GDR-MTP 选中的 FP32 state 则无需每轮降回 FP16。这样 prefill/decode/verify 的
 外部 binding dtype 固定，同时不丢掉 rollback 路线已经保留的 FP32 state。
@@ -351,7 +359,13 @@ jq -e '
     .custom_op_audit[] | .status] | all(. == "PASS")) and
   ((.graphs[] | select(.name == "target-verify-commit") |
     .metadata.verify_scalar_state_seed_policy) ==
-      "per-linear-layer-jit-v1")
+      "per-linear-layer-jit-v1") and
+  ((.graphs[] | select(.name == "target-verify-commit") |
+    .metadata.verify_cache_index_policy) == "once-per-verify-v1") and
+  ((.graphs[] | select(.name == "target-verify-commit") |
+    .custom_op_audit[] |
+    select(.torch_target == "qwen35_dflash.npu_cache_update.default") |
+    .ge_node_occurrences) == 256)
 ' "$INCREMENTAL_BUNDLE/deployment-manifest.json"
 
 PYTHONPATH="$PWD/framework/python:$PWD" "$MODEL_PYTHON" -m pytest -q \

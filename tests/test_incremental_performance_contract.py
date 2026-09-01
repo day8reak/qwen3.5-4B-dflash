@@ -116,6 +116,25 @@ def test_incremental_state_budget_matches_locked_qwen35_shapes() -> None:
         conv_bank_fp16
     )
     assert budget["conv_input_bank_gathers_eliminated_per_verify"] == linear_layers
+    legacy_index_nodes = full_layers * 2 * verify_rows * 2
+    assert budget["legacy_cache_index_div_or_remainder_nodes_per_verify"] == (
+        legacy_index_nodes
+    )
+    assert budget["current_cache_index_div_or_remainder_nodes_per_verify"] == 2
+    assert budget["cache_index_div_or_remainder_nodes_eliminated_per_verify"] == (
+        legacy_index_nodes - 2
+    )
+    assert budget["legacy_cache_index_cast_nodes_per_verify"] == legacy_index_nodes
+    assert budget["current_cache_index_cast_nodes_per_verify"] == 2
+    assert budget["cache_index_cast_nodes_eliminated_per_verify"] == (
+        legacy_index_nodes - 2
+    )
+    assert budget["full_attention_mask_casts_eliminated_per_target_call"] == (
+        full_layers
+    )
+    assert budget["cache_update_model_nodes_per_verify_unchanged"] == (
+        full_layers * 2 * verify_rows
+    )
     assert budget["seed_policy"] == "per-linear-layer-jit-v1"
 
 
@@ -167,6 +186,7 @@ def test_tensor_abi_persists_only_scalar_target_state() -> None:
     assert tensor_abi["scalar_state_seed_policy"] == (
         "per-linear-layer-jit-v1"
     )
+    assert tensor_abi["verify_cache_index_policy"] == "once-per-verify-v1"
     carriers = {item["name"]: item for item in tensor_abi["round_carriers"]}
     assert carriers["verify_input_ids"]["shape"] == [1, 16]
     assert carriers["logical_proposal_count"]["range"] == [1, 15]
@@ -187,9 +207,12 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 12
+    assert framework_lock["schema_version"] == 13
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
+    ]
+    assert "once-per-verify-v1" in framework_lock["runtime"][
+        "incremental_verify_cache_indices"
     ]
     runtime = framework_lock["runtime"]
     assert "input device mirrors" in runtime["memory"]
