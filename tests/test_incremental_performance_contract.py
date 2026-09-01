@@ -104,6 +104,19 @@ def test_incremental_state_budget_matches_locked_qwen35_shapes() -> None:
     assert budget["transient_verify_bank_subtotal"] == (
         recurrent_bank_fp32 + conv_bank_fp16
     )
+    assert budget["legacy_graph_entry_seed_live_set"] == (
+        recurrent_bank_fp32 + conv_bank_fp16
+    )
+    per_layer_seed = recurrent_bank_fp32 // linear_layers
+    assert budget["per_linear_layer_jit_recurrent_seed_max"] == per_layer_seed
+    assert budget["source_graph_seed_live_set_reduction_candidate"] == (
+        budget["legacy_graph_entry_seed_live_set"] - per_layer_seed
+    )
+    assert budget["conv_input_bank_materialization_bytes_eliminated_per_verify"] == (
+        conv_bank_fp16
+    )
+    assert budget["conv_input_bank_gathers_eliminated_per_verify"] == linear_layers
+    assert budget["seed_policy"] == "per-linear-layer-jit-v1"
 
 
 def test_topology_is_selected_by_evidence_not_file_count() -> None:
@@ -151,6 +164,9 @@ def test_tensor_abi_persists_only_scalar_target_state() -> None:
         "target_conv_state_bank [24,1,16,8192,4]",
         "target_recurrent_state_bank [24,1,16,32,128,128]",
     ]
+    assert tensor_abi["scalar_state_seed_policy"] == (
+        "per-linear-layer-jit-v1"
+    )
     carriers = {item["name"]: item for item in tensor_abi["round_carriers"]}
     assert carriers["verify_input_ids"]["shape"] == [1, 16]
     assert carriers["logical_proposal_count"]["range"] == [1, 15]
@@ -171,7 +187,10 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 11
+    assert framework_lock["schema_version"] == 12
+    assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
+        "incremental_verify_scalar_state_seed"
+    ]
     runtime = framework_lock["runtime"]
     assert "input device mirrors" in runtime["memory"]
     assert "last K+1 rows" in runtime["memory"]

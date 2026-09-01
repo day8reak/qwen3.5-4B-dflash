@@ -23,6 +23,7 @@ HELPERS = {
     "_require_dflash_accepted_tokens",
     "_select_dflash_state_slot",
     "seed_dflash_gdn_state_banks",
+    "seed_dflash_recurrent_state_bank",
     "rebase_dflash_gdn_state_banks",
     "torch_dflash_causal_conv1d_mtp",
 }
@@ -119,6 +120,43 @@ def assert_gdr_effective_length_source_contract() -> None:
         "accepted_tokens",
     ]
 
+    gdn_class = next(
+        node
+        for node in rollback_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Qwen3_5GatedDeltaNet"
+    )
+    gdn_forward = next(
+        node
+        for node in gdn_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "forward"
+    )
+    seed_calls = [
+        node
+        for node in ast.walk(gdn_forward)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "seed_dflash_recurrent_state_bank"
+    ]
+    assert len(seed_calls) == 1
+
+    text_model = next(
+        node
+        for node in rollback_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Qwen3_5TextModel"
+    )
+    policy = next(
+        node
+        for node in text_model.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "dflash_scalar_state_seed_policy"
+            for target in node.targets
+        )
+    )
+    assert isinstance(policy.value, ast.Constant)
+    assert policy.value.value == "per-linear-layer-jit-v1"
+
 
 def main() -> None:
     assert_gdr_effective_length_source_contract()
@@ -127,9 +165,17 @@ def main() -> None:
     assert helper["DFLASH_MAX_PROPOSALS"] == 15
     assert helper["DFLASH_MAX_VERIFY_TOKENS"] == 16
     seed = helper["seed_dflash_gdn_state_banks"]
+    seed_recurrent = helper["seed_dflash_recurrent_state_bank"]
     rebase = helper["rebase_dflash_gdn_state_banks"]
     conv = helper["torch_dflash_causal_conv1d_mtp"]
     normalize_effective_length = helper["_normalize_gdr_effective_length"]
+
+    recurrent_seed = seed_recurrent(
+        torch.zeros(2, 3, 4, 5, dtype=torch.float16),
+        7,
+    )
+    assert recurrent_seed.shape == (2, 7, 3, 4, 5)
+    assert recurrent_seed.dtype is torch.float32
 
     default_effective_length = normalize_effective_length(
         None,
@@ -206,6 +252,32 @@ def main() -> None:
         )
         torch.testing.assert_close(output, expected_output, rtol=1e-6, atol=1e-6)
         torch.testing.assert_close(next_bank, expected_bank, rtol=0, atol=0)
+        scalar_conv = torch.stack(
+            [
+                conv_bank[index, int(accepted[index])]
+                for index in range(conv_bank.shape[0])
+            ]
+        )
+        scalar_output, scalar_next_bank = conv(
+            hidden,
+            scalar_conv,
+            weight,
+            bias,
+            accepted,
+            "silu",
+        )
+        torch.testing.assert_close(
+            scalar_output,
+            expected_output,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            scalar_next_bank,
+            expected_bank,
+            rtol=0,
+            atol=0,
+        )
 
     rebased_conv, rebased_recurrent = rebase(
         next_bank,

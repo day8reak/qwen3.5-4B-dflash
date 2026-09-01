@@ -201,11 +201,31 @@ def seed_dflash_gdn_state_banks(
     conv_bank = conv_state.unsqueeze(1).expand(
         conv_state.shape[0], verify_tokens, *conv_state.shape[1:]
     ).clone()
+    recurrent_bank = seed_dflash_recurrent_state_bank(
+        recurrent_state,
+        verify_tokens,
+    )
+    return conv_bank, recurrent_bank
+
+
+def seed_dflash_recurrent_state_bank(
+    recurrent_state: torch.Tensor,
+    verify_tokens: int,
+) -> torch.Tensor:
+    """Seed only the GDR-MTP recurrent input bank from committed state."""
+
+    if isinstance(verify_tokens, bool) or not isinstance(verify_tokens, int):
+        raise TypeError("verify_tokens must be an integer")
+    if not 1 <= verify_tokens <= DFLASH_MAX_VERIFY_TOKENS:
+        raise ValueError(
+            f"verify_tokens must be in [1,{DFLASH_MAX_VERIFY_TOKENS}]"
+        )
+    if recurrent_state.ndim != 4:
+        raise ValueError("recurrent_state must have shape [B,H,Dk,Dv]")
     recurrent_state = recurrent_state.to(torch.float32)
-    recurrent_bank = recurrent_state.unsqueeze(1).expand(
+    return recurrent_state.unsqueeze(1).expand(
         recurrent_state.shape[0], verify_tokens, *recurrent_state.shape[1:]
     ).clone()
-    return conv_bank, recurrent_bank
 
 
 def rebase_dflash_gdn_state_banks(
@@ -245,7 +265,8 @@ def torch_dflash_causal_conv1d_mtp(
 
     Args:
         hidden_states: ``[B,C,T]`` projected Q/K/V rows.
-        conv_state_bank: ``[B,T,C,Kc]`` previous provisional windows.
+        conv_state_bank: committed scalar ``[B,C,Kc]`` or previous
+            provisional windows ``[B,T,C,Kc]``.
         weight: ``[C,Kc]`` depthwise convolution weight.
         bias: optional ``[C]`` bias.
         accepted_tokens: ``int8[B]`` slot selected from the previous bank.
@@ -258,19 +279,25 @@ def torch_dflash_causal_conv1d_mtp(
 
     if hidden_states.ndim != 3:
         raise ValueError("hidden_states must have shape [B,C,T]")
-    if conv_state_bank.ndim != 4:
-        raise ValueError("conv_state_bank must have shape [B,T,C,Kc]")
     batch_size, channels, sequence_length = hidden_states.shape
     if sequence_length < 1 or sequence_length > DFLASH_MAX_VERIFY_TOKENS:
         raise ValueError(
             f"DFlash verify sequence length must be in "
             f"[1,{DFLASH_MAX_VERIFY_TOKENS}]"
         )
-    expected_bank_prefix = (batch_size, sequence_length, channels)
-    if tuple(conv_state_bank.shape[:3]) != expected_bank_prefix:
+    scalar_state = conv_state_bank.ndim == 3
+    bank_state = conv_state_bank.ndim == 4
+    if not scalar_state and not bank_state:
         raise ValueError(
-            "conv_state_bank must use the same [B,T,C] dimensions as input"
+            "conv_state_bank must have shape [B,C,Kc] or [B,T,C,Kc]"
         )
+    expected_prefix = (
+        (batch_size, channels)
+        if scalar_state
+        else (batch_size, sequence_length, channels)
+    )
+    if tuple(conv_state_bank.shape[:-1]) != expected_prefix:
+        raise ValueError("conv state dimensions differ from hidden_states")
     state_length = conv_state_bank.shape[-1]
     if tuple(weight.shape) != (channels, state_length):
         raise ValueError(
@@ -286,7 +313,16 @@ def torch_dflash_causal_conv1d_mtp(
     if activation not in {"silu", "swish"}:
         raise ValueError("the locked Qwen3.5 GDN path requires SiLU")
 
-    base_state = _select_dflash_state_slot(conv_state_bank, accepted_tokens)
+    if scalar_state:
+        _require_dflash_accepted_tokens(
+            accepted_tokens,
+            batch_size=batch_size,
+            state_slots=sequence_length,
+            device=conv_state_bank.device,
+        )
+        base_state = conv_state_bank
+    else:
+        base_state = _select_dflash_state_slot(conv_state_bank, accepted_tokens)
     history = torch.cat((base_state, hidden_states), dim=-1).to(weight.dtype)
     convolution = F.conv1d(
         history,
@@ -1153,19 +1189,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.activation,
             ).transpose(1, 2)
         else:
-            if conv_state.ndim != 4:
+            scalar_state = conv_state.ndim == 3 and recurrent_state.ndim == 4
+            bank_state = conv_state.ndim == 4 and recurrent_state.ndim == 5
+            if not scalar_state and not bank_state:
                 raise ValueError(
-                    "DFlash conv_state must have shape [B,K+1,C,Kc]"
+                    "DFlash GDN state must be either scalar "
+                    "([B,C,Kc], [B,H,Dk,Dv]) or banked "
+                    "([B,K+1,C,Kc], [B,K+1,H,Dk,Dv])"
                 )
-            if recurrent_state.ndim != 5:
-                raise ValueError(
-                    "DFlash recurrent_state must have shape [B,K+1,H,Dk,Dv]"
+            if scalar_state:
+                # The incremental OM persists only the committed scalar state.
+                # Causal-conv consumes that scalar directly; seed only the
+                # recurrent T-slot input immediately before this layer calls
+                # GDR-MTP.  The former graph wrapper seeded both banks for all
+                # 24 layers up front, including an avoidable 24 MiB conv copy
+                # and gather at T=16.
+                recurrent_state = seed_dflash_recurrent_state_bank(
+                    recurrent_state,
+                    seq_len,
                 )
             expected_conv = (
-                batch_size,
-                seq_len,
-                self.conv_dim,
-                self.conv_kernel_size,
+                (batch_size, self.conv_dim, self.conv_kernel_size)
+                if scalar_state
+                else (
+                    batch_size,
+                    seq_len,
+                    self.conv_dim,
+                    self.conv_kernel_size,
+                )
             )
             expected_recurrent = (
                 batch_size,
@@ -1379,6 +1430,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
     )
     dflash_feature_capture_point = "decoder_post_layer_pre_final_norm"
     dflash_state_contract_id = "qwen3.5-4b-dflash-target-state-bank-v1"
+    dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
 
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__(config)
@@ -1496,6 +1548,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
     )
     dflash_feature_capture_point = "decoder_post_layer_pre_final_norm"
     dflash_state_contract_id = "qwen3.5-4b-dflash-target-state-bank-v1"
+    dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
 
     def __init__(self, config):
         super().__init__(config)

@@ -31,7 +31,7 @@ golden”则明确需要 `CausalConv1dMTP`。
 | --- | --- | --- | --- | --- | --- |
 | `ChunkGatedDeltaRule` | 复用 receiver 新 ABI、已接线 | 普通 prompt/decode GDR；固定物理行数时忽略无效尾部 | Q/K/V、g、beta、`effective_length`、初始 state | attention output、最终 FP32 state | P0，已有 |
 | `GatedDeltaRuleMTP` | 已完成、已接线 | 选择上一轮 committed recurrent slot，计算 T 行并保存逐行 provisional state | Q/K/V、g、beta、state bank、`accepted_tokens` | attention output、FP32 state bank | P0，已有 |
-| `CausalConv1dMTP` | Torch-NPU golden | 同一 accepted slot 上执行 depthwise causal conv，保存逐行 conv window | mixed QKV、conv bank、weight/bias、`accepted_tokens` | activated rows、FP16 conv bank | P1，去 golden 必需 |
+| `CausalConv1dMTP` | Torch-NPU golden | 从 committed scalar 或同一 accepted slot 执行 depthwise causal conv，保存逐行 conv window | mixed QKV、scalar/banked conv state、weight/bias、`accepted_tokens` | activated rows、FP16 conv bank | P1，去 golden 必需 |
 | `CacheUpdateMTP` | 现有 op 逐 row | 一次写入 T 行 paged K 或 V，支持跨 64-token block | cache、updates、positions、block table | 原位 cache | 条件 P1 |
 | `FusedInferAttentionMTP` | 复用现有 attention | 历史 paged KV + 当前 T 行 block-causal attention | Q、K/V cache、mask、length/table | T 行 attention | 条件 P1 |
 | `DFlashBlockGQA` | Draft Tensor 分解 | 直接读取 committed/new KV，避免 repeat/concat 和小算子链 | Draft Q、committed/new K/V、mask | 6 层 attention rows | 性能 P1 |
@@ -132,7 +132,7 @@ causal_conv1d_mtp(
 | Tensor | Shape | Dtype |
 | --- | --- | --- |
 | hidden states | `[B,Cg,T]` | FP16 |
-| previous conv bank | `[B,T,Cg,Kc]` | FP16 |
+| committed conv / previous conv bank | `[B,Cg,Kc]` 或 `[B,T,Cg,Kc]` | FP16 |
 | weight | `[Cg,Kc]` | FP16 |
 | bias | `[Cg]` 或无 | FP16 |
 | `accepted_tokens` | `[B]` | INT8 |
@@ -142,6 +142,11 @@ causal_conv1d_mtp(
 当前 `torch_dflash_causal_conv1d_mtp` 已实现相同语义，输入在 NPU 时没有 CPU fallback，但会形成
 gather、concat/unfold、depthwise conv、activation 和中间 tensor。新算子必须逐 row、逐 state
 slot 对齐该 golden，并与 GDR、KV、feature 使用同一个 accepted count。
+
+五 OM incremental graph 已经持久化选中的 scalar conv state，因此该路径直接消费
+`[B,Cg,Kc]`，不再先复制 24 份 T=16 input bank，也不执行 24 次 previous-slot gather；原始
+torch_npu rollback 路径仍可传 `[B,T,Cg,Kc]` bank。两种输入必须生成完全相同的逐 row output 与
+next bank，CPU exact test 已冻结这一点；真实 AIR/OM 的算子数和时延仍需 msprof 确认。
 
 验收档位：`K=1/3/5/7/15`，`a=0/1/K-1/K`，连续多轮及动态 T；拒绝后继续执行至少一个 token，
 确认 rejected window 未污染 committed state。

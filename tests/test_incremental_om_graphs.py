@@ -32,6 +32,8 @@ class _TokenHead(nn.Module):
 
 
 class _FakeLanguageModel(nn.Module):
+    dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
+
     def forward(
         self,
         *,
@@ -47,13 +49,17 @@ class _FakeLanguageModel(nn.Module):
         if accepted_tokens is None:
             past_key_values[0] = (conv + 1, recurrent + 1)
         else:
+            # The graph boundary must pass committed scalar states.  The real
+            # rollback GDN expands them one linear layer at a time.
+            assert conv.ndim == 3
+            assert recurrent.ndim == 4
             slots = torch.arange(
-                conv.shape[1], dtype=conv.dtype, device=conv.device
+                inputs_embeds.shape[1], dtype=conv.dtype, device=conv.device
             ).reshape(1, -1, 1, 1)
             recurrent_slots = slots.reshape(1, -1, 1, 1, 1)
             past_key_values[0] = (
-                conv + slots,
-                recurrent + recurrent_slots,
+                conv.unsqueeze(1) + slots,
+                recurrent.unsqueeze(1) + recurrent_slots,
             )
         key, value = past_key_values[1]
         past_key_values[1] = (key + 1, value + 1)

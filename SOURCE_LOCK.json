@@ -121,7 +121,7 @@
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
     "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
     "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
-    "hiai_modeling_sha256": "4ee480159f32633709c97d4d8422bf37a5a2f46223046d9090c56fb3ee529bf2",
+    "hiai_modeling_sha256": "3ae42f28adea6b660bbcfd3bfda6fb6b66694bcb6acc7d83ce55eff39ff06664",
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
     "wrapper_sha256": "a62e4a554cd566194455a993e37dd0bc045579424d99c85e789dd241b1408020",
     "shared_qlinear_source_file": "models/modeling_qwen3_5_hiai_nd.py",

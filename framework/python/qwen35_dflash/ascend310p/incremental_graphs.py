@@ -19,6 +19,7 @@ from .contracts import AirGraphSpec, CustomOpExportSpec
 VERIFY_ROWS = 16
 PROPOSAL_ROWS = VERIFY_ROWS - 1
 PREFILL_ROWS = 64
+SCALAR_STATE_SEED_POLICY = "per-linear-layer-jit-v1"
 
 
 class _ExplicitTargetGraph(nn.Module):
@@ -42,6 +43,14 @@ class _ExplicitTargetGraph(nn.Module):
             lm_head, nn.Module
         ):
             raise TypeError("incremental Target requires language_model and lm_head")
+        if (
+            getattr(language_model, "dflash_scalar_state_seed_policy", None)
+            != SCALAR_STATE_SEED_POLICY
+        ):
+            raise RuntimeError(
+                "incremental Target requires rollback modeling with "
+                f"{SCALAR_STATE_SEED_POLICY} scalar-state seeding"
+            )
         config = getattr(execution, "config", None)
         layer_types = tuple(getattr(config, "layer_types", ()))
         if not layer_types or any(
@@ -79,18 +88,18 @@ class _ExplicitTargetGraph(nn.Module):
             if layer_type == "linear_attention":
                 conv = conv_state[linear_index]
                 recurrent = recurrent_state[linear_index]
-                if verify_rows is not None:
-                    conv = conv.unsqueeze(1).expand(
-                        conv.shape[0], verify_rows, *conv.shape[1:]
-                    ).clone()
-                    recurrent = recurrent.unsqueeze(1).expand(
-                        recurrent.shape[0], verify_rows, *recurrent.shape[1:]
-                    ).clone()
-                else:
+                if verify_rows is None:
                     # Ordinary causal-conv updates its Tensor in place.  Keep
                     # the public OM input immutable and return the clone.
                     conv = conv.clone()
                     recurrent = recurrent.clone()
+                # Verify deliberately keeps the public committed state scalar
+                # here.  Causal-conv consumes the scalar directly; rollback
+                # modeling seeds only the recurrent fixed T-slot input just
+                # before each linear-attention layer consumes it.  Expanding
+                # both banks for all 24 layers at this boundary created about
+                # 792 MiB of graph-entry seed tensors.  The GDR-MTP custom-op
+                # ABI and its per-row output bank are unchanged.
                 state.append((conv, recurrent))
                 linear_index += 1
             else:
@@ -701,6 +710,13 @@ def incremental_state_graph_specs(
         "state_owner": "C++ request context device buffers",
         "target_all_q_length_policy": "fixed kv_cache_max_len plus explicit causal mask and logical cursor",
         "target_all_q_length_evidence": "PENDING_REAL_NPU_EQUIVALENCE",
+        "verify_scalar_state_seed_policy": SCALAR_STATE_SEED_POLICY,
+        "verify_scalar_state_seed_evidence": (
+            "source graph passes committed scalar GDN state; causal-conv "
+            "consumes scalar state directly and recurrent state is seeded one "
+            "linear-attention layer at a time; AIR/ATC peak memory remains a "
+            "real-toolchain gate"
+        ),
         "draft_feature_tail": (
             "TorchAir discrete dynamic N gears: verify N=16 and prompt feature "
             "batches N=64..kv_cache_max_len in 64-row increments"

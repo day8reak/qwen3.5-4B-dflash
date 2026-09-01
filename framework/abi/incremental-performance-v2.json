@@ -178,7 +178,8 @@
       "target_conv_state_bank [24,1,16,8192,4]",
       "target_recurrent_state_bank [24,1,16,32,128,128]"
     ],
-    "bank_policy": "verify constructs banks inside the graph, the exact tail gathers slot accepted_count, and only grouped scalar states persist"
+    "bank_policy": "verify receives grouped committed scalar states, lets causal-conv consume its scalar state directly, seeds only the fixed 16-slot recurrent GDR-MTP input immediately before each linear-attention layer, gathers slot accepted_count at the exact tail, and persists only grouped scalar states",
+    "scalar_state_seed_policy": "per-linear-layer-jit-v1"
   },
   "state_ownership": {
     "owner": "one C++ request context with persistent device buffers",
@@ -222,7 +223,13 @@
     "transient_target_conv_bank_fp16": 25165824,
     "transient_target_recurrent_bank_fp32": 805306368,
     "transient_verify_bank_subtotal": 830472192,
-    "notes": "excludes model weights, model workspaces, I/O buffers, allocator/runtime overhead and optional feature/logit intermediates"
+    "legacy_graph_entry_seed_live_set": 830472192,
+    "per_linear_layer_jit_recurrent_seed_max": 33554432,
+    "source_graph_seed_live_set_reduction_candidate": 796917760,
+    "conv_input_bank_materialization_bytes_eliminated_per_verify": 25165824,
+    "conv_input_bank_gathers_eliminated_per_verify": 24,
+    "seed_policy": "per-linear-layer-jit-v1",
+    "notes": "the JIT seed values describe source-graph input-seed tensors, not a measured OM peak; provisional output banks still exist; excludes model weights, model workspaces, I/O buffers, allocator/runtime overhead and optional feature/logit intermediates"
   },
   "physical_topology_candidates": [
     {

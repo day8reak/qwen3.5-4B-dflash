@@ -67,7 +67,7 @@ I/O buffer + runtime margin
 
 ### 2.1 查询完整候选集
 
-构建后，使用新增的 `qwen35_dflash_om_inspect`。下面的 `974651392` 是本页表格中
+构建后，使用新增的 `qwen35_dflash_om_inspect`。下面的 `999817216` 是本页表格中
 `persistent state + T16 transient banks` 的小计；1 GiB margin 只是示例，真机应按 I/O、feature、
 logit、allocator 和并存服务重新声明。`DEVICE_BUDGET_BYTES` 必须来自本次目标机预算，不能照抄：
 
@@ -101,7 +101,29 @@ cmake --build "$CPP_BUILD" -j
 ```bash
 jq '{models, budget, assumptions, claim_boundary}' \
   "$AI_RUN_DIR/out/performance/five-graph-memory.json"
+
+jq '.models[] | select(.role == "target-verify-commit") |
+  {sha256, work_bytes, weight_bytes}' \
+  "$AI_RUN_DIR/out/performance/five-graph-memory.json"
 ```
+
+`per-linear-layer-jit-v1` 是否真的降低编译后 workspace，必须使用相同 checkpoint、量化文件、
+`max_sequence_length`、CANN/ATC 和 SoC 分别生成旧/新 OM 后比较，不能拿源码字节公式替代：
+
+```bash
+OLD_REPORT=/ABSOLUTE/PATH/old-five-graph-memory.json
+NEW_REPORT="$AI_RUN_DIR/out/performance/five-graph-memory.json"
+
+jq -s '
+  map(.models[] | select(.role == "target-verify-commit") |
+      {sha256, work_bytes, weight_bytes}) |
+  {old: .[0], new: .[1],
+   work_bytes_delta: (.[1].work_bytes - .[0].work_bytes)}
+' "$OLD_REPORT" "$NEW_REPORT"
+```
+
+这个 A/B 只判断编译后 workspace；最终是否更快仍以同身份、未开启 profiler 的 3+10
+端到端报告为准。
 
 `fits_declared_budget=true` 只表示静态估算未超预算。它不替代完整集合同时 load、运行时显存峰值、
 数值正确性或性能测试。
@@ -120,11 +142,23 @@ jq '{models, budget, assumptions, claim_boundary}' \
 | Target conv bank FP16 | 25,165,824 | 24 | verify transient |
 | Target recurrent bank FP32 | 805,306,368 | 768 | verify transient |
 | verify bank 小计 | 830,472,192 | 792 | graph workspace/transient |
+| 旧图入口同时播种的输入 bank | 830,472,192 | 792 | 已从源码图删除 |
+| 当前单层 recurrent 即时播种 | 33,554,432 | 32 | layer-local transient |
 
 这里尚未包含模型权重、ATC workspace、I/O、feature、logit 中间量和 allocator/runtime overhead。
 尤其是 792 MiB state bank：它不应该每轮搬回 host，也不应该作为下一轮的持久输出。推荐在
 verify graph 尾部根据接受数 `a` gather slot `a`，只持久化选中的 scalar state；bank 只作为当轮
 workspace。
+
+当前源码进一步使用 `per-linear-layer-jit-v1`：verify 的五个公开 Target state 输入仍是 scalar
+ABI，wrapper 不再在进入 32 层 body 前一次性复制 24 份 T=16 GDN 输入 bank。causal-conv 直接
+读取已经 committed 的 scalar conv state；只有 recurrent state 在每个 linear-attention layer
+调用 GDR-MTP 前即时播种。这样每次 verify 明确删除 25,165,824 bytes 的 conv input-bank
+materialization 和 24 次 bank-slot gather；recurrent 输入 seed 的源码图同时 live set 从整组
+805,306,368 bytes 变成单层 33,554,432 bytes。数值、自定义算子签名和 OM 外部输入/输出均不变。
+这里描述的是源码图工作量/生命周期，不是 310P 上已经实测的 OM 峰值：必须在新 AIR/OM 上检查
+`target-verify-commit.work_bytes` 并以 msprof 结果为准。输出 provisional bank 仍然存在，不能把
+这项改动误报成已消除全部 792 MiB verify bank。
 
 持久 recurrent 统一用 FP32：普通 GDR 仍保留 receiver 现有的 FP16 输出边界，再把该结果无损
 扩宽到 FP32；GDR-MTP 选中的 FP32 state 则无需每轮降回 FP16。这样 prefill/decode/verify 的
@@ -314,7 +348,10 @@ jq -e '
   ((.graphs[] | select(.name == "target-prefill-head") |
     .custom_op_audit | length) == 2) and
   ([.graphs[] | select(.name == "target-prefill-head") |
-    .custom_op_audit[] | .status] | all(. == "PASS"))
+    .custom_op_audit[] | .status] | all(. == "PASS")) and
+  ((.graphs[] | select(.name == "target-verify-commit") |
+    .metadata.verify_scalar_state_seed_policy) ==
+      "per-linear-layer-jit-v1")
 ' "$INCREMENTAL_BUNDLE/deployment-manifest.json"
 
 PYTHONPATH="$PWD/framework/python:$PWD" "$MODEL_PYTHON" -m pytest -q \
