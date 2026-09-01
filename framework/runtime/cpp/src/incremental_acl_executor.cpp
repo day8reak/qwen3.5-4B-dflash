@@ -478,20 +478,40 @@ const char* IncrementalStateResetPolicyName(
   return "unknown";
 }
 
+const char* IncrementalDecodeCarrierPolicyName(
+    IncrementalDecodeCarrierPolicy policy) noexcept {
+  switch (policy) {
+    case IncrementalDecodeCarrierPolicy::kOneTokenHostFallback:
+      return "one-token-h2d";
+    case IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact:
+      return "last-token-d2d";
+  }
+  return "unknown";
+}
+
 class AclIncrementalExecutor::Impl {
  public:
   Impl(
       const IncrementalOmPaths& paths,
       int device_id,
       const IncrementalModelProgress& progress,
-      IncrementalStateResetPolicy state_reset_policy)
-      : device_id_(device_id), state_reset_policy_(state_reset_policy) {
+      IncrementalStateResetPolicy state_reset_policy,
+      IncrementalDecodeCarrierPolicy decode_carrier_policy)
+      : device_id_(device_id),
+        state_reset_policy_(state_reset_policy),
+        decode_carrier_policy_(decode_carrier_policy) {
     if (device_id < 0) {
       throw std::invalid_argument("device ID must be non-negative");
     }
     if (state_reset_policy_ != IncrementalStateResetPolicy::kAsyncMemset &&
         state_reset_policy_ != IncrementalStateResetPolicy::kImmutableZero) {
       throw std::invalid_argument("unknown incremental state reset policy");
+    }
+    if (decode_carrier_policy_ !=
+            IncrementalDecodeCarrierPolicy::kOneTokenHostFallback &&
+        decode_carrier_policy_ !=
+            IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact) {
+      throw std::invalid_argument("unknown incremental decode carrier policy");
     }
     try {
       Check(aclInit(nullptr), "aclInit");
@@ -585,6 +605,9 @@ class AclIncrementalExecutor::Impl {
   }
   IncrementalStateResetPolicy state_reset_policy() const noexcept {
     return state_reset_policy_;
+  }
+  IncrementalDecodeCarrierPolicy decode_carrier_policy() const noexcept {
+    return decode_carrier_policy_;
   }
 
   void Reset(
@@ -1865,9 +1888,16 @@ class AclIncrementalExecutor::Impl {
       std::size_t model_executions,
       std::size_t state_index) {
     StatefulStep result = ReadCompact(verify, model_executions, state_index);
-    decode_carrier_valid_ = true;
-    decode_carrier_row_ = result.token_ids.size() - 1;
-    decode_carrier_token_id_ = result.token_ids.back();
+    decode_carrier_valid_ =
+        result.token_ids.size() == 1 ||
+        decode_carrier_policy_ ==
+            IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact;
+    if (decode_carrier_valid_) {
+      decode_carrier_row_ = result.token_ids.size() - 1;
+      decode_carrier_token_id_ = result.token_ids.back();
+    } else {
+      decode_carrier_row_ = 0;
+    }
     return result;
   }
 
@@ -1972,6 +2002,8 @@ class AclIncrementalExecutor::Impl {
   int device_id_ = 0;
   IncrementalStateResetPolicy state_reset_policy_ =
       IncrementalStateResetPolicy::kAsyncMemset;
+  IncrementalDecodeCarrierPolicy decode_carrier_policy_ =
+      IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact;
   bool initialized_ = false;
   bool device_set_ = false;
   bool reset_ = false;
@@ -2064,9 +2096,14 @@ AclIncrementalExecutor::AclIncrementalExecutor(
     IncrementalOmPaths model_paths,
     int device_id,
     IncrementalModelProgress progress,
-    IncrementalStateResetPolicy state_reset_policy)
+    IncrementalStateResetPolicy state_reset_policy,
+    IncrementalDecodeCarrierPolicy decode_carrier_policy)
     : impl_(std::make_unique<Impl>(
-          model_paths, device_id, progress, state_reset_policy)) {}
+          model_paths,
+          device_id,
+          progress,
+          state_reset_policy,
+          decode_carrier_policy)) {}
 
 AclIncrementalExecutor::~AclIncrementalExecutor() = default;
 AclIncrementalExecutor::AclIncrementalExecutor(
@@ -2135,6 +2172,11 @@ AclIncrementalExecutor::execution_stats() const noexcept {
 IncrementalStateResetPolicy
 AclIncrementalExecutor::state_reset_policy() const noexcept {
   return impl_->state_reset_policy();
+}
+
+IncrementalDecodeCarrierPolicy
+AclIncrementalExecutor::decode_carrier_policy() const noexcept {
+  return impl_->decode_carrier_policy();
 }
 
 }  // namespace qwen35::dflash

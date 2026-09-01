@@ -10,6 +10,9 @@ endforeach()
 if(NOT DEFINED RESET_POLICY)
   set(RESET_POLICY "async-memset")
 endif()
+if(NOT DEFINED DECODE_CARRIER_POLICY)
+  set(DECODE_CARRIER_POLICY "last-token-d2d")
+endif()
 if(NOT DEFINED MEASUREMENT_PROTOCOL)
   set(MEASUREMENT_PROTOCOL "evidence")
 endif()
@@ -52,6 +55,7 @@ execute_process(
     --device-id 0
     --measurement-protocol "${MEASUREMENT_PROTOCOL}"
     --state-reset-policy "${RESET_POLICY}"
+    --decode-carrier-policy "${DECODE_CARRIER_POLICY}"
   RESULT_VARIABLE result
   OUTPUT_VARIABLE stdout
   ERROR_VARIABLE stderr
@@ -79,6 +83,7 @@ string(JSON model_executions GET "${report}" execution_io_counters model_executi
 string(JSON synchronizations GET "${report}" execution_io_counters stream_synchronizations)
 string(JSON resets GET "${report}" execution_io_counters state_resets)
 string(JSON report_reset_policy GET "${report}" protocol state_reset_policy)
+string(JSON report_decode_carrier_policy GET "${report}" protocol decode_carrier_policy)
 string(JSON reset_only_barriers GET "${report}" protocol state_reset_only_barriers)
 string(JSON state_memsets GET "${report}" execution_io_counters state_memset_operations)
 string(JSON state_memset_bytes GET "${report}" execution_io_counters state_memset_bytes)
@@ -157,6 +162,27 @@ elseif(RESET_POLICY STREQUAL "immutable-zero")
 else()
   message(FATAL_ERROR "unknown RESET_POLICY=${RESET_POLICY}")
 endif()
+if(DECODE_CARRIER_POLICY STREQUAL "last-token-d2d")
+  if(NOT report_decode_carrier_policy STREQUAL DECODE_CARRIER_POLICY OR
+     NOT decode_uploads EQUAL 0 OR
+     NOT decode_carrier_hits EQUAL decode_executions OR
+     NOT decode_multi_token_carrier_hits GREATER 0 OR
+     NOT decode_multi_token_carrier_hits LESS decode_carrier_hits OR
+     NOT decode_device_compactions EQUAL decode_multi_token_carrier_hits)
+    message(FATAL_ERROR "fake last-token D2D counters failed: ${report}")
+  endif()
+elseif(DECODE_CARRIER_POLICY STREQUAL "one-token-h2d")
+  if(NOT report_decode_carrier_policy STREQUAL DECODE_CARRIER_POLICY OR
+     NOT decode_uploads GREATER 0 OR
+     NOT decode_carrier_hits GREATER 0 OR
+     NOT decode_multi_token_carrier_hits EQUAL 0 OR
+     NOT decode_device_compactions EQUAL 0 OR
+     NOT decode_device_compaction_bytes EQUAL 0)
+    message(FATAL_ERROR "fake one-token H2D counters failed: ${report}")
+  endif()
+else()
+  message(FATAL_ERROR "unknown DECODE_CARRIER_POLICY=${DECODE_CARRIER_POLICY}")
+endif()
 if(NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR
@@ -188,12 +214,8 @@ if(NOT status STREQUAL "PASS" OR
    NOT prefill_h2d_elided EQUAL prefill_executions OR
    NOT closed_decode_routes EQUAL decode_executions OR
    NOT decode_carrier_hits GREATER 0 OR
-   NOT decode_multi_token_carrier_hits GREATER 0 OR
-   NOT decode_multi_token_carrier_hits LESS decode_carrier_hits OR
    NOT decode_h2d_elided EQUAL decode_carrier_hits OR
-   NOT decode_device_compactions EQUAL decode_multi_token_carrier_hits OR
    NOT decode_device_compaction_bytes EQUAL expected_decode_device_compaction_bytes OR
-   NOT decode_uploads EQUAL 0 OR
    NOT decode_upload_bytes EQUAL expected_decode_upload_bytes OR
    NOT compact_ping_pong_bytes GREATER 0 OR
    NOT proposal_upload_bytes EQUAL expected_proposal_upload_bytes OR

@@ -20,6 +20,8 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     IMMUTABLE_ZERO_STATE_RESET_POLICY,
     INCREMENTAL_CPP_RUNNER_ID,
     INCREMENTAL_STATE_POLICY,
+    LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+    ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
     _INCREMENTAL_GRAPH_ABI,
     _resolve_incremental_oms,
     validate_cpp_runner_options,
@@ -54,6 +56,7 @@ def _hashes() -> dict[str, str]:
 def _report(
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     prompt_token_ids: list[int] | None = None,
+    decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
 ) -> dict[str, object]:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
     request_count = 26
@@ -67,9 +70,13 @@ def _report(
     prefill_feature_rows = dflash_request_count * prompt_chunks * 64
     prefill_control_bytes = 896
     decode_executions = 65
-    decode_upload_operations = 0
+    last_token_d2d = (
+        decode_carrier_policy == LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
+    )
+    decode_upload_operations = 0 if last_token_d2d else 13
     decode_carrier_hits = decode_executions - decode_upload_operations
-    decode_multi_token_carrier_hits = 13
+    decode_multi_token_carrier_hits = 13 if last_token_d2d else 0
+    decode_device_compactions = decode_multi_token_carrier_hits
     proposal_upload_operations = 2
     immutable_zero = (
         state_reset_policy == IMMUTABLE_ZERO_STATE_RESET_POLICY
@@ -132,8 +139,13 @@ def _report(
                 "on device; row zero binds directly and later rows use an "
                 "8-byte D2D copy into the aligned decode scalar; caller "
                 "overrides use the pinned-host H2D fallback"
+                if last_token_d2d
+                else "one-token compact Target results bind row zero "
+                "directly; multi-token commits and caller overrides use the "
+                "pinned-host 8-byte H2D fallback"
             ),
             "state_reset_policy": state_reset_policy,
+            "decode_carrier_policy": decode_carrier_policy,
             "state_reset_only_barriers": 0,
             "state_reset_device_work_included_by_prefill_barrier": (
                 not immutable_zero
@@ -212,10 +224,10 @@ def _report(
             ),
             "decode_id_h2d_operations_elided": decode_carrier_hits,
             "decode_id_device_compaction_operations": (
-                decode_multi_token_carrier_hits
+                decode_device_compactions
             ),
             "decode_id_device_compaction_bytes": (
-                decode_multi_token_carrier_hits * 8
+                decode_device_compactions * 8
             ),
             "proposal_count_upload_operations": proposal_upload_operations,
             "proposal_count_upload_bytes": proposal_upload_operations * 4,
@@ -266,6 +278,7 @@ def _validate(
     report: dict[str, object],
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     prompt_token_ids: list[int] | None = None,
+    decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
 ) -> None:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
     validate_incremental_cpp_runner_report(
@@ -276,6 +289,7 @@ def _validate(
         max_new_tokens=6,
         max_draft_tokens=3,
         state_reset_policy=state_reset_policy,
+        decode_carrier_policy=decode_carrier_policy,
     )
 
 
@@ -286,15 +300,38 @@ def _validate(
         IMMUTABLE_ZERO_STATE_RESET_POLICY,
     ],
 )
+@pytest.mark.parametrize(
+    "decode_carrier_policy",
+    [
+        LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+        ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
+    ],
+)
 def test_incremental_runner_report_closes_state_and_transaction_counters(
     state_reset_policy: str,
+    decode_carrier_policy: str,
 ) -> None:
-    _validate(_report(state_reset_policy), state_reset_policy)
+    _validate(
+        _report(
+            state_reset_policy,
+            decode_carrier_policy=decode_carrier_policy,
+        ),
+        state_reset_policy,
+        decode_carrier_policy=decode_carrier_policy,
+    )
 
 
 def test_incremental_runner_report_closes_multi_chunk_prefill() -> None:
     prompt = [1] * 69 + [10]
     _validate(_report(prompt_token_ids=prompt), prompt_token_ids=prompt)
+
+
+def test_incremental_runner_rejects_decode_carrier_policy_mismatch() -> None:
+    report = _report(
+        decode_carrier_policy=ONE_TOKEN_H2D_DECODE_CARRIER_POLICY
+    )
+    with pytest.raises(RuntimeError, match="decode carrier policy differs"):
+        _validate(report)
 
 
 @pytest.mark.parametrize(
@@ -354,6 +391,7 @@ def test_incremental_runner_config_is_explicit() -> None:
             "runtime": "AscendCL",
             "state_policy": INCREMENTAL_STATE_POLICY,
             "state_reset_policy": IMMUTABLE_ZERO_STATE_RESET_POLICY,
+            "decode_carrier_policy": ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
             "pad_token_id": 0,
         },
         0,
@@ -362,6 +400,10 @@ def test_incremental_runner_config_is_explicit() -> None:
     assert (
         identity["state_reset_policy"]
         == IMMUTABLE_ZERO_STATE_RESET_POLICY
+    )
+    assert (
+        identity["decode_carrier_policy"]
+        == ONE_TOKEN_H2D_DECODE_CARRIER_POLICY
     )
 
 
@@ -376,6 +418,22 @@ def test_incremental_runner_rejects_unknown_state_reset_policy() -> None:
                 "runtime": "AscendCL",
                 "state_policy": INCREMENTAL_STATE_POLICY,
                 "state_reset_policy": "unknown",
+            },
+            0,
+        )
+
+
+def test_incremental_runner_rejects_unknown_decode_carrier_policy() -> None:
+    with pytest.raises(ValueError, match="decode_carrier_policy"):
+        validate_cpp_runner_options(
+            {
+                "device_model": "Ascend310P3",
+                "cann": "test-cann",
+                "driver": "test-driver",
+                "firmware": "test-firmware",
+                "runtime": "AscendCL",
+                "state_policy": INCREMENTAL_STATE_POLICY,
+                "decode_carrier_policy": "unknown",
             },
             0,
         )
@@ -496,6 +554,7 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
             "runtime": "fake-AscendCL",
             "state_policy": INCREMENTAL_STATE_POLICY,
             "state_reset_policy": IMMUTABLE_ZERO_STATE_RESET_POLICY,
+            "decode_carrier_policy": LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
             "pad_token_id": 0,
         },
         prompt_token_ids=[10],
@@ -515,6 +574,9 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
     assert "--model" not in command
     assert command[command.index("--state-reset-policy") + 1] == (
         IMMUTABLE_ZERO_STATE_RESET_POLICY
+    )
+    assert command[command.index("--decode-carrier-policy") + 1] == (
+        LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
     )
     assert command[command.index("--measurement-protocol") + 1] == "evidence"
     assert payload["backend_metadata"]["state_policy"] == (

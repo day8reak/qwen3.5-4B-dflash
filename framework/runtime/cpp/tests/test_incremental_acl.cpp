@@ -20,7 +20,8 @@ void Require(bool condition, const std::string& message) {
 
 void RunPolicy(
     const std::array<std::filesystem::path, 5>& model_paths,
-    qwen35::dflash::IncrementalStateResetPolicy reset_policy) {
+    qwen35::dflash::IncrementalStateResetPolicy reset_policy,
+    qwen35::dflash::IncrementalDecodeCarrierPolicy decode_carrier_policy) {
   qwen35::dflash::IncrementalOmPaths paths{
       model_paths[0], model_paths[1], model_paths[2], model_paths[3],
       model_paths[4]};
@@ -33,13 +34,17 @@ void RunPolicy(
           loaded_roles.emplace_back(role);
         }
       },
-      reset_policy);
+      reset_policy,
+      decode_carrier_policy);
   Require(loaded_roles.size() == 5, "not all fake OMs were loaded");
   Require(executor.sequence_length() == 128, "fake state capacity differs");
   Require(executor.prefill_width() == 64, "fake prefill gear differs");
   Require(executor.proposal_width() == 15, "fake proposal width differs");
   Require(executor.eos_table_width() == 4, "fake EOS width differs");
   Require(executor.state_reset_policy() == reset_policy, "reset policy differs");
+  Require(
+      executor.decode_carrier_policy() == decode_carrier_policy,
+      "decode carrier policy differs");
 
   qwen35::dflash::GenerationOptions options;
   options.max_new_tokens = 6;
@@ -142,19 +147,11 @@ void RunPolicy(
                   stats.prefill_control_bytes_per_slot,
       "prefill controls were not packed into one H2D per chunk");
   Require(
-      stats.decode_id_upload_operations == 0 &&
-          stats.decode_id_device_carrier_hits ==
-              stats.target_decode1_executions &&
-          stats.decode_id_multi_token_carrier_hits > 0 &&
-          stats.decode_id_multi_token_carrier_hits <
-              stats.decode_id_device_carrier_hits &&
-          stats.decode_id_upload_operations +
+      stats.decode_id_upload_operations +
                   stats.decode_id_device_carrier_hits ==
               stats.target_decode1_executions &&
           stats.decode_id_h2d_operations_elided ==
               stats.decode_id_device_carrier_hits &&
-          stats.decode_id_device_compaction_operations ==
-              stats.decode_id_multi_token_carrier_hits &&
           stats.decode_id_device_compaction_bytes ==
               stats.decode_id_device_compaction_operations *
                   sizeof(std::int64_t) &&
@@ -171,7 +168,29 @@ void RunPolicy(
               stats.prefill_control_upload_bytes +
                   stats.decode_id_upload_bytes +
                   stats.proposal_count_upload_bytes,
-      "last-token decode carrier or packed H2D counters do not close");
+      "decode carrier route or packed H2D counters do not close");
+  if (decode_carrier_policy ==
+      qwen35::dflash::IncrementalDecodeCarrierPolicy::
+          kLastTokenDeviceCompact) {
+    Require(
+        stats.decode_id_upload_operations == 0 &&
+            stats.decode_id_device_carrier_hits ==
+                stats.target_decode1_executions &&
+            stats.decode_id_multi_token_carrier_hits > 0 &&
+            stats.decode_id_multi_token_carrier_hits <
+                stats.decode_id_device_carrier_hits &&
+            stats.decode_id_device_compaction_operations ==
+                stats.decode_id_multi_token_carrier_hits,
+        "last-token D2D decode carrier counters differ");
+  } else {
+    Require(
+        stats.decode_id_upload_operations > 0 &&
+            stats.decode_id_device_carrier_hits > 0 &&
+            stats.decode_id_multi_token_carrier_hits == 0 &&
+            stats.decode_id_device_compaction_operations == 0 &&
+            stats.decode_id_device_compaction_bytes == 0,
+        "one-token H2D fallback decode carrier counters differ");
+  }
   Require(stats.working_state_device_bytes > 0, "working state is missing");
   Require(
       stats.compact_ping_pong_device_bytes > 0 &&
@@ -293,14 +312,28 @@ int main(int argc, char** argv) {
     };
     RunPolicy(
         paths,
-        qwen35::dflash::IncrementalStateResetPolicy::kAsyncMemset);
+        qwen35::dflash::IncrementalStateResetPolicy::kAsyncMemset,
+        qwen35::dflash::IncrementalDecodeCarrierPolicy::
+            kLastTokenDeviceCompact);
     RunPolicy(
         paths,
-        qwen35::dflash::IncrementalStateResetPolicy::kImmutableZero);
+        qwen35::dflash::IncrementalStateResetPolicy::kImmutableZero,
+        qwen35::dflash::IncrementalDecodeCarrierPolicy::
+            kLastTokenDeviceCompact);
+    RunPolicy(
+        paths,
+        qwen35::dflash::IncrementalStateResetPolicy::kAsyncMemset,
+        qwen35::dflash::IncrementalDecodeCarrierPolicy::
+            kOneTokenHostFallback);
+    RunPolicy(
+        paths,
+        qwen35::dflash::IncrementalStateResetPolicy::kImmutableZero,
+        qwen35::dflash::IncrementalDecodeCarrierPolicy::
+            kOneTokenHostFallback);
     TestExplicitDecodeOverride(paths);
-    std::cout << "PASS: both reset policies preserve exact five-OM tokens, "
-                 "device state routing, compact synchronization and explicit "
-                 "decode override fallback\n";
+    std::cout << "PASS: both reset and decode carrier policies preserve exact "
+                 "five-OM tokens, device state routing, compact "
+                 "synchronization and explicit decode override fallback\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

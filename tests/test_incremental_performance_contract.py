@@ -245,6 +245,9 @@ def test_document_contains_memory_inspector_and_claim_boundary() -> None:
     assert "--model target-verify-commit=" in document
     assert "--state-bytes" in document
     assert "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE" in document
+    assert "--decode-carrier-policy" in document
+    assert "one-token-h2d" in document
+    assert "last-token-d2d" in document
     assert "不能宣称" in document
 
 
@@ -253,7 +256,7 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 15
+    assert framework_lock["schema_version"] == 16
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -281,10 +284,11 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert runner["current_integrated_om_io"].startswith(
         "persistent input device mirror"
     )
-    assert "last committed token always stays on device" in runner[
+    assert "last-token-d2d" in runner[
         "incremental_five_om_io"
     ]
     assert "D2D" in runner["incremental_five_om_io"]
+    assert "same-binary" in runner["required_decode_carrier_policy"]
     assert "maximum_target_elements_per_call" in runner["required_io_counters"]
 
 
@@ -295,6 +299,15 @@ def test_decode_device_carrier_contract_closes_frozen_fake_acl_work() -> None:
 
     assert "D2D" in hot_loop["last_committed_token_to_decode"]
     assert "8-byte" in hot_loop["decode_fallback"]
+    assert set(hot_loop["decode_carrier_policies"]) == {
+        "one-token-h2d",
+        "last-token-d2d",
+    }
+    selection_gate = hot_loop["decode_carrier_selection_gate"]
+    assert "same runner binary" in selection_gate
+    assert "3 warmups plus 10 measurements" in selection_gate
+    assert "zero token/EOS mismatch" in selection_gate
+    assert "measurement noise" in selection_gate
     assert "64-byte" in hot_loop["rejected_unaligned_multi_row_binding"]
     assert evidence["target_decode1_executions"] == (
         evidence["decode_id_device_carrier_hits"]

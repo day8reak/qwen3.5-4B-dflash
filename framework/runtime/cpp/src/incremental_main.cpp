@@ -29,6 +29,7 @@ using qwen35::dflash::BenchmarkResult;
 using qwen35::dflash::Distribution;
 using qwen35::dflash::GenerationMeasurement;
 using qwen35::dflash::IncrementalModelMemory;
+using qwen35::dflash::IncrementalDecodeCarrierPolicy;
 using qwen35::dflash::IncrementalStateResetPolicy;
 using qwen35::dflash::PairedBenchmarkResult;
 using qwen35::dflash::ProgressCallback;
@@ -65,6 +66,8 @@ struct Arguments {
   bool progress = true;
   IncrementalStateResetPolicy state_reset_policy =
       IncrementalStateResetPolicy::kAsyncMemset;
+  IncrementalDecodeCarrierPolicy decode_carrier_policy =
+      IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact;
   MeasurementProtocol measurement_protocol = MeasurementProtocol::kEvidence;
 };
 
@@ -93,6 +96,8 @@ void Usage(std::ostream& stream) {
       << "  --measurement-protocol MODE             evidence (default) or profile\n"
       << "  --state-reset-policy POLICY             async-memset (default) or "
          "immutable-zero\n"
+      << "  --decode-carrier-policy POLICY          last-token-d2d (default) or "
+         "one-token-h2d\n"
       << "  --progress true|false                    live stderr progress\n";
 }
 
@@ -284,6 +289,18 @@ Arguments ParseArguments(int argc, char** argv) {
   } else {
     throw std::invalid_argument(
         "state-reset-policy must be async-memset or immutable-zero");
+  }
+  const std::string decode_carrier_policy = TakeOptional(
+      &values, "decode-carrier-policy", "last-token-d2d");
+  if (decode_carrier_policy == "last-token-d2d") {
+    result.decode_carrier_policy =
+        IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact;
+  } else if (decode_carrier_policy == "one-token-h2d") {
+    result.decode_carrier_policy =
+        IncrementalDecodeCarrierPolicy::kOneTokenHostFallback;
+  } else {
+    throw std::invalid_argument(
+        "decode-carrier-policy must be last-token-d2d or one-token-h2d");
   }
   const std::int64_t device_id = ParseInt64(
       TakeOptional(&values, "device-id", "0"), "device-id");
@@ -561,10 +578,20 @@ void WriteReport(
             "final physical prompt chunk\","
          << "\"device_suballocation_policy\":\"64-byte segment starts; "
             "ALIGN_UP(payload,32)+32 reserved span\","
-         << "\"decode_input_policy\":\"the last committed token from any "
-            "compact Target result stays on device; row zero binds directly "
-            "and later rows use an 8-byte D2D copy into the aligned decode "
-            "scalar; caller overrides use the pinned-host H2D fallback\","
+         << "\"decode_carrier_policy\":\""
+         << qwen35::dflash::IncrementalDecodeCarrierPolicyName(
+                executor.decode_carrier_policy())
+         << "\",\"decode_input_policy\":\""
+         << (executor.decode_carrier_policy() ==
+                     IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact
+                 ? "the last committed token from any compact Target result "
+                   "stays on device; row zero binds directly and later rows "
+                   "use an 8-byte D2D copy into the aligned decode scalar; "
+                   "caller overrides use the pinned-host H2D fallback"
+                 : "one-token compact Target results bind row zero directly; "
+                   "multi-token commits and caller overrides use the "
+                   "pinned-host 8-byte H2D fallback")
+         << "\","
          << "\"state_reset_policy\":\""
          << qwen35::dflash::IncrementalStateResetPolicyName(
                 executor.state_reset_policy())
@@ -776,7 +803,8 @@ int main(int argc, char** argv) {
           }
           PrintProgress(arguments.progress, message.str());
         },
-        arguments.state_reset_policy);
+        arguments.state_reset_policy,
+        arguments.decode_carrier_policy);
     const auto load_end = std::chrono::steady_clock::now();
     const double load_ms = std::chrono::duration<double, std::milli>(
         load_end - load_start).count();

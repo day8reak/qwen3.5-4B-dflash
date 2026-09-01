@@ -38,6 +38,18 @@ enum class IncrementalStateResetPolicy {
 const char* IncrementalStateResetPolicyName(
     IncrementalStateResetPolicy policy) noexcept;
 
+enum class IncrementalDecodeCarrierPolicy {
+  // Bind one-token compact row zero directly. A multi-token result falls back
+  // to the original 8-byte pinned-host H2D path on the next decode.
+  kOneTokenHostFallback,
+  // Keep every last committed token on device. Multi-token rows compact D2D
+  // into the existing aligned scalar before the next decode.
+  kLastTokenDeviceCompact,
+};
+
+const char* IncrementalDecodeCarrierPolicyName(
+    IncrementalDecodeCarrierPolicy policy) noexcept;
+
 struct IncrementalAclExecutionStats {
   std::size_t target_prefill_executions = 0;
   std::size_t target_prefill_head_executions = 0;
@@ -100,9 +112,10 @@ using IncrementalModelProgress = std::function<void(
 // once after the final physical prompt chunk. This moves the prefill head
 // weight instead of retaining a dead copy in the body artifact.
 // Target/Draft states and compact Target results are ping-ponged in device
-// arenas. The last committed token in any compact result stays on device: row
-// zero binds directly and later rows compact D2D into the aligned input. An
-// explicit caller override retains the original H2D fallback.
+// arenas. The carrier policy either binds only one-token row zero and falls
+// back to H2D after multi-token commits, or retains every last committed token,
+// binding row zero directly and compacting later rows D2D into the aligned
+// input. An explicit caller override retains the original H2D fallback.
 // Proposal IDs, Target features and cursors never cross the host boundary. A speculative
 // method enqueues Draft -> Target verify/commit and performs one stream sync
 // only after a compact transaction result has been queued for D2H. The first
@@ -116,7 +129,9 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
       int device_id = 0,
       IncrementalModelProgress progress = {},
       IncrementalStateResetPolicy state_reset_policy =
-          IncrementalStateResetPolicy::kAsyncMemset);
+          IncrementalStateResetPolicy::kAsyncMemset,
+      IncrementalDecodeCarrierPolicy decode_carrier_policy =
+          IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact);
   ~AclIncrementalExecutor() override;
 
   AclIncrementalExecutor(const AclIncrementalExecutor&) = delete;
@@ -147,6 +162,7 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
   const std::vector<IncrementalModelMemory>& model_memory() const noexcept;
   const IncrementalAclExecutionStats& execution_stats() const noexcept;
   IncrementalStateResetPolicy state_reset_policy() const noexcept;
+  IncrementalDecodeCarrierPolicy decode_carrier_policy() const noexcept;
 
  private:
   class Impl;

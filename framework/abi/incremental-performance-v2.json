@@ -303,6 +303,11 @@
     "draft_to_verify": "the [anchor,p0..p14] carrier stays on device and binds directly to Target verify",
     "last_committed_token_to_decode": "the preceding compact Target result stays on device; row zero binds directly and later rows use one 8-byte D2D copy into the aligned decode scalar; no decode-ID H2D is issued by the standard scheduler",
     "decode_fallback": "an explicit caller override retains the exact 8-byte pinned-host H2D route",
+    "decode_carrier_policies": {
+      "one-token-h2d": "one-row compact Target results bind row zero directly; multi-token commits and explicit caller overrides use the pinned-host 8-byte H2D fallback",
+      "last-token-d2d": "the last token from every compact Target result stays device-resident; row zero binds directly, later rows use one aligned 8-byte D2D compaction, and explicit caller overrides use pinned-host H2D"
+    },
+    "decode_carrier_selection_gate": "compare both policies with the same runner binary, OM hashes, prompt/token limits, reset policy, device identity and alternating order; require zero token/EOS mismatch and unprofiled 3 warmups plus 10 measurements, then select last-token-d2d only when its median and p90 improve measurably; retain one-token-h2d when the result is a tie or within measurement noise; msprof is diagnostic only",
     "rejected_unaligned_multi_row_binding": "compact token rows 1 through 15 begin at 8-byte strides and cannot be bound directly as model inputs under the 64-byte AscendCL input-address rule; Fake ACL must reject that plan, so later rows use the aligned scalar D2D route",
     "synchronization": "one host-visible synchronization after verify/commit per speculative round",
     "ordinary": "never execute Draft",

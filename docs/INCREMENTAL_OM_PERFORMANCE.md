@@ -421,6 +421,7 @@ jq '{
   status,
   runner_id,
   candidate_status,
+  decode_carrier_policy: .protocol.decode_carrier_policy,
   models,
   abi,
   model_memory_query,
@@ -477,8 +478,9 @@ host_to_device_operations           = prefill_control_upload_operations
 `ALIGN_UP(tensor_bytes,32)+32`，最终 carrier 再按 64 bytes 对齐；默认 `eos_table_width=4` 时为
 896 bytes。最后三个加数分别代表 packed prefill、仅供显式调用者覆盖使用的 decode ID 回退，
 以及 prefill 后 proposal count 改值；三类 operation/byte 分项之和必须严格等于总 H2D 计数。
-每次 `target-decode1` 必须恰好落入 device carrier 或 host upload 两条路径之一；多 token carrier
-还必须以一条 8-byte D2D compaction 闭合。这个布局遵守
+每次 `target-decode1` 必须恰好落入 device carrier 或 host upload 两条路径之一；选择
+`last-token-d2d` 时，多 token carrier 还必须以一条 8-byte D2D compaction 闭合；选择
+`one-token-h2d` 时，这两个 multi-token/D2D 计数必须都为 0。这个布局遵守
 [`aclrtMalloc` 对大块内存二次划分的 64-byte 起始地址与分段跨度约束](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0095.html)。
 
 因此 2048-token prompt 的每次请求会把原来的 32 次 prefill host completion 降为 1 次，同时把
@@ -506,7 +508,7 @@ API/timeline，并以未开 msprof 的同源 3+10 median/p90 决定是否保留�
 [`aclmdlExecuteAsync` 是异步模型执行接口](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/apiref/appdevgapi/aclcppdevg_03_0299.html)，
 而锁页 host 内存上的 [`aclrtMemcpyAsync` 仅表示任务已下发，必须同步后才能确认复制完成](https://www.hiascend.com/document/detail/en/canncommercial/850/API/appdevgapi/aclcppdevg_03_0106.html)。
 因此五个 OM、所有 H2D 和最终 D2H 必须使用同一个 stream；最终同步前不得覆写或释放已下发
-H2D 的 host 源。Fake ACL 回归会主动拒绝这种过早复用，但真实 CANN/310P 的首轮仍须按 5.6 节
+H2D 的 host 源。Fake ACL 回归会主动拒绝这种过早复用，但真实 CANN/310P 的首轮仍须按 5.7 节
 采集 timeline，确认调用顺序和输出一致后才能把该候选作为正式时延证据。
 
 ### 5.4 A/B 选择状态重置策略
@@ -628,7 +630,88 @@ jq -s 'map({
 这个优化主要影响每次请求的第一次 prefill/TTFT，对长生成的稳态 TPOT 理论上帮助较小。报告中
 的 `acl_and_five_model_load` 包含 `immutable-zero` 的一次性初始化；正式 model latency 不包含它。
 
-### 5.5 直接运行二进制
+### 5.5 A/B 选择 decode carrier 策略
+
+`decode_carrier_policy` 是同一个 C++ runner 内的精确运行时开关，不改变五个 OM、AIR、tensor ABI
+或 token 语义：
+
+- `one-token-h2d`：一行 compact 结果直接在 device 上复用；多 token commit 的最后一个 token
+  从已经下载的 compact host 结果经 pinned-host 8-byte H2D 回填。它是结构更简单的基线；
+- `last-token-d2d`：所有 compact 结果的最后一个 token 都保留在 device；第 0 行直接复用，后续行
+  先做一次 8-byte D2D 到 64-byte 对齐 scalar。它减少 H2D 次数，但没有减少 memcpy API 总次数。
+
+先固定同一个 `state_reset_policy`，生成两份只差 carrier 字段的配置：
+
+```bash
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-carrier-one-token-h2d.json"
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-carrier-last-token-d2d.json"
+
+jq '.decode_carrier_policy = "one-token-h2d"' \
+  "$AI_RUN_DIR/runner-carrier-one-token-h2d.json" > \
+  "$AI_RUN_DIR/runner-carrier-one-token-h2d.tmp.json"
+mv "$AI_RUN_DIR/runner-carrier-one-token-h2d.tmp.json" \
+  "$AI_RUN_DIR/runner-carrier-one-token-h2d.json"
+jq '.decode_carrier_policy = "last-token-d2d"' \
+  "$AI_RUN_DIR/runner-carrier-last-token-d2d.json" > \
+  "$AI_RUN_DIR/runner-carrier-last-token-d2d.tmp.json"
+mv "$AI_RUN_DIR/runner-carrier-last-token-d2d.tmp.json" \
+  "$AI_RUN_DIR/runner-carrier-last-token-d2d.json"
+# 两份文件的 device_model/cann/driver/firmware/state_reset_policy 必须完全相同。
+```
+
+使用同一个 runner 二进制、deployment manifest、五个 OM SHA-256、prompt、token 上限和 device。
+顺序跑完后再反向跑一组，不能换二进制或只保留较快的一次：
+
+```bash
+for CARRIER_POLICY in one-token-h2d last-token-d2d; do
+  "$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
+    --deployment-manifest "$INCREMENTAL_BUNDLE/deployment-manifest.json" \
+    --runner \
+      "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+    --runner-config \
+      "$AI_RUN_DIR/runner-carrier-${CARRIER_POLICY}.json" \
+    --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
+    --prompt '请用一句话解释为什么天空是蓝色的。' \
+    --chat \
+    --max-new-tokens 32 \
+    --max-draft-tokens 15 \
+    --device-id 0 \
+    --output "$AI_RUN_DIR/reports/carrier-${CARRIER_POLICY}.json"
+done
+```
+
+比较 report 中的精确路由和未开 profiling 的 3+10 分布：
+
+```bash
+jq -s 'map({
+  policy: .protocol.decode_carrier_policy,
+  parity: .ordinary_parity,
+  h2d_operations: .execution_io_counters.host_to_device_operations,
+  h2d_bytes: .execution_io_counters.host_to_device_bytes,
+  decode_uploads: .execution_io_counters.decode_id_upload_operations,
+  carrier_hits: .execution_io_counters.decode_id_device_carrier_hits,
+  multi_token_hits:
+    .execution_io_counters.decode_id_multi_token_carrier_hits,
+  d2d_operations:
+    .execution_io_counters.decode_id_device_compaction_operations,
+  d2d_bytes: .execution_io_counters.decode_id_device_compaction_bytes,
+  ordinary_median_ms: .ordinary.latency_ms.model_total.median,
+  ordinary_p90_ms: .ordinary.latency_ms.model_total.p90,
+  dflash_median_ms: .dflash.latency_ms.model_total.median,
+  dflash_p90_ms: .dflash.latency_ms.model_total.p90
+})' \
+  "$AI_RUN_DIR/reports/carrier-one-token-h2d.json" \
+  "$AI_RUN_DIR/reports/carrier-last-token-d2d.json"
+```
+
+两份报告都必须是 token/EOS 零差异，且 `decode_carrier_policy` 必须与配置相同。只有
+`last-token-d2d` 在同机、未开 msprof 的正反顺序 3+10 中 median 和 p90 都达到事先约定的可测
+改善，才把它设为部署默认值；结果持平或落在测量噪声内时保留 `one-token-h2d`。msprof 只能解释
+8-byte H2D/D2D、launch 或同步差异，不能替代这个选择门禁。
+
+### 5.6 直接运行二进制
 
 控制面是推荐路径。需要排除 Python 控制面时，可直接执行同一个 runner：
 
@@ -663,14 +746,16 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
   --repetitions 10 \
   --device-id 0 \
   --state-reset-policy async-memset \
+  --decode-carrier-policy last-token-d2d \
   --progress true
 ```
 
 把 `--state-reset-policy` 的值换成 `immutable-zero` 即可运行另一 buffer plan；不要改变 OM
-文件或 token 输入。`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，
-不能保留文字占位符。
+文件或 token 输入。把 `--decode-carrier-policy` 换成 `one-token-h2d` 可运行第 5.5 节的同二进制
+carrier 基线。`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，不能保留
+文字占位符。
 
-### 5.6 用 msprof 分角色确认五 OM 耗时
+### 5.7 用 msprof 分角色确认五 OM 耗时
 
 五个 OM 是独立 model ID，因此最可靠的 profile 是运行完整状态机，再在 msprof 导出的
 model/task/op 表中按 model ID 和 role 文件名分组。不要分别喂随机 state 跑五个 OM 后把数字相加；
@@ -681,6 +766,7 @@ export DFLASH_SOURCE=/ABSOLUTE/PATH/qwen3.5-4B-dflash
 export PROFILE_ROOT=/ABSOLUTE/PATH/qwen35-five-om-msprof
 export TOKEN_IDS='REAL,COMMA,SEPARATED,TOKEN,IDS'
 export RESET_POLICY=async-memset
+export DECODE_CARRIER_POLICY=last-token-d2d
 mkdir -p "$PROFILE_ROOT"
 
 for AIC_METRIC in PipeUtilization Memory MemoryUB; do
@@ -716,6 +802,7 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
       --repetitions 1 \
       --device-id 0 \
       --state-reset-policy "$RESET_POLICY" \
+      --decode-carrier-policy "$DECODE_CARRIER_POLICY" \
       --progress false
 done
 ```
@@ -735,9 +822,10 @@ draft-propose/target-verify-commit` 映射，再按 model ID 汇总 duration。`
 必须重新关闭 profiling，以 `--measurement-protocol evidence --warmup 3 --repetitions 10` 跑上面
 的正式命令。profile report 会明确写入 `formal_latency_evidence=false`，不能混入候选提升依据。
 
-另外必须把 `api_statistic`/timeline 中的 memcpy 与 report 对齐：标准 scheduler 的所有 decode
-carrier hit 都不得出现 8-byte decode-ID H2D；多 token 尾槽必须恰好出现一次 8-byte D2D，只有
-显式调用者覆盖才允许 H2D。以下门禁先验证 report 自闭合，再人工用时间线定位对应 memcpy：
+另外必须把 `api_statistic`/timeline 中的 memcpy 与 report 对齐：carrier hit 都不得出现
+8-byte decode-ID H2D。`last-token-d2d` 的多 token 尾槽必须恰好出现一次 8-byte D2D；
+`one-token-h2d` 的 multi-token/D2D 计数必须为 0，multi-token commit 改走 8-byte H2D。以下门禁
+先验证 report 自闭合，再人工用时间线定位对应 memcpy：
 
 ```bash
 jq -e '
@@ -752,7 +840,15 @@ jq -e '
   ($io.decode_id_device_compaction_bytes ==
    (8 * $io.decode_id_device_compaction_operations)) and
   ($io.decode_id_upload_bytes ==
-   (8 * $io.decode_id_upload_operations))
+   (8 * $io.decode_id_upload_operations)) and
+  (if .protocol.decode_carrier_policy == "last-token-d2d" then
+     ($io.decode_id_upload_operations == 0) and
+     ($io.decode_id_device_carrier_hits ==
+      $io.target_decode1_executions)
+   elif .protocol.decode_carrier_policy == "one-token-h2d" then
+     ($io.decode_id_multi_token_carrier_hits == 0) and
+     ($io.decode_id_device_compaction_operations == 0)
+   else false end)
 ' "$CASE_ROOT/runner-report.json"
 ```
 
@@ -770,7 +866,7 @@ jq -e '
 
 单 OM 的 msprof 命令已经写在 `docs/QUANT_AIR_OM_FRAMEWORK.md` 的“单独 profile 每个 OM”章节。
 当前完整状态机包含 `target-prefill`、`target-prefill-head`、`target-decode1`、
-`draft-propose` 和 `target-verify-commit`。使用第 5.6 节的一次进程级采集，再按 model ID/role
+`draft-propose` 和 `target-verify-commit`。使用第 5.7 节的一次进程级采集，再按 model ID/role
 汇总；不要分别构造不真实的随机状态运行这些 OM。
 
 ## 7. 当前证据边界

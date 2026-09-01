@@ -630,7 +630,9 @@ $AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner
 
 第一个二进制运行单一重计算 OM 基线；第二个二进制运行已批准、尚待真机提升的五图常驻 OM
 候选。`build-cpp` 会同时构建并 host-test 两者。五图的导出 factory、runner 配置、直接运行、
-report 门禁和 msprof 命令见 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5 节。
+report 门禁、同二进制 `one-token-h2d`/`last-token-d2d` A/B 和 msprof 命令见
+`docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5 节。runner 配置中的 `decode_carrier_policy` 只改变
+C++ buffer/copy 路由，不要求重新生成 AIR 或 OM。
 
 不要把 build 目录或二进制提交进源码仓库。
 
@@ -820,17 +822,18 @@ msprof 只能回答重计算基线 OM 中每个算子、device task 和 AscendCL
 集成图强行拆出 prefill/decode/verify/draft 的模型级时延。
 
 分支同时提供 `create_quant_incremental_state_graphs` 和五图常驻 OM C++ runner。生成五个独立 OM
-后，应使用 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.6 节的完整状态机 msprof 命令，并按
+后，应使用 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节的完整状态机 msprof 命令，并按
 model ID/role 分组；两类 profile 不得混成同一份时延基线。该 runner 会把长 prompt 的中间
 64-row chunk 留在同一 stream，仅最后一个 chunk 下载 compact 结果并同步；报告中的 elided
 prefill 计数必须与 `ceil(prompt_tokens/64)-1` 按请求数闭合。每个 chunk 的 ID、有效长度、
 proposal count 和 EOS 表还会合并为一次 packed H2D；`prefill_control_upload_operations` 必须等于
-`target_prefill_executions`，各分项 operation/byte 必须与总 H2D 严格闭合。普通连续 decode 会把
-上一事务最后提交的 compact token 留在 device：第 0 行直接绑定，多 token 末行做一次 8-byte
-D2D 到对齐 scalar；只有调用者改写 ID 才执行 H2D 回退。report 必须满足
+`target_prefill_executions`，各分项 operation/byte 必须与总 H2D 严格闭合。普通连续 decode 可由
+同一二进制选择两种精确策略：`one-token-h2d` 仅把一行 compact 结果直接绑定，多 token commit
+走 8-byte H2D；`last-token-d2d` 把最后提交的 compact token 留在 device，第 0 行直接绑定，多
+token 末行做一次 8-byte D2D 到对齐 scalar。report 必须满足
 `decode_id_device_carrier_hits + decode_id_upload_operations == target_decode1_executions`，且
-`decode_id_device_compaction_operations == decode_id_multi_token_carrier_hits`；真机 msprof API
-timeline 必须证明 carrier hit 没有 decode-ID H2D，并单独比较新增 D2D 与被替换 H2D 的耗时。
+`decode_id_device_compaction_operations == decode_id_multi_token_carrier_hits`；真机必须用相同
+runner/OM/input 做未 profile 的 3+10 A/B，msprof API timeline 仅用于解释新增 D2D 与被替换 H2D。
 
 正式时延基线仍然使用 11.3 中未开 profiling 的 3 次 warmup + 10 次
 measurement 报告。下面的 msprof 命令只做瓶颈定位，采集器引入的开销不能算入
@@ -971,7 +974,7 @@ rg --files "$PROF_DIR" | \
 当前五图增量候选应使用 `qwen35_dflash_incremental_acl_runner` 运行完整状态机，并按
 `target-prefill`、`target-prefill-head`、`target-decode1`、`draft-propose`、
 `target-verify-commit` 的 model ID 分组；完整命令见
-`docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.6 节。不要拿只接受集成图 2 input/2 output ABI 的
+`docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节。不要拿只接受集成图 2 input/2 output ABI 的
 `qwen35_dflash_acl_runner` 改文件名运行这些状态 OM，也不要用随机零 state 作为性能或正确性
 证据。
 

@@ -32,6 +32,12 @@ _INCREMENTAL_STATE_RESET_POLICIES = {
     ASYNC_MEMSET_STATE_RESET_POLICY,
     IMMUTABLE_ZERO_STATE_RESET_POLICY,
 }
+ONE_TOKEN_H2D_DECODE_CARRIER_POLICY = "one-token-h2d"
+LAST_TOKEN_D2D_DECODE_CARRIER_POLICY = "last-token-d2d"
+_INCREMENTAL_DECODE_CARRIER_POLICIES = {
+    ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
+    LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
+}
 _INCREMENTAL_ABI_ID = (
     "qwen35-4b-dflash-ascend310p-incremental-performance-v2"
 )
@@ -206,6 +212,17 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
             f"{ASYNC_MEMSET_STATE_RESET_POLICY!r} or "
             f"{IMMUTABLE_ZERO_STATE_RESET_POLICY!r}"
         )
+    decode_carrier_policy = str(
+        options.get(
+            "decode_carrier_policy", LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
+        )
+    ).strip()
+    if decode_carrier_policy not in _INCREMENTAL_DECODE_CARRIER_POLICIES:
+        raise ValueError(
+            "C++ runner decode_carrier_policy must be "
+            f"{LAST_TOKEN_D2D_DECODE_CARRIER_POLICY!r} or "
+            f"{ONE_TOKEN_H2D_DECODE_CARRIER_POLICY!r}"
+        )
     return {
         "cpu_fallback": False,
         "device": {
@@ -220,6 +237,7 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
         "graph_name": graph_name,
         "state_policy": state_policy,
         "state_reset_policy": state_reset_policy,
+        "decode_carrier_policy": decode_carrier_policy,
         "pad_token_id": pad_token_id,
     }
 
@@ -630,6 +648,7 @@ def validate_incremental_cpp_runner_report(
     max_new_tokens: int,
     max_draft_tokens: int,
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
+    decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
 ) -> None:
     """Validate five resident graphs, device state routing and paired parity."""
 
@@ -693,6 +712,10 @@ def validate_incremental_cpp_runner_report(
         raise ValueError("expected incremental state reset policy is invalid")
     if protocol.get("state_reset_policy") != state_reset_policy:
         raise RuntimeError("incremental runner state reset policy differs")
+    if decode_carrier_policy not in _INCREMENTAL_DECODE_CARRIER_POLICIES:
+        raise ValueError("expected incremental decode carrier policy is invalid")
+    if protocol.get("decode_carrier_policy") != decode_carrier_policy:
+        raise RuntimeError("incremental runner decode carrier policy differs")
     if protocol.get("state_reset_only_barriers") != 0:
         raise RuntimeError("incremental runner added a reset-only barrier")
     immutable_zero = state_reset_policy == IMMUTABLE_ZERO_STATE_RESET_POLICY
@@ -735,12 +758,17 @@ def validate_incremental_cpp_runner_report(
         "64-byte segment starts; ALIGN_UP(payload,32)+32 reserved span"
     ):
         raise RuntimeError("incremental device suballocation policy differs")
-    if protocol.get("decode_input_policy") != (
+    expected_decode_input_policy = (
         "the last committed token from any compact Target result stays on "
         "device; row zero binds directly and later rows use an 8-byte D2D "
         "copy into the aligned decode scalar; caller overrides use the "
         "pinned-host H2D fallback"
-    ):
+        if decode_carrier_policy == LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
+        else "one-token compact Target results bind row zero directly; "
+        "multi-token commits and caller overrides use the pinned-host "
+        "8-byte H2D fallback"
+    )
+    if protocol.get("decode_input_policy") != expected_decode_input_policy:
         raise RuntimeError("incremental decode input carrier policy differs")
     abi = report.get("abi", {})
     if abi.get("id") != _INCREMENTAL_ABI_ID:
@@ -1003,33 +1031,47 @@ def validate_incremental_cpp_runner_report(
     proposal_upload_operations = execution.get(
         "proposal_count_upload_operations"
     )
+    decode_route_values = (
+        decode_upload_operations,
+        decode_carrier_hits,
+        decode_multi_token_carrier_hits,
+        decode_device_compactions,
+        decode_device_compaction_bytes,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in decode_route_values
+    ):
+        raise RuntimeError("incremental decode carrier counters are invalid")
+    if (
+        decode_upload_operations + decode_carrier_hits != decode
+        or decode_multi_token_carrier_hits > decode_carrier_hits
+        or execution.get("decode_id_h2d_operations_elided")
+        != decode_carrier_hits
+        or decode_device_compaction_bytes != decode_device_compactions * 8
+        or execution.get("decode_id_upload_bytes")
+        != decode_upload_operations * 8
+    ):
+        raise RuntimeError("incremental decode carrier counters do not close")
+    if decode_carrier_policy == LAST_TOKEN_D2D_DECODE_CARRIER_POLICY:
+        if (
+            decode_upload_operations != 0
+            or decode_carrier_hits != decode
+            or decode_device_compactions
+            != decode_multi_token_carrier_hits
+        ):
+            raise RuntimeError("incremental last-token D2D counters differ")
+    elif (
+        decode_multi_token_carrier_hits != 0
+        or decode_device_compactions != 0
+        or decode_device_compaction_bytes != 0
+    ):
+        raise RuntimeError("incremental one-token H2D counters differ")
     if (
         prefill_upload_operations != prefill
         or execution.get("prefill_control_upload_bytes")
         != prefill * expected_control_bytes
         or execution.get("prefill_h2d_operations_elided") != prefill
-        or isinstance(decode_upload_operations, bool)
-        or not isinstance(decode_upload_operations, int)
-        or decode_upload_operations != 0
-        or isinstance(decode_carrier_hits, bool)
-        or not isinstance(decode_carrier_hits, int)
-        or decode_carrier_hits < 0
-        or decode_upload_operations + decode_carrier_hits != decode
-        or decode_carrier_hits != decode
-        or isinstance(decode_multi_token_carrier_hits, bool)
-        or not isinstance(decode_multi_token_carrier_hits, int)
-        or decode_multi_token_carrier_hits < 0
-        or decode_multi_token_carrier_hits > decode_carrier_hits
-        or execution.get("decode_id_h2d_operations_elided")
-        != decode_carrier_hits
-        or isinstance(decode_device_compactions, bool)
-        or not isinstance(decode_device_compactions, int)
-        or decode_device_compactions != decode_multi_token_carrier_hits
-        or isinstance(decode_device_compaction_bytes, bool)
-        or not isinstance(decode_device_compaction_bytes, int)
-        or decode_device_compaction_bytes != decode_device_compactions * 8
-        or execution.get("decode_id_upload_bytes")
-        != decode_upload_operations * 8
         or isinstance(proposal_upload_operations, bool)
         or not isinstance(proposal_upload_operations, int)
         or proposal_upload_operations < 0
@@ -1177,7 +1219,12 @@ def run_cpp_pair(
     ])
     if incremental:
         command.extend(
-            ["--state-reset-policy", identity["state_reset_policy"]]
+            [
+                "--state-reset-policy",
+                identity["state_reset_policy"],
+                "--decode-carrier-policy",
+                identity["decode_carrier_policy"],
+            ]
         )
     command.extend(["--progress", "true" if progress else "false"])
     _progress(
@@ -1223,6 +1270,7 @@ def run_cpp_pair(
             max_new_tokens=max_new_tokens,
             max_draft_tokens=max_draft_tokens,
             state_reset_policy=identity["state_reset_policy"],
+            decode_carrier_policy=identity["decode_carrier_policy"],
         )
     else:
         assert om_record is not None
