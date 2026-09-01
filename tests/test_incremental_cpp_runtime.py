@@ -67,8 +67,9 @@ def _report(
     prefill_feature_rows = dflash_request_count * prompt_chunks * 64
     prefill_control_bytes = 896
     decode_executions = 65
-    decode_upload_operations = 13
+    decode_upload_operations = 0
     decode_carrier_hits = decode_executions - decode_upload_operations
+    decode_multi_token_carrier_hits = 13
     proposal_upload_operations = 2
     immutable_zero = (
         state_reset_policy == IMMUTABLE_ZERO_STATE_RESET_POLICY
@@ -127,10 +128,10 @@ def _report(
                 "64-byte segment starts; ALIGN_UP(payload,32)+32 reserved span"
             ),
             "decode_input_policy": (
-                "one-token compact Target results ping-pong with Target state "
-                "and feed the next decode directly on device; caller overrides "
-                "and multi-token commits use the original pinned-host H2D "
-                "fallback"
+                "the last committed token from any compact Target result stays "
+                "on device; row zero binds directly and later rows use an "
+                "8-byte D2D copy into the aligned decode scalar; caller "
+                "overrides use the pinned-host H2D fallback"
             ),
             "state_reset_policy": state_reset_policy,
             "state_reset_only_barriers": 0,
@@ -206,7 +207,16 @@ def _report(
             "decode_id_upload_operations": decode_upload_operations,
             "decode_id_upload_bytes": decode_upload_operations * 8,
             "decode_id_device_carrier_hits": decode_carrier_hits,
+            "decode_id_multi_token_carrier_hits": (
+                decode_multi_token_carrier_hits
+            ),
             "decode_id_h2d_operations_elided": decode_carrier_hits,
+            "decode_id_device_compaction_operations": (
+                decode_multi_token_carrier_hits
+            ),
+            "decode_id_device_compaction_bytes": (
+                decode_multi_token_carrier_hits * 8
+            ),
             "proposal_count_upload_operations": proposal_upload_operations,
             "proposal_count_upload_bytes": proposal_upload_operations * 4,
             "state_resets": 26,
@@ -298,7 +308,10 @@ def test_incremental_runner_report_closes_multi_chunk_prefill() -> None:
         ("prefill_control_upload_bytes", 1),
         ("host_to_device_operations", 1),
         ("decode_id_device_carrier_hits", 1),
+        ("decode_id_multi_token_carrier_hits", 66),
         ("decode_id_h2d_operations_elided", 1),
+        ("decode_id_device_compaction_operations", 12),
+        ("decode_id_device_compaction_bytes", 1),
         ("compact_ping_pong_device_bytes", 1),
         ("proposal_count_upload_bytes", 7),
     ],

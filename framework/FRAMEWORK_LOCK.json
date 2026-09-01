@@ -1,6 +1,6 @@
 {
-  "schema_version": 14,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v14",
+  "schema_version": 15,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v15",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -179,7 +179,7 @@
     "incremental_prefill_completion": "non-final prompt chunks keep Target state and contiguous feature slabs ordered on one stream without executing Draft; a pinned-host staging slot per maximum 64-row chunk prevents asynchronous H2D source reuse, and only the final chunk executes one prebound dynamic-gear Draft, returns compact output and synchronizes",
     "incremental_prefill_control": "one carrier with AscendCL-compliant 64-byte-aligned device subsegments coalesces input IDs, effective length, total prompt count, proposal count, EOS IDs and EOS count into exactly one H2D per prompt chunk; strict report counters close every H2D operation and byte",
     "incremental_prefill_head": "target-prefill excludes lm_head and exports last_hidden; target-prefill-head owns only the moved QLinear/top1/EOS boundary and executes once per completed prompt, while report counters require one elision for every non-final chunk",
-    "incremental_decode_device_carrier": "two compact result arenas ping-pong with Target state; a preceding one-token result binds directly to target-decode1 and elides its 8-byte H2D, while multi-token commits and explicit caller overrides preserve the original pinned-host fallback; report counters must close every carrier hit, fallback upload and added compact byte",
+    "incremental_decode_device_carrier": "two compact result arenas ping-pong with Target state; the last token of every committed result remains device-resident, row zero binds directly to target-decode1, later rows use one 8-byte D2D copy into the existing aligned scalar, and only an explicit caller override uses pinned-host H2D; report counters close carrier, D2D compaction and fallback routes",
     "incremental_verify_scalar_state_seed": "per-linear-layer-jit-v1 keeps committed GDN state scalar at the target-verify-commit graph boundary, lets causal-conv consume scalar state directly, and seeds only the fixed 16-slot recurrent input immediately before each linear-attention layer; it preserves the GDR-MTP ABI and requires regenerated AIR/OM workspace and latency evidence",
     "incremental_verify_cache_indices": "once-per-verify-v1 derives the 16 target-block and in-block-offset values once from the logical cursor and reuses them across K/V in all eight full-attention layers; the exact source graph removes 510 repeated div/remainder and 510 repeated cast constructions while retaining all 256 single-row CacheUpdate nodes until batched update receives separate approval",
     "incremental_device_suballocation": "control, compact-result and Target/Draft state arenas reserve ALIGN_UP(payload,32)+32 bytes per segment and begin every segment at a 64-byte-aligned address"

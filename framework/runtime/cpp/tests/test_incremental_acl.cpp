@@ -142,13 +142,22 @@ void RunPolicy(
                   stats.prefill_control_bytes_per_slot,
       "prefill controls were not packed into one H2D per chunk");
   Require(
-      stats.decode_id_upload_operations > 0 &&
-          stats.decode_id_device_carrier_hits > 0 &&
+      stats.decode_id_upload_operations == 0 &&
+          stats.decode_id_device_carrier_hits ==
+              stats.target_decode1_executions &&
+          stats.decode_id_multi_token_carrier_hits > 0 &&
+          stats.decode_id_multi_token_carrier_hits <
+              stats.decode_id_device_carrier_hits &&
           stats.decode_id_upload_operations +
                   stats.decode_id_device_carrier_hits ==
               stats.target_decode1_executions &&
           stats.decode_id_h2d_operations_elided ==
               stats.decode_id_device_carrier_hits &&
+          stats.decode_id_device_compaction_operations ==
+              stats.decode_id_multi_token_carrier_hits &&
+          stats.decode_id_device_compaction_bytes ==
+              stats.decode_id_device_compaction_operations *
+                  sizeof(std::int64_t) &&
           stats.decode_id_upload_bytes ==
               stats.decode_id_upload_operations * sizeof(std::int64_t) &&
           stats.proposal_count_upload_bytes ==
@@ -162,7 +171,7 @@ void RunPolicy(
               stats.prefill_control_upload_bytes +
                   stats.decode_id_upload_bytes +
                   stats.proposal_count_upload_bytes,
-      "device-carried decode ID or packed H2D counters do not close");
+      "last-token decode carrier or packed H2D counters do not close");
   Require(stats.working_state_device_bytes > 0, "working state is missing");
   Require(
       stats.compact_ping_pong_device_bytes > 0 &&

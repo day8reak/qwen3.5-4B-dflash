@@ -278,10 +278,10 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   要求的分段 padding，prefill 后只有 proposal count 真正变化时才单独下发 4-byte H2D；
 - Target/Draft state arena 与 compact result arena 也使用同一条 64-byte 起始地址、
   `ALIGN_UP(payload,32)+32` 分段规则；Fake ACL 会拒绝任何未对齐的模型输入/输出绑定；
-- compact result 使用与 Target state 同步翻转的两套 device arena；上一事务只提交一个 token 且
-  调用者没有改写该 ID 时，下一次 `target-decode1` 直接绑定上一套 compact device token，不再
-  上传 8-byte decode ID。上一事务提交多个 token 或调用者显式改写 ID 时，仍走原有 pinned-host
-  H2D，token 语义和五个 OM 的外部 ABI 均不改变；
+- compact result 使用与 Target state 同步翻转的两套 device arena；上一事务最后提交的 token
+  始终留在 device。第 0 行直接绑定到下一次 `target-decode1`；多 token 结果的末行因模型输入
+  起始地址必须 64-byte 对齐，先做一次 8-byte D2D 到现有对齐 scalar。标准 scheduler 不再上传
+  decode ID，只有调用者显式改写 ID 才走 pinned-host H2D；token 语义和五个 OM 的 ABI 均不改变；
 - Draft 的 `N=16,64,128,...,kv_cache_max_len` 离散 gear 通过 TorchAir
   `set_dim_gears` 写入 AIR；C++ 启动时逐档核验并预建 dataset，request 热循环不调用
   `aclmdlSetInputDynamicDims`；
@@ -462,6 +462,9 @@ prefill_control_upload_bytes        = target_prefill_executions * control_bytes
 decode_id_device_carrier_hits       + decode_id_upload_operations
                                     = target_decode1_executions
 decode_id_h2d_operations_elided     = decode_id_device_carrier_hits
+decode_id_device_compaction_operations
+                                    = decode_id_multi_token_carrier_hits
+decode_id_device_compaction_bytes   = 8 * decode_id_device_compaction_operations
 decode_id_upload_bytes              = 8 * decode_id_upload_operations
 stream_synchronizations             = R + decode1 + verify-commit
 device_to_host_operations           = stream_synchronizations
@@ -472,9 +475,10 @@ host_to_device_operations           = prefill_control_upload_operations
 
 其中每个字段的 device offset 都按 64 bytes 对齐，每段物理跨度为
 `ALIGN_UP(tensor_bytes,32)+32`，最终 carrier 再按 64 bytes 对齐；默认 `eos_table_width=4` 时为
-896 bytes。最后三个加数分别代表 packed prefill、无法使用 device carrier 时的单 token decode
-ID 回退，以及 prefill 后 proposal count 改值；三类 operation/byte 分项之和必须严格等于总 H2D
-计数。每次 `target-decode1` 必须恰好落入 device carrier 或 host upload 两条路径之一。这个布局遵守
+896 bytes。最后三个加数分别代表 packed prefill、仅供显式调用者覆盖使用的 decode ID 回退，
+以及 prefill 后 proposal count 改值；三类 operation/byte 分项之和必须严格等于总 H2D 计数。
+每次 `target-decode1` 必须恰好落入 device carrier 或 host upload 两条路径之一；多 token carrier
+还必须以一条 8-byte D2D compaction 闭合。这个布局遵守
 [`aclrtMalloc` 对大块内存二次划分的 64-byte 起始地址与分段跨度约束](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0095.html)。
 
 因此 2048-token prompt 的每次请求会把原来的 32 次 prefill host completion 降为 1 次，同时把
@@ -489,11 +493,14 @@ control buffer。相对于每 chunk 分别上传 ID 和有效长度，2048-token
 70-token/two-chunk Fake ACL 的第一阶段冻结调用证据是 H2D operations 从 185 降为 130（减少
 55，约 29.7%）；由于把 EOS/control 与真机要求的分段 padding 一并装入每个 carrier，H2D
 payload 从 27,392 增至 47,216 bytes（其中本轮累计 prompt count 使每个 carrier 从 832 增至
-896）。在此基础上，one-token device carrier 命中 65 次、回退上传 13 次，使 H2D operations
-进一步从 130 降到 65，payload 从 47,216 降到 46,696 bytes。代价是 compact device arena 从
-一套 512 bytes 改为两套共 1,024 bytes；D2H operations/bytes 保持 117/32,604 不变。这些都只
-证明 Fake ACL 下的调用结构、路由闭合和字节计数，不是 310P 时延结论；真机必须以未开 msprof
-的 3+10 报告判断 API/Draft 调用减少是否覆盖增加的 control/feature/compact 常驻内存。
+896）。在此基础上，第一版 one-token device carrier 命中 65 次、回退上传 13 次，使 H2D
+operations 从 130 降到 65，payload 从 47,216 降到 46,696 bytes。当前 last-token carrier 把
+这 13 次多 token 回退改成 13 次、共 104 bytes 的 D2D，使 78 次 decode 全部命中 device
+carrier，H2D operations 再降到 52，payload 降到 46,592 bytes。它没有减少 memcpy API 总数：
+one-token 版本的 65 次 H2D，变成当前 52 次 H2D + 13 次 D2D，仍为 65 次。compact device arena
+仍为两套共 1,024 bytes；D2H operations/bytes 保持 117/32,604 不变。这些都只证明 Fake ACL
+下的调用结构、路由闭合和字节计数，不是 310P 时延结论；真机必须比较 8-byte H2D 与 D2D 的
+API/timeline，并以未开 msprof 的同源 3+10 median/p90 决定是否保留该候选。
 
 这条排队规则依赖 AscendCL 的公开异步语义：[Stream 内任务按原始顺序执行](https://www.hiascend.com/document/detail/en/canncommercial/800/appdevg/aclcppdevg/aclcppdevg_000004.html)，
 [`aclmdlExecuteAsync` 是异步模型执行接口](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/apiref/appdevgapi/aclcppdevg_03_0299.html)，
@@ -585,10 +592,16 @@ jq -s 'map({
     .execution_io_counters.prefill_staging_pinned_host_bytes,
   decode_carrier_hits:
     .execution_io_counters.decode_id_device_carrier_hits,
+  decode_multi_token_carrier_hits:
+    .execution_io_counters.decode_id_multi_token_carrier_hits,
   decode_fallback_uploads:
     .execution_io_counters.decode_id_upload_operations,
   decode_h2d_elided:
     .execution_io_counters.decode_id_h2d_operations_elided,
+  decode_d2d_compactions:
+    .execution_io_counters.decode_id_device_compaction_operations,
+  decode_d2d_bytes:
+    .execution_io_counters.decode_id_device_compaction_bytes,
   compact_ping_pong_bytes:
     .model_memory_query.compact_ping_pong_device_bytes,
   transaction_syncs: .execution_io_counters.stream_synchronizations,
@@ -722,9 +735,9 @@ draft-propose/target-verify-commit` 映射，再按 model ID 汇总 duration。`
 必须重新关闭 profiling，以 `--measurement-protocol evidence --warmup 3 --repetitions 10` 跑上面
 的正式命令。profile report 会明确写入 `formal_latency_evidence=false`，不能混入候选提升依据。
 
-另外必须把 `api_statistic`/timeline 中的 H2D 与 report 对齐：普通连续 decode 的 carrier hit
-不得出现 8-byte decode-ID H2D；只有上一事务提交多个 token 或调用者改写 ID 时才允许出现该
-H2D。以下门禁先验证 report 自闭合，再人工用时间线定位对应 memcpy：
+另外必须把 `api_statistic`/timeline 中的 memcpy 与 report 对齐：标准 scheduler 的所有 decode
+carrier hit 都不得出现 8-byte decode-ID H2D；多 token 尾槽必须恰好出现一次 8-byte D2D，只有
+显式调用者覆盖才允许 H2D。以下门禁先验证 report 自闭合，再人工用时间线定位对应 memcpy：
 
 ```bash
 jq -e '
@@ -734,6 +747,10 @@ jq -e '
     $io.target_decode1_executions) and
   ($io.decode_id_h2d_operations_elided ==
    $io.decode_id_device_carrier_hits) and
+  ($io.decode_id_device_compaction_operations ==
+   $io.decode_id_multi_token_carrier_hits) and
+  ($io.decode_id_device_compaction_bytes ==
+   (8 * $io.decode_id_device_compaction_operations)) and
   ($io.decode_id_upload_bytes ==
    (8 * $io.decode_id_upload_operations))
 ' "$CASE_ROOT/runner-report.json"

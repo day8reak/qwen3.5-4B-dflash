@@ -30,7 +30,7 @@
     ],
     "stable_token_ids_across_repetitions": true,
     "current_integrated_om_io": "persistent input device mirror with changed-range H2D; Target D2H tail is bounded by K+1; full Draft ID D2H; one stream synchronization per model execution",
-    "incremental_five_om_io": "compact Target results ping-pong with Target state; one-token results directly feed target-decode1 on device, while multi-token commits or caller overrides retain the exact 8-byte H2D fallback",
+    "incremental_five_om_io": "compact Target results ping-pong with Target state; the last committed token always stays on device, with row zero directly bound and later rows copied D2D into the aligned decode scalar; only an explicit caller override retains the exact 8-byte H2D fallback",
     "required_io_counters": [
       "model_executions",
       "stream_synchronizations",
@@ -38,7 +38,9 @@
       "device_to_host_bytes and full_device_to_host_bytes",
       "maximum_target_elements_per_call",
       "decode_id_device_carrier_hits and decode_id_upload_operations",
+      "decode_id_multi_token_carrier_hits",
       "decode_id_h2d_operations_elided",
+      "decode_id_device_compaction_operations and bytes",
       "compact_ping_pong_device_bytes"
     ]
   },

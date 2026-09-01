@@ -253,7 +253,7 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 14
+    assert framework_lock["schema_version"] == 15
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -281,9 +281,10 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert runner["current_integrated_om_io"].startswith(
         "persistent input device mirror"
     )
-    assert "directly feed target-decode1" in runner[
+    assert "last committed token always stays on device" in runner[
         "incremental_five_om_io"
     ]
+    assert "D2D" in runner["incremental_five_om_io"]
     assert "maximum_target_elements_per_call" in runner["required_io_counters"]
 
 
@@ -292,19 +293,30 @@ def test_decode_device_carrier_contract_closes_frozen_fake_acl_work() -> None:
     hot_loop = contract["hot_loop"]
     evidence = hot_loop["fake_acl_70_token_paired_3_plus_10"]
 
-    assert "directly" in hot_loop["one_token_to_decode"]
+    assert "D2D" in hot_loop["last_committed_token_to_decode"]
     assert "8-byte" in hot_loop["decode_fallback"]
+    assert "64-byte" in hot_loop["rejected_unaligned_multi_row_binding"]
     assert evidence["target_decode1_executions"] == (
         evidence["decode_id_device_carrier_hits"]
         + evidence["decode_id_upload_operations"]
     )
-    assert evidence["decode_id_h2d_operations_eliminated_vs_previous_runner"] == (
+    assert evidence[
+        "decode_id_h2d_operations_eliminated_vs_packed_prefill_baseline"
+    ] == (
         evidence["decode_id_device_carrier_hits"]
     )
-    assert evidence["total_h2d_operations_previous"] == 130
-    assert evidence["total_h2d_operations_current"] == 65
-    assert evidence["total_h2d_bytes_previous"] == 47216
-    assert evidence["total_h2d_bytes_current"] == 46696
+    assert evidence["decode_id_device_carrier_hits"] == 78
+    assert evidence["decode_id_multi_token_carrier_hits"] == 13
+    assert evidence["decode_id_device_compaction_operations"] == 13
+    assert evidence["decode_id_device_compaction_bytes"] == 104
+    assert evidence["total_h2d_operations_packed_prefill_baseline"] == 130
+    assert evidence["total_h2d_operations_one_token_carrier"] == 65
+    assert evidence["total_h2d_operations_current"] == 52
+    assert evidence["total_h2d_bytes_packed_prefill_baseline"] == 47216
+    assert evidence["total_h2d_bytes_one_token_carrier"] == 46696
+    assert evidence["total_h2d_bytes_current"] == 46592
+    assert evidence["copy_api_operations_one_token_carrier"] == 65
+    assert evidence["copy_api_operations_current_h2d_plus_d2d"] == 65
     assert evidence["compact_ping_pong_device_bytes"] == 1024
     assert evidence["additional_compact_device_bytes_vs_previous_runner"] == 512
     assert evidence["device_to_host_operations_unchanged"] == 117

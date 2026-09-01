@@ -611,6 +611,7 @@ class AclIncrementalExecutor::Impl {
     proposal_ready_ = false;
     prepared_proposal_count_ = 0;
     decode_carrier_valid_ = false;
+    decode_carrier_row_ = 0;
     feature_source_ = FeatureSource::kNone;
     prefill_staging_index_ = 0;
     prefill_total_token_count_ = 0;
@@ -728,8 +729,17 @@ class AclIncrementalExecutor::Impl {
     }
     DatasetPlan* plan = nullptr;
     if (decode_carrier_valid_ && decode_carrier_token_id_ == input_token_id) {
-      plan = &decode_carrier_plans_[target_state_index_];
+      if (decode_carrier_row_ == 0) {
+        plan = &decode_carrier_plans_[target_state_index_];
+      } else {
+        CompactDecodeIdToAlignedInput(
+            target_state_index_, decode_carrier_row_);
+        plan = &decode_upload_plans_[target_state_index_];
+      }
       ++stats_.decode_id_device_carrier_hits;
+      if (decode_carrier_row_ != 0) {
+        ++stats_.decode_id_multi_token_carrier_hits;
+      }
       ++stats_.decode_id_h2d_operations_elided;
     } else {
       *static_cast<std::int64_t*>(decode_id_.host) = input_token_id;
@@ -1721,6 +1731,30 @@ class AclIncrementalExecutor::Impl {
     stream_work_pending_ = true;
   }
 
+  void CompactDecodeIdToAlignedInput(
+      std::size_t state_index,
+      std::size_t row) {
+    if (row == 0 || row >= verify_width_) {
+      throw std::out_of_range("decode carrier compaction row is invalid");
+    }
+    const BufferView source = CompactView(
+        state_index,
+        compact_token_offset_ + row * sizeof(std::int64_t),
+        decode_id_.bytes);
+    Check(
+        aclrtMemcpyAsync(
+            decode_id_.device.data,
+            decode_id_.device.bytes,
+            source.data,
+            source.bytes,
+            ACL_MEMCPY_DEVICE_TO_DEVICE,
+            stream_),
+        "aclrtMemcpyAsync(decode carrier device compaction)");
+    stream_work_pending_ = true;
+    ++stats_.decode_id_device_compaction_operations;
+    stats_.decode_id_device_compaction_bytes += source.bytes;
+  }
+
   void Upload(const MirrorBuffer& buffer, std::size_t bytes) {
     UploadFromHost(buffer.device.View(), buffer.host, bytes);
   }
@@ -1831,10 +1865,9 @@ class AclIncrementalExecutor::Impl {
       std::size_t model_executions,
       std::size_t state_index) {
     StatefulStep result = ReadCompact(verify, model_executions, state_index);
-    decode_carrier_valid_ = result.token_ids.size() == 1;
-    if (decode_carrier_valid_) {
-      decode_carrier_token_id_ = result.token_ids.front();
-    }
+    decode_carrier_valid_ = true;
+    decode_carrier_row_ = result.token_ids.size() - 1;
+    decode_carrier_token_id_ = result.token_ids.back();
     return result;
   }
 
@@ -2015,6 +2048,7 @@ class AclIncrementalExecutor::Impl {
   bool proposal_ready_ = false;
   std::size_t prepared_proposal_count_ = 0;
   bool decode_carrier_valid_ = false;
+  std::size_t decode_carrier_row_ = 0;
   std::int64_t decode_carrier_token_id_ = 0;
   FeatureSource feature_source_ = FeatureSource::kNone;
   bool proposal_value_valid_ = false;

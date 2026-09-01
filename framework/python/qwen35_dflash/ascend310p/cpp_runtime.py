@@ -736,9 +736,10 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental device suballocation policy differs")
     if protocol.get("decode_input_policy") != (
-        "one-token compact Target results ping-pong with Target state and "
-        "feed the next decode directly on device; caller overrides and "
-        "multi-token commits use the original pinned-host H2D fallback"
+        "the last committed token from any compact Target result stays on "
+        "device; row zero binds directly and later rows use an 8-byte D2D "
+        "copy into the aligned decode scalar; caller overrides use the "
+        "pinned-host H2D fallback"
     ):
         raise RuntimeError("incremental decode input carrier policy differs")
     abi = report.get("abi", {})
@@ -990,6 +991,15 @@ def validate_incremental_cpp_runner_report(
     )
     decode_upload_operations = execution.get("decode_id_upload_operations")
     decode_carrier_hits = execution.get("decode_id_device_carrier_hits")
+    decode_multi_token_carrier_hits = execution.get(
+        "decode_id_multi_token_carrier_hits"
+    )
+    decode_device_compactions = execution.get(
+        "decode_id_device_compaction_operations"
+    )
+    decode_device_compaction_bytes = execution.get(
+        "decode_id_device_compaction_bytes"
+    )
     proposal_upload_operations = execution.get(
         "proposal_count_upload_operations"
     )
@@ -1000,14 +1010,24 @@ def validate_incremental_cpp_runner_report(
         or execution.get("prefill_h2d_operations_elided") != prefill
         or isinstance(decode_upload_operations, bool)
         or not isinstance(decode_upload_operations, int)
-        or decode_upload_operations < 0
+        or decode_upload_operations != 0
         or isinstance(decode_carrier_hits, bool)
         or not isinstance(decode_carrier_hits, int)
         or decode_carrier_hits < 0
         or decode_upload_operations + decode_carrier_hits != decode
-        or (decode > 0 and decode_carrier_hits == 0)
+        or decode_carrier_hits != decode
+        or isinstance(decode_multi_token_carrier_hits, bool)
+        or not isinstance(decode_multi_token_carrier_hits, int)
+        or decode_multi_token_carrier_hits < 0
+        or decode_multi_token_carrier_hits > decode_carrier_hits
         or execution.get("decode_id_h2d_operations_elided")
         != decode_carrier_hits
+        or isinstance(decode_device_compactions, bool)
+        or not isinstance(decode_device_compactions, int)
+        or decode_device_compactions != decode_multi_token_carrier_hits
+        or isinstance(decode_device_compaction_bytes, bool)
+        or not isinstance(decode_device_compaction_bytes, int)
+        or decode_device_compaction_bytes != decode_device_compactions * 8
         or execution.get("decode_id_upload_bytes")
         != decode_upload_operations * 8
         or isinstance(proposal_upload_operations, bool)

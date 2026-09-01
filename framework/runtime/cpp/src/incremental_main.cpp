@@ -561,10 +561,10 @@ void WriteReport(
             "final physical prompt chunk\","
          << "\"device_suballocation_policy\":\"64-byte segment starts; "
             "ALIGN_UP(payload,32)+32 reserved span\","
-         << "\"decode_input_policy\":\"one-token compact Target results "
-            "ping-pong with Target state and feed the next decode directly "
-            "on device; caller overrides and multi-token commits use the "
-            "original pinned-host H2D fallback\","
+         << "\"decode_input_policy\":\"the last committed token from any "
+            "compact Target result stays on device; row zero binds directly "
+            "and later rows use an 8-byte D2D copy into the aligned decode "
+            "scalar; caller overrides use the pinned-host H2D fallback\","
          << "\"state_reset_policy\":\""
          << qwen35::dflash::IncrementalStateResetPolicyName(
                 executor.state_reset_policy())
@@ -635,8 +635,14 @@ void WriteReport(
          << execution.decode_id_upload_bytes
          << ",\"decode_id_device_carrier_hits\":"
          << execution.decode_id_device_carrier_hits
+         << ",\"decode_id_multi_token_carrier_hits\":"
+         << execution.decode_id_multi_token_carrier_hits
          << ",\"decode_id_h2d_operations_elided\":"
          << execution.decode_id_h2d_operations_elided
+         << ",\"decode_id_device_compaction_operations\":"
+         << execution.decode_id_device_compaction_operations
+         << ",\"decode_id_device_compaction_bytes\":"
+         << execution.decode_id_device_compaction_bytes
          << ",\"proposal_count_upload_operations\":"
          << execution.proposal_count_upload_operations
          << ",\"proposal_count_upload_bytes\":"

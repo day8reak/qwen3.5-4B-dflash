@@ -825,11 +825,12 @@ model ID/role 分组；两类 profile 不得混成同一份时延基线。该 ru
 64-row chunk 留在同一 stream，仅最后一个 chunk 下载 compact 结果并同步；报告中的 elided
 prefill 计数必须与 `ceil(prompt_tokens/64)-1` 按请求数闭合。每个 chunk 的 ID、有效长度、
 proposal count 和 EOS 表还会合并为一次 packed H2D；`prefill_control_upload_operations` 必须等于
-`target_prefill_executions`，各分项 operation/byte 必须与总 H2D 严格闭合。普通连续 decode 还会
-把上一事务唯一提交的 compact token 直接留在 device 并绑定到下一次 `target-decode1`；只有
-multi-token commit 或调用者改写 ID 才执行 8-byte H2D 回退。report 必须满足
-`decode_id_device_carrier_hits + decode_id_upload_operations == target_decode1_executions`，真机
-msprof API timeline 也必须证明 carrier hit 没有对应的 decode-ID H2D。
+`target_prefill_executions`，各分项 operation/byte 必须与总 H2D 严格闭合。普通连续 decode 会把
+上一事务最后提交的 compact token 留在 device：第 0 行直接绑定，多 token 末行做一次 8-byte
+D2D 到对齐 scalar；只有调用者改写 ID 才执行 H2D 回退。report 必须满足
+`decode_id_device_carrier_hits + decode_id_upload_operations == target_decode1_executions`，且
+`decode_id_device_compaction_operations == decode_id_multi_token_carrier_hits`；真机 msprof API
+timeline 必须证明 carrier hit 没有 decode-ID H2D，并单独比较新增 D2D 与被替换 H2D 的耗时。
 
 正式时延基线仍然使用 11.3 中未开 profiling 的 3 次 warmup + 10 次
 measurement 报告。下面的 msprof 命令只做瓶颈定位，采集器引入的开销不能算入

@@ -59,7 +59,10 @@ struct IncrementalAclExecutionStats {
   std::size_t decode_id_upload_operations = 0;
   std::size_t decode_id_upload_bytes = 0;
   std::size_t decode_id_device_carrier_hits = 0;
+  std::size_t decode_id_multi_token_carrier_hits = 0;
   std::size_t decode_id_h2d_operations_elided = 0;
+  std::size_t decode_id_device_compaction_operations = 0;
+  std::size_t decode_id_device_compaction_bytes = 0;
   std::size_t proposal_count_upload_operations = 0;
   std::size_t proposal_count_upload_bytes = 0;
   std::size_t state_resets = 0;
@@ -97,8 +100,9 @@ using IncrementalModelProgress = std::function<void(
 // once after the final physical prompt chunk. This moves the prefill head
 // weight instead of retaining a dead copy in the body artifact.
 // Target/Draft states and compact Target results are ping-ponged in device
-// arenas. A one-token compact result is rebound directly as the next ordinary
-// decode input; an explicit caller override retains the original H2D fallback.
+// arenas. The last committed token in any compact result stays on device: row
+// zero binds directly and later rows compact D2D into the aligned input. An
+// explicit caller override retains the original H2D fallback.
 // Proposal IDs, Target features and cursors never cross the host boundary. A speculative
 // method enqueues Draft -> Target verify/commit and performs one stream sync
 // only after a compact transaction result has been queued for D2H. The first
