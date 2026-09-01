@@ -1,6 +1,6 @@
 {
-  "schema_version": 5,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v5",
+  "schema_version": 6,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v6",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -100,7 +100,7 @@
         "fake_meta_outputs": [
           "layout-derived attention output shape and receiver dtype rule"
         ],
-        "constraints": "current recompute lowering requires all_seq_lengths_q to equal actual_seq_lengths_q",
+        "constraints": "allQLen is always passed through the SymInt[] all_seq_lengths_q frontend argument; optional Tensor pse_shift remains absent; current recompute lowering requires all_seq_lengths_q to equal actual_seq_lengths_q",
         "default_ge_op_type": "FusedInferAttentionScore",
         "converter": "framework mapping to registered GE IR",
         "minimum_occurrences": 1

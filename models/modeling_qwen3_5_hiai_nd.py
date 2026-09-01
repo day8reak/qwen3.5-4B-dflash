@@ -580,10 +580,10 @@ class Qwen3_5Attention(nn.Module):
             "inner_precise": 2,
             "atten_mask": attention_mask,
         }
-        if export_flag:
-            attn_params["pse_shift"] = allQLen
-        else:
-            attn_params["all_seq_lengths_q"] = allQLen
+        # allQLen is a sequence-length list (SymInt[]), not a PSE Tensor.
+        # Keep the receiver frontend ABI identical in eager and AIR export so
+        # dispatcher validation reaches the registered Fake/GE converter.
+        attn_params["all_seq_lengths_q"] = allQLen
         attn_output = torch_npu.adn_fused_infer_attention(**attn_params)
         attn_output = attn_output.reshape(q_origin_shape)
         attn_output = (
@@ -728,10 +728,8 @@ class Qwen3_5Attention(nn.Module):
                 "inner_precise": 2,
                 "atten_mask": attention_mask,
             }
-            if export_flag:
-                attn_params["pse_shift"] = allQLen
-            else:
-                attn_params["all_seq_lengths_q"] = allQLen
+            # allQLen is a sequence-length list (SymInt[]), not a PSE Tensor.
+            attn_params["all_seq_lengths_q"] = allQLen
             attn_output = torch_npu.adn_fused_infer_attention(**attn_params)
             attn_output = attn_output.reshape(q_origin_shape)
             attn_output = (

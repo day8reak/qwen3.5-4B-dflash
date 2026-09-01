@@ -929,6 +929,19 @@ def test_both_hiai_models_route_only_air_cache_updates_through_functional_op() -
     assert rollback.count("export_flag=export_flag") >= 6
 
 
+def test_both_hiai_models_route_query_lengths_to_attention_length_abi() -> None:
+    sources = (
+        ROOT / "models" / "modeling_qwen3_5_hiai_nd.py",
+        ROOT / "models" / "modeling_qwen3_5_hiai_nd_dflash_rollback.py",
+    )
+    for source in sources:
+        text = source.read_text(encoding="utf-8")
+        assert 'attn_params["pse_shift"] = allQLen' not in text, source
+        assert (
+            text.count('attn_params["all_seq_lengths_q"] = allQLen') == 2
+        ), source
+
+
 def test_air_ops_match_quant_branch_decomposed_golden() -> None:
     torch.manual_seed(7)
     ops = AirDFlashOps()

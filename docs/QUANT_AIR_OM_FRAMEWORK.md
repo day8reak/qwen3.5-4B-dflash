@@ -108,6 +108,9 @@ GDR 的模型合同是 Q/K/V `[B,S,32,128]` FP16、g `[B,S,32]` FP32、beta
 `[B,32,128,128]` FP32、输出 `[B,S,32,128]` FP16；当前导出必须设置
 `output_final_state=True`。`adn_fused_infer_attention` 的当前重算 lowering 还要求
 `all_seq_lengths_q == actual_seq_lengths_q`，不满足时在生成错误 AIR 前直接失败。
+`allQLen` 是 `SymInt[]` 序列长度，两个 HIAI modeling 文件在 eager 和 AIR 路径都把它传给
+`all_seq_lengths_q`。当前路线没有 PSE tensor，因此 `pse_shift` 保持 `None`；不能为了通过类型
+检查把长度列表转换成 Tensor 后塞进 `pse_shift`。
 
 Fake/Meta 不执行任何算子数值，正式 eager、AIR 和 OM 也不会执行 Fake。若 torch-npu 已有 Meta，
 框架先运行 shape/dtype/alias 探针并复用；只有缺失时才调用 `torch.library.register_fake`。任何 schema
@@ -298,6 +301,22 @@ host 侧 buffer、调用顺序、scheduler 和 JSON 门禁。
 
 这个探针仍不是 OM 证据，但能在耗时导出之前发现 checkpoint、量化 topology、embedding、
 Draft 或 receiver ABI 错误。
+
+### 5.3 从拷贝源码目录采集完整 AIR 诊断
+
+NPU 机器上即使只有直接拷贝的源码、没有 `.git`，也可以执行：
+
+```bash
+"$MODEL_PYTHON" framework/scripts/collect_air_debug.py \
+  --factory-config "$AI_RUN_DIR/factory.json" \
+  --output-dir "$AI_RUN_DIR/reports"
+```
+
+采集器不调用 Git，也不复制 checkpoint、量化权重、AIR 或 OM。它会记录关键源码 SHA256 并附带
+这些小型源码文件的快照，同时收集 Python/package/CANN/NPU 身份、七个前端算子的真实 schema
+与 dispatch table、脱敏后的 factory 配置、完整 Dynamo 导出日志和已有的 JSON/log/pbtxt 诊断。
+即使 AIR 导出失败，也会先在 `--output-dir` 生成 `air-debug-*.tar.gz`，随后返回原导出退出码；
+把该压缩包回传即可。若日志过大，可增加 `--no-dynamo-logs`，但第一次失败建议保留默认完整日志。
 
 ## 6. 生成 AIR
 
@@ -618,6 +637,7 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
 | `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
 | `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 旧版 AIR 路径把 `Tensor(a!) -> Tensor(a!)` 直接交给 AOTAutograd；Fake 正确也无法 functionalize | 更新本分支；确认 FX target 为 `qwen35_dflash.npu_cache_update.default`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
+| `pse_shift` 期望 `Optional[Tensor]` 但收到 `[64]` / `immutable_list` | 旧版 modeling 在 export 路径把 `allQLen` 长度列表误接到了 PSE 输入，尚未进入 Fake/converter | 更新本分支；确认两个 modeling 文件均传 `all_seq_lengths_q=allQLen` 且不构造伪 PSE Tensor |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |
 | TorchAir graph break | 某个 Python/自定义 op 未被捕获 | 定位首个 graph break，补正式 converter；不要伪造 AIR |
