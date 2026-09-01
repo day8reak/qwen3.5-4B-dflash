@@ -142,8 +142,13 @@ void RunPolicy(
                   stats.prefill_control_bytes_per_slot,
       "prefill controls were not packed into one H2D per chunk");
   Require(
-      stats.decode_id_upload_operations ==
+      stats.decode_id_upload_operations > 0 &&
+          stats.decode_id_device_carrier_hits > 0 &&
+          stats.decode_id_upload_operations +
+                  stats.decode_id_device_carrier_hits ==
               stats.target_decode1_executions &&
+          stats.decode_id_h2d_operations_elided ==
+              stats.decode_id_device_carrier_hits &&
           stats.decode_id_upload_bytes ==
               stats.decode_id_upload_operations * sizeof(std::int64_t) &&
           stats.proposal_count_upload_bytes ==
@@ -157,8 +162,12 @@ void RunPolicy(
               stats.prefill_control_upload_bytes +
                   stats.decode_id_upload_bytes +
                   stats.proposal_count_upload_bytes,
-      "packed H2D counters do not close");
+      "device-carried decode ID or packed H2D counters do not close");
   Require(stats.working_state_device_bytes > 0, "working state is missing");
+  Require(
+      stats.compact_ping_pong_device_bytes > 0 &&
+          stats.carrier_device_bytes > stats.compact_ping_pong_device_bytes,
+      "compact result ping-pong allocation was not reported");
   Require(stats.state_reset_bytes_per_request > 0, "reset byte set is empty");
   Require(
       stats.state_device_bytes == stats.working_state_device_bytes +
@@ -214,6 +223,51 @@ void RunPolicy(
   Require(executor.model_memory().size() == 5, "model memory set differs");
 }
 
+void TestExplicitDecodeOverride(
+    const std::array<std::filesystem::path, 5>& model_paths) {
+  qwen35::dflash::IncrementalOmPaths paths{
+      model_paths[0], model_paths[1], model_paths[2], model_paths[3],
+      model_paths[4]};
+  qwen35::dflash::AclIncrementalExecutor executor(
+      std::move(paths),
+      0,
+      {},
+      qwen35::dflash::IncrementalStateResetPolicy::kAsyncMemset);
+
+  executor.Reset(0, {});
+  const auto prefill = executor.PrefillChunk({10}, false, 0);
+  Require(
+      prefill.token_ids == std::vector<std::int64_t>({11}),
+      "override test prefill token differs");
+
+  const auto before_hit = executor.execution_stats();
+  const auto carrier_decode = executor.DecodeOne(11);
+  Require(
+      carrier_decode.token_ids == std::vector<std::int64_t>({12}),
+      "device-carried decode token differs");
+  const auto after_hit = executor.execution_stats();
+  Require(
+      after_hit.decode_id_device_carrier_hits ==
+              before_hit.decode_id_device_carrier_hits + 1 &&
+          after_hit.decode_id_upload_operations ==
+              before_hit.decode_id_upload_operations,
+      "matching decode ID did not use the device carrier");
+
+  const auto override_decode = executor.DecodeOne(99);
+  Require(
+      override_decode.token_ids == std::vector<std::int64_t>({100}),
+      "explicit decode override was not honored");
+  const auto& after_override = executor.execution_stats();
+  Require(
+      after_override.decode_id_device_carrier_hits ==
+              after_hit.decode_id_device_carrier_hits &&
+          after_override.decode_id_upload_operations ==
+              after_hit.decode_id_upload_operations + 1 &&
+          after_override.decode_id_upload_bytes ==
+              after_hit.decode_id_upload_bytes + sizeof(std::int64_t),
+      "explicit decode override did not use the exact H2D fallback");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -234,8 +288,10 @@ int main(int argc, char** argv) {
     RunPolicy(
         paths,
         qwen35::dflash::IncrementalStateResetPolicy::kImmutableZero);
+    TestExplicitDecodeOverride(paths);
     std::cout << "PASS: both reset policies preserve exact five-OM tokens, "
-                 "device state routing and compact synchronization\n";
+                 "device state routing, compact synchronization and explicit "
+                 "decode override fallback\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

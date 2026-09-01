@@ -518,6 +518,8 @@ void WriteReport(
          << ",\"state_reset_bytes_per_request\":"
          << execution.state_reset_bytes_per_request
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
+         << ",\"compact_ping_pong_device_bytes\":"
+         << execution.compact_ping_pong_device_bytes
          << ",\"prefill_control_bytes_per_slot\":"
          << execution.prefill_control_bytes_per_slot
          << ",\"prefill_staging_pinned_host_bytes\":"
@@ -559,6 +561,10 @@ void WriteReport(
             "final physical prompt chunk\","
          << "\"device_suballocation_policy\":\"64-byte segment starts; "
             "ALIGN_UP(payload,32)+32 reserved span\","
+         << "\"decode_input_policy\":\"one-token compact Target results "
+            "ping-pong with Target state and feed the next decode directly "
+            "on device; caller overrides and multi-token commits use the "
+            "original pinned-host H2D fallback\","
          << "\"state_reset_policy\":\""
          << qwen35::dflash::IncrementalStateResetPolicyName(
                 executor.state_reset_policy())
@@ -627,6 +633,10 @@ void WriteReport(
          << execution.decode_id_upload_operations
          << ",\"decode_id_upload_bytes\":"
          << execution.decode_id_upload_bytes
+         << ",\"decode_id_device_carrier_hits\":"
+         << execution.decode_id_device_carrier_hits
+         << ",\"decode_id_h2d_operations_elided\":"
+         << execution.decode_id_h2d_operations_elided
          << ",\"proposal_count_upload_operations\":"
          << execution.proposal_count_upload_operations
          << ",\"proposal_count_upload_bytes\":"
@@ -655,6 +665,8 @@ void WriteReport(
          << ",\"state_reset_bytes_per_request\":"
          << execution.state_reset_bytes_per_request
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
+         << ",\"compact_ping_pong_device_bytes\":"
+         << execution.compact_ping_pong_device_bytes
          << ",\"prefill_staging_slots\":"
          << execution.prefill_staging_slots
          << ",\"prefill_control_bytes_per_slot\":"

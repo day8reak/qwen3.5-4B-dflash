@@ -58,6 +58,8 @@ struct IncrementalAclExecutionStats {
   std::size_t prefill_h2d_operations_elided = 0;
   std::size_t decode_id_upload_operations = 0;
   std::size_t decode_id_upload_bytes = 0;
+  std::size_t decode_id_device_carrier_hits = 0;
+  std::size_t decode_id_h2d_operations_elided = 0;
   std::size_t proposal_count_upload_operations = 0;
   std::size_t proposal_count_upload_bytes = 0;
   std::size_t state_resets = 0;
@@ -75,6 +77,7 @@ struct IncrementalAclExecutionStats {
   std::size_t immutable_zero_state_device_bytes = 0;
   std::size_t state_reset_bytes_per_request = 0;
   std::size_t carrier_device_bytes = 0;
+  std::size_t compact_ping_pong_device_bytes = 0;
   std::size_t prefill_staging_slots = 0;
   std::size_t prefill_control_bytes_per_slot = 0;
   std::size_t prefill_staging_pinned_host_bytes = 0;
@@ -93,8 +96,10 @@ using IncrementalModelProgress = std::function<void(
 // The prefill body excludes its QLinear LM head; a small head-only OM runs
 // once after the final physical prompt chunk. This moves the prefill head
 // weight instead of retaining a dead copy in the body artifact.
-// Target and Draft states are ping-ponged in device arenas.  Proposal IDs,
-// Target features and cursors never cross the host boundary.  A speculative
+// Target/Draft states and compact Target results are ping-ponged in device
+// arenas. A one-token compact result is rebound directly as the next ordinary
+// decode input; an explicit caller override retains the original H2D fallback.
+// Proposal IDs, Target features and cursors never cross the host boundary. A speculative
 // method enqueues Draft -> Target verify/commit and performs one stream sync
 // only after a compact transaction result has been queued for D2H. The first
 // prefill after Reset either enqueues state clears on the same stream or reads

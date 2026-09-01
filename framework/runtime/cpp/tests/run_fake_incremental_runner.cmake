@@ -111,6 +111,9 @@ string(JSON prefill_control_upload_bytes GET "${report}" execution_io_counters p
 string(JSON prefill_h2d_elided GET "${report}" execution_io_counters prefill_h2d_operations_elided)
 string(JSON decode_uploads GET "${report}" execution_io_counters decode_id_upload_operations)
 string(JSON decode_upload_bytes GET "${report}" execution_io_counters decode_id_upload_bytes)
+string(JSON decode_carrier_hits GET "${report}" execution_io_counters decode_id_device_carrier_hits)
+string(JSON decode_h2d_elided GET "${report}" execution_io_counters decode_id_h2d_operations_elided)
+string(JSON compact_ping_pong_bytes GET "${report}" execution_io_counters compact_ping_pong_device_bytes)
 string(JSON proposal_uploads GET "${report}" execution_io_counters proposal_count_upload_operations)
 string(JSON proposal_upload_bytes GET "${report}" execution_io_counters proposal_count_upload_bytes)
 string(JSON h2d_operations GET "${report}" execution_io_counters host_to_device_operations)
@@ -128,6 +131,7 @@ math(EXPR expected_dflash_requests "${EXPECTED_RESETS} / 2")
 math(EXPR expected_prefill_feature_rows "${expected_dflash_requests} * 128")
 math(EXPR expected_prefill_control_bytes "${prefill_executions} * ${prefill_control_slot_bytes}")
 math(EXPR expected_decode_upload_bytes "${decode_uploads} * 8")
+math(EXPR closed_decode_routes "${decode_uploads} + ${decode_carrier_hits}")
 math(EXPR expected_proposal_upload_bytes "${proposal_uploads} * 4")
 math(EXPR closed_h2d_operations "${prefill_control_uploads} + ${decode_uploads} + ${proposal_uploads}")
 math(EXPR closed_h2d_bytes "${prefill_control_upload_bytes} + ${decode_upload_bytes} + ${proposal_upload_bytes}")
@@ -178,8 +182,12 @@ if(NOT status STREQUAL "PASS" OR
    NOT prefill_control_uploads EQUAL prefill_executions OR
    NOT prefill_control_upload_bytes EQUAL expected_prefill_control_bytes OR
    NOT prefill_h2d_elided EQUAL prefill_executions OR
-   NOT decode_uploads EQUAL decode_executions OR
+   NOT closed_decode_routes EQUAL decode_executions OR
+   NOT decode_carrier_hits GREATER 0 OR
+   NOT decode_h2d_elided EQUAL decode_carrier_hits OR
+   NOT decode_uploads LESS decode_executions OR
    NOT decode_upload_bytes EQUAL expected_decode_upload_bytes OR
+   NOT compact_ping_pong_bytes GREATER 0 OR
    NOT proposal_upload_bytes EQUAL expected_proposal_upload_bytes OR
    NOT h2d_operations EQUAL closed_h2d_operations OR
    NOT h2d_bytes EQUAL closed_h2d_bytes OR

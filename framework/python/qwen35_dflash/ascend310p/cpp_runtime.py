@@ -735,6 +735,12 @@ def validate_incremental_cpp_runner_report(
         "64-byte segment starts; ALIGN_UP(payload,32)+32 reserved span"
     ):
         raise RuntimeError("incremental device suballocation policy differs")
+    if protocol.get("decode_input_policy") != (
+        "one-token compact Target results ping-pong with Target state and "
+        "feed the next decode directly on device; caller overrides and "
+        "multi-token commits use the original pinned-host H2D fallback"
+    ):
+        raise RuntimeError("incremental decode input carrier policy differs")
     abi = report.get("abi", {})
     if abi.get("id") != _INCREMENTAL_ABI_ID:
         raise RuntimeError("incremental runner ABI identity differs")
@@ -791,6 +797,7 @@ def validate_incremental_cpp_runner_report(
         "working_state_device_bytes",
         "state_reset_bytes_per_request",
         "carrier_device_bytes",
+        "compact_ping_pong_device_bytes",
         "prefill_control_bytes_per_slot",
         "prefill_staging_pinned_host_bytes",
         "prefill_feature_slab_bytes",
@@ -958,6 +965,12 @@ def validate_incremental_cpp_runner_report(
             raise RuntimeError(f"incremental {field} reports differ")
     if execution.get("carrier_device_bytes") != memory.get("carrier_device_bytes"):
         raise RuntimeError("incremental carrier byte reports differ")
+    if execution.get("compact_ping_pong_device_bytes") != memory.get(
+        "compact_ping_pong_device_bytes"
+    ):
+        raise RuntimeError("incremental compact ping-pong byte reports differ")
+    if memory["compact_ping_pong_device_bytes"] > memory["carrier_device_bytes"]:
+        raise RuntimeError("incremental compact ping-pong exceeds carrier bytes")
     if (
         execution.get("prefill_staging_slots") != expected_staging_slots
         or execution.get("prefill_control_bytes_per_slot")
@@ -976,6 +989,7 @@ def validate_incremental_cpp_runner_report(
         "prefill_control_upload_operations"
     )
     decode_upload_operations = execution.get("decode_id_upload_operations")
+    decode_carrier_hits = execution.get("decode_id_device_carrier_hits")
     proposal_upload_operations = execution.get(
         "proposal_count_upload_operations"
     )
@@ -984,8 +998,18 @@ def validate_incremental_cpp_runner_report(
         or execution.get("prefill_control_upload_bytes")
         != prefill * expected_control_bytes
         or execution.get("prefill_h2d_operations_elided") != prefill
-        or decode_upload_operations != decode
-        or execution.get("decode_id_upload_bytes") != decode * 8
+        or isinstance(decode_upload_operations, bool)
+        or not isinstance(decode_upload_operations, int)
+        or decode_upload_operations < 0
+        or isinstance(decode_carrier_hits, bool)
+        or not isinstance(decode_carrier_hits, int)
+        or decode_carrier_hits < 0
+        or decode_upload_operations + decode_carrier_hits != decode
+        or (decode > 0 and decode_carrier_hits == 0)
+        or execution.get("decode_id_h2d_operations_elided")
+        != decode_carrier_hits
+        or execution.get("decode_id_upload_bytes")
+        != decode_upload_operations * 8
         or isinstance(proposal_upload_operations, bool)
         or not isinstance(proposal_upload_operations, int)
         or proposal_upload_operations < 0

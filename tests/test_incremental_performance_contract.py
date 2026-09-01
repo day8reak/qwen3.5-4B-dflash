@@ -253,12 +253,15 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 13
+    assert framework_lock["schema_version"] == 14
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
     assert "once-per-verify-v1" in framework_lock["runtime"][
         "incremental_verify_cache_indices"
+    ]
+    assert "ping-pong" in framework_lock["runtime"][
+        "incremental_decode_device_carrier"
     ]
     runtime = framework_lock["runtime"]
     assert "input device mirrors" in runtime["memory"]
@@ -278,4 +281,31 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert runner["current_integrated_om_io"].startswith(
         "persistent input device mirror"
     )
+    assert "directly feed target-decode1" in runner[
+        "incremental_five_om_io"
+    ]
     assert "maximum_target_elements_per_call" in runner["required_io_counters"]
+
+
+def test_decode_device_carrier_contract_closes_frozen_fake_acl_work() -> None:
+    contract = _contract()
+    hot_loop = contract["hot_loop"]
+    evidence = hot_loop["fake_acl_70_token_paired_3_plus_10"]
+
+    assert "directly" in hot_loop["one_token_to_decode"]
+    assert "8-byte" in hot_loop["decode_fallback"]
+    assert evidence["target_decode1_executions"] == (
+        evidence["decode_id_device_carrier_hits"]
+        + evidence["decode_id_upload_operations"]
+    )
+    assert evidence["decode_id_h2d_operations_eliminated_vs_previous_runner"] == (
+        evidence["decode_id_device_carrier_hits"]
+    )
+    assert evidence["total_h2d_operations_previous"] == 130
+    assert evidence["total_h2d_operations_current"] == 65
+    assert evidence["total_h2d_bytes_previous"] == 47216
+    assert evidence["total_h2d_bytes_current"] == 46696
+    assert evidence["compact_ping_pong_device_bytes"] == 1024
+    assert evidence["additional_compact_device_bytes_vs_previous_runner"] == 512
+    assert evidence["device_to_host_operations_unchanged"] == 117
+    assert evidence["device_to_host_bytes_unchanged"] == 32604

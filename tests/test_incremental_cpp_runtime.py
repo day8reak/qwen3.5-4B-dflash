@@ -67,6 +67,8 @@ def _report(
     prefill_feature_rows = dflash_request_count * prompt_chunks * 64
     prefill_control_bytes = 896
     decode_executions = 65
+    decode_upload_operations = 13
+    decode_carrier_hits = decode_executions - decode_upload_operations
     proposal_upload_operations = 2
     immutable_zero = (
         state_reset_policy == IMMUTABLE_ZERO_STATE_RESET_POLICY
@@ -124,6 +126,12 @@ def _report(
             "device_suballocation_policy": (
                 "64-byte segment starts; ALIGN_UP(payload,32)+32 reserved span"
             ),
+            "decode_input_policy": (
+                "one-token compact Target results ping-pong with Target state "
+                "and feed the next decode directly on device; caller overrides "
+                "and multi-token commits use the original pinned-host H2D "
+                "fallback"
+            ),
             "state_reset_policy": state_reset_policy,
             "state_reset_only_barriers": 0,
             "state_reset_device_work_included_by_prefill_barrier": (
@@ -153,6 +161,7 @@ def _report(
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 4096,
+            "compact_ping_pong_device_bytes": 1024,
             "prefill_control_bytes_per_slot": prefill_control_bytes,
             "prefill_staging_pinned_host_bytes": 1792,
             "prefill_feature_slab_bytes": 1024,
@@ -194,8 +203,10 @@ def _report(
                 target_prefill_executions * prefill_control_bytes
             ),
             "prefill_h2d_operations_elided": target_prefill_executions,
-            "decode_id_upload_operations": decode_executions,
-            "decode_id_upload_bytes": decode_executions * 8,
+            "decode_id_upload_operations": decode_upload_operations,
+            "decode_id_upload_bytes": decode_upload_operations * 8,
+            "decode_id_device_carrier_hits": decode_carrier_hits,
+            "decode_id_h2d_operations_elided": decode_carrier_hits,
             "proposal_count_upload_operations": proposal_upload_operations,
             "proposal_count_upload_bytes": proposal_upload_operations * 4,
             "state_resets": 26,
@@ -208,12 +219,12 @@ def _report(
             ),
             "host_to_device_operations": (
                 target_prefill_executions
-                + decode_executions
+                + decode_upload_operations
                 + proposal_upload_operations
             ),
             "host_to_device_bytes": (
                 target_prefill_executions * prefill_control_bytes
-                + decode_executions * 8
+                + decode_upload_operations * 8
                 + proposal_upload_operations * 4
             ),
             "device_to_host_operations": 117,
@@ -223,6 +234,7 @@ def _report(
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 4096,
+            "compact_ping_pong_device_bytes": 1024,
             "prefill_staging_slots": 2,
             "prefill_control_bytes_per_slot": prefill_control_bytes,
             "prefill_staging_pinned_host_bytes": 1792,
@@ -285,6 +297,9 @@ def test_incremental_runner_report_closes_multi_chunk_prefill() -> None:
         ("prefill_control_upload_operations", 25),
         ("prefill_control_upload_bytes", 1),
         ("host_to_device_operations", 1),
+        ("decode_id_device_carrier_hits", 1),
+        ("decode_id_h2d_operations_elided", 1),
+        ("compact_ping_pong_device_bytes", 1),
         ("proposal_count_upload_bytes", 7),
     ],
 )

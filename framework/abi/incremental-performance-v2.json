@@ -199,7 +199,9 @@
     ],
     "target_full_attention": "provisional physical KV writes are allowed; only the logical cursor advances by anchor plus accepted proposals and rejected slots are overwritten later",
     "target_gdr_and_conv": "verify may materialize per-row banks as graph workspace, but its graph tail gathers slot a and persists only the selected scalar state",
-    "draft": "committed KV persists; the transient mask block is never committed"
+    "draft": "committed KV persists; the transient mask block is never committed",
+    "ordinary_decode_token": "two compact result arenas ping-pong with the Target state index; when the previous transaction committed exactly one token, its device-resident first row binds directly to the next target-decode1 input",
+    "ordinary_decode_override": "a caller-supplied token that differs from the tracked one-token carrier, or a preceding multi-token commit, uses the original pinned-host 8-byte H2D path"
   },
   "strict_greedy_transaction": {
     "verify_input": "[anchor, p0, ..., p(K-1)]",
@@ -299,10 +301,33 @@
     "resident_datasets_and_device_buffers": true,
     "stream": "one request stream unless profile proves overlap safe and beneficial",
     "draft_to_verify": "the [anchor,p0..p14] carrier stays on device and binds directly to Target verify",
+    "one_token_to_decode": "the preceding compact Target token stays on device and binds directly to the next ordinary decode; no decode-ID H2D is issued on a carrier hit",
+    "decode_fallback": "multi-token commits and explicit caller overrides retain the exact 8-byte pinned-host H2D route",
     "synchronization": "one host-visible synchronization after verify/commit per speculative round",
     "ordinary": "never execute Draft",
     "prefill": "never execute Draft proposal or full LM head for non-final prompt chunks",
-    "verify": "never recompute the committed historical prefix"
+    "verify": "never recompute the committed historical prefix",
+    "runtime_counter_invariants": [
+      "decode_id_device_carrier_hits + decode_id_upload_operations == target_decode1_executions",
+      "decode_id_h2d_operations_elided == decode_id_device_carrier_hits",
+      "decode_id_upload_bytes == 8 * decode_id_upload_operations",
+      "compact_ping_pong_device_bytes is positive and included in carrier_device_bytes"
+    ],
+    "fake_acl_70_token_paired_3_plus_10": {
+      "classification": "host structural evidence only; not Ascend310P latency",
+      "target_decode1_executions": 78,
+      "decode_id_device_carrier_hits": 65,
+      "decode_id_upload_operations": 13,
+      "decode_id_h2d_operations_eliminated_vs_previous_runner": 65,
+      "total_h2d_operations_previous": 130,
+      "total_h2d_operations_current": 65,
+      "total_h2d_bytes_previous": 47216,
+      "total_h2d_bytes_current": 46696,
+      "compact_ping_pong_device_bytes": 1024,
+      "additional_compact_device_bytes_vs_previous_runner": 512,
+      "device_to_host_operations_unchanged": 117,
+      "device_to_host_bytes_unchanged": 32604
+    }
   },
   "activation_gate": {
     "requires_explicit_approval": false,
