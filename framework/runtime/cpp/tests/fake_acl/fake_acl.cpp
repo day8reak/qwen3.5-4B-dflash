@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -485,7 +486,8 @@ aclError aclrtMalloc(void** device_ptr, std::size_t size, aclrtMemMallocPolicy) 
   if (device_ptr == nullptr || size == 0) {
     return 1;
   }
-  *device_ptr = std::malloc(size);
+  const std::size_t aligned_size = (size + 63) / 64 * 64;
+  *device_ptr = std::aligned_alloc(64, aligned_size);
   return *device_ptr == nullptr ? 1 : ACL_SUCCESS;
 }
 
@@ -766,6 +768,14 @@ aclError aclmdlExecuteAsync(
     aclrtStream) {
   const auto iterator = g_models.find(model_id);
   if (iterator == g_models.end() || input == nullptr || output == nullptr) {
+    return 1;
+  }
+  const auto aligned = [](const aclDataBuffer* buffer) {
+    return buffer != nullptr && buffer->data != nullptr &&
+        reinterpret_cast<std::uintptr_t>(buffer->data) % 64 == 0;
+  };
+  if (!std::all_of(input->buffers.begin(), input->buffers.end(), aligned) ||
+      !std::all_of(output->buffers.begin(), output->buffers.end(), aligned)) {
     return 1;
   }
   switch (iterator->second) {

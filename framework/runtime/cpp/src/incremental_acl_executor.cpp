@@ -37,6 +37,25 @@ std::size_t Align(std::size_t value, std::size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
 
+std::size_t ReserveDeviceSegment(
+    std::size_t* cursor,
+    std::size_t payload_bytes) {
+  if (cursor == nullptr || payload_bytes == 0) {
+    throw std::logic_error("invalid device segment reservation");
+  }
+  const std::size_t offset = Align(*cursor, kBufferAlignment);
+  const std::size_t padded_bytes = Align(payload_bytes, 32);
+  if (padded_bytes > std::numeric_limits<std::size_t>::max() - 32) {
+    throw std::overflow_error("device segment size overflow");
+  }
+  const std::size_t segment_bytes = padded_bytes + 32;
+  if (segment_bytes > std::numeric_limits<std::size_t>::max() - offset) {
+    throw std::overflow_error("device arena size overflow");
+  }
+  *cursor = offset + segment_bytes;
+  return offset;
+}
+
 struct TensorSpec {
   std::string name;
   aclDataType dtype = ACL_DT_UNDEFINED;
@@ -339,12 +358,7 @@ struct StateArena {
     offsets.reserve(specs.size());
     std::size_t total = 0;
     for (const auto& spec : specs) {
-      total = Align(total, kBufferAlignment);
-      offsets.push_back(total);
-      if (spec.bytes > std::numeric_limits<std::size_t>::max() - total) {
-        throw std::overflow_error("state arena size overflow");
-      }
-      total += spec.bytes;
+      offsets.push_back(ReserveDeviceSegment(&total, spec.bytes));
     }
     allocation.Allocate(Align(total, kBufferAlignment));
     tensors.reserve(specs.size());
@@ -586,17 +600,7 @@ class AclIncrementalExecutor::Impl {
     feature_source_ = FeatureSource::kNone;
     prefill_staging_index_ = 0;
 
-    if (!eos_uploaded_ || eos_token_ids != uploaded_eos_ids_) {
-      auto* eos_values = static_cast<std::int64_t*>(eos_ids_.host);
-      std::fill_n(eos_values, eos_table_width_, 0);
-      std::copy(eos_token_ids.begin(), eos_token_ids.end(), eos_values);
-      *static_cast<std::int32_t*>(eos_count_.host) =
-          static_cast<std::int32_t>(eos_token_ids.size());
-      pending_eos_ids_ = eos_token_ids;
-      eos_upload_pending_ = true;
-    } else {
-      eos_upload_pending_ = false;
-    }
+    configured_eos_token_ids_ = eos_token_ids;
     ++stats_.state_resets;
     reset_pending_ = true;
     reset_ = true;
@@ -643,20 +647,9 @@ class AclIncrementalExecutor::Impl {
     }
     const std::size_t staging_index = prefill_staging_index_++;
     const bool use_immutable_zero = ApplyPendingReset();
-    if (prepare_draft) {
-      SetProposalCount(
-          logical_proposal_count, ProposalCountHost(staging_index));
-    }
-
-    auto* values = static_cast<std::int64_t*>(PrefillIdsHost(staging_index));
-    std::fill_n(values, prefill_width_, pad_token_id_);
-    std::copy(token_ids.begin(), token_ids.end(), values);
-    void* effective_length_host = EffectiveLengthHost(staging_index);
-    *static_cast<std::int16_t*>(effective_length_host) =
-        static_cast<std::int16_t>(token_ids.size());
-    UploadFromHost(prefill_ids_, values, prefill_ids_.bytes);
-    UploadFromHost(
-        effective_length_, effective_length_host, effective_length_.bytes);
+    PreparePrefillControl(
+        staging_index, token_ids, prepare_draft, logical_proposal_count);
+    UploadPrefillControl(staging_index);
 
     if (use_immutable_zero) {
       Execute(prefill_, initial_prefill_plan_);
@@ -703,6 +696,8 @@ class AclIncrementalExecutor::Impl {
     }
     *static_cast<std::int64_t*>(decode_id_.host) = input_token_id;
     Upload(decode_id_, decode_id_.bytes);
+    ++stats_.decode_id_upload_operations;
+    stats_.decode_id_upload_bytes += decode_id_.bytes;
     Execute(decode_, decode_plans_[target_state_index_]);
     ++stats_.target_decode1_executions;
     target_state_index_ = 1 - target_state_index_;
@@ -1000,19 +995,26 @@ class AclIncrementalExecutor::Impl {
         stats_.working_state_device_bytes +
         stats_.immutable_zero_state_device_bytes;
 
-    prefill_ids_.Allocate(prefill_.PublicInput(0).bytes);
-    effective_length_.Allocate(prefill_.PublicInput(1).bytes);
-    eos_ids_.Allocate(prefill_.PublicInput(2).bytes);
-    eos_count_.Allocate(prefill_.PublicInput(3).bytes);
+    std::size_t control_cursor = 0;
+    prefill_ids_offset_ = ReserveDeviceSegment(
+        &control_cursor, prefill_.PublicInput(0).bytes);
+    eos_ids_offset_ = ReserveDeviceSegment(
+        &control_cursor, prefill_.PublicInput(2).bytes);
+    proposal_count_offset_ = ReserveDeviceSegment(
+        &control_cursor, verify_.PublicInput(1).bytes);
+    eos_count_offset_ = ReserveDeviceSegment(
+        &control_cursor, prefill_.PublicInput(3).bytes);
+    effective_length_offset_ = ReserveDeviceSegment(
+        &control_cursor, prefill_.PublicInput(1).bytes);
+    prefill_control_.Allocate(Align(control_cursor, kBufferAlignment));
     decode_id_.Allocate(decode_.PublicInput(0).bytes);
-    proposal_count_.Allocate(verify_.PublicInput(1).bytes);
     stats_.prefill_staging_slots =
         (sequence_length_ - 1) / prefill_width_ + 1;
     if (stats_.prefill_staging_slots == 0) {
       throw std::logic_error("prefill staging ring has no slots");
     }
-    const std::size_t staging_bytes_per_slot =
-        prefill_ids_.bytes + effective_length_.bytes + proposal_count_.bytes;
+    stats_.prefill_control_bytes_per_slot = prefill_control_.bytes;
+    const std::size_t staging_bytes_per_slot = prefill_control_.bytes;
     if (stats_.prefill_staging_slots >
         std::numeric_limits<std::size_t>::max() / staging_bytes_per_slot) {
       throw std::overflow_error("prefill pinned host staging size overflow");
@@ -1020,30 +1022,29 @@ class AclIncrementalExecutor::Impl {
     stats_.prefill_staging_pinned_host_bytes =
         stats_.prefill_staging_slots * staging_bytes_per_slot;
     const std::size_t extra_slots = stats_.prefill_staging_slots - 1;
-    extra_prefill_ids_host_.resize(extra_slots);
-    extra_effective_length_host_.resize(extra_slots);
-    extra_proposal_count_host_.resize(extra_slots);
+    extra_prefill_control_host_.resize(extra_slots);
     for (std::size_t index = 0; index < extra_slots; ++index) {
-      extra_prefill_ids_host_[index].Allocate(prefill_ids_.bytes);
-      extra_effective_length_host_[index].Allocate(effective_length_.bytes);
-      extra_proposal_count_host_[index].Allocate(proposal_count_.bytes);
+      extra_prefill_control_host_[index].Allocate(prefill_control_.bytes);
     }
 
-    compact_token_offset_ = 0;
-    compact_commit_offset_ = Align(prefill_.outputs[0].bytes, 4);
-    compact_finished_offset_ =
-        Align(compact_commit_offset_ + prefill_.outputs[1].bytes, 4);
-    compact_drafted_offset_ =
-        Align(compact_finished_offset_ + prefill_.outputs[2].bytes, 4);
-    compact_accepted_offset_ =
-        Align(compact_drafted_offset_ + verify_.outputs[2].bytes, 4);
-    compact_rejected_offset_ =
-        Align(compact_accepted_offset_ + verify_.outputs[3].bytes, 4);
+    std::size_t compact_cursor = 0;
+    compact_token_offset_ = ReserveDeviceSegment(
+        &compact_cursor, prefill_.outputs[0].bytes);
+    compact_commit_offset_ = ReserveDeviceSegment(
+        &compact_cursor, prefill_.outputs[1].bytes);
+    compact_finished_offset_ = ReserveDeviceSegment(
+        &compact_cursor, prefill_.outputs[2].bytes);
+    compact_drafted_offset_ = ReserveDeviceSegment(
+        &compact_cursor, verify_.outputs[2].bytes);
+    compact_accepted_offset_ = ReserveDeviceSegment(
+        &compact_cursor, verify_.outputs[3].bytes);
+    compact_rejected_offset_ = ReserveDeviceSegment(
+        &compact_cursor, verify_.outputs[4].bytes);
     compact_ordinary_bytes_ =
         compact_finished_offset_ + prefill_.outputs[2].bytes;
     compact_verify_bytes_ =
         compact_rejected_offset_ + verify_.outputs[4].bytes;
-    compact_.Allocate(Align(compact_verify_bytes_, kBufferAlignment));
+    compact_.Allocate(Align(compact_cursor, kBufferAlignment));
 
     const std::size_t feature_allocation = std::max(
         {prefill_.outputs[3].bytes,
@@ -1058,49 +1059,123 @@ class AclIncrementalExecutor::Impl {
     }
 
     stats_.carrier_device_bytes =
-        prefill_ids_.device.bytes + effective_length_.device.bytes +
-        eos_ids_.device.bytes + eos_count_.device.bytes +
-        decode_id_.device.bytes + proposal_count_.device.bytes +
+        prefill_control_.device.bytes + decode_id_.device.bytes +
         compact_.device.bytes + prefill_features_.bytes +
         verify_features_.bytes + committed_input_count_.bytes +
         verify_ids_.bytes + dynamic_controls_[0].bytes +
         dynamic_controls_[1].bytes;
   }
 
-  static void* StagingHost(
-      MirrorBuffer& primary,
-      std::vector<HostAllocation>& extra,
-      std::size_t index,
-      const char* description) {
+  void* PrefillControlHost(std::size_t index) {
     if (index == 0) {
-      return primary.host;
+      return prefill_control_.host;
     }
-    if (index - 1 >= extra.size() || extra[index - 1].data == nullptr) {
-      throw std::out_of_range(
-          std::string(description) + " staging index is invalid");
+    if (index - 1 >= extra_prefill_control_host_.size() ||
+        extra_prefill_control_host_[index - 1].data == nullptr) {
+      throw std::out_of_range("prefill control staging index is invalid");
     }
-    return extra[index - 1].data;
+    return extra_prefill_control_host_[index - 1].data;
   }
 
   void* PrefillIdsHost(std::size_t index) {
-    return StagingHost(
-        prefill_ids_, extra_prefill_ids_host_, index, "prefill IDs");
+    return static_cast<std::byte*>(PrefillControlHost(index)) +
+        prefill_ids_offset_;
   }
 
   void* EffectiveLengthHost(std::size_t index) {
-    return StagingHost(
-        effective_length_,
-        extra_effective_length_host_,
-        index,
-        "effective length");
+    return static_cast<std::byte*>(PrefillControlHost(index)) +
+        effective_length_offset_;
   }
 
   void* ProposalCountHost(std::size_t index) {
-    return StagingHost(
-        proposal_count_,
-        extra_proposal_count_host_,
-        index,
-        "proposal count");
+    return static_cast<std::byte*>(PrefillControlHost(index)) +
+        proposal_count_offset_;
+  }
+
+  void* EosIdsHost(std::size_t index) {
+    return static_cast<std::byte*>(PrefillControlHost(index)) +
+        eos_ids_offset_;
+  }
+
+  void* EosCountHost(std::size_t index) {
+    return static_cast<std::byte*>(PrefillControlHost(index)) +
+        eos_count_offset_;
+  }
+
+  BufferView PrefillControlView(
+      std::size_t offset,
+      std::size_t bytes) const {
+    if (offset > prefill_control_.device.bytes ||
+        bytes > prefill_control_.device.bytes - offset) {
+      throw std::out_of_range("prefill control device view is invalid");
+    }
+    return BufferView{
+        static_cast<std::byte*>(prefill_control_.device.data) + offset,
+        bytes,
+    };
+  }
+
+  BufferView PrefillIdsView() const {
+    return PrefillControlView(
+        prefill_ids_offset_, prefill_.PublicInput(0).bytes);
+  }
+
+  BufferView EffectiveLengthView() const {
+    return PrefillControlView(
+        effective_length_offset_, prefill_.PublicInput(1).bytes);
+  }
+
+  BufferView EosIdsView() const {
+    return PrefillControlView(eos_ids_offset_, prefill_.PublicInput(2).bytes);
+  }
+
+  BufferView EosCountView() const {
+    return PrefillControlView(eos_count_offset_, prefill_.PublicInput(3).bytes);
+  }
+
+  BufferView ProposalCountView() const {
+    return PrefillControlView(
+        proposal_count_offset_, verify_.PublicInput(1).bytes);
+  }
+
+  void PreparePrefillControl(
+      std::size_t staging_index,
+      const std::vector<std::int64_t>& token_ids,
+      bool prepare_draft,
+      std::size_t logical_proposal_count) {
+    auto* input_ids = static_cast<std::int64_t*>(
+        PrefillIdsHost(staging_index));
+    std::fill_n(input_ids, prefill_width_, pad_token_id_);
+    std::copy(token_ids.begin(), token_ids.end(), input_ids);
+    *static_cast<std::int16_t*>(EffectiveLengthHost(staging_index)) =
+        static_cast<std::int16_t>(token_ids.size());
+
+    auto* eos_ids = static_cast<std::int64_t*>(EosIdsHost(staging_index));
+    std::fill_n(eos_ids, eos_table_width_, 0);
+    std::copy(
+        configured_eos_token_ids_.begin(),
+        configured_eos_token_ids_.end(),
+        eos_ids);
+    *static_cast<std::int32_t*>(EosCountHost(staging_index)) =
+        static_cast<std::int32_t>(configured_eos_token_ids_.size());
+
+    const std::size_t proposal_count = prepare_draft
+        ? logical_proposal_count
+        : (proposal_value_valid_ ? proposal_value_ : 1);
+    *static_cast<std::int32_t*>(ProposalCountHost(staging_index)) =
+        static_cast<std::int32_t>(proposal_count);
+    proposal_value_ = proposal_count;
+    proposal_value_valid_ = true;
+  }
+
+  void UploadPrefillControl(std::size_t staging_index) {
+    UploadFromHost(
+        prefill_control_,
+        PrefillControlHost(staging_index),
+        prefill_control_.bytes);
+    ++stats_.prefill_control_upload_operations;
+    stats_.prefill_control_upload_bytes += prefill_control_.bytes;
+    ++stats_.prefill_h2d_operations_elided;
   }
 
   void InitializeImmutableZeroState() {
@@ -1167,8 +1242,8 @@ class AclIncrementalExecutor::Impl {
       prefill_plans_[current].Build(
           prefill_,
           TargetInputs(
-              {prefill_ids_.View(), effective_length_.View(), eos_ids_.View(),
-               eos_count_.View()},
+              {PrefillIdsView(), EffectiveLengthView(), EosIdsView(),
+               EosCountView()},
               current),
           {CompactView(compact_token_offset_, prefill_.outputs[0].bytes),
            CompactView(compact_commit_offset_, prefill_.outputs[1].bytes),
@@ -1183,7 +1258,7 @@ class AclIncrementalExecutor::Impl {
       decode_plans_[current].Build(
           decode_,
           TargetInputs(
-              {decode_id_.View(), eos_ids_.View(), eos_count_.View()},
+              {decode_id_.View(), EosIdsView(), EosCountView()},
               current),
           {CompactView(compact_token_offset_, decode_.outputs[0].bytes),
            CompactView(compact_commit_offset_, decode_.outputs[1].bytes),
@@ -1196,8 +1271,8 @@ class AclIncrementalExecutor::Impl {
       verify_plans_[current].Build(
           verify_,
           TargetInputs(
-              {verify_ids_.View(), proposal_count_.View(), eos_ids_.View(),
-               eos_count_.View()},
+              {verify_ids_.View(), ProposalCountView(), EosIdsView(),
+               EosCountView()},
               current),
           {CompactView(compact_token_offset_, verify_.outputs[0].bytes),
            CompactView(compact_commit_offset_, verify_.outputs[1].bytes),
@@ -1223,7 +1298,7 @@ class AclIncrementalExecutor::Impl {
              committed_input_count_.View(),
              CompactView(compact_token_offset_, draft_.PublicInput(2).bytes),
              CompactView(compact_commit_offset_, draft_.PublicInput(3).bytes),
-             proposal_count_.View(),
+             ProposalCountView(),
              draft_states_[current].tensors[0],
              draft_states_[current].tensors[1],
              draft_states_[current].tensors[2]},
@@ -1250,8 +1325,8 @@ class AclIncrementalExecutor::Impl {
           prefill_,
           [&]() {
             std::vector<BufferView> inputs{
-                prefill_ids_.View(), effective_length_.View(), eos_ids_.View(),
-                eos_count_.View()};
+                PrefillIdsView(), EffectiveLengthView(), EosIdsView(),
+                EosCountView()};
             inputs.insert(
                 inputs.end(),
                 target_zero_state_.tensors.begin(),
@@ -1274,7 +1349,7 @@ class AclIncrementalExecutor::Impl {
            committed_input_count_.View(),
            CompactView(compact_token_offset_, draft_.PublicInput(2).bytes),
            CompactView(compact_commit_offset_, draft_.PublicInput(3).bytes),
-           proposal_count_.View(),
+           ProposalCountView(),
            draft_zero_state_.tensors[0],
            draft_zero_state_.tensors[1],
            draft_zero_state_.tensors[2]},
@@ -1343,13 +1418,6 @@ class AclIncrementalExecutor::Impl {
       ++stats_.state_memset_operations;
       stats_.state_memset_bytes += draft_states_[0].allocation.bytes;
     }
-    if (eos_upload_pending_) {
-      Upload(eos_ids_, eos_ids_.bytes);
-      Upload(eos_count_, eos_count_.bytes);
-      uploaded_eos_ids_ = pending_eos_ids_;
-      eos_uploaded_ = true;
-      eos_upload_pending_ = false;
-    }
     reset_pending_ = false;
     return use_immutable_zero;
   }
@@ -1360,15 +1428,18 @@ class AclIncrementalExecutor::Impl {
     }
   }
 
-  void SetProposalCount(std::size_t value, void* staging_host = nullptr) {
+  void SetProposalCount(std::size_t value) {
     RequireProposalCount(value);
     if (proposal_value_valid_ && proposal_value_ == value) {
       return;
     }
-    void* host = staging_host == nullptr ? proposal_count_.host : staging_host;
+    void* host = ProposalCountHost(0);
     *static_cast<std::int32_t*>(host) =
         static_cast<std::int32_t>(value);
-    UploadFromHost(proposal_count_, host, proposal_count_.bytes);
+    const std::size_t bytes = verify_.PublicInput(1).bytes;
+    UploadFromHost(ProposalCountView(), host, bytes);
+    ++stats_.proposal_count_upload_operations;
+    stats_.proposal_count_upload_bytes += bytes;
     proposal_value_ = value;
     proposal_value_valid_ = true;
   }
@@ -1401,23 +1472,30 @@ class AclIncrementalExecutor::Impl {
   }
 
   void Upload(const MirrorBuffer& buffer, std::size_t bytes) {
-    UploadFromHost(buffer, buffer.host, bytes);
+    UploadFromHost(buffer.device.View(), buffer.host, bytes);
   }
 
   void UploadFromHost(
       const MirrorBuffer& buffer,
       const void* host,
       std::size_t bytes) {
-    if (bytes == 0 || bytes > buffer.bytes) {
-      throw std::out_of_range("host-to-device copy exceeds mirrored buffer");
+    UploadFromHost(buffer.device.View(), host, bytes);
+  }
+
+  void UploadFromHost(
+      const BufferView& destination,
+      const void* host,
+      std::size_t bytes) {
+    if (bytes == 0 || bytes > destination.bytes) {
+      throw std::out_of_range("host-to-device copy exceeds device buffer");
     }
     if (host == nullptr) {
       throw std::invalid_argument("host-to-device source is null");
     }
     Check(
         aclrtMemcpyAsync(
-            buffer.device.data,
-            buffer.device.bytes,
+            destination.data,
+            destination.bytes,
             host,
             bytes,
             ACL_MEMCPY_HOST_TO_DEVICE,
@@ -1517,24 +1595,12 @@ class AclIncrementalExecutor::Impl {
     verify_features_.Release();
     prefill_features_.Release();
     compact_.Release();
-    for (auto& host : extra_proposal_count_host_) {
+    for (auto& host : extra_prefill_control_host_) {
       host.Release();
     }
-    for (auto& host : extra_effective_length_host_) {
-      host.Release();
-    }
-    for (auto& host : extra_prefill_ids_host_) {
-      host.Release();
-    }
-    extra_proposal_count_host_.clear();
-    extra_effective_length_host_.clear();
-    extra_prefill_ids_host_.clear();
-    proposal_count_.Release();
+    extra_prefill_control_host_.clear();
     decode_id_.Release();
-    eos_count_.Release();
-    eos_ids_.Release();
-    effective_length_.Release();
-    prefill_ids_.Release();
+    prefill_control_.Release();
     for (auto& state : draft_states_) {
       state.Release();
     }
@@ -1602,15 +1668,9 @@ class AclIncrementalExecutor::Impl {
   std::array<StateArena, 2> draft_states_;
   StateArena target_zero_state_;
   StateArena draft_zero_state_;
-  MirrorBuffer prefill_ids_;
-  MirrorBuffer effective_length_;
-  MirrorBuffer eos_ids_;
-  MirrorBuffer eos_count_;
+  MirrorBuffer prefill_control_;
   MirrorBuffer decode_id_;
-  MirrorBuffer proposal_count_;
-  std::vector<HostAllocation> extra_prefill_ids_host_;
-  std::vector<HostAllocation> extra_effective_length_host_;
-  std::vector<HostAllocation> extra_proposal_count_host_;
+  std::vector<HostAllocation> extra_prefill_control_host_;
   MirrorBuffer compact_;
   DeviceAllocation prefill_features_;
   DeviceAllocation verify_features_;
@@ -1626,6 +1686,11 @@ class AclIncrementalExecutor::Impl {
   std::size_t compact_rejected_offset_ = 0;
   std::size_t compact_ordinary_bytes_ = 0;
   std::size_t compact_verify_bytes_ = 0;
+  std::size_t prefill_ids_offset_ = 0;
+  std::size_t effective_length_offset_ = 0;
+  std::size_t eos_ids_offset_ = 0;
+  std::size_t eos_count_offset_ = 0;
+  std::size_t proposal_count_offset_ = 0;
 
   std::array<DatasetPlan, 2> prefill_plans_;
   std::array<DatasetPlan, 2> decode_plans_;
@@ -1645,11 +1710,8 @@ class AclIncrementalExecutor::Impl {
   bool proposal_value_valid_ = false;
   std::size_t proposal_value_ = 0;
   std::int64_t pad_token_id_ = 0;
-  bool eos_uploaded_ = false;
-  bool eos_upload_pending_ = false;
   bool reset_pending_ = false;
-  std::vector<std::int64_t> uploaded_eos_ids_;
-  std::vector<std::int64_t> pending_eos_ids_;
+  std::vector<std::int64_t> configured_eos_token_ids_;
   IncrementalAclExecutionStats stats_;
 };
 

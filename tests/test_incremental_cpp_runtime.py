@@ -61,6 +61,9 @@ def _report(
     deferred_prefill = request_count * (prompt_chunks - 1)
     target_prefill_executions = request_count * prompt_chunks
     draft_propose_executions = 39 + 13 * (prompt_chunks - 1)
+    prefill_control_bytes = 832
+    decode_executions = 65
+    proposal_upload_operations = 2
     immutable_zero = (
         state_reset_policy == IMMUTABLE_ZERO_STATE_RESET_POLICY
     )
@@ -96,6 +99,14 @@ def _report(
                 "intermediate prompt chunks stay queued; final chunk performs "
                 "the only compact D2H and stream synchronization"
             ),
+            "prefill_control_policy": (
+                "IDs, effective length, proposal count and EOS table share "
+                "one H2D carrier with 64-byte-aligned device subsegments per "
+                "prompt chunk"
+            ),
+            "device_suballocation_policy": (
+                "64-byte segment starts; ALIGN_UP(payload,32)+32 reserved span"
+            ),
             "state_reset_policy": state_reset_policy,
             "state_reset_only_barriers": 0,
             "state_reset_device_work_included_by_prefill_barrier": (
@@ -112,6 +123,7 @@ def _report(
             "prefill_width": 64,
             "proposal_width": 15,
             "verify_width": 16,
+            "eos_table_width": 4,
         },
         "model_memory_query": {
             "source": "aclmdlQuerySize",
@@ -123,7 +135,8 @@ def _report(
             "immutable_zero_state_device_bytes": zero_state_bytes,
             "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 512,
-            "prefill_staging_pinned_host_bytes": 1036,
+            "prefill_control_bytes_per_slot": prefill_control_bytes,
+            "prefill_staging_pinned_host_bytes": 1664,
             "explicit_allocated_device_bytes_excluding_runtime": (
                 64 + 1024 + state_bytes + 512
             ),
@@ -136,12 +149,12 @@ def _report(
         "execution_io_counters": {
             "model_executions": (
                 target_prefill_executions
-                + 65
+                + decode_executions
                 + draft_propose_executions
                 + 26
             ),
             "target_prefill_executions": target_prefill_executions,
-            "target_decode1_executions": 65,
+            "target_decode1_executions": decode_executions,
             "draft_propose_executions": draft_propose_executions,
             "target_verify_commit_executions": 26,
             "stream_synchronizations": 117,
@@ -149,6 +162,15 @@ def _report(
             "deferred_prefill_chunks": deferred_prefill,
             "prefill_synchronizations_elided": deferred_prefill,
             "prefill_compact_downloads_elided": deferred_prefill,
+            "prefill_control_upload_operations": target_prefill_executions,
+            "prefill_control_upload_bytes": (
+                target_prefill_executions * prefill_control_bytes
+            ),
+            "prefill_h2d_operations_elided": target_prefill_executions,
+            "decode_id_upload_operations": decode_executions,
+            "decode_id_upload_bytes": decode_executions * 8,
+            "proposal_count_upload_operations": proposal_upload_operations,
+            "proposal_count_upload_bytes": proposal_upload_operations * 4,
             "state_resets": 26,
             "state_memset_operations": 0 if immutable_zero else 52,
             "state_memset_bytes": 0 if immutable_zero else 26 * reset_bytes,
@@ -157,8 +179,16 @@ def _report(
             "state_initialization_stream_synchronizations": (
                 1 if immutable_zero else 0
             ),
-            "host_to_device_operations": 80,
-            "host_to_device_bytes": 4096,
+            "host_to_device_operations": (
+                target_prefill_executions
+                + decode_executions
+                + proposal_upload_operations
+            ),
+            "host_to_device_bytes": (
+                target_prefill_executions * prefill_control_bytes
+                + decode_executions * 8
+                + proposal_upload_operations * 4
+            ),
             "device_to_host_operations": 117,
             "device_to_host_bytes": 8192,
             "state_device_bytes": state_bytes,
@@ -167,7 +197,8 @@ def _report(
             "state_reset_bytes_per_request": reset_bytes,
             "carrier_device_bytes": 512,
             "prefill_staging_slots": 2,
-            "prefill_staging_pinned_host_bytes": 1036,
+            "prefill_control_bytes_per_slot": prefill_control_bytes,
+            "prefill_staging_pinned_host_bytes": 1664,
         },
         "ordinary": _mode("ordinary-greedy"),
         "dflash": _mode("dflash-strict-greedy"),
@@ -221,6 +252,10 @@ def test_incremental_runner_report_closes_multi_chunk_prefill() -> None:
         ("device_to_host_operations", 118),
         ("state_resets", 25),
         ("model_executions", 157),
+        ("prefill_control_upload_operations", 25),
+        ("prefill_control_upload_bytes", 1),
+        ("host_to_device_operations", 1),
+        ("proposal_count_upload_bytes", 7),
     ],
 )
 def test_incremental_runner_rejects_inconsistent_execution_counters(

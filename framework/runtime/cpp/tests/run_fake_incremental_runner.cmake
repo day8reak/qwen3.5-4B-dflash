@@ -94,7 +94,17 @@ string(JSON deferred_prefill GET "${report}" execution_io_counters deferred_pref
 string(JSON prefill_syncs_elided GET "${report}" execution_io_counters prefill_synchronizations_elided)
 string(JSON prefill_d2h_elided GET "${report}" execution_io_counters prefill_compact_downloads_elided)
 string(JSON prefill_staging_slots GET "${report}" execution_io_counters prefill_staging_slots)
+string(JSON prefill_control_slot_bytes GET "${report}" execution_io_counters prefill_control_bytes_per_slot)
 string(JSON prefill_staging_bytes GET "${report}" execution_io_counters prefill_staging_pinned_host_bytes)
+string(JSON prefill_control_uploads GET "${report}" execution_io_counters prefill_control_upload_operations)
+string(JSON prefill_control_upload_bytes GET "${report}" execution_io_counters prefill_control_upload_bytes)
+string(JSON prefill_h2d_elided GET "${report}" execution_io_counters prefill_h2d_operations_elided)
+string(JSON decode_uploads GET "${report}" execution_io_counters decode_id_upload_operations)
+string(JSON decode_upload_bytes GET "${report}" execution_io_counters decode_id_upload_bytes)
+string(JSON proposal_uploads GET "${report}" execution_io_counters proposal_count_upload_operations)
+string(JSON proposal_upload_bytes GET "${report}" execution_io_counters proposal_count_upload_bytes)
+string(JSON h2d_operations GET "${report}" execution_io_counters host_to_device_operations)
+string(JSON h2d_bytes GET "${report}" execution_io_counters host_to_device_bytes)
 string(JSON decode_executions GET "${report}" execution_io_counters target_decode1_executions)
 string(JSON draft_executions GET "${report}" execution_io_counters draft_propose_executions)
 string(JSON verify_executions GET "${report}" execution_io_counters target_verify_commit_executions)
@@ -104,6 +114,11 @@ math(EXPR role_total
 )
 math(EXPR closed_state_bytes "${working_state_bytes} + ${zero_state_bytes}")
 math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
+math(EXPR expected_prefill_control_bytes "${prefill_executions} * ${prefill_control_slot_bytes}")
+math(EXPR expected_decode_upload_bytes "${decode_uploads} * 8")
+math(EXPR expected_proposal_upload_bytes "${proposal_uploads} * 4")
+math(EXPR closed_h2d_operations "${prefill_control_uploads} + ${decode_uploads} + ${proposal_uploads}")
+math(EXPR closed_h2d_bytes "${prefill_control_upload_bytes} + ${decode_upload_bytes} + ${proposal_upload_bytes}")
 if(RESET_POLICY STREQUAL "async-memset")
   math(EXPR expected_state_memsets "2 * ${resets}")
   math(EXPR expected_state_memset_bytes "${reset_bytes} * ${resets}")
@@ -137,7 +152,16 @@ if(NOT status STREQUAL "PASS" OR
    NOT prefill_syncs_elided EQUAL deferred_prefill OR
    NOT prefill_d2h_elided EQUAL deferred_prefill OR
    NOT prefill_staging_slots EQUAL 2 OR
-   NOT prefill_staging_bytes GREATER 0 OR
+   NOT prefill_control_slot_bytes EQUAL 832 OR
+   NOT prefill_staging_bytes EQUAL 1664 OR
+   NOT prefill_control_uploads EQUAL prefill_executions OR
+   NOT prefill_control_upload_bytes EQUAL expected_prefill_control_bytes OR
+   NOT prefill_h2d_elided EQUAL prefill_executions OR
+   NOT decode_uploads EQUAL decode_executions OR
+   NOT decode_upload_bytes EQUAL expected_decode_upload_bytes OR
+   NOT proposal_upload_bytes EQUAL expected_proposal_upload_bytes OR
+   NOT h2d_operations EQUAL closed_h2d_operations OR
+   NOT h2d_bytes EQUAL closed_h2d_bytes OR
    NOT report_reset_policy STREQUAL RESET_POLICY OR
    NOT reset_only_barriers EQUAL 0 OR
    NOT state_bytes EQUAL closed_state_bytes OR

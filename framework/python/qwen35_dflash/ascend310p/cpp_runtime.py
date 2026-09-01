@@ -699,6 +699,15 @@ def validate_incremental_cpp_runner_report(
         "only compact D2H and stream synchronization"
     ):
         raise RuntimeError("incremental prefill completion policy differs")
+    if protocol.get("prefill_control_policy") != (
+        "IDs, effective length, proposal count and EOS table share one H2D "
+        "carrier with 64-byte-aligned device subsegments per prompt chunk"
+    ):
+        raise RuntimeError("incremental prefill control policy differs")
+    if protocol.get("device_suballocation_policy") != (
+        "64-byte segment starts; ALIGN_UP(payload,32)+32 reserved span"
+    ):
+        raise RuntimeError("incremental device suballocation policy differs")
     abi = report.get("abi", {})
     if abi.get("id") != _INCREMENTAL_ABI_ID:
         raise RuntimeError("incremental runner ABI identity differs")
@@ -708,6 +717,7 @@ def validate_incremental_cpp_runner_report(
     verify_width = abi.get("verify_width")
     sequence_capacity = abi.get("sequence_capacity")
     prefill_width = abi.get("prefill_width")
+    eos_table_width = abi.get("eos_table_width")
     if (
         isinstance(proposal_width, bool)
         or not isinstance(proposal_width, int)
@@ -722,6 +732,9 @@ def validate_incremental_cpp_runner_report(
         or isinstance(prefill_width, bool)
         or not isinstance(prefill_width, int)
         or prefill_width != 64
+        or isinstance(eos_table_width, bool)
+        or not isinstance(eos_table_width, int)
+        or eos_table_width <= 0
         or sequence_capacity % prefill_width
         or len(prompt_token_ids) > sequence_capacity
     ):
@@ -749,6 +762,7 @@ def validate_incremental_cpp_runner_report(
         "working_state_device_bytes",
         "state_reset_bytes_per_request",
         "carrier_device_bytes",
+        "prefill_control_bytes_per_slot",
         "prefill_staging_pinned_host_bytes",
     ):
         value = memory.get(field)
@@ -773,11 +787,24 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental state allocation does not close")
     expected_staging_slots = sequence_capacity // prefill_width
-    expected_staging_host_bytes = expected_staging_slots * (
-        prefill_width * 8 + 2 + 4
+    control_cursor = 0
+    for tensor_bytes in (
+        prefill_width * 8,
+        eos_table_width * 8,
+        4,
+        4,
+        2,
+    ):
+        control_cursor = (control_cursor + 63) // 64 * 64
+        control_cursor += (tensor_bytes + 31) // 32 * 32 + 32
+    expected_control_bytes = (control_cursor + 63) // 64 * 64
+    expected_staging_host_bytes = (
+        expected_staging_slots * expected_control_bytes
     )
     if (
-        memory["prefill_staging_pinned_host_bytes"]
+        memory["prefill_control_bytes_per_slot"]
+        != expected_control_bytes
+        or memory["prefill_staging_pinned_host_bytes"]
         != expected_staging_host_bytes
     ):
         raise RuntimeError("incremental prefill pinned-host staging differs")
@@ -864,10 +891,45 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental carrier byte reports differ")
     if (
         execution.get("prefill_staging_slots") != expected_staging_slots
+        or execution.get("prefill_control_bytes_per_slot")
+        != expected_control_bytes
         or execution.get("prefill_staging_pinned_host_bytes")
         != expected_staging_host_bytes
     ):
         raise RuntimeError("incremental prefill staging reports differ")
+    prefill_upload_operations = execution.get(
+        "prefill_control_upload_operations"
+    )
+    decode_upload_operations = execution.get("decode_id_upload_operations")
+    proposal_upload_operations = execution.get(
+        "proposal_count_upload_operations"
+    )
+    if (
+        prefill_upload_operations != prefill
+        or execution.get("prefill_control_upload_bytes")
+        != prefill * expected_control_bytes
+        or execution.get("prefill_h2d_operations_elided") != prefill
+        or decode_upload_operations != decode
+        or execution.get("decode_id_upload_bytes") != decode * 8
+        or isinstance(proposal_upload_operations, bool)
+        or not isinstance(proposal_upload_operations, int)
+        or proposal_upload_operations < 0
+        or execution.get("proposal_count_upload_bytes")
+        != proposal_upload_operations * 4
+        or execution.get("host_to_device_operations")
+        != (
+            prefill_upload_operations
+            + decode_upload_operations
+            + proposal_upload_operations
+        )
+        or execution.get("host_to_device_bytes")
+        != (
+            execution["prefill_control_upload_bytes"]
+            + execution["decode_id_upload_bytes"]
+            + execution["proposal_count_upload_bytes"]
+        )
+    ):
+        raise RuntimeError("incremental packed H2D counters differ")
     for field in (
         "host_to_device_operations", "host_to_device_bytes",
         "device_to_host_bytes",

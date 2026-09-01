@@ -47,6 +47,13 @@ struct IncrementalAclExecutionStats {
   std::size_t deferred_prefill_chunks = 0;
   std::size_t prefill_synchronizations_elided = 0;
   std::size_t prefill_compact_downloads_elided = 0;
+  std::size_t prefill_control_upload_operations = 0;
+  std::size_t prefill_control_upload_bytes = 0;
+  std::size_t prefill_h2d_operations_elided = 0;
+  std::size_t decode_id_upload_operations = 0;
+  std::size_t decode_id_upload_bytes = 0;
+  std::size_t proposal_count_upload_operations = 0;
+  std::size_t proposal_count_upload_bytes = 0;
   std::size_t state_resets = 0;
   std::size_t state_memset_operations = 0;
   std::size_t state_memset_bytes = 0;
@@ -63,6 +70,7 @@ struct IncrementalAclExecutionStats {
   std::size_t state_reset_bytes_per_request = 0;
   std::size_t carrier_device_bytes = 0;
   std::size_t prefill_staging_slots = 0;
+  std::size_t prefill_control_bytes_per_slot = 0;
   std::size_t prefill_staging_pinned_host_bytes = 0;
 };
 

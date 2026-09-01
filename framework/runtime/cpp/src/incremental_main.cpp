@@ -513,6 +513,8 @@ void WriteReport(
          << ",\"state_reset_bytes_per_request\":"
          << execution.state_reset_bytes_per_request
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
+         << ",\"prefill_control_bytes_per_slot\":"
+         << execution.prefill_control_bytes_per_slot
          << ",\"prefill_staging_pinned_host_bytes\":"
          << execution.prefill_staging_pinned_host_bytes
          << ",\"explicit_allocated_device_bytes_excluding_runtime\":"
@@ -532,6 +534,11 @@ void WriteReport(
          << "\"prefill_completion_policy\":\"intermediate prompt chunks "
             "stay queued; final chunk performs the only compact D2H and "
             "stream synchronization\","
+         << "\"prefill_control_policy\":\"IDs, effective length, proposal "
+            "count and EOS table share one H2D carrier with 64-byte-aligned "
+            "device subsegments per prompt chunk\","
+         << "\"device_suballocation_policy\":\"64-byte segment starts; "
+            "ALIGN_UP(payload,32)+32 reserved span\","
          << "\"state_reset_policy\":\""
          << qwen35::dflash::IncrementalStateResetPolicyName(
                 executor.state_reset_policy())
@@ -580,6 +587,20 @@ void WriteReport(
          << execution.prefill_synchronizations_elided
          << ",\"prefill_compact_downloads_elided\":"
          << execution.prefill_compact_downloads_elided
+         << ",\"prefill_control_upload_operations\":"
+         << execution.prefill_control_upload_operations
+         << ",\"prefill_control_upload_bytes\":"
+         << execution.prefill_control_upload_bytes
+         << ",\"prefill_h2d_operations_elided\":"
+         << execution.prefill_h2d_operations_elided
+         << ",\"decode_id_upload_operations\":"
+         << execution.decode_id_upload_operations
+         << ",\"decode_id_upload_bytes\":"
+         << execution.decode_id_upload_bytes
+         << ",\"proposal_count_upload_operations\":"
+         << execution.proposal_count_upload_operations
+         << ",\"proposal_count_upload_bytes\":"
+         << execution.proposal_count_upload_bytes
          << ",\"state_resets\":" << execution.state_resets
          << ",\"state_memset_operations\":"
          << execution.state_memset_operations
@@ -606,6 +627,8 @@ void WriteReport(
          << ",\"carrier_device_bytes\":" << execution.carrier_device_bytes
          << ",\"prefill_staging_slots\":"
          << execution.prefill_staging_slots
+         << ",\"prefill_control_bytes_per_slot\":"
+         << execution.prefill_control_bytes_per_slot
          << ",\"prefill_staging_pinned_host_bytes\":"
          << execution.prefill_staging_pinned_host_bytes
          << "},\"prompt_token_ids\":";

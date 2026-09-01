@@ -110,8 +110,35 @@ void RunPolicy(
       "multi-chunk prefill did not elide one sync/D2H per intermediate chunk");
   Require(
       stats.prefill_staging_slots == 2 &&
-          stats.prefill_staging_pinned_host_bytes > 0,
+          stats.prefill_control_bytes_per_slot == 832 &&
+          stats.prefill_staging_pinned_host_bytes == 1664,
       "prefill pinned-host staging ring differs");
+  Require(
+      stats.prefill_control_upload_operations ==
+              stats.target_prefill_executions &&
+          stats.prefill_h2d_operations_elided ==
+              stats.target_prefill_executions &&
+          stats.prefill_control_upload_bytes ==
+              stats.prefill_control_upload_operations *
+                  stats.prefill_control_bytes_per_slot,
+      "prefill controls were not packed into one H2D per chunk");
+  Require(
+      stats.decode_id_upload_operations ==
+              stats.target_decode1_executions &&
+          stats.decode_id_upload_bytes ==
+              stats.decode_id_upload_operations * sizeof(std::int64_t) &&
+          stats.proposal_count_upload_bytes ==
+              stats.proposal_count_upload_operations *
+                  sizeof(std::int32_t) &&
+          stats.host_to_device_operations ==
+              stats.prefill_control_upload_operations +
+                  stats.decode_id_upload_operations +
+                  stats.proposal_count_upload_operations &&
+          stats.host_to_device_bytes ==
+              stats.prefill_control_upload_bytes +
+                  stats.decode_id_upload_bytes +
+                  stats.proposal_count_upload_bytes,
+      "packed H2D counters do not close");
   Require(stats.working_state_device_bytes > 0, "working state is missing");
   Require(stats.state_reset_bytes_per_request > 0, "reset byte set is empty");
   Require(

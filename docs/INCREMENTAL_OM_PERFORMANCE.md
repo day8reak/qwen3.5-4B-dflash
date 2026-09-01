@@ -220,7 +220,11 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
 - reset 支持两个精确策略：默认 `async-memset` 把 state clear 排入第一次 prefill；候选
   `immutable-zero` 在进程启动时建立只读零状态，使每次请求不再清零大状态。二者都没有
   reset-only barrier，后者以额外一套 Target+Draft 状态显存换 TTFT；
-- EOS 表和 `logical_proposal_count` 仅在值变化时 H2D；
+- 每个 prompt chunk 的 64 个 ID、有效长度、proposal count 和 EOS 表共用一个 832-byte
+  host/device control carrier，只下发一次 H2D；每个 device 子段按 64 bytes 对齐并保留 AscendCL
+  要求的分段 padding，prefill 后只有 proposal count 真正变化时才单独下发 4-byte H2D；
+- Target/Draft state arena 与 compact result arena 也使用同一条 64-byte 起始地址、
+  `ALIGN_UP(payload,32)+32` 分段规则；Fake ACL 会拒绝任何未对齐的模型输入/输出绑定；
 - Draft 的 `N=64/N=16` 动态 gear 在 dataset 建立时预绑定，不在 decode 热循环反复配置；
 - ordinary 路径只执行 `target-prefill`/`target-decode1`，不执行 Draft。
 
@@ -326,14 +330,35 @@ prefill_completion_synchronizations = R
 deferred_prefill_chunks            = R * (C - 1)
 prefill_synchronizations_elided     = deferred_prefill_chunks
 prefill_compact_downloads_elided    = deferred_prefill_chunks
+prefill_control_upload_operations   = target_prefill_executions
+prefill_h2d_operations_elided       = target_prefill_executions
+prefill_control_upload_bytes        = target_prefill_executions * control_bytes
 stream_synchronizations             = R + decode1 + verify-commit
 device_to_host_operations           = stream_synchronizations
+host_to_device_operations           = prefill_control_upload_operations
+                                    + decode_id_upload_operations
+                                    + proposal_count_upload_operations
 ```
+
+其中每个字段的 device offset 都按 64 bytes 对齐，每段物理跨度为
+`ALIGN_UP(tensor_bytes,32)+32`，最终 carrier 再按 64 bytes 对齐；默认 `eos_table_width=4` 时为
+832 bytes。最后三个加数分别代表 packed prefill、单 token decode ID 和 prefill 后 proposal
+count 改值，三类 operation/byte 分项之和必须严格等于总 H2D 计数。这个布局遵守
+[`aclrtMalloc` 对大块内存二次划分的 64-byte 起始地址与分段跨度约束](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0095.html)。
 
 因此 2048-token prompt 的每次请求会把原来的 32 次 prefill host completion 降为 1 次；整个
 paired 报告应消除 `26*31=806` 次 stream sync 和 compact D2H。它不减少 Target/Draft 的 device
 执行次数。为保证异步 H2D 源不在最终同步前被覆盖，runner 会常驻 `2048/64=32` 个 pinned-host
-staging slot；每个 slot 只有 `64*8 + 2 + 4 = 518` 字节，总计 16,576 字节，不增加 device buffer。
+staging slot；每个 slot 为 832 字节，总计 26,624 字节，device 侧只需同一个 832-byte packed
+control buffer。相对于每 chunk 分别上传 ID 和有效长度，2048-token paired 报告至少再消除
+`26*32=832` 次小 H2D API 调用。
+
+70-token/two-chunk Fake ACL 的冻结调用证据是 H2D operations 从 185 降为 130（减少 55，约
+29.7%）；由于把 EOS/control 与真机要求的分段 padding 一并装入每个 carrier，H2D payload 从
+27,392 增至 43,888 bytes。这只证明调用合并和计数闭合，不是 310P 时延结论；真机必须以未开
+msprof 的 3+10 报告判断 API 减少是否覆盖多出的 16,496 bytes。把旧 compact/state 子分配修正为
+官方对齐规则后，同一 Fake ACL 报告的 D2H operations 保持 117，payload 从 15,756 增至 32,604
+bytes；这同样是必须在真机 A/B 中保留的显式代价，不能从 Fake ACL 推断净时延收益。
 
 这条排队规则依赖 AscendCL 的公开异步语义：[Stream 内任务按原始顺序执行](https://www.hiascend.com/document/detail/en/canncommercial/800/appdevg/aclcppdevg/aclcppdevg_000004.html)，
 [`aclmdlExecuteAsync` 是异步模型执行接口](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/apiref/appdevgapi/aclcppdevg_03_0299.html)，
