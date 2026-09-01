@@ -12,7 +12,11 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import torch
 
 from .contracts import AirGraphSpec
-from .custom_op_export import audit_custom_op_export, prepare_custom_op_export
+from .custom_op_export import (
+    audit_custom_op_export,
+    prepare_custom_op_export,
+    validate_gdr_ge_prototype_environment,
+)
 from .standard_op_export import (
     audit_aten_softplus_export,
     prepare_aten_softplus_export,
@@ -88,6 +92,8 @@ def export_air_bundle(
             raise RuntimeError(
                 "TorchAir is required for AIR export; activate the declared CANN/TorchAir environment"
             ) from error
+
+    gdr_ge_prototype = validate_gdr_ge_prototype_environment()
 
     # The receiver TorchAir release registers aten.softplus.default but its
     # converter raises NotImplementedError.  Override it before Dynamo traces
@@ -182,6 +188,7 @@ def export_air_bundle(
             "torch": str(torch.__version__),
             "torch_npu": _module_version("torch_npu"),
             "torchair": str(getattr(torchair, "__version__", "unknown")),
+            "gdr_ge_prototype": gdr_ge_prototype,
         },
         "graphs": graphs,
     }

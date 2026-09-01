@@ -42,6 +42,7 @@ from qwen35_dflash.ascend310p.custom_op_export import (
     _validate_npu_quant_matmul_meta,
     audit_custom_op_export,
     prepare_custom_op_export,
+    validate_gdr_ge_prototype_environment,
 )
 from qwen35_dflash.ascend310p.exporter import export_air_bundle
 from qwen35_dflash.ascend310p.input_manifest import (
@@ -169,6 +170,10 @@ class _FakeTorchAirGeAttr:
         return ("int", value)
 
     @staticmethod
+    def Bool(value: bool) -> tuple[str, bool]:
+        return ("bool", value)
+
+    @staticmethod
     def Str(value: str) -> tuple[str, str]:
         return ("str", value)
 
@@ -244,6 +249,83 @@ class _FakeTorchAir:
             'op {\n  name: "rms"\n  type: "RmsNorm"\n}\n'
             'op {\n  name: "softplus"\n  type: "SoftplusV2"\n}\n',
             encoding="utf-8",
+        )
+
+
+def _write_gdr_ge_prototype(root: Path, *, effective_length: bool) -> Path:
+    header = root / "op_proto" / "inc" / "op_proto.h"
+    header.parent.mkdir(parents=True)
+    effective_input = (
+        "    .INPUT(effective_length, ge::TensorType::ALL())\n"
+        if effective_length
+        else ""
+    )
+    header.write_text(
+        "REG_OP(ChunkGatedDeltaRule)\n"
+        "    .INPUT(query, ge::TensorType::ALL())\n"
+        "    .INPUT(key, ge::TensorType::ALL())\n"
+        "    .INPUT(value, ge::TensorType::ALL())\n"
+        "    .INPUT(g, ge::TensorType::ALL())\n"
+        "    .INPUT(beta, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(initial_state, ge::TensorType::ALL())\n"
+        f"{effective_input}"
+        "    .OUTPUT(core_attn, ge::TensorType::ALL())\n"
+        "    .OUTPUT(last_recurrent_state, ge::TensorType::ALL())\n"
+        "    .ATTR(chunk_size, Int, 64)\n"
+        "    .ATTR(output_final_state, Bool, false)\n"
+        "    .ATTR(use_qk_l2norm_in_kernel, Bool, false)\n"
+        "    .OP_END_FACTORY_REG(ChunkGatedDeltaRule);\n",
+        encoding="utf-8",
+    )
+    return header
+
+
+def test_gdr_ge_prototype_preflight_accepts_one_effective_length_v2(
+    tmp_path: Path,
+) -> None:
+    vendor = tmp_path / "current_gdr"
+    header = _write_gdr_ge_prototype(vendor, effective_length=True)
+
+    result = validate_gdr_ge_prototype_environment(
+        ascend_custom_opp_path=str(vendor),
+        ld_library_path=str(vendor / "op_api" / "lib"),
+    )
+
+    assert result["status"] == "PASS"
+    assert result["abi"] == "effective-length-v2-named-inputs"
+    assert result["prototype_path"] == str(header.resolve())
+    assert len(result["prototype_sha256"]) == 64
+    assert result["environment_sources"] == [
+        "ASCEND_CUSTOM_OPP_PATH",
+        "LD_LIBRARY_PATH",
+    ]
+
+
+def test_gdr_ge_prototype_preflight_rejects_duplicate_vendor_roots(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "current_gdr"
+    legacy = tmp_path / "legacy_gdr"
+    _write_gdr_ge_prototype(current, effective_length=True)
+    _write_gdr_ge_prototype(legacy, effective_length=False)
+
+    with pytest.raises(RuntimeError, match="multiple ChunkGatedDeltaRule"):
+        validate_gdr_ge_prototype_environment(
+            ascend_custom_opp_path=os.pathsep.join((str(current), str(legacy))),
+            ld_library_path="",
+        )
+
+
+def test_gdr_ge_prototype_preflight_rejects_legacy_abi(
+    tmp_path: Path,
+) -> None:
+    legacy = tmp_path / "legacy_gdr"
+    _write_gdr_ge_prototype(legacy, effective_length=False)
+
+    with pytest.raises(RuntimeError, match="incompatible ChunkGatedDeltaRule"):
+        validate_gdr_ge_prototype_environment(
+            ascend_custom_opp_path=str(legacy),
+            ld_library_path="",
         )
 
 
@@ -507,17 +589,25 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
     }
 
     placeholder = object()
+    query, key, value, gate, beta, effective_length, initial_state = (
+        object() for _ in range(7)
+    )
+    gdr_session = next(
+        session
+        for session in sessions
+        if session.spec.torch_op == NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP
+    )
     torchair.converters[operations["npu_chunk_gated_delta_rule"]](
-        placeholder,
-        placeholder,
-        placeholder,
-        placeholder,
-        placeholder,
-        placeholder,
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        effective_length,
         64,
-        placeholder,
+        initial_state,
         True,
-        False,
+        True,
         meta_outputs=(placeholder, placeholder),
     )
     torchair.converters[functional_cache_update](*([placeholder] * 4))
@@ -542,6 +632,30 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
         NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
     }
+    gdr_call = next(
+        call
+        for call in torchair.ge.calls
+        if call[0] == NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE
+    )
+    assert gdr_call[1] == ()
+    assert gdr_call[2] == {
+        "inputs": {
+            "query": query,
+            "key": key,
+            "value": value,
+            "g": gate,
+            "beta": beta,
+            "initial_state": initial_state,
+            "effective_length": effective_length,
+        },
+        "outputs": ["core_attn", "last_recurrent_state"],
+        "attrs": {
+            "chunk_size": ("int", 64),
+            "output_final_state": ("bool", True),
+            "use_qk_l2norm_in_kernel": ("bool", True),
+        },
+    }
+    assert gdr_session.converter_mode == "named-gdr-effective-length-v2"
 
 
 def test_gdr_fake_keeps_frontend_operator_in_strict_export() -> None:

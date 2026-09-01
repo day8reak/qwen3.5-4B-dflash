@@ -76,9 +76,15 @@
           "value shape, query dtype/device",
           "initial_state shape, float32, input device"
         ],
-        "constraints": "locked route requires output_final_state=true; effective_length is int16[B]",
+        "constraints": "locked route requires output_final_state=true; effective_length is int16[B]; exactly one effective_length-v2 GE prototype may be active",
+        "ge_prototype": {
+          "inputs": ["query", "key", "value", "g", "beta", "initial_state", "effective_length"],
+          "optional_inputs": ["initial_state"],
+          "outputs": ["core_attn", "last_recurrent_state"],
+          "attrs": ["chunk_size", "output_final_state", "use_qk_l2norm_in_kernel"]
+        },
         "default_ge_op_type": "ChunkGatedDeltaRule",
-        "converter": "framework registered GE IR",
+        "converter": "framework named-input GE IR; never PyTorch positional order",
         "minimum_occurrences": 1
       },
       {
@@ -133,6 +139,7 @@
   "compiler": {
     "exporter": "TorchAir dynamo_export",
     "custom_op_gate": "validate and propagate AIR custom_op_audit before ATC",
+    "gdr_prototype_gate": "reject duplicate or legacy ChunkGatedDeltaRule prototypes from ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH before checkpoint load",
     "atc_mode": 0,
     "atc_framework": 1,
     "soc_policy": "exact 310P variant required; generic Ascend310P rejected"

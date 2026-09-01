@@ -106,7 +106,19 @@ schema/Meta 预检，但不能虚构一次图命中。
 GDR 的模型合同是 Q/K/V `[B,S,32,128]` FP16、g `[B,S,32]` FP32、beta
 `[B,S,32]` FP16、`effective_length [B]` INT16、initial/final state
 `[B,32,128,128]` FP32、输出 `[B,S,32,128]` FP16；当前导出必须设置
-`output_final_state=True`。`adn_fused_infer_attention` 的当前重算 lowering 还要求
+`output_final_state=True`。PyTorch 前端参数顺序是 `effective_length, chunk_size,
+initial_state, ...`，但当前 GE v2 原型的输入顺序是 `initial_state,
+effective_length`，三个标量是 ATTR。框架因此必须使用 named inputs/outputs/attrs：
+
+```text
+inputs: query, key, value, g, beta, initial_state, effective_length
+outputs: core_attn, last_recurrent_state
+attrs: chunk_size, output_final_state, use_qk_l2norm_in_kernel
+```
+
+不能把 PyTorch schema 的十个参数按 positional 顺序直接传给 GE，否则
+`effective_length` 会落到 `initial_state` 位置，`chunk_size` 会落到 Tensor 输入位置。
+`adn_fused_infer_attention` 的当前重算 lowering 还要求
 `all_seq_lengths_q == actual_seq_lengths_q`，不满足时在生成错误 AIR 前直接失败。
 `allQLen` 是 `SymInt[]` 序列长度，两个 HIAI modeling 文件在 eager 和 AIR 路径都把它传给
 `all_seq_lengths_q`。当前路线没有 PSE tensor，因此 `pse_shift` 保持 `None`；不能为了通过类型
@@ -128,9 +140,9 @@ clone 或额外 NPU launch；rollback 多行写在 AIR 路径中显式串接每�
 `keep_inference_input_mutations=True` 不能解除非 ATen 算子“返回值带 alias”的限制。
 
 七个预期 GE type 都在 `factory.json` 中显式锁定。builtin converter 和当前 fused-attention 精确
-映射必须使用表中的 type；RMS/GDR/cache 只有在目标环境把同一参数顺序的 IR 正式注册为其他
-type 时才可改名。该值不会自动回退：指定 IR 未注册、converter 没有命中，或 `dynamo.pbtxt` 中
-required type 数为 0，导出都会失败，不会生成伪 PASS manifest。
+映射必须使用表中的 type；GDR 当前只允许上述 `ChunkGatedDeltaRule` v2 named ABI。该值不会
+自动回退：指定 IR 未注册、converter 没有命中，或 `dynamo.pbtxt` 中 required type 数为 0，
+导出都会失败，不会生成伪 PASS manifest。
 
 ### 2.2 TorchAir 标准算子精确补丁
 
@@ -172,6 +184,8 @@ gear。
 7. 原量化 YAML 及其 `quanted_pth`、`embedding_weight_path`、
    `embedding_scale_path`；
 8. receiver 的 `models/export_model_wrapper_qwen3_5.py`。
+9. `ASCEND_CUSTOM_OPP_PATH` 和 `LD_LIBRARY_PATH` 中只有一套
+   `ChunkGatedDeltaRule`，且其 `op_proto.h` 包含 `effective_length` v2 输入。
 
 禁止用 CPU fallback 代替设备结论。仓库不保存 checkpoint、量化权重、AIR、OM、编译缓存、
 日志或性能报告。
@@ -215,6 +229,26 @@ atc --version
 ```
 
 任何 import、设备或 ATC 失败都应先修环境；不要让导出流程自动降级到 CPU。
+
+在加载权重前单独检查 GDR GE 原型：
+
+```bash
+"$MODEL_PYTHON" - <<'PY'
+from qwen35_dflash.ascend310p.custom_op_export import (
+    validate_gdr_ge_prototype_environment,
+)
+
+result = validate_gdr_ge_prototype_environment()
+print(result)
+assert result["status"] == "PASS"
+assert result["abi"] == "effective-length-v2-named-inputs"
+PY
+```
+
+导出器也会自动执行同一检查。若两个环境变量指向两套同名
+`ChunkGatedDeltaRule`，会在加载 checkpoint 前失败并列出两个 `op_proto.h`。必须同时从
+`ASCEND_CUSTOM_OPP_PATH` 和 `LD_LIBRARY_PATH` 移除旧 vendor 根；不要只依赖路径先后顺序，
+也不要删除不属于当前用户的安装目录。
 
 ## 4. 锁定外部模型和量化输入
 
@@ -372,6 +406,9 @@ root = Path(os.environ["AI_RUN_DIR"]) / "artifacts" / "quant-dflash"
 data = json.loads((root / "air-manifest.json").read_text())
 assert data["status"] == "PASS"
 assert data["schema_version"] == 3
+gdr_proto = data["environment"]["gdr_ge_prototype"]
+assert gdr_proto["status"] == "PASS"
+assert gdr_proto["abi"] == "effective-length-v2-named-inputs"
 assert len(data["graphs"]) == 1
 graph = data["graphs"][0]
 assert graph["name"] == "quant_dflash_recompute"

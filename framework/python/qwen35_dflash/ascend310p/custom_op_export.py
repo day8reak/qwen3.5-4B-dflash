@@ -10,7 +10,9 @@ audits the resulting ``dynamo.pbtxt`` before declaring an AIR bundle passing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import inspect
+import os
 from pathlib import Path
 import re
 import threading
@@ -39,6 +41,26 @@ NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE = "QuantBatchMatmulV3"
 NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE = "ScatterNdUpdate"
 
 _GE_TYPE_FIELD = re.compile(r'\btype:\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+_GDR_GE_PROTO_BLOCK = re.compile(
+    r"REG_OP\s*\(\s*ChunkGatedDeltaRule\s*\)"
+    r"(?P<body>.*?)"
+    r"\.OP_END_FACTORY_REG\s*\(\s*ChunkGatedDeltaRule\s*\)",
+    re.DOTALL,
+)
+_GDR_GE_PROTO_TOKENS = (
+    ".INPUT(query,",
+    ".INPUT(key,",
+    ".INPUT(value,",
+    ".INPUT(g,",
+    ".INPUT(beta,",
+    ".OPTIONAL_INPUT(initial_state,",
+    ".INPUT(effective_length,",
+    ".OUTPUT(core_attn,",
+    ".OUTPUT(last_recurrent_state,",
+    ".ATTR(chunk_size,Int,64)",
+    ".ATTR(output_final_state,Bool,false)",
+    ".ATTR(use_qk_l2norm_in_kernel,Bool,false)",
+)
 _FAKE_REGISTRATION_LOCK = threading.Lock()
 _FUNCTIONAL_OP_REGISTRATION_LOCK = threading.Lock()
 _FUNCTIONAL_OP_LIBRARIES: list[torch.library.Library] = []
@@ -71,6 +93,113 @@ class CustomOpExportSession:
     converter_mode: str
     converter_policy: str
     converter_calls: int = 0
+
+
+def _gdr_proto_headers(
+    ascend_custom_opp_path: str,
+    ld_library_path: str,
+) -> dict[Path, set[str]]:
+    headers: dict[Path, set[str]] = {}
+
+    def add_root(root: Path, source: str) -> None:
+        candidates = [root / "op_proto" / "inc" / "op_proto.h"]
+        if root.name == "vendors" and root.is_dir():
+            candidates.extend(sorted(root.glob("*/op_proto/inc/op_proto.h")))
+        for candidate in candidates:
+            if candidate.is_file():
+                resolved = candidate.resolve()
+                headers.setdefault(resolved, set()).add(source)
+
+    for raw_entry in ascend_custom_opp_path.split(os.pathsep):
+        if raw_entry:
+            add_root(Path(raw_entry).expanduser(), "ASCEND_CUSTOM_OPP_PATH")
+    for raw_entry in ld_library_path.split(os.pathsep):
+        if not raw_entry:
+            continue
+        entry = Path(raw_entry).expanduser()
+        if entry.name in {"lib", "lib64"} and entry.parent.name == "op_api":
+            add_root(entry.parent.parent, "LD_LIBRARY_PATH")
+    return headers
+
+
+def validate_gdr_ge_prototype_environment(
+    *,
+    ascend_custom_opp_path: str | None = None,
+    ld_library_path: str | None = None,
+) -> dict[str, Any]:
+    """Reject duplicate or legacy ``ChunkGatedDeltaRule`` GE prototypes.
+
+    The effective-length PyTorch ABI and GE ABI deliberately use different
+    input ordering. This check identifies the one compatible GE prototype
+    before checkpoint load, turning a stale vendor overlay into an actionable
+    error instead of a generic GE ``ERR03005``.
+    """
+
+    ascend_path = (
+        os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+        if ascend_custom_opp_path is None
+        else ascend_custom_opp_path
+    )
+    library_path = (
+        os.environ.get("LD_LIBRARY_PATH", "")
+        if ld_library_path is None
+        else ld_library_path
+    )
+    if not ascend_path and not library_path:
+        return {
+            "status": "NOT_CONFIGURED",
+            "ge_op_type": NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+            "reason": "ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH are empty",
+        }
+
+    matches: list[tuple[Path, set[str], bytes, str]] = []
+    for header, sources in _gdr_proto_headers(
+        ascend_path,
+        library_path,
+    ).items():
+        payload = header.read_bytes()
+        text = payload.decode("utf-8", errors="replace")
+        block = _GDR_GE_PROTO_BLOCK.search(text)
+        if block is not None:
+            matches.append((header, sources, payload, block.group("body")))
+
+    if not matches:
+        return {
+            "status": "NOT_FOUND",
+            "ge_op_type": NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+            "reason": "no readable ChunkGatedDeltaRule op_proto.h was found",
+        }
+    if len(matches) != 1:
+        locations = "; ".join(str(item[0]) for item in matches)
+        raise RuntimeError(
+            "multiple ChunkGatedDeltaRule GE prototypes are active: "
+            f"{locations}. Keep exactly one effective_length-v2 vendor root "
+            "in ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH"
+        )
+
+    header, sources, payload, body = matches[0]
+    compact = re.sub(r"\s+", "", body)
+    positions = [compact.find(token) for token in _GDR_GE_PROTO_TOKENS]
+    missing = [
+        token
+        for token, position in zip(_GDR_GE_PROTO_TOKENS, positions)
+        if position < 0
+    ]
+    if missing or positions != sorted(positions):
+        details = ", ".join(missing) if missing else "declaration order"
+        raise RuntimeError(
+            f"incompatible ChunkGatedDeltaRule GE prototype at {header}: "
+            f"{details}. Expected query/key/value/g/beta, optional "
+            "initial_state, effective_length, two outputs, and three attrs"
+        )
+    return {
+        "status": "PASS",
+        "ge_op_type": NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+        "abi": "effective-length-v2-named-inputs",
+        "prototype_path": str(header),
+        "prototype_sha256": hashlib.sha256(payload).hexdigest(),
+        "environment_sources": sorted(sources),
+    }
 
 
 def _fake_adn_rms_norm(
@@ -843,6 +972,12 @@ def _register_framework_converter(
 
         converter.__name__ = "convert_npu_adn_rms_norm_default"
     elif adapter.torch_op == NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP:
+        if spec.ge_op_type != NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE:
+            raise RuntimeError(
+                "npu_chunk_gated_delta_rule currently has an exact named lowering "
+                f"only to {NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE}"
+            )
+        _require_ge_attrs(ge_api, ("Int", "Bool"))
 
         def converter(
             query: Any,
@@ -858,12 +993,48 @@ def _register_framework_converter(
             meta_outputs: Any = None,
         ) -> Any:
             del meta_outputs
-            return emit_positional(
-                query, key, value, g, beta, effective_length, chunk_size,
-                initial_state, output_final_state, use_qk_l2norm_in_kernel,
+            if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+                raise TypeError("GDR chunk_size must be a compile-time int")
+            if not isinstance(output_final_state, bool):
+                raise TypeError(
+                    "GDR output_final_state must be a compile-time bool"
+                )
+            if not isinstance(use_qk_l2norm_in_kernel, bool):
+                raise TypeError(
+                    "GDR use_qk_l2norm_in_kernel must be a compile-time bool"
+                )
+            session.converter_calls += 1
+            result = custom_op(
+                spec.ge_op_type,
+                inputs={
+                    "query": query,
+                    "key": key,
+                    "value": value,
+                    "g": g,
+                    "beta": beta,
+                    "initial_state": initial_state,
+                    "effective_length": effective_length,
+                },
+                outputs=["core_attn", "last_recurrent_state"],
+                attrs={
+                    "chunk_size": ge_api.attr.Int(chunk_size),
+                    "output_final_state": ge_api.attr.Bool(
+                        output_final_state
+                    ),
+                    "use_qk_l2norm_in_kernel": ge_api.attr.Bool(
+                        use_qk_l2norm_in_kernel
+                    ),
+                },
             )
+            if not isinstance(result, (tuple, list)) or len(result) != 2:
+                raise RuntimeError(
+                    "ChunkGatedDeltaRule GE IR must return core_attn and "
+                    "last_recurrent_state"
+                )
+            return result
 
         converter.__name__ = "convert_npu_chunk_gated_delta_rule_default"
+        session.converter_mode = "named-gdr-effective-length-v2"
     elif adapter.torch_op in {
         NPU_CACHE_UPDATE_TORCH_OP,
         FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
@@ -1116,4 +1287,5 @@ __all__ = [
     "CustomOpExportSession",
     "audit_custom_op_export",
     "prepare_custom_op_export",
+    "validate_gdr_ge_prototype_environment",
 ]
