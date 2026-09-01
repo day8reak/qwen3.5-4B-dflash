@@ -118,6 +118,16 @@
       }
     ],
     "custom_operator_preservation_gate": "all seven schemas and Meta contracts must validate; required paths need their declared dynamo.pbtxt GE-node counts, and framework converters also need matching call counts",
+    "standard_operator_overrides": [
+      {
+        "frontend": "aten.softplus.default",
+        "source": "torch.nn.functional.softplus",
+        "default_ge_op_type": "SoftplusV2",
+        "attributes": {"beta": 1.0, "threshold": 20.0},
+        "converter": "framework exact one-node override",
+        "reason": "receiver TorchAir registers the frontend converter but raises NotImplementedError"
+      }
+    ],
     "state_policy": "recompute committed prefix"
   },
   "compiler": {

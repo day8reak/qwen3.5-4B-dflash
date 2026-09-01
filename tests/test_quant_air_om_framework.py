@@ -54,6 +54,12 @@ from qwen35_dflash.ascend310p.quant_factory import (
     QuantFullPrefixExportTarget,
     create_quant_recompute_graph,
 )
+from qwen35_dflash.ascend310p.standard_op_export import (
+    ATEN_SOFTPLUS_GE_OP_TYPE,
+    ATEN_SOFTPLUS_TORCH_TARGET,
+    audit_aten_softplus_export,
+    prepare_aten_softplus_export,
+)
 from qwen35_dflash.ascend310p.utils import sha256_file
 from qwen35_dflash.ascend310p.workflow import DEFAULT_GRAPH_FACTORY
 from models.dflash_v1 import dflash_ascend310p_ops as golden_ops
@@ -229,11 +235,81 @@ class _FakeTorchAir:
         converter = self.converter
         assert converter is not None
         converter(object(), object(), 1e-6, meta_outputs=(object(), object()))
+        softplus_converter = self.converters.get(torch.ops.aten.softplus.default)
+        assert softplus_converter is not None
+        softplus_converter(object(), 1, 20, meta_outputs=object())
         root = Path(export_path)
         (root / f"{export_name}.air").write_bytes(b"air")
         (root / "dynamo.pbtxt").write_text(
-            'op {\n  name: "rms"\n  type: "RmsNorm"\n}\n',
+            'op {\n  name: "rms"\n  type: "RmsNorm"\n}\n'
+            'op {\n  name: "softplus"\n  type: "SoftplusV2"\n}\n',
             encoding="utf-8",
+        )
+
+
+def test_aten_softplus_converter_emits_one_softplus_v2_node() -> None:
+    torchair = _FakeTorchAir()
+    session = prepare_aten_softplus_export(torchair)
+    converter = torchair.converters[torch.ops.aten.softplus.default]
+    input_node = object()
+
+    output = converter(
+        input_node,
+        beta=1,
+        threshold=20,
+        meta_outputs=object(),
+    )
+
+    assert output is not None
+    assert session.torch_target == ATEN_SOFTPLUS_TORCH_TARGET
+    assert session.ge_op_type == ATEN_SOFTPLUS_GE_OP_TYPE
+    assert session.converter_calls == 1
+    assert torchair.ge.calls == [
+        (
+            ATEN_SOFTPLUS_GE_OP_TYPE,
+            (),
+            {
+                "inputs": {"x": input_node},
+                "outputs": ["y"],
+                "attrs": {
+                    "beta": ("float", 1.0),
+                    "threshold": ("float", 20.0),
+                },
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("argument", [torch.tensor(1.0), True, float("inf")])
+def test_aten_softplus_converter_rejects_non_static_finite_attributes(
+    argument: object,
+) -> None:
+    torchair = _FakeTorchAir()
+    prepare_aten_softplus_export(torchair)
+    converter = torchair.converters[torch.ops.aten.softplus.default]
+
+    with pytest.raises((TypeError, ValueError), match="compile-time|finite"):
+        converter(object(), beta=argument)
+
+
+def test_aten_softplus_audit_rejects_missing_ge_node(tmp_path: Path) -> None:
+    torchair = _FakeTorchAir()
+    session = prepare_aten_softplus_export(torchair)
+    converter = torchair.converters[torch.ops.aten.softplus.default]
+    converter(object())
+    graph_dir = tmp_path / "air" / "missing"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "dynamo.pbtxt").write_text(
+        'op {\n  name: "wrong"\n  type: "Exp"\n}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="SoftplusV2 nodes"):
+        audit_aten_softplus_export(
+            session,
+            graph_dir,
+            calls_before=0,
+            relative_to=tmp_path,
         )
 
 
@@ -809,12 +885,21 @@ def test_air_export_audits_retained_adn_rms_norm(
     )
     graph = result["graphs"][0]
     audit = graph["custom_op_audit"][0]
+    standard_override = graph["standard_op_overrides"][0]
     assert result["schema_version"] == 3
     assert audit["status"] == "PASS"
     assert audit["torch_target"] == "npu.adn_rms_norm.default"
     assert audit["ge_op_type"] == "RmsNorm"
     assert audit["converter_calls"] == 1
     assert audit["ge_node_occurrences"] == 1
+    assert standard_override["status"] == "PASS"
+    assert standard_override["torch_target"] == ATEN_SOFTPLUS_TORCH_TARGET
+    assert standard_override["ge_op_type"] == ATEN_SOFTPLUS_GE_OP_TYPE
+    assert standard_override["converter_calls"] == 1
+    assert standard_override["ge_node_occurrences"] == 1
+    assert standard_override["lowering"] == (
+        "one GE node per call; beta and threshold preserved"
+    )
     assert torchair.ge.calls[0][0] == "RmsNorm"
     assert any(
         item["path"].endswith("dynamo.pbtxt")

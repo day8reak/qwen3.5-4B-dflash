@@ -132,6 +132,26 @@ clone 或额外 NPU launch；rollback 多行写在 AIR 路径中显式串接每�
 type 时才可改名。该值不会自动回退：指定 IR 未注册、converter 没有命中，或 `dynamo.pbtxt` 中
 required type 数为 0，导出都会失败，不会生成伪 PASS manifest。
 
+### 2.2 TorchAir 标准算子精确补丁
+
+目标环境的 TorchAir 虽然注册了 `torch.ops.aten.softplus.default`，对应 converter 却会主动抛出
+`NotImplementedError`。模型的 Gated DeltaNet 在公共 `forward()` 中通过 `F.softplus` 计算
+FP32 gate，因此框架在 `dynamo_export` 前覆盖该 converter，并精确生成一个 GE
+`SoftplusV2` 节点。`beta` 和 `threshold` 必须是有限的编译期数值，并原样写入 GE Float 属性；
+当前模型使用 PyTorch 默认值 `1.0` 和 `20.0`。
+
+这不是近似替换，也不会改两个 modeling 文件的 eager 数学。不要把它展开为
+`maximum + log1p + exp + abs`：展开会增加图节点，并且不再直接保留 PyTorch Softplus 的
+threshold 分支。导出后可检查：
+
+```bash
+rg -n 'type: "SoftplusV2"' \
+  "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
+```
+
+至少应命中一次；`air-manifest.json` 的 `standard_op_overrides` 同时记录本图 converter 调用数。
+七个 NPU 自定义算子的 Fake、converter 和保留门禁仍由上一节独立执行。
+
 如果 `S=64`，则 `prompt_tokens + generated_tokens` 不能超过 64。需要更长上下文时重新编译
 `S=128/256/...`。当前重算路径的延迟随 `S` 增大，因此先使用能够覆盖验证 workload 的最小
 gear。
@@ -399,7 +419,7 @@ PY
 还可以直接检查 TorchAir 的可读 GE 图：
 
 ```bash
-rg -n 'type: "(DynamicQuant|QuantBatchMatmulV3|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|FusedInferAttentionScore|ScatterNdUpdate)"' \
+rg -n 'type: "(SoftplusV2|DynamicQuant|QuantBatchMatmulV3|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|FusedInferAttentionScore|ScatterNdUpdate)"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
 ```
 

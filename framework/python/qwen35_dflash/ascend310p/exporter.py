@@ -13,6 +13,10 @@ import torch
 
 from .contracts import AirGraphSpec
 from .custom_op_export import audit_custom_op_export, prepare_custom_op_export
+from .standard_op_export import (
+    audit_aten_softplus_export,
+    prepare_aten_softplus_export,
+)
 from .utils import atomic_write_json, file_record, require_run_output, resolve_callable
 
 
@@ -85,6 +89,11 @@ def export_air_bundle(
                 "TorchAir is required for AIR export; activate the declared CANN/TorchAir environment"
             ) from error
 
+    # The receiver TorchAir release registers aten.softplus.default but its
+    # converter raises NotImplementedError.  Override it before Dynamo traces
+    # the model, preserving PyTorch beta/threshold semantics as one GE node.
+    softplus_export = prepare_aten_softplus_export(torchair)
+
     # Import TorchAir before invoking the factory. The production factory loads
     # both 4B checkpoints, so a missing export runtime must fail before that
     # expensive and memory-heavy operation starts.
@@ -96,6 +105,7 @@ def export_air_bundle(
 
     graphs: list[dict[str, Any]] = []
     for spec in specs:
+        softplus_calls_before = softplus_export.converter_calls
         graph_dir = air_root / spec.name
         graph_dir.mkdir()
         custom_op_sessions = [
@@ -116,6 +126,12 @@ def export_air_bundle(
         custom_op_audit = audit_custom_op_export(
             custom_op_sessions,
             graph_dir,
+            relative_to=root,
+        )
+        softplus_audit = audit_aten_softplus_export(
+            softplus_export,
+            graph_dir,
+            calls_before=softplus_calls_before,
             relative_to=root,
         )
 
@@ -143,6 +159,7 @@ def export_air_bundle(
                     for name, item in spec.example_kwargs.items()
                 },
                 "metadata": dict(spec.metadata),
+                "standard_op_overrides": [softplus_audit],
                 "custom_op_audit": custom_op_audit,
                 "air": air_record,
                 "payload_files": records,
