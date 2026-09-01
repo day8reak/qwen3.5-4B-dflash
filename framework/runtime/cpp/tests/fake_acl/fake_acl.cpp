@@ -29,6 +29,7 @@ enum class Role {
   kTargetDecode,
   kDraftPropose,
   kTargetVerify,
+  kTargetStep,
 };
 
 struct Spec {
@@ -84,6 +85,9 @@ Role RoleFromPath(const char* path) {
   if (value.find("draft-propose") != std::string::npos) {
     return Role::kDraftPropose;
   }
+  if (value.find("target-verify-commit-dynamic") != std::string::npos) {
+    return Role::kTargetStep;
+  }
   if (value.find("target-verify-commit") != std::string::npos) {
     return Role::kTargetVerify;
   }
@@ -116,8 +120,11 @@ std::size_t TypeBytes(aclDataType dtype) {
 std::size_t Bytes(const Spec& spec) {
   std::size_t result = TypeBytes(spec.dtype);
   for (const std::int64_t raw : spec.shape) {
-    const std::size_t value =
-        raw == -1 ? kIncrementalSequenceLength : static_cast<std::size_t>(raw);
+    const std::size_t value = raw == -1
+        ? (std::string(spec.name) == "verify_input_ids"
+               ? kVerifyRows
+               : kIncrementalSequenceLength)
+        : static_cast<std::size_t>(raw);
     result *= value;
   }
   return result;
@@ -174,6 +181,18 @@ const std::vector<Spec>& Inputs(Role role) {
       kTargetValue,
       kTargetCursor,
   };
+  static const std::vector<Spec> target_step{
+      {ACL_INT64, {1, -1}, "verify_input_ids"},
+      {ACL_INT32, {1}, "logical_proposal_count"},
+      {ACL_INT64, {4}, "eos_token_ids"},
+      {ACL_INT32, {1}, "eos_token_count"},
+      kTargetConv,
+      kTargetRecurrent,
+      kTargetKey,
+      kTargetValue,
+      kTargetCursor,
+      {ACL_UINT64, {64}, "ascend_mbatch_shape_data"},
+  };
   switch (role) {
     case Role::kTargetPrefill:
       return prefill;
@@ -185,6 +204,8 @@ const std::vector<Spec>& Inputs(Role role) {
       return draft;
     case Role::kTargetVerify:
       return verify;
+    case Role::kTargetStep:
+      return target_step;
     case Role::kIntegrated:
       return integrated;
   }
@@ -252,6 +273,7 @@ const std::vector<Spec>& Outputs(Role role) {
     case Role::kDraftPropose:
       return draft;
     case Role::kTargetVerify:
+    case Role::kTargetStep:
       return verify;
     case Role::kIntegrated:
       return integrated;
@@ -410,7 +432,18 @@ aclError ExecuteDraft(const aclmdlDataset* input, aclmdlDataset* output) {
 
 aclError ExecuteVerify(const aclmdlDataset* input, aclmdlDataset* output) {
   const auto proposal_count = Scalar<std::int32_t>(input->buffers[1]);
-  if (proposal_count <= 0 || proposal_count > 15) {
+  if (proposal_count < 0 || proposal_count > 15) {
+    return 1;
+  }
+  if (input->dynamic_dims.dimCount != 0) {
+    if (input->dynamic_dims.dimCount < 2 ||
+        input->dynamic_dims.dims[1] != proposal_count + 1 ||
+        input->buffers[0]->size <
+            static_cast<std::size_t>(proposal_count + 1) *
+                sizeof(std::int64_t)) {
+      return 1;
+    }
+  } else if (proposal_count == 0) {
     return 1;
   }
   const auto* verify = static_cast<const std::int64_t*>(input->buffers[0]->data);
@@ -725,10 +758,11 @@ aclError aclmdlGetInputDynamicGearCount(
     std::size_t,
     std::size_t* gear_count) {
   if (description == nullptr || gear_count == nullptr ||
-      description->role != Role::kDraftPropose) {
+      (description->role != Role::kDraftPropose &&
+       description->role != Role::kTargetStep)) {
     return 1;
   }
-  *gear_count = 3;
+  *gear_count = description->role == Role::kDraftPropose ? 3 : 16;
   return ACL_SUCCESS;
 }
 
@@ -737,16 +771,24 @@ aclError aclmdlGetInputDynamicDims(
     std::size_t,
     aclmdlIODims* dimensions,
     std::size_t gear_count) {
-  if (description == nullptr || dimensions == nullptr || gear_count != 3 ||
-      description->role != Role::kDraftPropose) {
+  if (description == nullptr || dimensions == nullptr ||
+      (description->role != Role::kDraftPropose &&
+       description->role != Role::kTargetStep)) {
     return 1;
   }
-  for (std::size_t gear = 0; gear < 3; ++gear) {
+  const std::size_t expected_gears =
+      description->role == Role::kDraftPropose ? 3 : 16;
+  if (gear_count != expected_gears) {
+    return 1;
+  }
+  for (std::size_t gear = 0; gear < expected_gears; ++gear) {
     const std::array<std::int64_t, 3> rows_by_gear{16, 64, 128};
-    const std::int64_t rows = rows_by_gear[gear];
+    const std::int64_t rows = description->role == Role::kDraftPropose
+        ? rows_by_gear[gear]
+        : static_cast<std::int64_t>(gear + 1);
     std::memset(&dimensions[gear], 0, sizeof(aclmdlIODims));
     std::vector<std::int64_t> flat;
-    const auto& inputs = Inputs(Role::kDraftPropose);
+    const auto& inputs = Inputs(description->role);
     for (std::size_t input = 0; input + 1 < inputs.size(); ++input) {
       for (const std::int64_t value : inputs[input].shape) {
         flat.push_back(value == -1 ? rows : value);
@@ -794,8 +836,14 @@ aclError aclmdlSetInputDynamicDims(
     std::size_t index,
     const aclmdlIODims* dimensions) {
   const auto iterator = g_models.find(model_id);
-  if (iterator == g_models.end() || iterator->second != Role::kDraftPropose ||
-      dataset == nullptr || index != 8 || dimensions == nullptr) {
+  if (iterator == g_models.end() || dataset == nullptr || dimensions == nullptr) {
+    return 1;
+  }
+  const std::size_t expected_index =
+      iterator->second == Role::kDraftPropose
+      ? 8
+      : (iterator->second == Role::kTargetStep ? 9 : 999);
+  if (index != expected_index) {
     return 1;
   }
   dataset->dynamic_dims = *dimensions;
@@ -831,6 +879,7 @@ aclError aclmdlExecuteAsync(
     case Role::kDraftPropose:
       return ExecuteDraft(input, output);
     case Role::kTargetVerify:
+    case Role::kTargetStep:
       return ExecuteVerify(input, output);
   }
   return 1;

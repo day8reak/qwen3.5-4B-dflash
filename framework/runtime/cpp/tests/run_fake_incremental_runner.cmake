@@ -1,5 +1,5 @@
 set(required_values
-  RUNNER PREFILL PREFILL_SHA PREFILL_HEAD PREFILL_HEAD_SHA DECODE DECODE_SHA DRAFT DRAFT_SHA
+  RUNNER PREFILL PREFILL_SHA PREFILL_HEAD PREFILL_HEAD_SHA DRAFT DRAFT_SHA
   VERIFY VERIFY_SHA OUTPUT
 )
 foreach(required ${required_values})
@@ -7,6 +7,23 @@ foreach(required ${required_values})
     message(FATAL_ERROR "${required} is required")
   endif()
 endforeach()
+if(UNIFIED_TARGET_STEP)
+  set(EXPECTED_MODEL_COUNT 4)
+  set(TOPOLOGY_COUNT "four")
+  set(DECODE_ARGS)
+else()
+  foreach(required DECODE DECODE_SHA)
+    if(NOT DEFINED ${required})
+      message(FATAL_ERROR "${required} is required")
+    endif()
+  endforeach()
+  set(EXPECTED_MODEL_COUNT 5)
+  set(TOPOLOGY_COUNT "five")
+  set(DECODE_ARGS
+    --target-decode1 "${DECODE}"
+    --target-decode1-sha256 "${DECODE_SHA}"
+  )
+endif()
 if(NOT DEFINED RESET_POLICY)
   set(RESET_POLICY "async-memset")
 endif()
@@ -38,8 +55,7 @@ execute_process(
     --target-prefill-sha256 "${PREFILL_SHA}"
     --target-prefill-head "${PREFILL_HEAD}"
     --target-prefill-head-sha256 "${PREFILL_HEAD_SHA}"
-    --target-decode1 "${DECODE}"
-    --target-decode1-sha256 "${DECODE_SHA}"
+    ${DECODE_ARGS}
     --draft-propose "${DRAFT}"
     --draft-propose-sha256 "${DRAFT_SHA}"
     --target-verify-commit "${VERIFY}"
@@ -63,7 +79,7 @@ execute_process(
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "fake incremental runner failed: ${result}\n${stdout}\n${stderr}")
 endif()
-if(NOT stderr MATCHES "stage=validate-five-om-start" OR
+if(NOT stderr MATCHES "stage=validate-${TOPOLOGY_COUNT}-om-start" OR
    NOT stderr MATCHES "stage=model-load-done role=target-prefill" OR
    NOT stderr MATCHES "phase=warmup" OR
    NOT stderr MATCHES "stage=decode-done" OR
@@ -79,6 +95,8 @@ string(JSON eos_mismatch GET "${report}" ordinary_parity eos_mismatches)
 string(JSON repetitions GET "${report}" dflash repetitions)
 string(JSON report_protocol GET "${report}" protocol kind)
 string(JSON model_count LENGTH "${report}" models)
+string(JSON physical_topology GET "${report}" abi physical_topology)
+string(JSON resident_model_load GET "${report}" startup_ms acl_and_resident_model_load)
 string(JSON model_executions GET "${report}" execution_io_counters model_executions)
 string(JSON synchronizations GET "${report}" execution_io_counters stream_synchronizations)
 string(JSON resets GET "${report}" execution_io_counters state_resets)
@@ -115,6 +133,9 @@ string(JSON prefill_staging_bytes GET "${report}" execution_io_counters prefill_
 string(JSON prefill_feature_slab_bytes GET "${report}" execution_io_counters prefill_feature_slab_bytes)
 string(JSON prefill_feature_arena_bytes GET "${report}" execution_io_counters prefill_feature_arena_bytes)
 string(JSON draft_dynamic_gears GET "${report}" execution_io_counters draft_dynamic_gear_count)
+string(JSON target_step_dynamic_gears GET "${report}" execution_io_counters target_step_dynamic_gear_count)
+string(JSON target_step_input_rows GET "${report}" execution_io_counters target_step_input_rows)
+string(JSON target_step_elided_rows GET "${report}" execution_io_counters target_step_padded_rows_elided)
 string(JSON prefill_control_uploads GET "${report}" execution_io_counters prefill_control_upload_operations)
 string(JSON prefill_control_upload_bytes GET "${report}" execution_io_counters prefill_control_upload_bytes)
 string(JSON prefill_control_full_uploads GET "${report}" execution_io_counters prefill_control_full_upload_operations)
@@ -142,13 +163,21 @@ math(EXPR transactions "${prefill_completions} + ${decode_executions} + ${verify
 math(EXPR role_total
   "${prefill_executions} + ${prefill_head_executions} + ${decode_executions} + ${draft_executions} + ${verify_executions}"
 )
+math(EXPR target_step_transactions "${decode_executions} + ${verify_executions}")
+math(EXPR target_step_fixed_rows "16 * ${target_step_transactions}")
+math(EXPR target_step_closed_rows "${target_step_input_rows} + ${target_step_elided_rows}")
 math(EXPR closed_state_bytes "${working_state_bytes} + ${zero_state_bytes}")
 math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
 math(EXPR expected_dflash_requests "${EXPECTED_RESETS} / 2")
 math(EXPR expected_prefill_feature_rows "${expected_dflash_requests} * 128")
 math(EXPR expected_prefill_control_full_uploads "1")
-math(EXPR expected_prefill_control_proposal_uploads "1")
-math(EXPR expected_prefill_control_count_uploads "${expected_dflash_requests} - 1")
+if(UNIFIED_TARGET_STEP)
+  set(expected_prefill_control_proposal_uploads ${expected_dflash_requests})
+  set(expected_prefill_control_count_uploads 0)
+else()
+  set(expected_prefill_control_proposal_uploads 1)
+  math(EXPR expected_prefill_control_count_uploads "${expected_dflash_requests} - 1")
+endif()
 math(EXPR expected_prefill_control_base_uploads
   "${prefill_executions} - ${expected_prefill_control_full_uploads} - ${expected_prefill_control_proposal_uploads} - ${expected_prefill_control_count_uploads}"
 )
@@ -182,6 +211,25 @@ elseif(RESET_POLICY STREQUAL "immutable-zero")
 else()
   message(FATAL_ERROR "unknown RESET_POLICY=${RESET_POLICY}")
 endif()
+if(UNIFIED_TARGET_STEP)
+  set(EXPECTED_TOPOLOGY "split-prefill-head-four-resident-unified-target-step-v1")
+  string(JSON topology_model_load GET "${report}" startup_ms acl_and_four_model_load)
+  if(NOT target_step_dynamic_gears EQUAL 16 OR
+     NOT target_step_closed_rows EQUAL target_step_fixed_rows OR
+     NOT target_step_elided_rows GREATER 0)
+    message(FATAL_ERROR "fake unified Target-step row gates failed: ${report}")
+  endif()
+else()
+  set(EXPECTED_TOPOLOGY "split-prefill-head-five-resident-v1")
+  string(JSON topology_model_load GET "${report}" startup_ms acl_and_five_model_load)
+  if(NOT target_step_dynamic_gears EQUAL 0)
+    message(FATAL_ERROR "fake baseline unexpectedly reported Target-step gears: ${report}")
+  endif()
+endif()
+if(NOT physical_topology STREQUAL EXPECTED_TOPOLOGY OR
+   NOT resident_model_load EQUAL topology_model_load)
+  message(FATAL_ERROR "fake topology/startup identity differs: ${report}")
+endif()
 if(DECODE_CARRIER_POLICY STREQUAL "last-token-d2d")
   if(NOT report_decode_carrier_policy STREQUAL DECODE_CARRIER_POLICY OR
      NOT decode_uploads EQUAL 0 OR
@@ -206,7 +254,7 @@ endif()
 if(NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR
-   NOT repetitions EQUAL REPETITIONS OR NOT model_count EQUAL 5 OR
+   NOT repetitions EQUAL REPETITIONS OR NOT model_count EQUAL EXPECTED_MODEL_COUNT OR
    NOT report_protocol STREQUAL MEASUREMENT_PROTOCOL OR
    NOT model_executions EQUAL role_total OR
    NOT synchronizations EQUAL transactions OR

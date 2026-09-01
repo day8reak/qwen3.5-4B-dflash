@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .incremental import ExactAcceptCommitStateGraph, _valid_eos_matches
@@ -435,6 +436,69 @@ class TargetVerifyCommitStateGraph(_ExplicitTargetGraph):
         return (*transaction, key, value)
 
 
+class TargetStepStateGraph(TargetVerifyCommitStateGraph):
+    """Execute an exact dynamic ``T=1..16`` Target step.
+
+    ``T=1`` has zero Draft proposals and is therefore ordinary greedy decode.
+    ``T=K+1`` verifies exactly ``K`` proposals.  Only the expensive Target body
+    follows the selected physical gear; the small transaction tail pads its
+    three row carriers back to the frozen 16-row external ABI.  State banks are
+    not padded because the selected slot is always inside the physical prefix.
+    """
+
+    @staticmethod
+    def _pad_rows(value: Tensor, width: int) -> Tensor:
+        return F.pad(value, (0, width - value.shape[1]))
+
+    @staticmethod
+    def _pad_feature_rows(value: Tensor, width: int) -> Tensor:
+        return F.pad(value, (0, 0, 0, width - value.shape[1]))
+
+    def forward(
+        self,
+        verify_input_ids: Tensor,
+        logical_proposal_count: Tensor,
+        eos_token_ids: Tensor,
+        eos_token_count: Tensor,
+        conv_state: Tensor,
+        recurrent_state: Tensor,
+        key_cache: Tensor,
+        value_cache: Tensor,
+        logical_target_cursor: Tensor,
+    ) -> tuple[Tensor, ...]:
+        hidden, features, conv_bank, recurrent_bank, key, value = self._body(
+            verify_input_ids,
+            logical_target_cursor,
+            conv_state,
+            recurrent_state,
+            key_cache,
+            value_cache,
+            output_features=True,
+            gdr_effective_length=None,
+            verify=True,
+        )
+        assert features is not None
+        # Pad before dropping the anchor.  Padding an already empty ``T-1``
+        # slice makes torch.export infer a spurious T>=3 guard and excludes the
+        # required ordinary-decode T=1 gear.
+        fixed_input_ids = self._pad_rows(verify_input_ids, VERIFY_ROWS)
+        proposal_ids = fixed_input_ids[:, 1:]
+        target_top1 = self._pad_rows(self._top1(hidden), VERIFY_ROWS)
+        fixed_features = self._pad_feature_rows(features, VERIFY_ROWS)
+        transaction = self.transaction(
+            proposal_ids,
+            target_top1,
+            logical_proposal_count,
+            eos_token_ids,
+            eos_token_count,
+            conv_bank,
+            recurrent_bank,
+            fixed_features,
+            logical_target_cursor,
+        )
+        return (*transaction, key, value)
+
+
 class _FixedDraftCache:
     """Graph-local fixed-capacity Draft KV facade used by six Draft layers."""
 
@@ -655,9 +719,10 @@ def incremental_state_graph_specs(
     ordinary_custom_ops: tuple[CustomOpExportSpec, ...],
     head_custom_ops: tuple[CustomOpExportSpec, ...],
     verify_custom_ops: tuple[CustomOpExportSpec, ...],
+    unified_target_step: bool = False,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[AirGraphSpec, ...]:
-    """Create five physical graphs for four approved logical state roles."""
+    """Create the five-OM baseline or four-OM unified Target-step candidate."""
 
     if dtype is not torch.float16:
         raise ValueError("incremental state graphs currently require float16")
@@ -780,9 +845,10 @@ def incremental_state_graph_specs(
     decode = TargetDecodeOneStateGraph(
         target, kv_cache_max_len=kv_cache_max_len
     ).eval()
-    verify = TargetVerifyCommitStateGraph(
-        target, kv_cache_max_len=kv_cache_max_len
-    ).eval()
+    verify_type = (
+        TargetStepStateGraph if unified_target_step else TargetVerifyCommitStateGraph
+    )
+    verify = verify_type(target, kv_cache_max_len=kv_cache_max_len).eval()
     propose = DraftProposeStateGraph(
         draft,
         input_embedding,
@@ -800,165 +866,181 @@ def incremental_state_graph_specs(
         target_value,
         target_cursor,
     )
-    return (
-        AirGraphSpec(
-            name="target-prefill",
-            role="target-prefill",
-            model=prefill,
-            example_args=(
-                torch.zeros((1, PREFILL_ROWS), dtype=torch.long, device=target_device),
-                torch.full((1,), PREFILL_ROWS, dtype=torch.int16, device=target_device),
-                *state_inputs,
-            ),
-            input_names=(
-                "input_ids", "effective_length", "target_conv_state",
-                "target_recurrent_state", "target_key_cache",
-                "target_value_cache", "logical_target_cursor",
-            ),
-            output_names=(
-                "last_hidden", "target_feature_tail", "committed_input_count",
+    prefill_spec = AirGraphSpec(
+        name="target-prefill",
+        role="target-prefill",
+        model=prefill,
+        example_args=(
+            torch.zeros((1, PREFILL_ROWS), dtype=torch.long, device=target_device),
+            torch.full((1,), PREFILL_ROWS, dtype=torch.int16, device=target_device),
+            *state_inputs,
+        ),
+        input_names=(
+            "input_ids", "effective_length", "target_conv_state",
+            "target_recurrent_state", "target_key_cache",
+            "target_value_cache", "logical_target_cursor",
+        ),
+        output_names=(
+            "last_hidden", "target_feature_tail", "committed_input_count",
+            "target_conv_state", "target_recurrent_state",
+            "target_key_cache", "target_value_cache",
+            "logical_target_cursor",
+        ),
+        metadata=graph_metadata(
+            "target-prefill",
+            ordinary_custom_ops,
+            [
                 "target_conv_state", "target_recurrent_state",
                 "target_key_cache", "target_value_cache",
                 "logical_target_cursor",
-            ),
-            metadata=graph_metadata(
-                "target-prefill",
-                ordinary_custom_ops,
-                [
-                    "target_conv_state", "target_recurrent_state",
-                    "target_key_cache", "target_value_cache",
-                    "logical_target_cursor",
-                ],
-            ),
-            custom_ops=ordinary_custom_ops,
+            ],
         ),
-        AirGraphSpec(
-            name="target-prefill-head",
-            role="target-prefill-head",
-            model=prefill_head,
-            example_args=(
-                torch.zeros(
-                    (1, 1, int(getattr(config, "hidden_size"))),
-                    dtype=dtype,
-                    device=target_device,
-                ),
-                eos_ids,
-                eos_count,
+        custom_ops=ordinary_custom_ops,
+    )
+    prefill_head_spec = AirGraphSpec(
+        name="target-prefill-head",
+        role="target-prefill-head",
+        model=prefill_head,
+        example_args=(
+            torch.zeros(
+                (1, 1, int(getattr(config, "hidden_size"))),
+                dtype=dtype,
+                device=target_device,
             ),
-            input_names=(
-                "last_hidden", "eos_token_ids", "eos_token_count",
-            ),
-            output_names=(
-                "committed_token_ids", "commit_count", "finished",
-            ),
-            metadata=graph_metadata(
-                "target-prefill-head",
-                head_custom_ops,
-                ["last_hidden"],
-            ),
-            custom_ops=head_custom_ops,
+            eos_ids,
+            eos_count,
         ),
-        AirGraphSpec(
-            name="target-decode1",
-            role="target-decode1",
-            model=decode,
-            example_args=(
-                torch.zeros((1, 1), dtype=torch.long, device=target_device),
-                eos_ids,
-                eos_count,
-                *state_inputs,
-            ),
-            input_names=(
-                "input_ids", "eos_token_ids", "eos_token_count",
+        input_names=(
+            "last_hidden", "eos_token_ids", "eos_token_count",
+        ),
+        output_names=(
+            "committed_token_ids", "commit_count", "finished",
+        ),
+        metadata=graph_metadata(
+            "target-prefill-head",
+            head_custom_ops,
+            ["last_hidden"],
+        ),
+        custom_ops=head_custom_ops,
+    )
+    decode_spec = AirGraphSpec(
+        name="target-decode1",
+        role="target-decode1",
+        model=decode,
+        example_args=(
+            torch.zeros((1, 1), dtype=torch.long, device=target_device),
+            eos_ids,
+            eos_count,
+            *state_inputs,
+        ),
+        input_names=(
+            "input_ids", "eos_token_ids", "eos_token_count",
+            "target_conv_state", "target_recurrent_state",
+            "target_key_cache", "target_value_cache",
+            "logical_target_cursor",
+        ),
+        output_names=(
+            "committed_token_ids", "commit_count", "finished",
+            "target_conv_state", "target_recurrent_state",
+            "target_key_cache", "target_value_cache",
+            "logical_target_cursor",
+        ),
+        metadata=graph_metadata(
+            "target-decode1",
+            ordinary_custom_ops,
+            [
                 "target_conv_state", "target_recurrent_state",
                 "target_key_cache", "target_value_cache",
                 "logical_target_cursor",
-            ),
-            output_names=(
-                "committed_token_ids", "commit_count", "finished",
-                "target_conv_state", "target_recurrent_state",
-                "target_key_cache", "target_value_cache",
-                "logical_target_cursor",
-            ),
-            metadata=graph_metadata(
-                "target-decode1",
-                ordinary_custom_ops,
-                [
-                    "target_conv_state", "target_recurrent_state",
-                    "target_key_cache", "target_value_cache",
-                    "logical_target_cursor",
-                ],
-            ),
-            custom_ops=ordinary_custom_ops,
+            ],
         ),
-        AirGraphSpec(
-            name="draft-propose",
-            role="draft-propose",
-            model=propose,
-            example_args=(
-                torch.zeros((1, VERIFY_ROWS, feature_width), dtype=dtype, device=target_device),
-                torch.ones((1,), dtype=torch.int32, device=target_device),
-                torch.zeros((1, VERIFY_ROWS), dtype=torch.long, device=target_device),
-                torch.ones((1,), dtype=torch.int32, device=target_device),
-                torch.full((1,), PROPOSAL_ROWS, dtype=torch.int32, device=target_device),
-                draft_key,
-                draft_value,
-                draft_cursor,
-            ),
-            input_names=(
-                "target_feature_tail", "committed_input_count",
-                "previous_committed_token_ids", "previous_commit_count",
-                "logical_proposal_count", "draft_key_cache",
-                "draft_value_cache", "logical_draft_cursor",
-            ),
-            output_names=(
-                "verify_input_ids", "draft_key_cache", "draft_value_cache",
-                "logical_draft_cursor",
-            ),
-            dynamic=True,
-            input_dim_gears={0: {1: draft_feature_gears}},
-            metadata=graph_metadata(
-                "draft-propose",
-                (),
-                ["draft_key_cache", "draft_value_cache", "logical_draft_cursor"],
-            ),
+        custom_ops=ordinary_custom_ops,
+    )
+    draft_spec = AirGraphSpec(
+        name="draft-propose",
+        role="draft-propose",
+        model=propose,
+        example_args=(
+            torch.zeros((1, VERIFY_ROWS, feature_width), dtype=dtype, device=target_device),
+            torch.ones((1,), dtype=torch.int32, device=target_device),
+            torch.zeros((1, VERIFY_ROWS), dtype=torch.long, device=target_device),
+            torch.ones((1,), dtype=torch.int32, device=target_device),
+            torch.full((1,), PROPOSAL_ROWS, dtype=torch.int32, device=target_device),
+            draft_key,
+            draft_value,
+            draft_cursor,
         ),
-        AirGraphSpec(
-            name="target-verify-commit",
-            role="target-verify-commit",
-            model=verify,
-            example_args=(
-                torch.zeros((1, VERIFY_ROWS), dtype=torch.long, device=target_device),
-                torch.full((1,), PROPOSAL_ROWS, dtype=torch.int32, device=target_device),
-                eos_ids,
-                eos_count,
-                *state_inputs,
-            ),
-            input_names=(
-                "verify_input_ids", "logical_proposal_count", "eos_token_ids",
-                "eos_token_count", "target_conv_state",
-                "target_recurrent_state", "target_key_cache",
-                "target_value_cache", "logical_target_cursor",
-            ),
-            output_names=(
-                "committed_token_ids", "commit_count", "drafted_count",
-                "accepted_count", "rejected_count", "target_conv_state",
-                "target_recurrent_state", "target_feature_tail",
-                "committed_input_count", "logical_target_cursor", "finished",
-                "target_key_cache", "target_value_cache",
-            ),
-            metadata=graph_metadata(
-                "target-verify-commit",
-                verify_custom_ops,
-                [
-                    "target_conv_state", "target_recurrent_state",
-                    "target_key_cache", "target_value_cache",
-                    "logical_target_cursor",
-                ],
-            ),
-            custom_ops=verify_custom_ops,
+        input_names=(
+            "target_feature_tail", "committed_input_count",
+            "previous_committed_token_ids", "previous_commit_count",
+            "logical_proposal_count", "draft_key_cache",
+            "draft_value_cache", "logical_draft_cursor",
+        ),
+        output_names=(
+            "verify_input_ids", "draft_key_cache", "draft_value_cache",
+            "logical_draft_cursor",
+        ),
+        dynamic=True,
+        input_dim_gears={0: {1: draft_feature_gears}},
+        metadata=graph_metadata(
+            "draft-propose",
+            (),
+            ["draft_key_cache", "draft_value_cache", "logical_draft_cursor"],
         ),
     )
+    verify_metadata = graph_metadata(
+        "target-verify-commit",
+        verify_custom_ops,
+        [
+            "target_conv_state", "target_recurrent_state",
+            "target_key_cache", "target_value_cache",
+            "logical_target_cursor",
+        ],
+    )
+    if unified_target_step:
+        verify_metadata = {
+            **verify_metadata,
+            "physical_topology": "split-prefill-head-four-resident-unified-target-step-v1",
+            "target_step_gears": list(range(1, VERIFY_ROWS + 1)),
+            "target_step_t1_semantics": "ordinary strict-greedy decode with zero proposals",
+            "target_step_fixed_output_rows": VERIFY_ROWS,
+        }
+    verify_spec = AirGraphSpec(
+        name="target-verify-commit",
+        role="target-verify-commit",
+        model=verify,
+        example_args=(
+            torch.zeros((1, VERIFY_ROWS), dtype=torch.long, device=target_device),
+            torch.full((1,), PROPOSAL_ROWS, dtype=torch.int32, device=target_device),
+            eos_ids,
+            eos_count,
+            *state_inputs,
+        ),
+        input_names=(
+            "verify_input_ids", "logical_proposal_count", "eos_token_ids",
+            "eos_token_count", "target_conv_state",
+            "target_recurrent_state", "target_key_cache",
+            "target_value_cache", "logical_target_cursor",
+        ),
+        output_names=(
+            "committed_token_ids", "commit_count", "drafted_count",
+            "accepted_count", "rejected_count", "target_conv_state",
+            "target_recurrent_state", "target_feature_tail",
+            "committed_input_count", "logical_target_cursor", "finished",
+            "target_key_cache", "target_value_cache",
+        ),
+        dynamic=unified_target_step,
+        input_dim_gears=(
+            {0: {1: tuple(range(1, VERIFY_ROWS + 1))}}
+            if unified_target_step
+            else {}
+        ),
+        metadata=verify_metadata,
+        custom_ops=verify_custom_ops,
+    )
+    if unified_target_step:
+        return prefill_spec, prefill_head_spec, draft_spec, verify_spec
+    return prefill_spec, prefill_head_spec, decode_spec, draft_spec, verify_spec
 
 
 __all__ = [
@@ -969,6 +1051,7 @@ __all__ = [
     "TargetDecodeOneStateGraph",
     "TargetPrefillHeadGraph",
     "TargetPrefillStateGraph",
+    "TargetStepStateGraph",
     "TargetVerifyCommitStateGraph",
     "VERIFY_ROWS",
 ]

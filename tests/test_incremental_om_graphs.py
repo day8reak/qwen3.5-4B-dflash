@@ -10,6 +10,7 @@ from qwen35_dflash.ascend310p.incremental_graphs import (
     TargetDecodeOneStateGraph,
     TargetPrefillHeadGraph,
     TargetPrefillStateGraph,
+    TargetStepStateGraph,
     TargetVerifyCommitStateGraph,
     incremental_state_graph_specs,
 )
@@ -232,6 +233,101 @@ def test_target_graphs_are_torch_export_capture_safe() -> None:
     targets = [str(node.target) for node in exported.graph.nodes]
     assert sum("floor_divide" in target for target in targets) == 1
     assert sum("remainder" in target for target in targets) == 1
+
+
+def test_dynamic_target_step_matches_decode_and_fixed_verify() -> None:
+    target = _FakeTarget().eval()
+    conv, recurrent, key, value, cursor = _target_state()
+    eos_ids, eos_count = _eos()
+    step = TargetStepStateGraph(target, kv_cache_max_len=64).eval()
+    decode = TargetDecodeOneStateGraph(target, kv_cache_max_len=64).eval()
+    fixed = TargetVerifyCommitStateGraph(target, kv_cache_max_len=64).eval()
+
+    one = torch.tensor([[10]], dtype=torch.long)
+    step_one = step(
+        one,
+        torch.tensor([0], dtype=torch.int32),
+        eos_ids,
+        eos_count,
+        conv,
+        recurrent,
+        key,
+        value,
+        cursor,
+    )
+    decode_one = decode(
+        one, eos_ids, eos_count, conv, recurrent, key, value, cursor
+    )
+    assert step_one[0][0, 0].item() == decode_one[0][0, 0].item() == 11
+    assert step_one[1].tolist() == decode_one[1].tolist() == [1]
+    assert step_one[2:5][0].tolist() == [0]
+    assert step_one[3].tolist() == step_one[4].tolist() == [0]
+    assert step_one[5].shape == conv.shape
+    assert step_one[6].shape == recurrent.shape
+    assert step_one[7].shape == (1, 16, 4)
+    assert step_one[8].tolist() == [1]
+    assert step_one[9].tolist() == [1]
+
+    block = torch.arange(10, 26, dtype=torch.long).reshape(1, 16)
+    dynamic_full = step(
+        block,
+        torch.tensor([15], dtype=torch.int32),
+        eos_ids,
+        eos_count,
+        conv,
+        recurrent,
+        key,
+        value,
+        cursor,
+    )
+    fixed_full = fixed(
+        block,
+        torch.tensor([15], dtype=torch.int32),
+        eos_ids,
+        eos_count,
+        conv,
+        recurrent,
+        key,
+        value,
+        cursor,
+    )
+    for actual, expected in zip(dynamic_full, fixed_full):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_dynamic_target_step_torch_export_covers_t1_to_t16() -> None:
+    target = _FakeTarget().eval()
+    conv, recurrent, key, value, cursor = _target_state()
+    eos_ids, eos_count = _eos()
+    graph = TargetStepStateGraph(target, kv_cache_max_len=64).eval()
+    args = (
+        torch.arange(10, 26, dtype=torch.long).reshape(1, 16),
+        torch.tensor([15], dtype=torch.int32),
+        eos_ids,
+        eos_count,
+        conv,
+        recurrent,
+        key,
+        value,
+        cursor,
+    )
+    rows = torch.export.Dim("target_step_rows", min=1, max=16)
+    dynamic_shapes = ({1: rows},) + (None,) * (len(args) - 1)
+    exported = torch.export.export(
+        graph, args, dynamic_shapes=dynamic_shapes, strict=True
+    )
+    captured = exported.module()
+    for physical_rows in (1, 2, 7, 16):
+        call_args = (
+            args[0][:, :physical_rows],
+            torch.tensor([physical_rows - 1], dtype=torch.int32),
+            *args[2:],
+        )
+        eager = graph(*call_args)
+        actual = captured(*call_args)
+        assert len(actual) == 13
+        for captured_value, eager_value in zip(actual, eager):
+            torch.testing.assert_close(captured_value, eager_value)
 
 
 def test_prefill_body_and_head_export_without_cross_retaining_weights() -> None:
@@ -484,3 +580,31 @@ def test_draft_air_gears_cover_every_prompt_batch_capacity() -> None:
     assert specs[3].input_dim_gears == {
         0: {1: (16, 64, 128, 192, 256)}
     }
+
+
+def test_four_physical_specs_use_dynamic_unified_target_step() -> None:
+    specs = incremental_state_graph_specs(
+        _FakeTarget().eval(),
+        _FakeDraft().eval(),
+        kv_cache_max_len=64,
+        device="cpu",
+        dtype=torch.float16,
+        eos_table_width=4,
+        ordinary_custom_ops=(),
+        head_custom_ops=(),
+        verify_custom_ops=(),
+        unified_target_step=True,
+    )
+    assert [item.name for item in specs] == [
+        "target-prefill",
+        "target-prefill-head",
+        "draft-propose",
+        "target-verify-commit",
+    ]
+    target_step = specs[-1]
+    assert isinstance(target_step.model, TargetStepStateGraph)
+    assert target_step.dynamic is True
+    assert target_step.input_dim_gears == {
+        0: {1: tuple(range(1, 17))}
+    }
+    assert target_step.metadata["target_step_fixed_output_rows"] == 16

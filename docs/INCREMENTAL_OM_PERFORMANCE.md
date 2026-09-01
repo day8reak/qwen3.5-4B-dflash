@@ -9,8 +9,8 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
 - prompt 只 prefill 一次；
 - ordinary decode 每次只处理 1 行且不运行 Draft；
 - Draft 复用自己的 KV 和 Target 新增 feature，只生成最多 15 个 proposal；
-- Target verify 固定处理 16 个因果行，但只提交运行时 `logical_proposal_count` 指定的前缀，
-  不再重算历史前缀；
+- 五图基线的 Target verify 固定处理 16 个因果行；四图候选只处理 `T=K+1` 个真实行。两者都只
+  提交 `logical_proposal_count` 指定的前缀，不再重算历史前缀；
 - proposal、KV、GDR/conv state 和 feature 全部留在 device；
 - 一个 speculative round 只在 accept/commit 后同步一次，并只回传少量 token ID 和计数。
 
@@ -19,7 +19,7 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
 `APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE`：可以实现，但还不能冒充已经生成、真机验证或达到性能
 目标的 OM。
 
-## 1. 四个逻辑角色、五个当前物理 OM
+## 1. 五 OM 基线与四物理 OM 统一 Target-step 候选
 
 四个逻辑角色是：
 
@@ -28,19 +28,48 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
 | `target-prefill` | 1..64 行 prompt chunk，原 ChunkGatedDeltaRule | 非末 chunk 的完整 LM head、Draft proposal |
 | `target-decode1` | 1 行普通 decode / zero-accept fallback | Draft |
 | `draft-propose` | 复用 Draft KV，输出固定 `[anchor,p0..p14]` device carrier | Target |
-| `target-verify-commit` | 固定 T=16 verify、逻辑 K=1..15、精确 accept/状态选择 | 历史前缀重算、host state 搬运 |
+| `target-verify-commit` | 五图固定 T=16；四图动态 T=1..16；逻辑 K=0..15、精确 accept/状态选择 | 历史前缀重算、host state 搬运 |
 
 物理文件不一定恰好是四个：
 
 - 当前实现把逻辑 `target-prefill` 物理拆成 `target-prefill` body 和
   `target-prefill-head`。body 导出签名不引用 `lm_head`，head 只保留量化
   `QLinear + argmax + EOS`；因此非末 chunk 真正不做词表投影，末 chunk 才执行一次 head；
-- 如果 verify OM 能可靠包含 `T=1` gear，`target-decode1` 可以与它合并，成为 3 个常驻 OM；
+- 源码现在还提供统一 `target-verify-commit`：Target body 使用动态 `T=1..16`，`T=1`
+  表示零 proposal 的 ordinary decode，`T=K+1` 表示只计算本轮真实 K 个 proposal。由于 prefill
+  head 已物理拆出，这条路线是四个物理文件，而不是三个文件；
 - 如果 receiver 自定义算子和 ATC 能证明多 gear/分支完全可用，可进一步测试 2 个动态 OM；
 - 如果静态小图明显更快且显存足够，才选 4 个静态 OM；
 - 如果 launch/host 边界是主要热点，才测试 Draft→verify 的 supergraph。
 
 真正的选择规则是：所有候选都必须零 token/EOS 差异，然后选真机端到端 median latency 最低者。
+
+四物理 OM 候选的运行状态图如下。`T=1` 和 `T=K+1` 共用同一个已加载 Target model ID；每次
+Target 事务完成后只下载 compact 结果并同步一次，完整 state 继续留在 device：
+
+```mermaid
+flowchart LR
+  R[Reset device state] --> P[Target prefill body<br/>64-row chunks]
+  P --> H[Target prefill head<br/>final chunk only]
+  H --> I[Optional initial Draft<br/>compact D2H + prefill sync]
+  I --> M{generation mode}
+  M -->|ordinary| T1[Target step T=1<br/>proposal count 0]
+  M -->|DFlash; proposal ready| TK[Target step T=K+1]
+  D[Draft propose K] --> TK
+  T1 --> C[Exact commit + state slot]
+  TK --> C
+  C --> O[Compact D2H + one sync]
+  O --> E{EOS or token limit?}
+  E -->|ordinary continue| T1
+  E -->|DFlash continue| D
+  E -->|stop| X[Return tokens]
+```
+
+统一 Target-step 已通过 CPU `torch.export` 的 T=1/2/7/16 动态捕获和 Fake ACL C++ 完整生成
+状态机。图内先将小型 token/top1/feature 载体补齐到固定 16 行，再执行原来的精确 accept/commit，
+因此 13 个输出及 state ping-pong ABI 不变；昂贵的 Target body 和 GDR-MTP 只处理物理 T 行。
+这些是非目标证据。`npu_gated_delta_rule_mtp` 的 T=1、TorchAir 16 档 gear、ATC、自定义节点保留、
+真实 checkpoint ordinary parity 和时延都仍需 310P 证明，候选继续保持 `NOT_ACTIVE`。
 
 ## 2. 为什么不能按 OM 数量认定更快
 
@@ -95,8 +124,8 @@ cmake --build "$CPP_BUILD" -j
   --output "$AI_RUN_DIR/out/performance/five-graph-memory.json"
 ```
 
-三 OM 候选删除 `target-decode1` 行，并把输出名改为
-`three-resident-memory.json`。重点查看：
+四物理 OM 统一 Target-step 候选删除 `target-decode1` 行，并把输出名改为
+`four-graph-unified-target-step-memory.json`。重点查看：
 
 ```bash
 jq '{models, budget, assumptions, claim_boundary}' \
@@ -386,6 +415,65 @@ PYTHONPATH="$PWD/framework/python:$PWD" "$MODEL_PYTHON" -m pytest -q \
 `language_model`。这仍不能代替真机 `aclmdlQuerySize`；实际 OM 的 weight/work 内存以第 2.1 节
 完整五图查询为准。
 
+#### 5.2.1 生成四物理 OM 的统一 Target-step 候选
+
+使用同一个 factory 配置、checkpoint、量化文件和 receiver，只替换 factory 名；不要给 ATC
+手写 `--dynamic_dims`，16 档由 TorchAir AIR 中的 gear 合同携带：
+
+```bash
+export UNIFIED_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-unified-target-step"
+
+"$MODEL_PYTHON" -m qwen35_dflash.ascend310p build-om \
+  --factory \
+    qwen35_dflash.ascend310p.quant_factory:create_quant_unified_target_step_graphs \
+  --factory-config "$AI_RUN_DIR/factory-incremental.json" \
+  --bundle-dir "$UNIFIED_BUNDLE" \
+  --atc /ABSOLUTE/PATH/atc \
+  --soc-version Ascend310P3
+```
+
+生成后必须恰好是四个 role，且统一 Target 输入第 1 维包含完整 T=1..16；所有声明的自定义算子
+审计仍须为 PASS：
+
+```bash
+jq -e '
+  ([.graphs[].name] == [
+    "target-prefill", "target-prefill-head", "draft-propose",
+    "target-verify-commit"
+  ]) and
+  ((.graphs[] | select(.name == "target-verify-commit") | .dynamic) == true) and
+  ((.graphs[] | select(.name == "target-verify-commit") |
+    .input_dim_gears["0"]["1"]) ==
+    [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]) and
+  ([.graphs[].custom_op_audit[]?.status] | all(. == "PASS"))
+' "$UNIFIED_BUNDLE/deployment-manifest.json"
+
+PYTHONPATH="$PWD/framework/python:$PWD" "$MODEL_PYTHON" -m pytest -q \
+  tests/test_incremental_om_graphs.py \
+  tests/test_incremental_cpp_runtime.py
+```
+
+C++ runner 看到 manifest 中没有 `target-decode1` 且 verify gear 合同完整时会自动选择四模型路径；
+缺 T=1、任一中间 gear、动态标记或固定 13 输出都会在 load/控制面校验阶段失败。运行后再检查：
+
+```bash
+jq -e '
+  (.abi.physical_topology ==
+    "split-prefill-head-four-resident-unified-target-step-v1") and
+  (.models | length == 4) and
+  (.execution_io_counters.target_step_dynamic_gear_count == 16) and
+  ((.execution_io_counters.target_step_input_rows +
+    .execution_io_counters.target_step_padded_rows_elided) ==
+   (16 * (.execution_io_counters.target_decode1_executions +
+          .execution_io_counters.target_verify_commit_executions))) and
+  (.ordinary_parity.token_id_mismatches == 0) and
+  (.ordinary_parity.eos_mismatches == 0)
+' "$AI_RUN_DIR/reports/cpp-unified-target-step.json"
+```
+
+`target_step_padded_rows_elided` 是相对“每次固定 T=16”的源码行数差，不是时延节省；真实收益只能
+由关闭 profiler 后的配对 3+10 报告确认。
+
 ### 5.3 构建并通过控制面运行
 
 ```bash
@@ -648,7 +736,8 @@ jq -s 'map({
   10 次 `dflash` median/p90 明确更好时，才在部署配置中选择它；否则保留 `async-memset`。
 
 这个优化主要影响每次请求的第一次 prefill/TTFT，对长生成的稳态 TPOT 理论上帮助较小。报告中
-的 `acl_and_five_model_load` 包含 `immutable-zero` 的一次性初始化；正式 model latency 不包含它。
+的 `acl_and_resident_model_load`（五图兼容别名为 `acl_and_five_model_load`，统一图别名为
+`acl_and_four_model_load`）包含 `immutable-zero` 的一次性初始化；正式 model latency 不包含它。
 
 ### 5.5 A/B 选择 decode carrier 策略
 
@@ -775,7 +864,46 @@ export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_increment
 carrier 基线。`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer 的十进制 ID，不能保留
 文字占位符。
 
-### 5.7 用 msprof 分角色确认五 OM 耗时
+统一 Target-step 使用相同二进制，只改成四个 OM，**完全删除**两项 `--target-decode1` 参数：
+
+```bash
+export UNIFIED_PREFILL_OM="$UNIFIED_BUNDLE/om/target-prefill.om"
+export UNIFIED_PREFILL_HEAD_OM="$UNIFIED_BUNDLE/om/target-prefill-head.om"
+export UNIFIED_DRAFT_OM="$UNIFIED_BUNDLE/om/draft-propose.om"
+export UNIFIED_TARGET_STEP_OM="$UNIFIED_BUNDLE/om/target-verify-commit.om"
+
+"$INCREMENTAL_RUNNER" \
+  --target-prefill "$UNIFIED_PREFILL_OM" \
+  --target-prefill-sha256 \
+    "$(sha256sum "$UNIFIED_PREFILL_OM" | awk '{print $1}')" \
+  --target-prefill-head "$UNIFIED_PREFILL_HEAD_OM" \
+  --target-prefill-head-sha256 \
+    "$(sha256sum "$UNIFIED_PREFILL_HEAD_OM" | awk '{print $1}')" \
+  --draft-propose "$UNIFIED_DRAFT_OM" \
+  --draft-propose-sha256 \
+    "$(sha256sum "$UNIFIED_DRAFT_OM" | awk '{print $1}')" \
+  --target-verify-commit "$UNIFIED_TARGET_STEP_OM" \
+  --target-verify-commit-sha256 \
+    "$(sha256sum "$UNIFIED_TARGET_STEP_OM" | awk '{print $1}')" \
+  --output "$AI_RUN_DIR/reports/cpp-unified-target-step.json" \
+  --prompt-token-ids 'REAL,TOKEN,IDS' \
+  --eos-token-ids 'REAL,EOS,IDS' \
+  --pad-token-id 0 \
+  --max-new-tokens 32 \
+  --max-draft-tokens 15 \
+  --measurement-protocol evidence \
+  --warmup 3 \
+  --repetitions 10 \
+  --device-id 0 \
+  --state-reset-policy async-memset \
+  --decode-carrier-policy last-token-d2d \
+  --progress true
+```
+
+如果误把静态五图的 verify OM 放到这里，runner 会因缺少动态控制输入或 T=1..16 gear 而拒绝
+启动；不会静默退回固定 T=16。
+
+### 5.7 用 msprof 分角色确认五 OM 或统一 Target-step 耗时
 
 五个 OM 是独立 model ID，因此最可靠的 profile 是运行完整状态机，再在 msprof 导出的
 model/task/op 表中按 model ID 和 role 文件名分组。不要分别喂随机 state 跑五个 OM 后把数字相加；
@@ -827,6 +955,52 @@ for AIC_METRIC in PipeUtilization Memory MemoryUB; do
 done
 ```
 
+统一 Target-step 必须单独采一组 profile，仍然不带 `target-decode1`；三组 metric 不要塞进同一
+采集进程：
+
+```bash
+export UNIFIED_PROFILE_ROOT=/ABSOLUTE/PATH/qwen35-unified-target-step-msprof
+mkdir -p "$UNIFIED_PROFILE_ROOT"
+
+for AIC_METRIC in PipeUtilization Memory MemoryUB; do
+  LABEL="unified-target-step-${AIC_METRIC}"
+  CASE_ROOT="$UNIFIED_PROFILE_ROOT/$LABEL"
+  "$DFLASH_SOURCE/tools/run_msprof.sh" \
+    --label "$LABEL" \
+    --output-dir "$CASE_ROOT" \
+    --python "$MODEL_PYTHON" \
+    --aic-metrics "$AIC_METRIC" \
+    --no-msproftx \
+    -- \
+    "$INCREMENTAL_RUNNER" \
+      --target-prefill "$UNIFIED_PREFILL_OM" \
+      --target-prefill-sha256 \
+        "$(sha256sum "$UNIFIED_PREFILL_OM" | awk '{print $1}')" \
+      --target-prefill-head "$UNIFIED_PREFILL_HEAD_OM" \
+      --target-prefill-head-sha256 \
+        "$(sha256sum "$UNIFIED_PREFILL_HEAD_OM" | awk '{print $1}')" \
+      --draft-propose "$UNIFIED_DRAFT_OM" \
+      --draft-propose-sha256 \
+        "$(sha256sum "$UNIFIED_DRAFT_OM" | awk '{print $1}')" \
+      --target-verify-commit "$UNIFIED_TARGET_STEP_OM" \
+      --target-verify-commit-sha256 \
+        "$(sha256sum "$UNIFIED_TARGET_STEP_OM" | awk '{print $1}')" \
+      --output "$CASE_ROOT/runner-report.json" \
+      --prompt-token-ids "$TOKEN_IDS" \
+      --eos-token-ids 'REAL,EOS,IDS' \
+      --pad-token-id 0 \
+      --max-new-tokens 32 \
+      --max-draft-tokens 15 \
+      --measurement-protocol profile \
+      --warmup 1 \
+      --repetitions 1 \
+      --device-id 0 \
+      --state-reset-policy "$RESET_POLICY" \
+      --decode-carrier-policy "$DECODE_CARRIER_POLICY" \
+      --progress false
+done
+```
+
 采集后对每个 `PROF_*` 目录执行：
 
 ```bash
@@ -836,8 +1010,10 @@ rg --files "$PROF_DIR" | \
   rg '/(model|op_summary|op_statistic|api_statistic|task_time)_[^/]*\.csv$'
 ```
 
-用 model/task 表建立 `model_id -> target-prefill/target-prefill-head/target-decode1/
-draft-propose/target-verify-commit` 映射，再按 model ID 汇总 duration。`runner-report.json` 的各 role execution
+五图用 model/task 表建立 `model_id -> target-prefill/target-prefill-head/target-decode1/
+draft-propose/target-verify-commit` 映射；统一候选只有四个 model ID，ordinary 的
+`target_decode1_executions` 是逻辑计数，物理执行归入动态 `target-verify-commit`。再按 model ID 汇总
+duration，并用 gear/T 行数拆分 T=1 与 T>1。`runner-report.json` 的各 role execution
 次数是交叉校验依据。msprof 仅用于定位 kernel、Memcpy、launch、同步和空洞；最终 median/p90
 必须重新关闭 profiling，以 `--measurement-protocol evidence --warmup 3 --repetitions 10` 跑上面
 的正式命令。profile report 会明确写入 `formal_latency_evidence=false`，不能混入候选提升依据。
@@ -905,9 +1081,10 @@ jq -e '
 7. 只提升通过上述门禁且端到端最快的拓扑。
 
 单 OM 的 msprof 命令已经写在 `docs/QUANT_AIR_OM_FRAMEWORK.md` 的“单独 profile 每个 OM”章节。
-当前完整状态机包含 `target-prefill`、`target-prefill-head`、`target-decode1`、
-`draft-propose` 和 `target-verify-commit`。使用第 5.7 节的一次进程级采集，再按 model ID/role
-汇总；不要分别构造不真实的随机状态运行这些 OM。
+五图基线包含 `target-prefill`、`target-prefill-head`、`target-decode1`、`draft-propose` 和
+`target-verify-commit`；统一候选删除独立 decode，动态 verify 同时承担 T=1 ordinary 与 T>1
+verify。使用第 5.7 节的一次进程级采集，再按 model ID/role/gear 汇总；不要分别构造不真实的
+随机状态运行这些 OM。
 
 ## 7. 当前证据边界
 
@@ -919,6 +1096,10 @@ jq -e '
 - 792 MiB bank 会被编译器复用为理想 workspace；
 - receiver 自定义算子能通过动态 gear；
 - 已达到闭源框架时延。
+
+因此当前实现结论是“可导出、可由 C++ 选择、非目标动态图和完整 Fake ACL 状态机通过”，不是
+“四个真实 OM 已生成”或“性能已经更快”。真机首先比较完整集合的 `sum(weightSize)`：统一候选
+理论上删除一份独立 Target decode artifact，但实际节省只能以 `aclmdlQuerySize` 和完整 load 为准。
 
 这些结论必须由同一台 310P 上的组合 load、零差异验证、未 profile 的 10 次分布和 msprof
 诊断共同给出。

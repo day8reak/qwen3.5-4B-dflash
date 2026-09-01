@@ -60,6 +60,9 @@ QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v4"
 QUANT_INCREMENTAL_GRAPH_FACTORY_ID = (
     "qwen3.5-4b-quant-w8a8-dflash-incremental-state-v3"
 )
+QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY_ID = (
+    "qwen3.5-4b-quant-w8a8-dflash-unified-target-step-v1"
+)
 _TARGET_GDN_CHUNK = 64
 _GDR_EFFECTIVE_LENGTH_MAX = torch.iinfo(torch.int16).max
 _DTYPES = {"float16": torch.float16}
@@ -700,13 +703,16 @@ def create_quant_recompute_graph(
 def create_quant_incremental_state_graphs(
     config: Mapping[str, Any],
 ) -> tuple[AirGraphSpec, ...]:
-    """Build the approved state ABI as five physical AIR graphs.
+    """Build the approved state ABI as the baseline or unified AIR topology.
 
     This is an implementation candidate, not the default factory.  Export,
     ATC, real-model parity, complete resident-set memory and latency all remain
     promotion gates.
     """
 
+    unified_target_step = config.get("unified_target_step", False)
+    if not isinstance(unified_target_step, bool):
+        raise TypeError("unified_target_step must be a boolean")
     max_sequence_length = int(config.get("max_sequence_length", 0))
     if max_sequence_length <= 0 or max_sequence_length % _TARGET_GDN_CHUNK:
         raise ValueError(
@@ -749,7 +755,11 @@ def create_quant_incremental_state_graphs(
     )
     locked_inputs = identity["locked_inputs"]
     metadata = {
-        "factory_id": QUANT_INCREMENTAL_GRAPH_FACTORY_ID,
+        "factory_id": (
+            QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY_ID
+            if unified_target_step
+            else QUANT_INCREMENTAL_GRAPH_FACTORY_ID
+        ),
         "quant_branch_base_revision": QUANT_BASE_REVISION,
         "quant_source_lock": identity["quant_source_lock"],
         "target_precision": "W8A8 dynamic QLinear with FP16 outputs",
@@ -784,6 +794,11 @@ def create_quant_incremental_state_graphs(
         "approval_record": "framework/abi/approvals/incremental-performance-v2.json",
         "approval_status": "APPROVED",
         "activation_status": "NOT_ACTIVE",
+        "physical_topology": (
+            "split-prefill-head-four-resident-unified-target-step-v1"
+            if unified_target_step
+            else "split-prefill-head-five-resident-v1"
+        ),
     }
     ordinary_custom_ops = _target_custom_op_exports(config, mtp=False)
     head_op_names = {
@@ -807,8 +822,19 @@ def create_quant_incremental_state_graphs(
         ordinary_custom_ops=ordinary_custom_ops,
         head_custom_ops=head_custom_ops,
         verify_custom_ops=_target_custom_op_exports(config, mtp=True),
+        unified_target_step=unified_target_step,
         metadata=metadata,
     )
+
+
+def create_quant_unified_target_step_graphs(
+    config: Mapping[str, Any],
+) -> tuple[AirGraphSpec, ...]:
+    """Build the exact four-physical-OM candidate with Target ``T=1..16``."""
+
+    selected = dict(config)
+    selected["unified_target_step"] = True
+    return create_quant_incremental_state_graphs(selected)
 
 
 __all__ = [
@@ -816,7 +842,9 @@ __all__ = [
     "QUANT_BASE_REVISION",
     "QUANT_GRAPH_FACTORY_ID",
     "QUANT_INCREMENTAL_GRAPH_FACTORY_ID",
+    "QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY_ID",
     "QuantFullPrefixExportTarget",
     "create_quant_recompute_graph",
     "create_quant_incremental_state_graphs",
+    "create_quant_unified_target_step_graphs",
 ]

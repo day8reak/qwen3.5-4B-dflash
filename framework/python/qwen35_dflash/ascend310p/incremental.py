@@ -1,10 +1,13 @@
 """Exact device-side transaction tail for the incremental multi-OM route.
 
-The Target verify graph physically executes one fixed ``K + 1`` causal block.
-``logical_proposal_count`` may be smaller than ``K``; rows after that logical
-prefix are scratch rows and are never selected or committed.  Because every
-Target component is causal, those later rows cannot change logits, features or
-state slots belonging to the logical prefix.
+The five-artifact baseline Target verify graph physically executes one fixed
+``K + 1`` causal block. ``logical_proposal_count`` may be smaller than ``K``;
+rows after that logical prefix are scratch rows and are never selected or
+committed.  The unified Target-step candidate instead executes only
+``logical_proposal_count + 1`` rows and pads its transaction carriers before
+entering this fixed-width tail.  Because every Target component is causal,
+later padded or scratch rows cannot change logits, features or state slots
+belonging to the logical prefix.
 
 This module contains no host reads, ``Tensor.item`` calls, sampling or
 approximation.  It is intended to be embedded at the end of the Target verify

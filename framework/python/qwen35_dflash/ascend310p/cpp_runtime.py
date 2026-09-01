@@ -101,6 +101,15 @@ _INCREMENTAL_GRAPH_ABI: dict[str, tuple[list[str], list[str]]] = {
         ],
     ),
 }
+_UNIFIED_TARGET_STEP_GRAPH_ABI: dict[str, tuple[list[str], list[str]]] = {
+    role: binding
+    for role, binding in _INCREMENTAL_GRAPH_ABI.items()
+    if role != "target-decode1"
+}
+_BASELINE_INCREMENTAL_TOPOLOGY = "split-prefill-head-five-resident-v1"
+_UNIFIED_TARGET_STEP_TOPOLOGY = (
+    "split-prefill-head-four-resident-unified-target-step-v1"
+)
 _GENERIC_DEVICE_NAMES = {"310p", "ascend310p", "atlas310p"}
 
 
@@ -441,7 +450,7 @@ def _resolve_incremental_oms(
     dict[str, tuple[Path, dict[str, Any], dict[str, Any]]],
     dict[str, Any],
 ]:
-    """Resolve and hash-check the five-graph physical v2 deployment ABI."""
+    """Resolve and hash-check either exact physical v2 deployment topology."""
 
     manifest_path = Path(deployment_manifest).expanduser().resolve()
     manifest = load_json_object(manifest_path)
@@ -450,8 +459,23 @@ def _resolve_incremental_oms(
     if manifest.get("status") != "PASS":
         raise ValueError("deployment manifest is not passing")
     graphs = manifest.get("graphs", [])
+    graph_roles = {
+        str(graph.get("role"))
+        for graph in graphs
+        if isinstance(graph, Mapping)
+        and str(graph.get("name")) == str(graph.get("role"))
+    }
+    if set(_INCREMENTAL_GRAPH_ABI).issubset(graph_roles):
+        selected_abi = _INCREMENTAL_GRAPH_ABI
+    elif set(_UNIFIED_TARGET_STEP_GRAPH_ABI).issubset(graph_roles):
+        selected_abi = _UNIFIED_TARGET_STEP_GRAPH_ABI
+    else:
+        raise ValueError(
+            "deployment manifest matches neither the five-OM baseline nor "
+            "the four-OM unified Target-step ABI"
+        )
     resolved: dict[str, tuple[Path, dict[str, Any], dict[str, Any]]] = {}
-    for role, (input_names, output_names) in _INCREMENTAL_GRAPH_ABI.items():
+    for role, (input_names, output_names) in selected_abi.items():
         matches = [
             graph
             for graph in graphs
@@ -477,6 +501,15 @@ def _resolve_incremental_oms(
         if not om_path.is_file() or sha256_file(om_path) != expected_hash:
             raise ValueError(f"{role} OM artifact integrity check failed")
         resolved[role] = (om_path, graph, record)
+    if selected_abi is _UNIFIED_TARGET_STEP_GRAPH_ABI:
+        target_step = resolved["target-verify-commit"][1]
+        if target_step.get("dynamic") is not True or target_step.get(
+            "input_dim_gears"
+        ) != {"0": {"1": list(range(1, 17))}}:
+            raise ValueError(
+                "unified target-verify-commit must lock dynamic input-0 axis-1 "
+                "to every T=1..16 gear"
+            )
     return resolved, manifest
 
 
@@ -650,7 +683,7 @@ def validate_incremental_cpp_runner_report(
     state_reset_policy: str = ASYNC_MEMSET_STATE_RESET_POLICY,
     decode_carrier_policy: str = LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
 ) -> None:
-    """Validate five resident graphs, device state routing and paired parity."""
+    """Validate the resident graph set, device state routing and paired parity."""
 
     if (
         report.get("status") != "PASS"
@@ -663,7 +696,15 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental target report indicates CPU fallback")
     if int(report.get("device_id", -1)) != int(device_id):
         raise RuntimeError("incremental C++ runner used a different device ID")
-    expected_roles = list(_INCREMENTAL_GRAPH_ABI)
+    supplied_roles = list(om_sha256_by_role)
+    if supplied_roles == list(_INCREMENTAL_GRAPH_ABI):
+        expected_roles = list(_INCREMENTAL_GRAPH_ABI)
+        unified_target_step = False
+    elif supplied_roles == list(_UNIFIED_TARGET_STEP_GRAPH_ABI):
+        expected_roles = list(_UNIFIED_TARGET_STEP_GRAPH_ABI)
+        unified_target_step = True
+    else:
+        raise RuntimeError("incremental expected OM role set differs")
     models = report.get("models")
     if (
         not isinstance(models, list)
@@ -671,8 +712,6 @@ def validate_incremental_cpp_runner_report(
         or [item.get("role") for item in models] != expected_roles
     ):
         raise RuntimeError("incremental C++ report model role order differs")
-    if set(om_sha256_by_role) != set(expected_roles):
-        raise RuntimeError("incremental expected OM hash set differs")
     for item in models:
         role = str(item["role"])
         if item.get("sha256") != om_sha256_by_role[role]:
@@ -774,7 +813,12 @@ def validate_incremental_cpp_runner_report(
     abi = report.get("abi", {})
     if abi.get("id") != _INCREMENTAL_ABI_ID:
         raise RuntimeError("incremental runner ABI identity differs")
-    if abi.get("physical_topology") != "split-prefill-head-five-resident-v1":
+    expected_topology = (
+        _UNIFIED_TARGET_STEP_TOPOLOGY
+        if unified_target_step
+        else _BASELINE_INCREMENTAL_TOPOLOGY
+    )
+    if abi.get("physical_topology") != expected_topology:
         raise RuntimeError("incremental runner physical topology differs")
     if abi.get("state_policy") != "explicit device-resident ping-pong":
         raise RuntimeError("incremental state is not device resident")
@@ -808,7 +852,8 @@ def validate_incremental_cpp_runner_report(
     if memory.get("source") != "aclmdlQuerySize":
         raise RuntimeError("incremental runner omitted model memory queries")
     if memory.get("load_policy") != (
-        "five aclmdlLoadFromFileWithMem sessions; one max-sized serial "
+        f"{'four' if unified_target_step else 'five'} "
+        "aclmdlLoadFromFileWithMem sessions; one max-sized serial "
         "workspace; separate per-artifact weights; no cross-OM weight sharing "
         "assumed"
     ):
@@ -841,6 +886,9 @@ def validate_incremental_cpp_runner_report(
         value = memory.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise RuntimeError(f"incremental {field} is invalid")
+    expected_target_step_gears = 16 if unified_target_step else 0
+    if memory.get("target_step_dynamic_gear_count", 0) != expected_target_step_gears:
+        raise RuntimeError("incremental unified Target-step gear count differs")
     zero_state_bytes = memory.get("immutable_zero_state_device_bytes")
     if (
         isinstance(zero_state_bytes, bool)
@@ -941,6 +989,23 @@ def validate_incremental_cpp_runner_report(
     )
     if execution.get("model_executions") != sum(role_counts):
         raise RuntimeError("incremental model execution counters do not close")
+    if execution.get("target_step_dynamic_gear_count", 0) != (
+        16 if unified_target_step else 0
+    ):
+        raise RuntimeError("incremental execution Target-step gears differ")
+    if unified_target_step:
+        target_step_rows = execution.get("target_step_input_rows")
+        elided_rows = execution.get("target_step_padded_rows_elided")
+        if (
+            isinstance(target_step_rows, bool)
+            or not isinstance(target_step_rows, int)
+            or isinstance(elided_rows, bool)
+            or not isinstance(elided_rows, int)
+            or target_step_rows < decode + 2 * verify
+            or target_step_rows > 16 * (decode + verify)
+            or target_step_rows + elided_rows != 16 * (decode + verify)
+        ):
+            raise RuntimeError("incremental unified Target-step row counters differ")
     request_count = 2 * (3 + 10)
     prompt_chunks = (len(prompt_token_ids) + prefill_width - 1) // prefill_width
     expected_prefill = request_count * prompt_chunks
@@ -1131,14 +1196,22 @@ def validate_incremental_cpp_runner_report(
         if max_new_tokens > 1
         else 0
     )
-    expected_proposal_upload_operations = (
-        1
-        if expected_prefill_draft > 0 and expected_proposal_count != 1
-        else 0
-    )
-    expected_count_upload_operations = (
-        expected_prefill_draft - expected_proposal_upload_operations
-    )
+    if unified_target_step:
+        # Every paired ordinary request selects proposal_count=0 for T=1.
+        # The following DFlash request must therefore restore K in its final
+        # prefill upload.  That transition is part of the selected topology,
+        # not an unexpected control-plane regression.
+        expected_proposal_upload_operations = expected_prefill_draft
+        expected_count_upload_operations = 0
+    else:
+        expected_proposal_upload_operations = (
+            1
+            if expected_prefill_draft > 0 and expected_proposal_count != 1
+            else 0
+        )
+        expected_count_upload_operations = (
+            expected_prefill_draft - expected_proposal_upload_operations
+        )
     expected_base_upload_operations = (
         prefill
         - expected_full_upload_operations
@@ -1460,9 +1533,10 @@ def write_cpp_prompt_report(
     }
     if result.get("runner_id") == INCREMENTAL_CPP_RUNNER_ID:
         result["claim_boundary"] = (
-            "The five-graph C++ candidate keeps Target/Draft state and proposal carriers "
-            "on device. Promotion still requires real Ascend310P zero-mismatch, "
-            "complete-set memory and unprofiled same-device latency evidence."
+            "The multi-OM C++ candidate keeps Target/Draft state and proposal "
+            "carriers on device. Promotion still requires real Ascend310P "
+            "zero-mismatch, complete-set memory and unprofiled same-device "
+            "latency evidence."
         )
     else:
         result["claim_boundary"] = (

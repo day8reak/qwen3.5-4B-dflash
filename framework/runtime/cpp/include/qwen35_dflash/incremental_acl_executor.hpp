@@ -15,6 +15,7 @@ namespace qwen35::dflash {
 struct IncrementalOmPaths {
   std::filesystem::path target_prefill;
   std::filesystem::path target_prefill_head;
+  // Empty selects the unified dynamic target-verify-commit T=1..16 artifact.
   std::filesystem::path target_decode1;
   std::filesystem::path draft_propose;
   std::filesystem::path target_verify_commit;
@@ -108,6 +109,9 @@ struct IncrementalAclExecutionStats {
   std::size_t prefill_feature_slab_bytes = 0;
   std::size_t prefill_feature_arena_bytes = 0;
   std::size_t draft_dynamic_gear_count = 0;
+  std::size_t target_step_dynamic_gear_count = 0;
+  std::size_t target_step_input_rows = 0;
+  std::size_t target_step_padded_rows_elided = 0;
 };
 
 using IncrementalModelProgress = std::function<void(
@@ -116,7 +120,8 @@ using IncrementalModelProgress = std::function<void(
     std::size_t work_bytes,
     std::size_t weight_bytes)>;
 
-// Five resident OM sessions implementing the approved exact state graph.
+// Five baseline sessions or four sessions with one unified dynamic Target step
+// implement the approved exact state graph.
 // The prefill body excludes its QLinear LM head; a small head-only OM runs
 // once after the final physical prompt chunk. This moves the prefill head
 // weight instead of retaining a dead copy in the body artifact.
@@ -176,6 +181,7 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
   const IncrementalAclExecutionStats& execution_stats() const noexcept;
   IncrementalStateResetPolicy state_reset_policy() const noexcept;
   IncrementalDecodeCarrierPolicy decode_carrier_policy() const noexcept;
+  bool unified_target_step() const noexcept;
 
  private:
   class Impl;

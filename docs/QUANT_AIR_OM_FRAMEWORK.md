@@ -822,9 +822,12 @@ jq '.execution_io_counters | {
 msprof 只能回答重计算基线 OM 中每个算子、device task 和 AscendCL API 的耗时，不能从这张
 集成图强行拆出 prefill/decode/verify/draft 的模型级时延。
 
-分支同时提供 `create_quant_incremental_state_graphs` 和五图常驻 OM C++ runner。生成五个独立 OM
-后，应使用 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节的完整状态机 msprof 命令，并按
-model ID/role 分组；两类 profile 不得混成同一份时延基线。该 runner 会把长 prompt 的中间
+分支同时提供五图基线 `create_quant_incremental_state_graphs`、四物理 OM 动态候选
+`create_quant_unified_target_step_graphs` 和同一个常驻 OM C++ runner。生成后，应使用
+`docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节对应拓扑的完整状态机 msprof 命令，并按
+model ID/role/gear 分组；两类 profile 不得混成同一份时延基线。统一候选省略独立
+`target-decode1`，由 `target-verify-commit` 的 T=1 gear 执行 ordinary decode；T=K+1 只执行
+本轮有效 verify 行。该 runner 会把长 prompt 的中间
 64-row chunk 留在同一 stream，仅最后一个 chunk 下载 compact 结果并同步；报告中的 elided
 prefill 计数必须与 `ceil(prompt_tokens/64)-1` 按请求数闭合。每个 chunk 的 ID、有效长度、累计
 token 数、proposal count 和 EOS 表仍合并为一次 H2D，但复制长度按消费活性收窄为
@@ -1017,19 +1020,20 @@ rg --files "$PROF_DIR" | \
 ## 13. 下一性能阶段
 
 当前 C++ 已消除 Python token 热循环、重复 OM load、重复 host/device buffer 分配和多余 stream
-同步。若真实 profile 显示 OM 计算主导，下一步应基于 `quant` 已有 rollback 语义拆分四个**逻辑
-角色**：
+同步，并实现了五图基线与四物理 OM 统一 Target-step 候选。若真实 profile 显示 OM 计算主导，
+应基于 `quant` 已有 rollback 语义比较这些**逻辑角色**：
 
 1. `target-prefill.om`：分块 prompt body，不含 LM head；
 2. `target-prefill-head.om`：只在最后一个 prompt chunk 后运行量化 LM head/Top1/EOS；
 3. `target-decode1.om`：ordinary 单 token decode；
 4. `target-verify-commit.om`：anchor + 最多 15 proposals；
 5. `draft-propose.om`：增量 Draft KV；
-5. C++ request context 持有 Target/Draft state 的 persistent device buffer；
-6. proposal 直接在 device 上从 Draft 传给 Target verify；
-7. verify graph 尾部精确计算 accepted count 并选择 state slot，只把 compact commit result 搬回
+6. 统一候选删除第 3 项独立文件，由第 4 项的动态 T=1..16 同时承担 decode/verify；
+7. C++ request context 持有 Target/Draft state 的 persistent device buffer；
+8. proposal 直接在 device 上从 Draft 传给 Target verify；
+9. verify graph 尾部精确计算 accepted count 并选择 state slot，只把 compact commit result 搬回
    host；
-8. 对每一个 state 分支做 ordinary token/EOS 零差异门禁。
+10. 对每一个 state 分支做 ordinary token/EOS 零差异门禁。
 
 多 OM 可能更快的原因不是“文件数量更多”，而是它们允许把已经计算过的状态留在
 NPU，后续调用只处理新增 token：

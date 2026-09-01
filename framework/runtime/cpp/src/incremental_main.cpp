@@ -78,8 +78,8 @@ void Usage(std::ostream& stream) {
       << "  --target-prefill-sha256 HEX              expected prefill SHA-256\n"
       << "  --target-prefill-head PATH               final-chunk QLinear head OM\n"
       << "  --target-prefill-head-sha256 HEX         expected head SHA-256\n"
-      << "  --target-decode1 PATH                    hash-locked decode-one OM\n"
-      << "  --target-decode1-sha256 HEX              expected decode SHA-256\n"
+      << "  --target-decode1 PATH                    optional decode-one OM; omit for unified Target step\n"
+      << "  --target-decode1-sha256 HEX              required only with target-decode1\n"
       << "  --draft-propose PATH                     hash-locked Draft OM\n"
       << "  --draft-propose-sha256 HEX               expected Draft SHA-256\n"
       << "  --target-verify-commit PATH              hash-locked verify OM\n"
@@ -249,10 +249,24 @@ Arguments ParseArguments(int argc, char** argv) {
   auto values = ParseOptions(argc, argv);
   Arguments result;
   for (auto& model : result.models) {
-    model.path = TakeRequired(&values, model.role);
-    model.sha256 = NormalizeHash(
-        TakeRequired(&values, std::string(model.role) + "-sha256"),
-        std::string(model.role) + "-sha256");
+    if (std::string(model.role) == "target-decode1") {
+      const std::string path = TakeOptional(&values, model.role, "");
+      const std::string hash = TakeOptional(
+          &values, std::string(model.role) + "-sha256", "");
+      if (path.empty() != hash.empty()) {
+        throw std::invalid_argument(
+            "--target-decode1 and --target-decode1-sha256 must be supplied together");
+      }
+      if (!path.empty()) {
+        model.path = path;
+        model.sha256 = NormalizeHash(hash, "target-decode1-sha256");
+      }
+    } else {
+      model.path = TakeRequired(&values, model.role);
+      model.sha256 = NormalizeHash(
+          TakeRequired(&values, std::string(model.role) + "-sha256"),
+          std::string(model.role) + "-sha256");
+    }
   }
   result.output = TakeRequired(&values, "output");
   result.prompt_token_ids = ParseTokenIds(
@@ -462,7 +476,13 @@ void WriteReport(
     double benchmark_wall_ms,
     const PairedBenchmarkResult& result) {
   const auto& memory = executor.model_memory();
-  if (memory.size() != arguments.models.size()) {
+  std::vector<const ModelArgument*> present_models;
+  for (const auto& model : arguments.models) {
+    if (!model.path.empty()) {
+      present_models.push_back(&model);
+    }
+  }
+  if (memory.size() != present_models.size()) {
     throw std::runtime_error("incremental model memory record count differs");
   }
   const std::size_t sum_work = std::accumulate(
@@ -496,15 +516,17 @@ void WriteReport(
 
   output << std::setprecision(17)
          << "{\"schema_version\":3,\"status\":\"PASS\","
-         << "\"scope\":\"AscendCL C++ five-resident-OM paired model loop\","
+         << "\"scope\":\"AscendCL C++ "
+         << (executor.unified_target_step() ? "four" : "five")
+         << "-resident-OM paired model loop\","
          << "\"runner_id\":\"qwen35-dflash-ascendcl-cpp-incremental-v3\","
          << "\"runner_version\":\"" << JsonEscape(QWEN35_DFLASH_RUNNER_VERSION)
          << "\",\"candidate_status\":\"APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE\","
          << "\"cpu_fallback\":false,\"device_id\":" << arguments.device_id
          << ",\"models\":[";
-  for (std::size_t index = 0; index < arguments.models.size(); ++index) {
+  for (std::size_t index = 0; index < present_models.size(); ++index) {
     if (index != 0) output << ',';
-    const auto& model = arguments.models[index];
+    const auto& model = *present_models[index];
     if (memory[index].role != model.role) {
       throw std::runtime_error("incremental model memory role order differs");
     }
@@ -516,7 +538,11 @@ void WriteReport(
   }
   output << "],\"abi\":{"
          << "\"id\":\"qwen35-4b-dflash-ascend310p-incremental-performance-v2\","
-         << "\"physical_topology\":\"split-prefill-head-five-resident-v1\","
+         << "\"physical_topology\":\""
+         << (executor.unified_target_step()
+                 ? "split-prefill-head-four-resident-unified-target-step-v1"
+                 : "split-prefill-head-five-resident-v1")
+         << "\","
          << "\"state_policy\":\"explicit device-resident ping-pong\","
          << "\"sequence_capacity\":" << executor.sequence_length()
          << ",\"prefill_width\":" << executor.prefill_width()
@@ -555,10 +581,14 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
+         << ",\"target_step_dynamic_gear_count\":"
+         << execution.target_step_dynamic_gear_count
          << ",\"explicit_allocated_device_bytes_excluding_runtime\":"
          << max_work + sum_weight + execution.state_device_bytes +
                 execution.carrier_device_bytes
-         << ",\"load_policy\":\"five aclmdlLoadFromFileWithMem sessions; "
+         << ",\"load_policy\":\""
+         << (executor.unified_target_step() ? "four" : "five")
+         << " aclmdlLoadFromFileWithMem sessions; "
             "one max-sized serial workspace; separate per-artifact weights; "
             "no cross-OM weight sharing assumed\"},"
          << "\"protocol\":{\"warmup\":" << arguments.warmup
@@ -567,7 +597,9 @@ void WriteReport(
          << (formal_latency_evidence ? "evidence" : "profile")
          << "\",\"formal_latency_evidence\":"
          << (formal_latency_evidence ? "true" : "false")
-         << ",\"order\":\"alternating ordinary/DFlash in one five-model process\","
+         << ",\"order\":\"alternating ordinary/DFlash in one "
+         << (executor.unified_target_step() ? "four" : "five")
+         << "-model process\","
          << "\"model_load_excluded_from_latency\":true,"
          << "\"prefill_completion_policy\":\"intermediate prompt chunks "
             "stay queued; final chunk performs the only compact D2H and "
@@ -644,6 +676,12 @@ void WriteReport(
          << execution.draft_propose_executions
          << ",\"target_verify_commit_executions\":"
          << execution.target_verify_commit_executions
+         << ",\"target_step_dynamic_gear_count\":"
+         << execution.target_step_dynamic_gear_count
+         << ",\"target_step_input_rows\":"
+         << execution.target_step_input_rows
+         << ",\"target_step_padded_rows_elided\":"
+         << execution.target_step_padded_rows_elided
          << ",\"stream_synchronizations\":"
          << execution.stream_synchronizations
          << ",\"prefill_completion_synchronizations\":"
@@ -740,6 +778,8 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
+         << ",\"target_step_dynamic_gear_count\":"
+         << execution.target_step_dynamic_gear_count
          << "},\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
   output << ",\"eos_token_ids\":";
@@ -747,7 +787,12 @@ void WriteReport(
   output << ",\"limits\":{\"max_new_tokens\":"
          << arguments.max_new_tokens << ",\"max_draft_tokens\":"
          << arguments.max_draft_tokens << "},\"startup_ms\":{"
-         << "\"acl_and_five_model_load\":" << load_ms
+         << "\"acl_and_resident_model_load\":" << load_ms
+         << ",\""
+         << (executor.unified_target_step()
+                 ? "acl_and_four_model_load"
+                 : "acl_and_five_model_load")
+         << "\":" << load_ms
          << ",\"paired_benchmark_wall\":" << benchmark_wall_ms
          << "},\"ordinary\":";
   WriteBenchmark(output, result.ordinary);
@@ -796,8 +841,15 @@ void AtomicWrite(const std::filesystem::path& path, const std::string& payload) 
 int main(int argc, char** argv) {
   try {
     const Arguments arguments = ParseArguments(argc, argv);
-    PrintProgress(arguments.progress, "stage=validate-five-om-start");
+    const bool unified_target_step = arguments.models[2].path.empty();
+    const char* topology_count = unified_target_step ? "four" : "five";
+    PrintProgress(
+        arguments.progress,
+        std::string("stage=validate-") + topology_count + "-om-start");
     for (const auto& model : arguments.models) {
+      if (model.path.empty()) {
+        continue;
+      }
       if (!std::filesystem::is_regular_file(model.path)) {
         throw std::runtime_error(
             std::string(model.role) + " OM file does not exist: " +
@@ -811,7 +863,9 @@ int main(int argc, char** argv) {
           arguments.progress,
           std::string("stage=validate-om-done role=") + model.role);
     }
-    PrintProgress(arguments.progress, "stage=load-five-om-start");
+    PrintProgress(
+        arguments.progress,
+        std::string("stage=load-") + topology_count + "-om-start");
     const auto load_start = std::chrono::steady_clock::now();
     qwen35::dflash::IncrementalOmPaths paths{
         arguments.models[0].path,
@@ -838,7 +892,8 @@ int main(int argc, char** argv) {
         load_end - load_start).count();
     {
       std::ostringstream message;
-      message << "stage=load-five-om-done sequence_capacity="
+      message << "stage=load-" << topology_count
+              << "-om-done sequence_capacity="
               << executor.sequence_length() << " prefill_width="
               << executor.prefill_width() << " proposal_width="
               << executor.proposal_width() << " elapsed_ms=" << std::fixed

@@ -498,6 +498,7 @@ class AclIncrementalExecutor::Impl {
       IncrementalStateResetPolicy state_reset_policy,
       IncrementalDecodeCarrierPolicy decode_carrier_policy)
       : device_id_(device_id),
+        unified_target_step_(paths.target_decode1.empty()),
         state_reset_policy_(state_reset_policy),
         decode_carrier_policy_(decode_carrier_policy) {
     if (device_id < 0) {
@@ -525,7 +526,9 @@ class AclIncrementalExecutor::Impl {
       prefill_.Query(paths.target_prefill, "target-prefill", progress);
       prefill_head_.Query(
           paths.target_prefill_head, "target-prefill-head", progress);
-      decode_.Query(paths.target_decode1, "target-decode1", progress);
+      if (!unified_target_step_) {
+        decode_.Query(paths.target_decode1, "target-decode1", progress);
+      }
       draft_.Query(paths.draft_propose, "draft-propose", progress);
       verify_.Query(
           paths.target_verify_commit, "target-verify-commit", progress);
@@ -534,19 +537,24 @@ class AclIncrementalExecutor::Impl {
             "target-prefill-head weightSize must be smaller than the "
             "head-free target-prefill body; refusing a duplicated Target");
       }
-      memory_ = {
-          {prefill_.role, prefill_.work_bytes, prefill_.weight_bytes},
+      memory_.push_back(
+          {prefill_.role, prefill_.work_bytes, prefill_.weight_bytes});
+      memory_.push_back(
           {prefill_head_.role,
            prefill_head_.work_bytes,
-           prefill_head_.weight_bytes},
-          {decode_.role, decode_.work_bytes, decode_.weight_bytes},
-          {draft_.role, draft_.work_bytes, draft_.weight_bytes},
-          {verify_.role, verify_.work_bytes, verify_.weight_bytes},
-      };
+           prefill_head_.weight_bytes});
+      if (!unified_target_step_) {
+        memory_.push_back(
+            {decode_.role, decode_.work_bytes, decode_.weight_bytes});
+      }
+      memory_.push_back(
+          {draft_.role, draft_.work_bytes, draft_.weight_bytes});
+      memory_.push_back(
+          {verify_.role, verify_.work_bytes, verify_.weight_bytes});
       const std::size_t shared_work_bytes = std::max(
           {prefill_.work_bytes,
            prefill_head_.work_bytes,
-           decode_.work_bytes,
+           unified_target_step_ ? 0 : decode_.work_bytes,
            draft_.work_bytes,
            verify_.work_bytes});
       if (shared_work_bytes != 0) {
@@ -578,9 +586,11 @@ class AclIncrementalExecutor::Impl {
       };
       load(prefill_, model_weights_[0], false);
       load(prefill_head_, model_weights_[1], false);
-      load(decode_, model_weights_[2], false);
+      if (!unified_target_step_) {
+        load(decode_, model_weights_[2], false);
+      }
       load(draft_, model_weights_[3], true);
-      load(verify_, model_weights_[4], false);
+      load(verify_, model_weights_[4], unified_target_step_);
       ValidateAbi();
       AllocateBuffers();
       InitializeImmutableZeroState();
@@ -609,6 +619,7 @@ class AclIncrementalExecutor::Impl {
   IncrementalDecodeCarrierPolicy decode_carrier_policy() const noexcept {
     return decode_carrier_policy_;
   }
+  bool unified_target_step() const noexcept { return unified_target_step_; }
 
   void Reset(
       std::int64_t pad_token_id,
@@ -757,6 +768,9 @@ class AclIncrementalExecutor::Impl {
     if (input_token_id < 0) {
       throw std::invalid_argument("decode input token ID must be non-negative");
     }
+    if (unified_target_step_) {
+      SetTargetStepProposalCount(0);
+    }
     DatasetPlan* plan = nullptr;
     if (decode_carrier_valid_ && decode_carrier_token_id_ == input_token_id) {
       if (decode_carrier_row_ == 0) {
@@ -778,11 +792,17 @@ class AclIncrementalExecutor::Impl {
       stats_.decode_id_upload_bytes += decode_id_.bytes;
       plan = &decode_upload_plans_[target_state_index_];
     }
-    Execute(decode_, *plan);
+    Execute(unified_target_step_ ? verify_ : decode_, *plan);
     ++stats_.target_decode1_executions;
+    if (unified_target_step_) {
+      ++stats_.target_step_input_rows;
+      stats_.target_step_padded_rows_elided += verify_width_ - 1;
+    }
     target_state_index_ = 1 - target_state_index_;
     proposal_ready_ = false;
-    feature_source_ = FeatureSource::kNone;
+    feature_source_ = unified_target_step_
+        ? FeatureSource::kVerify
+        : FeatureSource::kNone;
     DownloadCompact(false, target_state_index_);
     Synchronize();
     return ReadCompactAndTrackCarrier(false, 1, target_state_index_);
@@ -808,8 +828,17 @@ class AclIncrementalExecutor::Impl {
       ExecuteDraft(FeatureSource::kVerify, verify_width_);
       ++executions;
     }
-    Execute(verify_, verify_plans_[target_state_index_]);
+    const std::size_t physical_rows = logical_proposal_count + 1;
+    DatasetPlan& target_plan = unified_target_step_
+        ? target_step_plans_.at(physical_rows - 1)[target_state_index_]
+        : verify_plans_[target_state_index_];
+    Execute(verify_, target_plan);
     ++stats_.target_verify_commit_executions;
+    stats_.target_step_input_rows +=
+        unified_target_step_ ? physical_rows : verify_width_;
+    if (unified_target_step_) {
+      stats_.target_step_padded_rows_elided += verify_width_ - physical_rows;
+    }
     target_state_index_ = 1 - target_state_index_;
     proposal_ready_ = false;
     feature_source_ = FeatureSource::kVerify;
@@ -853,8 +882,9 @@ class AclIncrementalExecutor::Impl {
         prefill_.outputs.size() != 8 ||
         prefill_head_.public_input_indices.size() != 3 ||
         prefill_head_.outputs.size() != 3 ||
-        decode_.public_input_indices.size() != 8 ||
-        decode_.outputs.size() != 8 ||
+        (!unified_target_step_ &&
+         (decode_.public_input_indices.size() != 8 ||
+          decode_.outputs.size() != 8)) ||
         draft_.public_input_indices.size() != 8 ||
         draft_.outputs.size() != 4 ||
         verify_.public_input_indices.size() != 9 ||
@@ -891,18 +921,26 @@ class AclIncrementalExecutor::Impl {
         prefill_head_.PublicInput(2), ACL_INT32, {1},
         "prefill-head eos_token_count");
 
-    RequireTensor(decode_.PublicInput(0), ACL_INT64, {1, 1}, "decode input_ids");
-    RequireSameTensor(
-        prefill_head_.PublicInput(1), decode_.PublicInput(1),
-        "decode EOS table");
-    RequireSameTensor(
-        prefill_head_.PublicInput(2), decode_.PublicInput(2),
-        "decode EOS count");
+    if (!unified_target_step_) {
+      RequireTensor(
+          decode_.PublicInput(0), ACL_INT64, {1, 1}, "decode input_ids");
+      RequireSameTensor(
+          prefill_head_.PublicInput(1), decode_.PublicInput(1),
+          "decode EOS table");
+      RequireSameTensor(
+          prefill_head_.PublicInput(2), decode_.PublicInput(2),
+          "decode EOS count");
+    }
 
     const auto& verify_ids = verify_.PublicInput(0);
+    const std::int64_t expected_verify_rows = unified_target_step_ ? -1 : 16;
     if (verify_ids.dtype != ACL_INT64 || verify_ids.shape.size() != 2 ||
-        verify_ids.shape[0] != 1 || verify_ids.shape[1] != 16) {
-      throw std::runtime_error("verify input IDs must be INT64[1,16]");
+        verify_ids.shape[0] != 1 ||
+        verify_ids.shape[1] != expected_verify_rows) {
+      throw std::runtime_error(
+          unified_target_step_
+              ? "unified Target input IDs must be dynamic INT64[1,-1]"
+              : "verify input IDs must be INT64[1,16]");
     }
     verify_width_ = 16;
     proposal_width_ = verify_width_ - 1;
@@ -920,14 +958,16 @@ class AclIncrementalExecutor::Impl {
         {prefill_.public_input_indices[2], prefill_.public_input_indices[3],
          prefill_.public_input_indices[4], prefill_.public_input_indices[5],
          prefill_.public_input_indices[6]});
-    RequireStateSet(
-        target_state_specs_,
-        SelectSpecs(
-            decode_.inputs,
-            {decode_.public_input_indices[3], decode_.public_input_indices[4],
-             decode_.public_input_indices[5], decode_.public_input_indices[6],
-             decode_.public_input_indices[7]}),
-        "decode Target");
+    if (!unified_target_step_) {
+      RequireStateSet(
+          target_state_specs_,
+          SelectSpecs(
+              decode_.inputs,
+              {decode_.public_input_indices[3], decode_.public_input_indices[4],
+               decode_.public_input_indices[5], decode_.public_input_indices[6],
+               decode_.public_input_indices[7]}),
+          "decode Target");
+    }
     RequireStateSet(
         target_state_specs_,
         SelectSpecs(
@@ -940,10 +980,12 @@ class AclIncrementalExecutor::Impl {
         target_state_specs_,
         SelectSpecs(prefill_.outputs, {3, 4, 5, 6, 7}),
         "prefill Target outputs");
-    RequireStateSet(
-        target_state_specs_,
-        SelectSpecs(decode_.outputs, {3, 4, 5, 6, 7}),
-        "decode Target outputs");
+    if (!unified_target_step_) {
+      RequireStateSet(
+          target_state_specs_,
+          SelectSpecs(decode_.outputs, {3, 4, 5, 6, 7}),
+          "decode Target outputs");
+    }
     RequireStateSet(
         target_state_specs_,
         SelectSpecs(verify_.outputs, {5, 6, 11, 12, 9}),
@@ -994,14 +1036,16 @@ class AclIncrementalExecutor::Impl {
     }
     feature_width_ = static_cast<std::size_t>(prefill_.outputs[1].shape[2]);
     RequireTensor(prefill_.outputs[2], ACL_INT32, {1}, "prefill feature count");
-    RequireSameTensor(
-        prefill_head_.outputs[0], decode_.outputs[0],
-        "decode committed IDs");
-    RequireSameTensor(
-        prefill_head_.outputs[1], decode_.outputs[1],
-        "decode commit count");
-    RequireSameTensor(
-        prefill_head_.outputs[2], decode_.outputs[2], "decode finished");
+    if (!unified_target_step_) {
+      RequireSameTensor(
+          prefill_head_.outputs[0], decode_.outputs[0],
+          "decode committed IDs");
+      RequireSameTensor(
+          prefill_head_.outputs[1], decode_.outputs[1],
+          "decode commit count");
+      RequireSameTensor(
+          prefill_head_.outputs[2], decode_.outputs[2], "decode finished");
+    }
 
     RequireSameTensor(
         prefill_head_.outputs[0], verify_.outputs[0],
@@ -1033,8 +1077,20 @@ class AclIncrementalExecutor::Impl {
         prefill_head_.outputs[1], draft_.PublicInput(3),
         "Draft previous count");
     RequireSameTensor(verify_.PublicInput(1), draft_.PublicInput(4), "Draft proposal count");
-    RequireSameTensor(verify_.PublicInput(0), draft_.outputs[0], "Draft verify IDs");
+    if (unified_target_step_) {
+      if (verify_.PublicInput(0).dtype != draft_.outputs[0].dtype ||
+          verify_.PublicInput(0).bytes != draft_.outputs[0].bytes) {
+        throw std::runtime_error(
+            "dynamic Target-step maximum input differs from Draft verify IDs");
+      }
+    } else {
+      RequireSameTensor(
+          verify_.PublicInput(0), draft_.outputs[0], "Draft verify IDs");
+    }
     ResolveDraftGears();
+    if (unified_target_step_) {
+      ResolveTargetStepGears();
+    }
   }
 
   std::vector<std::int64_t> FlattenDraftShape(std::size_t feature_rows) const {
@@ -1092,6 +1148,61 @@ class AclIncrementalExecutor::Impl {
     stats_.draft_dynamic_gear_count = draft_.dynamic_gears.size();
   }
 
+  std::vector<std::int64_t> FlattenTargetStepShape(
+      std::size_t physical_rows) const {
+    std::vector<std::int64_t> result;
+    for (std::size_t public_index = 0;
+         public_index < verify_.public_input_indices.size();
+         ++public_index) {
+      const auto& spec = verify_.PublicInput(public_index);
+      for (std::size_t dimension = 0; dimension < spec.shape.size();
+           ++dimension) {
+        std::int64_t value = spec.shape[dimension];
+        if (value == -1) {
+          if (public_index != 0 || dimension != 1) {
+            throw std::runtime_error(
+                "unified Target step has an unexpected dynamic dimension");
+          }
+          value = static_cast<std::int64_t>(physical_rows);
+        }
+        result.push_back(value);
+      }
+    }
+    return result;
+  }
+
+  void ResolveTargetStepGears() {
+    if (verify_.dynamic_gears.size() != verify_width_) {
+      throw std::runtime_error(
+          "unified Target step must expose exactly T=1..16 gears");
+    }
+    target_step_gears_.reserve(verify_width_);
+    for (std::size_t rows = 1; rows <= verify_width_; ++rows) {
+      const auto expected = FlattenTargetStepShape(rows);
+      const auto match = std::find_if(
+          verify_.dynamic_gears.begin(),
+          verify_.dynamic_gears.end(),
+          [&expected](const aclmdlIODims& gear) {
+            if (gear.dimCount != expected.size()) {
+              return false;
+            }
+            for (std::size_t index = 0; index < expected.size(); ++index) {
+              if (gear.dims[index] != expected[index]) {
+                return false;
+              }
+            }
+            return true;
+          });
+      if (match == verify_.dynamic_gears.end()) {
+        throw std::runtime_error(
+            "unified Target step is missing dynamic gear T=" +
+            std::to_string(rows));
+      }
+      target_step_gears_.push_back(*match);
+    }
+    stats_.target_step_dynamic_gear_count = target_step_gears_.size();
+  }
+
   void AllocateBuffers() {
     target_states_[0].Allocate(target_state_specs_);
     target_states_[1].Allocate(target_state_specs_);
@@ -1147,7 +1258,9 @@ class AclIncrementalExecutor::Impl {
         prefill_proposal_control_bytes_ >= prefill_control_.bytes) {
       throw std::logic_error("prefill control prefix layout is invalid");
     }
-    decode_id_.Allocate(decode_.PublicInput(0).bytes);
+    decode_id_.Allocate(
+        unified_target_step_ ? sizeof(std::int64_t)
+                             : decode_.PublicInput(0).bytes);
     stats_.prefill_staging_slots =
         (sequence_length_ - 1) / prefill_width_ + 1;
     if (stats_.prefill_staging_slots == 0) {
@@ -1230,6 +1343,11 @@ class AclIncrementalExecutor::Impl {
     }
     verify_dynamic_control_.Allocate(
         draft_.inputs.at(draft_.dynamic_input_index).bytes);
+    if (unified_target_step_) {
+      target_step_dynamic_control_.Allocate(
+          verify_.inputs.at(verify_.dynamic_input_index).bytes);
+      target_step_plans_.resize(verify_width_);
+    }
 
     prefill_plans_.resize(stats_.prefill_staging_slots);
     prefill_draft_plans_.resize(stats_.prefill_staging_slots);
@@ -1243,6 +1361,9 @@ class AclIncrementalExecutor::Impl {
         prefill_last_hidden_.bytes + committed_input_count_.bytes +
         verify_ids_.bytes +
         verify_dynamic_control_.bytes;
+    if (unified_target_step_) {
+      stats_.carrier_device_bytes += target_step_dynamic_control_.bytes;
+    }
     for (const auto& control : prefill_dynamic_controls_) {
       stats_.carrier_device_bytes += control.bytes;
     }
@@ -1566,61 +1687,103 @@ class AclIncrementalExecutor::Impl {
              target_states_[next].tensors[3],
              target_states_[next].tensors[4]});
       }
-      const auto decode_outputs = [this, next]() {
+      const auto verify_outputs = [this, next]() {
         return std::vector<BufferView>{
             CompactView(
-                next, compact_token_offset_, decode_.outputs[0].bytes),
+                next, compact_token_offset_, verify_.outputs[0].bytes),
             CompactView(
-                next, compact_commit_offset_, decode_.outputs[1].bytes),
+                next, compact_commit_offset_, verify_.outputs[1].bytes),
             CompactView(
-                next, compact_finished_offset_, decode_.outputs[2].bytes),
+                next, compact_drafted_offset_, verify_.outputs[2].bytes),
+            CompactView(
+                next, compact_accepted_offset_, verify_.outputs[3].bytes),
+            CompactView(
+                next, compact_rejected_offset_, verify_.outputs[4].bytes),
             target_states_[next].tensors[0],
             target_states_[next].tensors[1],
+            prefill_features_.View(verify_.outputs[7].bytes),
+            committed_input_count_.View(),
+            target_states_[next].tensors[4],
+            CompactView(
+                next, compact_finished_offset_, verify_.outputs[10].bytes),
             target_states_[next].tensors[2],
-            target_states_[next].tensors[3],
-            target_states_[next].tensors[4]};
+            target_states_[next].tensors[3]};
       };
-      decode_upload_plans_[current].Build(
-          decode_,
-          TargetInputs(
-              {decode_id_.View(), EosIdsView(), EosCountView()},
-              current),
-          decode_outputs());
-      decode_carrier_plans_[current].Build(
-          decode_,
-          TargetInputs(
-              {CompactView(
-                   current,
-                   compact_token_offset_,
-                   decode_.PublicInput(0).bytes),
-               EosIdsView(), EosCountView()},
-              current),
-          decode_outputs());
-      verify_plans_[current].Build(
-          verify_,
-          TargetInputs(
-              {verify_ids_.View(), ProposalCountView(), EosIdsView(),
-               EosCountView()},
-              current),
-          {CompactView(
-               next, compact_token_offset_, verify_.outputs[0].bytes),
-           CompactView(
-               next, compact_commit_offset_, verify_.outputs[1].bytes),
-           CompactView(
-               next, compact_drafted_offset_, verify_.outputs[2].bytes),
-           CompactView(
-               next, compact_accepted_offset_, verify_.outputs[3].bytes),
-           CompactView(
-               next, compact_rejected_offset_, verify_.outputs[4].bytes),
-           target_states_[next].tensors[0],
-           target_states_[next].tensors[1],
-           prefill_features_.View(verify_.outputs[7].bytes),
-           committed_input_count_.View(),
-           target_states_[next].tensors[4],
-           CompactView(
-               next, compact_finished_offset_, verify_.outputs[10].bytes),
-           target_states_[next].tensors[2],
-           target_states_[next].tensors[3]});
+      if (unified_target_step_) {
+        const auto build_target_step = [this, current, &verify_outputs](
+                                           DatasetPlan& plan,
+                                           const BufferView& input_ids,
+                                           std::size_t rows) {
+          plan.Build(
+              verify_,
+              TargetInputs(
+                  {input_ids, ProposalCountView(), EosIdsView(), EosCountView()},
+                  current),
+              verify_outputs(),
+              target_step_dynamic_control_.View());
+          Check(
+              aclmdlSetInputDynamicDims(
+                  verify_.id,
+                  plan.input,
+                  verify_.dynamic_input_index,
+                  &target_step_gears_.at(rows - 1)),
+              "target-verify-commit: aclmdlSetInputDynamicDims(T=" +
+                  std::to_string(rows) + ")");
+        };
+        build_target_step(
+            decode_upload_plans_[current],
+            decode_id_.View(),
+            1);
+        build_target_step(
+            decode_carrier_plans_[current],
+            CompactView(
+                current, compact_token_offset_, sizeof(std::int64_t)),
+            1);
+        for (std::size_t rows = 2; rows <= verify_width_; ++rows) {
+          build_target_step(
+              target_step_plans_[rows - 1][current],
+              verify_ids_.View(rows * sizeof(std::int64_t)),
+              rows);
+        }
+      } else {
+        const auto decode_outputs = [this, next]() {
+          return std::vector<BufferView>{
+              CompactView(
+                  next, compact_token_offset_, decode_.outputs[0].bytes),
+              CompactView(
+                  next, compact_commit_offset_, decode_.outputs[1].bytes),
+              CompactView(
+                  next, compact_finished_offset_, decode_.outputs[2].bytes),
+              target_states_[next].tensors[0],
+              target_states_[next].tensors[1],
+              target_states_[next].tensors[2],
+              target_states_[next].tensors[3],
+              target_states_[next].tensors[4]};
+        };
+        decode_upload_plans_[current].Build(
+            decode_,
+            TargetInputs(
+                {decode_id_.View(), EosIdsView(), EosCountView()},
+                current),
+            decode_outputs());
+        decode_carrier_plans_[current].Build(
+            decode_,
+            TargetInputs(
+                {CompactView(
+                     current,
+                     compact_token_offset_,
+                     decode_.PublicInput(0).bytes),
+                 EosIdsView(), EosCountView()},
+                current),
+            decode_outputs());
+        verify_plans_[current].Build(
+            verify_,
+            TargetInputs(
+                {verify_ids_.View(), ProposalCountView(), EosIdsView(),
+                 EosCountView()},
+                current),
+            verify_outputs());
+      }
       prefill_head_plans_[current].Build(
           prefill_head_,
           {prefill_last_hidden_.View(), EosIdsView(), EosCountView()},
@@ -1766,6 +1929,14 @@ class AclIncrementalExecutor::Impl {
 
   void SetProposalCount(std::size_t value) {
     RequireProposalCount(value);
+    SetTargetStepProposalCount(value);
+  }
+
+  void SetTargetStepProposalCount(std::size_t value) {
+    if (value > proposal_width_) {
+      throw std::invalid_argument(
+          "Target-step logical proposal count is outside 0..15");
+    }
     if (proposal_value_valid_ && proposal_value_ == value) {
       return;
     }
@@ -2008,6 +2179,12 @@ class AclIncrementalExecutor::Impl {
     for (auto& plan : verify_plans_) {
       plan.Release();
     }
+    for (auto& by_state : target_step_plans_) {
+      for (auto& plan : by_state) {
+        plan.Release();
+      }
+    }
+    target_step_plans_.clear();
     for (auto& plan : decode_carrier_plans_) {
       plan.Release();
     }
@@ -2021,6 +2198,7 @@ class AclIncrementalExecutor::Impl {
     }
     prefill_plans_.clear();
 
+    target_step_dynamic_control_.Release();
     verify_dynamic_control_.Release();
     for (auto& control : prefill_dynamic_controls_) {
       control.Release();
@@ -2076,6 +2254,7 @@ class AclIncrementalExecutor::Impl {
   }
 
   int device_id_ = 0;
+  bool unified_target_step_ = false;
   IncrementalStateResetPolicy state_reset_policy_ =
       IncrementalStateResetPolicy::kAsyncMemset;
   IncrementalDecodeCarrierPolicy decode_carrier_policy_ =
@@ -2105,6 +2284,7 @@ class AclIncrementalExecutor::Impl {
   std::vector<TensorSpec> draft_state_specs_;
   std::vector<aclmdlIODims> draft_gear_prefill_;
   aclmdlIODims draft_gear_verify_{};
+  std::vector<aclmdlIODims> target_step_gears_;
 
   std::array<StateArena, 2> target_states_;
   std::array<StateArena, 2> draft_states_;
@@ -2120,6 +2300,7 @@ class AclIncrementalExecutor::Impl {
   DeviceAllocation verify_ids_;
   std::vector<DeviceAllocation> prefill_dynamic_controls_;
   DeviceAllocation verify_dynamic_control_;
+  DeviceAllocation target_step_dynamic_control_;
 
   std::size_t compact_token_offset_ = 0;
   std::size_t compact_commit_offset_ = 0;
@@ -2143,6 +2324,7 @@ class AclIncrementalExecutor::Impl {
   std::array<DatasetPlan, 2> decode_upload_plans_;
   std::array<DatasetPlan, 2> decode_carrier_plans_;
   std::array<DatasetPlan, 2> verify_plans_;
+  std::vector<std::array<DatasetPlan, 2>> target_step_plans_;
   std::vector<std::array<std::array<DatasetPlan, 2>, 2>>
       prefill_draft_plans_;
   std::array<std::array<DatasetPlan, 2>, 2> verify_draft_plans_;
@@ -2259,6 +2441,10 @@ AclIncrementalExecutor::state_reset_policy() const noexcept {
 IncrementalDecodeCarrierPolicy
 AclIncrementalExecutor::decode_carrier_policy() const noexcept {
   return impl_->decode_carrier_policy();
+}
+
+bool AclIncrementalExecutor::unified_target_step() const noexcept {
+  return impl_->unified_target_step();
 }
 
 }  // namespace qwen35::dflash

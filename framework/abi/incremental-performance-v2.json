@@ -247,10 +247,13 @@
       "id": "three-resident",
       "physical_oms": [
         "target-prefill",
+        "target-prefill-head split from the logical prefill role",
         "draft-propose",
         "target-verify-commit with a proven T=1 decode gear"
       ],
       "preference": 1,
+      "source_implementation": "split-prefill-head-four-resident-unified-target-step-v1",
+      "source_evidence": "torch.export T=1/2/7/16 and complete Fake ACL ordinary/DFlash state machine pass; real AIR/ATC/custom-op/parity/memory/latency pending",
       "condition": "custom operators, TorchAir and ATC preserve exact T=1 and T=2..16 gears in one Target step artifact",
       "risk": "Target weights may still exist in both prefill and verify artifacts"
     },
@@ -358,6 +361,20 @@
       "additional_compact_device_bytes_vs_previous_runner": 512,
       "device_to_host_operations_unchanged": 117,
       "device_to_host_bytes_unchanged": 32604
+    },
+    "fake_acl_unified_target_step_70_token_paired_3_plus_10": {
+      "classification": "host structural and dynamic-gear routing evidence only; not Ascend310P latency",
+      "physical_topology": "split-prefill-head-four-resident-unified-target-step-v1",
+      "resident_model_count": 4,
+      "target_step_dynamic_gears": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+      "logical_decode_executions": 78,
+      "logical_verify_executions": 13,
+      "fixed_t16_equivalent_rows": 1456,
+      "physical_target_step_rows": 130,
+      "scratch_rows_elided": 1326,
+      "token_id_mismatches": 0,
+      "eos_mismatches": 0,
+      "claim_boundary": "row elimination and state-machine correctness are proven only against Fake ACL; no speedup ratio is claimed"
     }
   },
   "activation_gate": {

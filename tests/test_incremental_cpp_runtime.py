@@ -23,6 +23,7 @@ from qwen35_dflash.ascend310p.cpp_runtime import (  # noqa: E402
     LAST_TOKEN_D2D_DECODE_CARRIER_POLICY,
     ONE_TOKEN_H2D_DECODE_CARRIER_POLICY,
     _INCREMENTAL_GRAPH_ABI,
+    _UNIFIED_TARGET_STEP_GRAPH_ABI,
     _resolve_incremental_oms,
     validate_cpp_runner_options,
     validate_incremental_cpp_runner_report,
@@ -553,6 +554,45 @@ def test_resolve_incremental_oms_locks_all_five_abis_and_hashes(
         "graphs": graphs,
     }), encoding="utf-8")
     with pytest.raises(ValueError, match="output order"):
+        _resolve_incremental_oms(manifest_path)
+
+
+def test_resolve_incremental_oms_accepts_only_complete_t1_to_t16_target_step(
+    tmp_path: Path,
+) -> None:
+    graphs = []
+    for role, (inputs, outputs) in _UNIFIED_TARGET_STEP_GRAPH_ABI.items():
+        om = tmp_path / f"{role}.om"
+        om.write_bytes(role.encode("utf-8"))
+        graph = {
+            "name": role,
+            "role": role,
+            "input_names": inputs,
+            "output_names": outputs,
+            "om": {
+                "path": om.name,
+                "sha256": hashlib.sha256(om.read_bytes()).hexdigest(),
+            },
+        }
+        if role == "target-verify-commit":
+            graph["dynamic"] = True
+            graph["input_dim_gears"] = {
+                "0": {"1": list(range(1, 17))}
+            }
+        graphs.append(graph)
+    manifest_path = tmp_path / "deployment.json"
+    manifest = {
+        "artifact_kind": "qwen35-dflash-ascend310p-om-bundle",
+        "status": "PASS",
+        "graphs": graphs,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    resolved, _ = _resolve_incremental_oms(manifest_path)
+    assert list(resolved) == list(_UNIFIED_TARGET_STEP_GRAPH_ABI)
+
+    graphs[-1]["input_dim_gears"] = {"0": {"1": list(range(2, 17))}}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="T=1..16"):
         _resolve_incremental_oms(manifest_path)
 
 

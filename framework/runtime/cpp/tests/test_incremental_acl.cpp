@@ -319,12 +319,57 @@ void TestExplicitDecodeOverride(
       "explicit decode override did not use the exact H2D fallback");
 }
 
+void TestUnifiedTargetStep(
+    const std::array<std::filesystem::path, 4>& model_paths) {
+  qwen35::dflash::IncrementalOmPaths paths{
+      model_paths[0], model_paths[1], {}, model_paths[2], model_paths[3]};
+  std::vector<std::string> loaded_roles;
+  qwen35::dflash::AclIncrementalExecutor executor(
+      std::move(paths),
+      0,
+      [&](const char* role, const char* stage, std::size_t, std::size_t) {
+        if (std::string(stage) == "load-done") {
+          loaded_roles.emplace_back(role);
+        }
+      });
+  Require(executor.unified_target_step(), "unified Target-step was not selected");
+  Require(loaded_roles.size() == 4, "unified route did not load four OMs");
+  Require(executor.model_memory().size() == 4, "unified memory set differs");
+
+  qwen35::dflash::GenerationOptions options;
+  options.max_new_tokens = 6;
+  options.max_draft_tokens = 3;
+  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kOrdinary,
+      options);
+  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+      executor,
+      {10},
+      qwen35::dflash::GenerationMode::kDFlash,
+      options);
+  const std::vector<std::int64_t> expected{11, 12, 13, 14, 15, 16};
+  Require(ordinary.generated_token_ids == expected, "unified ordinary differs");
+  Require(dflash.generated_token_ids == expected, "unified DFlash differs");
+  const auto& stats = executor.execution_stats();
+  Require(
+      stats.target_step_dynamic_gear_count == 16,
+      "unified Target-step gears differ");
+  Require(
+      stats.target_step_input_rows + stats.target_step_padded_rows_elided ==
+          16 * (stats.target_decode1_executions +
+                stats.target_verify_commit_executions) &&
+          stats.target_step_padded_rows_elided > 0,
+      "unified Target-step physical/scratch rows do not close");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 6) {
-      throw std::invalid_argument("expected five fake OM paths");
+    if (argc != 7) {
+      throw std::invalid_argument("expected five baseline and one dynamic fake OM paths");
     }
     const std::array<std::filesystem::path, 5> paths{
         std::filesystem::path(argv[1]),
@@ -354,6 +399,8 @@ int main(int argc, char** argv) {
         qwen35::dflash::IncrementalDecodeCarrierPolicy::
             kOneTokenHostFallback);
     TestExplicitDecodeOverride(paths);
+    TestUnifiedTargetStep(
+        {paths[0], paths[1], paths[3], std::filesystem::path(argv[6])});
     std::cout << "PASS: both reset and decode carrier policies preserve exact "
                  "five-OM tokens, device state routing, compact "
                  "synchronization and explicit decode override fallback\n";
