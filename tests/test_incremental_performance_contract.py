@@ -17,10 +17,17 @@ DOCUMENT_PATH = ROOT / "docs" / "INCREMENTAL_OM_PERFORMANCE.md"
 FRAMEWORK_LOCK_PATH = ROOT / "framework" / "FRAMEWORK_LOCK.json"
 DEPLOYMENT_PATH = ROOT / "framework" / "abi" / "dflash-deployment-v1.json"
 PERFORMANCE_PATH = ROOT / "framework" / "abi" / "performance-v1.json"
+BATCHED_CACHE_UPDATE_PATH = (
+    ROOT / "framework" / "abi" / "batched-cache-update-v1.json"
+)
 
 
 def _contract() -> dict[str, object]:
     return json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+
+
+def _batched_cache_update_proposal() -> dict[str, object]:
+    return json.loads(BATCHED_CACHE_UPDATE_PATH.read_text(encoding="utf-8"))
 
 
 def test_incremental_contract_has_exact_approval_but_is_not_active() -> None:
@@ -136,6 +143,45 @@ def test_incremental_state_budget_matches_locked_qwen35_shapes() -> None:
         full_layers * 2 * verify_rows
     )
     assert budget["seed_policy"] == "per-linear-layer-jit-v1"
+
+
+def test_batched_cache_update_is_an_exact_unapproved_boundary() -> None:
+    proposal = _batched_cache_update_proposal()
+    assert proposal["status"] == "AWAITING_EXPLICIT_APPROVAL"
+    assert proposal["classification"] == (
+        "exact_graph_and_operator_boundary_change"
+    )
+    assert proposal["correctness_contract"]["approximation_allowed"] is False
+    assert proposal["correctness_contract"][
+        "external_om_bindings_unchanged"
+    ] is True
+    approval = proposal["approval"]
+    assert approval["required"] is True
+    assert approval["required_statement"] == "批准 batched-cache-update-v1"
+    assert approval["record_present"] is False
+    assert approval["existing_multi_om_approval_covers_this_change"] is False
+    assert not (ROOT / approval["record_path_after_approval"]).exists()
+
+
+def test_batched_cache_update_proposal_counts_match_locked_topology() -> None:
+    contract = _contract()
+    proposal = _batched_cache_update_proposal()
+    symbols = contract["symbols"]
+    baseline = proposal["baseline"]
+    candidate = proposal["candidate"]
+    current = (
+        symbols["full_attention_layers"]
+        * 2
+        * symbols["maximum_verify_rows"]
+    )
+    batched = symbols["full_attention_layers"] * 2
+    assert baseline["current_model_nodes_at_t16"] == current == 256
+    assert candidate["model_nodes_at_t16"] == batched == 16
+    assert candidate["model_nodes_eliminated_at_t16"] == current - batched
+    assert candidate["model_node_reduction_percent"] == 93.75
+    assert proposal["rollback"]["safe_git_commit"] == (
+        baseline["git_commit"]
+    )
 
 
 def test_topology_is_selected_by_evidence_not_file_count() -> None:

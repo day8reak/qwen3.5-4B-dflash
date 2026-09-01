@@ -167,6 +167,10 @@ full-attention layer 的 K/V 更新共同复用。旧源码按 `8 layers * 2(K/V
 mask 也直接以 ADN 需要的 FP16 `0/-inf` 创建，删除每个 Target call 中 8 个重复 mask cast。
 这些优化不改数值、公开 OM binding 或 CacheUpdate 自定义算子边界；当前 verify 仍有
 `8*2*16=256` 个单 row CacheUpdate 节点，不能把 index hoist 误报成已经完成 batched cache update。
+下一步的精确候选在 `framework/abi/batched-cache-update-v1.json`：用 `[T,2]` block/offset indices
+把 256 个节点合并成 16 个，并保持外部 OM binding、FP16 更新字节和逻辑 cursor commit/rollback
+不变。它仍是 `AWAITING_EXPLICIT_APPROVAL` 提案，不是已实现功能；实施前需要新的原样批准语句
+`批准 batched-cache-update-v1`，之前对多 OM 状态图的批准不能替代本次算子/图边界批准。
 
 持久 recurrent 统一用 FP32：普通 GDR 仍保留 receiver 现有的 FP16 输出边界，再把该结果无损
 扩宽到 FP32；GDR-MTP 选中的 FP32 state 则无需每轮降回 FP16。这样 prefill/decode/verify 的

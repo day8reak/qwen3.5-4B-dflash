@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "proposal_id": "qwen35-4b-dflash-batched-cache-update-v1",
+  "status": "AWAITING_EXPLICIT_APPROVAL",
+  "classification": "exact_graph_and_operator_boundary_change",
+  "objective": "replace the fixed-T16 Target verify graph's per-row paged K/V updates with one exact batched update per full-attention layer and cache kind",
+  "baseline": {
+    "branch": "framework/quant-air-om",
+    "git_commit": "c38dafe7351759c9a0f4416e431d2ff5a93fc3fb",
+    "cache_index_policy": "once-per-verify-v1",
+    "current_frontend": "qwen35_dflash.npu_cache_update.default",
+    "current_formula": "full_attention_layers * cache_kinds * verify_rows",
+    "current_model_nodes_at_t16": 256
+  },
+  "candidate": {
+    "formula": "full_attention_layers * cache_kinds",
+    "model_nodes_at_t16": 16,
+    "model_nodes_eliminated_at_t16": 240,
+    "model_node_reduction_percent": 93.75,
+    "logical_operation": "for every i in [0,T), cache[target_blocks[i], offsets_in_block[i], :, :] = updates[i, :, :]",
+    "cache_input_output": {
+      "shape": "[num_blocks,64,64,16]",
+      "dtype": "float16",
+      "aliasing": "output must preserve the current in-place cache semantics"
+    },
+    "indices": {
+      "shape": "[T,2]",
+      "dtype": "int32",
+      "columns": [
+        "target_block",
+        "offset_in_block"
+      ]
+    },
+    "updates": {
+      "shape": "[T,64,16]",
+      "dtype": "float16"
+    },
+    "ranked_backend_experiments": [
+      {
+        "rank": 1,
+        "frontend": "private exact functional wrapper",
+        "lowering_candidate": "ScatterNdUpdate",
+        "reason": "the supplied Ascend310P3 dispatch report exposes npu_scatter_nd_update_ with a Functionalize kernel; AIR custom-node preservation and ATC support are still unproven"
+      },
+      {
+        "rank": 2,
+        "frontend": "CacheUpdateMTP",
+        "lowering_candidate": "new or extended custom operator",
+        "reason": "use only if ScatterNdUpdate cannot retain exact cross-block batched writes or cannot survive AIR-to-OM conversion"
+      }
+    ]
+  },
+  "correctness_contract": {
+    "ordinary_target_is_authoritative": true,
+    "token_id_mismatches_allowed": 0,
+    "eos_mismatches_allowed": 0,
+    "state_mismatches_allowed": 0,
+    "approximation_allowed": false,
+    "fp16_update_bytes_must_be_identical": true,
+    "logical_cursor_commit_and_rollback_semantics_unchanged": true,
+    "external_om_bindings_unchanged": true,
+    "duplicate_indices": "reject at the graph boundary; valid verify positions are strictly increasing"
+  },
+  "known_risks": [
+    "functionalization may clone the cache or break the required alias instead of retaining one in-place device update",
+    "TorchAir may decompose the frontend back into row-wise nodes or fail to preserve a supported GE custom node",
+    "ATC may reject the selected frontend, dtype, rank, layout or cross-64-token-block indices on Ascend310P3",
+    "blocked NZ cache layout may not match generic ScatterNdUpdate's logical contiguous interpretation",
+    "duplicate-index update order is backend-dependent and therefore prohibited",
+    "source node reduction does not prove lower OM latency; only same-device msprof and no-profiler measurements can do so"
+  ],
+  "required_gates": {
+    "host_exact_tensor_cases": {
+      "verify_rows": [
+        1,
+        2,
+        4,
+        6,
+        8,
+        16
+      ],
+      "round_start_positions": [
+        47,
+        48,
+        49,
+        62,
+        63,
+        64,
+        65
+      ],
+      "checks": [
+        "batched cache equals the current row-wise cache bit-for-bit",
+        "prefix and suffix sentinels are unchanged",
+        "K and V are both covered for all 8 full-attention layers",
+        "rejected physical tail is invisible after logical cursor rollback and is safely overwritten next round"
+      ]
+    },
+    "export": [
+      "strict torch.export succeeds without graph break",
+      "Target verify graph contains exactly 16 retained batched cache-update nodes",
+      "Target verify graph contains zero qwen35_dflash.npu_cache_update.default row-wise nodes",
+      "all other required custom nodes and the five-OM external tensor ABI remain unchanged"
+    ],
+    "target": [
+      "AIR export succeeds with custom-node audit",
+      "ATC succeeds for Ascend310P3",
+      "ordinary and DFlash strict-greedy token IDs and EOS are identical",
+      "K/V cache and recurrent/conv committed state pass full-state comparison",
+      "cross-block cases pass with fallback disabled and runtime/device identity recorded",
+      "three warmups plus ten no-profiler measurements show a repeatable end-to-end improvement",
+      "msprof attributes the change to lower cache-update launch or execution cost and is not used as formal latency evidence"
+    ]
+  },
+  "approval": {
+    "required": true,
+    "required_statement": "批准 batched-cache-update-v1",
+    "record_path_after_approval": "framework/abi/approvals/batched-cache-update-v1.json",
+    "record_present": false,
+    "existing_multi_om_approval_covers_this_change": false,
+    "implementation_must_not_start_before_approval": true
+  },
+  "rollback": {
+    "safe_git_commit": "c38dafe7351759c9a0f4416e431d2ff5a93fc3fb",
+    "meaning": "pushed exact verify-index hoist with the existing 256 row-wise CacheUpdate nodes and unchanged OM ABI"
+  },
+  "claim_boundary": "This file is an approval proposal only. It does not claim implementation, AIR/OM conversion, target correctness, or latency improvement."
+}

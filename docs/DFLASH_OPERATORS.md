@@ -172,7 +172,10 @@ tail 下一轮不可见并被覆写。算子只做物理写入；是否提交 `1
 当前五 OM 源码已经把 `[T]` target-block/offset 向量在 verify 入口计算一次并跨 8 层 K/V 复用，
 但仍逐 row 调用 CacheUpdate：T=16 时是 `8*2*16=256` 个模型节点。把它改成显式二维 indices
 `[[block_i,offset_i], ...]` 的一次 ScatterNdUpdate/CacheUpdateMTP 可降为 `8*2=16` 个节点，属于
-新的算子/图边界，必须先取得 `batched-cache-update-v1` 的明确批准，再做 AIR/OM 实验。
+新的算子/图边界。机器可读方案位于 `framework/abi/batched-cache-update-v1.json`；它锁定逐 bit
+一致、跨 64-token block、alias/回滚语义、AIR 自定义节点计数和真机 profile 门禁。该方案当前是
+`AWAITING_EXPLICIT_APPROVAL`，必须收到原样批准语句 `批准 batched-cache-update-v1` 后才能开始
+实现；已有的“批准多OM状态图”不覆盖这次算子边界变化。
 
 ### 5.2 `FusedInferAttentionMTP`
 
