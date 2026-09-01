@@ -244,6 +244,16 @@ def _validate_runner_report(
             speculative_staging_bytes = 0
             speculative_staging_device_bytes = 0
             speculative_staging_host_bytes = 0
+        if int(report.get("schema_version", 0)) >= 10:
+            speculative_direct_bindings = counters.get(
+                "speculative_window_direct_output_bindings"
+            )
+            speculative_direct_bytes = counters.get(
+                "speculative_window_direct_output_bytes"
+            )
+        else:
+            speculative_direct_bindings = 0
+            speculative_direct_bytes = 0
         prefill_completions = counters.get(
             "prefill_completion_synchronizations"
         )
@@ -306,6 +316,8 @@ def _validate_runner_report(
             speculative_staging_bytes,
             speculative_staging_device_bytes,
             speculative_staging_host_bytes,
+            speculative_direct_bindings,
+            speculative_direct_bytes,
         )
         if any(
             isinstance(value, bool)
@@ -345,9 +357,21 @@ def _validate_runner_report(
             != speculative_staging_operations * compact_verify_bytes
             or speculative_staging_operations > verify_transactions
             or (
-                int(report.get("schema_version", 0)) >= 9
+                int(report.get("schema_version", 0)) == 9
                 and requested_sync_window <= 2
                 and speculative_staging_operations != 0
+            )
+            or (
+                int(report.get("schema_version", 0)) >= 10
+                and speculative_staging_operations != 0
+            )
+            or speculative_direct_bytes
+            != speculative_direct_bindings * compact_verify_bytes
+            or speculative_direct_bindings > verify_transactions
+            or (
+                int(report.get("schema_version", 0)) >= 10
+                and requested_sync_window <= 2
+                and speculative_direct_bindings != 0
             )
             or (
                 int(report.get("schema_version", 0)) >= 9
@@ -905,6 +929,12 @@ def analyze_incremental_msprof(
     speculative_staging_bytes = int(
         counters.get("speculative_window_staging_bytes", 0)
     )
+    speculative_direct_bindings = int(
+        counters.get("speculative_window_direct_output_bindings", 0)
+    )
+    speculative_direct_bytes = int(
+        counters.get("speculative_window_direct_output_bytes", 0)
+    )
     prefill_verify_windows = int(
         counters.get("prefill_verify_coalesced_windows", 0)
     )
@@ -1032,6 +1062,14 @@ def analyze_incremental_msprof(
                 "events; api_statistic has duration/count but no copy size."
             ),
         },
+        "expected_verify_direct_output_signature": {
+            "bindings": speculative_direct_bindings,
+            "bytes": speculative_direct_bytes,
+            "profiler_interpretation": (
+                "These bytes are Verify model outputs bound directly to the "
+                "window arena; they must not appear as aclrtMemcpyAsync."
+            ),
+        },
         "expected_draft_feature_signature": (
             {
                 "policy": report["protocol"]["draft_feature_policy"],
@@ -1073,6 +1111,10 @@ def analyze_incremental_msprof(
                 speculative_staging_operations
             ),
             "speculative_window_staging_bytes": speculative_staging_bytes,
+            "speculative_window_direct_output_bindings": (
+                speculative_direct_bindings
+            ),
+            "speculative_window_direct_output_bytes": speculative_direct_bytes,
             "prefill_verify_coalesced_windows": prefill_verify_windows,
             "prefill_verify_synchronizations_elided": (
                 prefill_verify_syncs_elided

@@ -780,7 +780,7 @@ def validate_incremental_cpp_runner_report(
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
-    if report.get("schema_version") != 9:
+    if report.get("schema_version") != 10:
         raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
@@ -1320,6 +1320,12 @@ def validate_incremental_cpp_runner_report(
     speculative_staging_bytes = execution.get(
         "speculative_window_staging_bytes"
     )
+    speculative_direct_bindings = execution.get(
+        "speculative_window_direct_output_bindings"
+    )
+    speculative_direct_bytes = execution.get(
+        "speculative_window_direct_output_bytes"
+    )
     prefill_verify_fields = (
         "prefill_verify_coalesced_windows",
         "prefill_verify_synchronizations_elided",
@@ -1384,11 +1390,21 @@ def validate_incremental_cpp_runner_report(
         or isinstance(speculative_staging_bytes, bool)
         or not isinstance(speculative_staging_bytes, int)
         or speculative_staging_bytes < 0
+        or isinstance(speculative_direct_bindings, bool)
+        or not isinstance(speculative_direct_bindings, int)
+        or speculative_direct_bindings < 0
+        or isinstance(speculative_direct_bytes, bool)
+        or not isinstance(speculative_direct_bytes, int)
+        or speculative_direct_bytes < 0
         or speculative_staging_bytes
         != speculative_staging_operations
         * memory["compact_verify_result_bytes"]
-        or speculative_staging_operations > verify
-        or (dflash_sync_window <= 2 and speculative_staging_operations != 0)
+        or speculative_staging_operations != 0
+        or speculative_direct_bytes
+        != speculative_direct_bindings
+        * memory["compact_verify_result_bytes"]
+        or speculative_direct_bindings > verify
+        or (dflash_sync_window <= 2 and speculative_direct_bindings != 0)
         or prefill_verify_windows != expected_prefill_verify_windows
         or prefill_verify_syncs_elided != prefill_verify_windows
         or prefill_verify_d2h_elided != prefill_verify_windows
@@ -1591,26 +1607,23 @@ def validate_incremental_cpp_runner_report(
         if max_new_tokens > 2
         else 0
     )
-    expected_proposal_upload_operations = (
+    minimum_proposal_upload_operations = (
         1
         if expected_prefill_draft > 0 and expected_proposal_count != 1
         else 0
     )
-    expected_count_upload_operations = (
-        expected_prefill_draft - expected_proposal_upload_operations
-    )
     expected_base_upload_operations = (
         prefill
         - expected_full_upload_operations
-        - expected_count_upload_operations
-        - expected_proposal_upload_operations
+        - prefill_count_upload_operations
+        - prefill_proposal_upload_operations
     )
     expected_prefill_upload_bytes = (
         expected_control_bytes * expected_full_upload_operations
         + expected_base_control_bytes * expected_base_upload_operations
-        + expected_count_control_bytes * expected_count_upload_operations
+        + expected_count_control_bytes * prefill_count_upload_operations
         + expected_proposal_control_bytes
-        * expected_proposal_upload_operations
+        * prefill_proposal_upload_operations
     )
     expected_control_bytes_elided = (
         prefill * expected_control_bytes - expected_prefill_upload_bytes
@@ -1622,9 +1635,10 @@ def validate_incremental_cpp_runner_report(
         or prefill_base_upload_operations
         != expected_base_upload_operations
         or prefill_count_upload_operations
-        != expected_count_upload_operations
+        + prefill_proposal_upload_operations
+        != expected_prefill_draft
         or prefill_proposal_upload_operations
-        != expected_proposal_upload_operations
+        < minimum_proposal_upload_operations
         or prefill_full_upload_operations
         + prefill_base_upload_operations
         + prefill_count_upload_operations

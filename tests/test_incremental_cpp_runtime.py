@@ -153,7 +153,7 @@ def _report(
     complete_windows, final_window = divmod(
         remaining_verify_transactions, dflash_sync_window
     )
-    speculative_staging_operations = (
+    speculative_direct_bindings = (
         complete_windows * dflash_sync_window
         + (final_window if final_window > 2 else 0)
         if dflash_sync_window > 2
@@ -186,7 +186,7 @@ def _report(
         for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
-        "schema_version": 9,
+        "schema_version": 10,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -359,11 +359,13 @@ def _report(
             "speculative_d2h_padding_bytes": (
                 speculative_syncs_elided * 60
             ),
-            "speculative_window_staging_operations": (
-                speculative_staging_operations
+            "speculative_window_staging_operations": 0,
+            "speculative_window_staging_bytes": 0,
+            "speculative_window_direct_output_bindings": (
+                speculative_direct_bindings
             ),
-            "speculative_window_staging_bytes": (
-                speculative_staging_operations * 452
+            "speculative_window_direct_output_bytes": (
+                speculative_direct_bindings * 452
             ),
             "speculative_window_staging_device_bytes": 4096,
             "speculative_window_staging_pinned_host_bytes": 4096,
@@ -766,6 +768,23 @@ def test_incremental_runner_accepts_prefill_first_verify_coalescing() -> None:
     assert counters["prefill_verify_coalesced_windows"] == 13
     assert counters["prefill_verify_synchronizations_elided"] == 13
     assert counters["prefill_verify_d2h_operations_elided"] == 13
+
+
+def test_incremental_runner_accepts_acceptance_dependent_proposal_routes() -> None:
+    report = _report(dflash_sync_window=8)
+    counters = report["execution_io_counters"]
+    counters["prefill_control_count_upload_operations"] = 0
+    counters["prefill_control_proposal_upload_operations"] = 13
+    upload_bytes = 896 + 12 * 578 + 13 * 708
+    counters["prefill_control_upload_bytes"] = upload_bytes
+    counters["prefill_control_h2d_bytes_elided"] = 26 * 896 - upload_bytes
+    counters["host_to_device_bytes"] = (
+        upload_bytes
+        + counters["decode_id_upload_bytes"]
+        + counters["proposal_count_upload_bytes"]
+    )
+
+    _validate(report, dflash_sync_window=8)
 
 
 def test_incremental_runner_rejects_prefill_completion_policy_mismatch() -> None:

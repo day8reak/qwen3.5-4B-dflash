@@ -121,6 +121,16 @@ def _schema_nine_runner_report() -> dict[str, object]:
     return report
 
 
+def _schema_ten_runner_report() -> dict[str, object]:
+    report = _schema_nine_runner_report()
+    report["schema_version"] = 10
+    report["runner_version"] = "1.18.0"
+    counters = report["execution_io_counters"]
+    counters["speculative_window_direct_output_bindings"] = 0
+    counters["speculative_window_direct_output_bytes"] = 0
+    return report
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -286,6 +296,8 @@ def test_msprof_analysis_attributes_every_role_and_dynamic_gear(
         "speculative_d2h_padding_bytes": 0,
         "speculative_window_staging_operations": 0,
         "speculative_window_staging_bytes": 0,
+        "speculative_window_direct_output_bindings": 0,
+        "speculative_window_direct_output_bytes": 0,
         "prefill_verify_coalesced_windows": 0,
         "prefill_verify_synchronizations_elided": 0,
         "prefill_verify_d2h_operations_elided": 0,
@@ -395,11 +407,11 @@ def test_msprof_analysis_accepts_schema_nine_staging_contract(
     ] == {"operations": 0, "bytes": 0}
 
 
-def test_msprof_analysis_counts_extended_window_staging_memcpy(
+def test_msprof_analysis_counts_extended_window_direct_outputs_without_memcpy(
     tmp_path: Path,
 ) -> None:
     report_path, profile = _case(tmp_path)
-    report = _schema_nine_runner_report()
+    report = _schema_ten_runner_report()
     report["protocol"]["dflash_sync_window"] = 8
     counters = report["execution_io_counters"]
     counters.update(
@@ -421,8 +433,10 @@ def test_msprof_analysis_counts_extended_window_staging_memcpy(
             "speculative_synchronizations_elided": 2,
             "speculative_d2h_operations_elided": 2,
             "speculative_d2h_padding_bytes": 120,
-            "speculative_window_staging_operations": 3,
-            "speculative_window_staging_bytes": 1356,
+            "speculative_window_staging_operations": 0,
+            "speculative_window_staging_bytes": 0,
+            "speculative_window_direct_output_bindings": 3,
+            "speculative_window_direct_output_bytes": 1356,
         }
     )
     report["profile_model_execution_trace"] = [
@@ -458,7 +472,7 @@ def test_msprof_analysis_counts_extended_window_staging_memcpy(
     _write_api_csv(
         api_path,
         execute_count=9,
-        memcpy_count=8,
+        memcpy_count=5,
         synchronize_count=2,
     )
 
@@ -469,22 +483,47 @@ def test_msprof_analysis_counts_extended_window_staging_memcpy(
 
     assert payload["api_count_gates"]["aclrtMemcpyAsync"] == {
         "status": "PASS",
-        "expected": 8,
-        "observed": 8,
+        "expected": 5,
+        "observed": 5,
     }
     assert payload["expected_memcpy_signature"][
         "device_to_device_speculative_staging"
-    ] == {"operations": 3, "bytes": 1356}
+    ] == {"operations": 0, "bytes": 0}
+    assert payload["expected_verify_direct_output_signature"] == {
+        "bindings": 3,
+        "bytes": 1356,
+        "profiler_interpretation": (
+            "These bytes are Verify model outputs bound directly to the "
+            "window arena; they must not appear as aclrtMemcpyAsync."
+        ),
+    }
 
 
 def test_msprof_analysis_rejects_staging_for_window_one(
     tmp_path: Path,
 ) -> None:
     report_path, profile = _case(tmp_path)
-    report = _schema_nine_runner_report()
+    report = _schema_ten_runner_report()
     counters = report["execution_io_counters"]
     counters["speculative_window_staging_operations"] = 1
     counters["speculative_window_staging_bytes"] = 452
+    _write_json(report_path, report)
+
+    with pytest.raises(MsprofAnalysisError, match="do not close"):
+        analyze_incremental_msprof(
+            profile_dir=profile,
+            runner_report=report_path,
+        )
+
+
+def test_msprof_analysis_rejects_direct_output_for_window_one(
+    tmp_path: Path,
+) -> None:
+    report_path, profile = _case(tmp_path)
+    report = _schema_ten_runner_report()
+    counters = report["execution_io_counters"]
+    counters["speculative_window_direct_output_bindings"] = 1
+    counters["speculative_window_direct_output_bytes"] = 452
     _write_json(report_path, report)
 
     with pytest.raises(MsprofAnalysisError, match="do not close"):

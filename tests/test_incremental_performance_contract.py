@@ -33,7 +33,7 @@ def _batched_cache_update_proposal() -> dict[str, object]:
 def test_incremental_contract_has_exact_approval_but_is_not_active() -> None:
     contract = _contract()
     approval = json.loads(APPROVAL_PATH.read_text(encoding="utf-8"))
-    assert contract["schema_version"] == 6
+    assert contract["schema_version"] == 7
     assert contract["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
     assert approval["status"] == "APPROVED"
     assert approval["approval_statement"] == "批准多OM状态图"
@@ -325,12 +325,12 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 21
+    assert framework_lock["schema_version"] == 22
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v21"
+        "qwen3.5-4b-quant-air-om-ascendcl-v22"
     )
     assert deployment["schema_version"] == 2
-    assert performance["schema_version"] == 3
+    assert performance["schema_version"] == 4
     assert "per-linear-layer-jit-v1" in framework_lock["runtime"][
         "incremental_verify_scalar_state_seed"
     ]
@@ -553,8 +553,17 @@ def test_extended_sync_window_records_exact_structural_evidence() -> None:
     assert evidence["target_verify_commit_executions"] == 52
     assert evidence["speculative_sync_windows"] == 13
     assert evidence["speculative_synchronizations_elided"] == 39
-    assert evidence["speculative_window_staging_operations"] == 52
-    assert evidence["speculative_window_staging_bytes"] == 52 * 452
+    assert evidence["speculative_window_staging_operations"] == 0
+    assert evidence["speculative_window_staging_bytes"] == 0
+    assert evidence["speculative_window_direct_output_bindings"] == 52
+    assert evidence["speculative_window_direct_output_bytes"] == 52 * 452
+    assert (
+        evidence["compact_staging_d2d_operations_eliminated_vs_schema_6"]
+        == 52
+    )
+    assert evidence["compact_staging_d2d_bytes_eliminated_vs_schema_6"] == (
+        52 * 452
+    )
     assert evidence["speculative_window_staging_device_bytes"] == 4096
     assert evidence["proposal_count_staging_pinned_host_bytes"] == 32
 

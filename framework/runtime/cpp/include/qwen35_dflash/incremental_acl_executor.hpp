@@ -84,6 +84,8 @@ struct IncrementalAclExecutionStats {
   std::size_t speculative_d2h_padding_bytes = 0;
   std::size_t speculative_window_staging_operations = 0;
   std::size_t speculative_window_staging_bytes = 0;
+  std::size_t speculative_window_direct_output_bindings = 0;
+  std::size_t speculative_window_direct_output_bytes = 0;
   std::size_t speculative_window_staging_device_bytes = 0;
   std::size_t speculative_window_staging_pinned_host_bytes = 0;
   std::size_t prefill_verify_coalesced_windows = 0;
@@ -172,8 +174,11 @@ using IncrementalModelProgress = std::function<void(
 // The prefill body excludes its QLinear LM head; a small head-only OM runs
 // once after the final physical prompt chunk. This moves the prefill head
 // weight instead of retaining a dead copy in the body artifact.
-// Target/Draft states and compact Target results are ping-ponged in device
-// arenas. The carrier policy either binds only one-token row zero and falls
+// Target/Draft states are ping-ponged in device arenas. Ordinary and short
+// speculative windows bind compact Target results to the matching ping-pong
+// slot; extended windows bind each result directly to a dedicated staging slot
+// so later Target executions cannot overwrite it. The carrier policy either
+// binds only one-token row zero and falls
 // back to H2D after multi-token commits, or retains every last committed token,
 // binding row zero directly and compacting later rows D2D into the aligned
 // input. An explicit caller override retains the original H2D fallback.

@@ -327,9 +327,10 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   仍分配自己的 `weightSize`，不假设跨文件共享权重；
 - Target/Draft state 双缓冲留在 device，proposal 与 feature carrier 不回 host；
 - 默认 `draft-propose -> target-verify-commit -> compact D2H -> synchronize` 每轮一个 barrier；
-  `dflash_sync_window=2` 直接合并两套 compact arena，`3..8` 则把结果 D2D 到 4 KiB staging
-  arena；所有候选都在 token budget 安全时连续排完整事务，最后只做一次 D2H/同步，不改变
-  AIR/OM 输入输出；
+  `dflash_sync_window=2` 直接合并两套 compact arena，`3..8` 则让每次 Verify 的 compact 输出
+  直接绑定到 4 KiB staging arena 的独立 slot，后续 Draft/Decode 原地读取，不再执行结果 staging
+  D2D；所有候选都在 token budget 安全时连续排完整事务，最后只做一次 D2H/同步，不改变
+  AIR/OM tensor ABI；
 - 默认 `prefill_completion_policy=separate` 在最后一个 prefill 后暴露首 token；精确候选
   `coalesce-first-verify` 复用相同的两套 compact arena，把最后 prefill、已准备好的 Draft 和第一次
   Target verify 连续排入同一 stream，再用一次连续 D2H 和一次同步同时取回 prefill/verify 结果。
@@ -734,12 +735,12 @@ H2D 均为 65 次/32,180 bytes；window 1 的 D2H 为 455 次/122,005 bytes，wi
 DFlash measurement 的两个 transaction 从两个 host window 合并为一个。这个用例
 证明 `K=15/14` 路由真实执行，不代表真机时延已经改善。
 
-扩展 staging 路径也冻结了结构证据：70-token prompt、`max_new_tokens=58`、K 上限 15 时，每个
+扩展 direct-output 路径也冻结了结构证据：70-token prompt、`max_new_tokens=58`、K 上限 15 时，每个
 DFlash request 实际预算安全序列为 `15,15,15,8`。paired 3+10 的 13 个 DFlash request 共执行
-52 个 verify，但只形成 13 个 host-visible window，省 39 次 D2H/同步；52 次 compact D2D 共
-23,504 bytes，连续 D2H padding 共 2,340 bytes。五图与统一 Target-step 都保持 token `11..68`
-和零 token/EOS mismatch。它同样只是 Fake ACL 结构证据；新增 D2D 是否值得，必须在 310P 上
-比较 window 1/2/4/8。
+52 个 verify，但只形成 13 个 host-visible window，省 39 次 D2H/同步；52 次 direct output
+binding 覆盖 23,504 bytes，compact staging D2D 为 0，连续 D2H padding 共 2,340 bytes。五图与
+统一 Target-step 都保持 token `11..68` 和零 token/EOS mismatch。它同样只是 Fake ACL 结构
+证据；最终仍必须在 310P 上比较 window 1/2/4/8。
 
 这条排队规则依赖 AscendCL 的公开异步语义：[Stream 内任务按原始顺序执行](https://www.hiascend.com/document/detail/en/canncommercial/800/appdevg/aclcppdevg/aclcppdevg_000004.html)，
 [`aclmdlExecuteAsync` 是异步模型执行接口](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/apiref/appdevgapi/aclcppdevg_03_0299.html)，
@@ -969,11 +970,13 @@ buffer 路径分成三类：
 
 - window 1：直接下载一份 452-byte verify compact result；
 - window 2：直接合并两个 512-byte ping-pong slot，只做一次 `512+452` bytes D2H；
-- window 3..8：每个事务结束后，把 452 bytes 从与 Target state 绑定的两槽 ping-pong D2D 到
-  一个常驻的 8×512=4096-byte staging arena，最后只做一次连续 D2H 和一次同步。
+- window 3..8：预绑定 Verify output dataset，让每个 452-byte compact result 直接写入常驻
+  8×512=4096-byte staging arena 的独立 slot；后续 Draft 和 ordinary Decode 能直接读取该 slot，
+  最后只做一次连续 D2H 和一次同步。
 
-后两类减少 host barrier，但 window 3..8 额外增加 D2D，且在拒绝或早 EOS 时可能执行后续无用
-事务，所以不能假设窗口越大越快。它没有增加 OM，也没有改变 AIR/OM tensor ABI；默认仍是 1。
+后两类减少 host barrier；window 3..8 已消除此前每事务一次的 452-byte D2D，但在拒绝或早 EOS
+时仍可能执行后续无用事务，所以不能假设窗口越大越快。它没有增加 OM，也没有改变 AIR/OM
+tensor ABI；默认仍是 1。
 
 先生成四份只差该字段的配置：
 
@@ -1019,8 +1022,8 @@ for ORDER in forward reverse; do
 done
 ```
 
-先对同一顺序的四份报告做精确性和计数闭合，再看 latency。window 1/2 的 staging 操作必须为
-0；window 4/8 只有实际组成了至少 3 事务的窗口才会大于 0：
+先对同一顺序的四份报告做精确性和计数闭合，再看 latency。所有窗口的 compact staging D2D
+必须为 0；window 4/8 只有实际组成了至少 3 事务的窗口时，direct-output binding 才会大于 0：
 
 ```bash
 jq -e -s '
@@ -1054,8 +1057,12 @@ jq -e -s '
     ($io.speculative_window_staging_bytes ==
      ($io.speculative_window_staging_operations *
       $io.compact_verify_result_bytes)) and
+    ($io.speculative_window_staging_operations == 0) and
+    ($io.speculative_window_direct_output_bytes ==
+     ($io.speculative_window_direct_output_bindings *
+      $io.compact_verify_result_bytes)) and
     ((.protocol.dflash_sync_window > 2) or
-     ($io.speculative_window_staging_operations == 0)) and
+     ($io.speculative_window_direct_output_bindings == 0)) and
     ($io.speculative_window_staging_device_bytes ==
      (8 * $io.compact_slot_bytes)) and
     ($io.speculative_window_staging_pinned_host_bytes ==
@@ -1085,6 +1092,10 @@ jq -s 'map({
     .execution_io_counters.speculative_window_staging_operations,
   staging_d2d_bytes:
     .execution_io_counters.speculative_window_staging_bytes,
+  direct_output_bindings:
+    .execution_io_counters.speculative_window_direct_output_bindings,
+  direct_output_bytes:
+    .execution_io_counters.speculative_window_direct_output_bytes,
   compact_slot_bytes: .execution_io_counters.compact_slot_bytes,
   compact_verify_result_bytes:
     .execution_io_counters.compact_verify_result_bytes,
@@ -1108,7 +1119,7 @@ jq -s 'map({
 
 把相同检查再用于 reverse 四份报告。只有某个候选在同机正反顺序、未开 msprof 的 3+10 中
 token/EOS 全部一致，且代表性的长度、接受率和早 EOS 用例里 DFlash median 与 p90 都稳定改善，
-才可以选择它。若额外 D2D/graph work 抵消同步收益、拒绝或 EOS workload 变慢，或结果落在噪声
+才可以选择它。若额外排队的 graph work 抵消同步收益、拒绝或 EOS workload 变慢，或结果落在噪声
 内，继续使用默认 window 1。Fake ACL 只能验证排队、预算和 buffer 生命周期，不能作为选择门禁
 的时延输入。
 
@@ -1640,8 +1651,10 @@ done
 目录。分析器会要求 `aclmdlExecuteAsync` 按 transaction 闭合、实际 D2H 加
 `speculative_d2h_operations_elided` 和 `prefill_verify_d2h_operations_elided` 后按 transaction
 闭合，而 `aclrtSynchronizeStream` 按
-`speculative_sync_windows` 闭合；window 3..8 的 `aclrtMemcpyAsync` 还必须加上
-`speculative_window_staging_operations`，任何候选都不应伪装成少执行了 verify。
+`speculative_sync_windows` 闭合。schema 10 的 window 3..8 必须报告
+`speculative_window_staging_operations=0`，所以 `aclrtMemcpyAsync` 期望值不再加 compact staging；
+`speculative_window_direct_output_bindings/bytes` 则必须与 Verify 直接输出闭合，但不会作为 memcpy
+事件出现。任何候选都不应伪装成少执行了 verify。
 
 统一 Target-step 必须单独采一组 profile，仍然不带 `target-decode1`；三组 metric 不要塞进同一
 采集进程：
@@ -1735,6 +1748,7 @@ jq '{
   top_operators: .top_operators[:20],
   api_statistics: .api_statistics[:20],
   expected_memcpy_signature,
+  expected_verify_direct_output_signature,
   expected_synchronization_signature
 }' "$MSPROF_ANALYSIS"
 ```

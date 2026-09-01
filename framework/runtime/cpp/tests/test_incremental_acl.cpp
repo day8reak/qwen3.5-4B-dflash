@@ -250,6 +250,8 @@ void RunPolicy(
               stats.speculative_window_staging_device_bytes &&
           stats.speculative_window_staging_operations == 0 &&
           stats.speculative_window_staging_bytes == 0 &&
+          stats.speculative_window_direct_output_bindings == 0 &&
+          stats.speculative_window_direct_output_bytes == 0 &&
           stats.carrier_device_bytes >
               stats.compact_ping_pong_device_bytes +
                   stats.speculative_window_staging_device_bytes,
@@ -533,11 +535,13 @@ void TestCommittedDraftFeaturePrefix(
   }
   if (sync_window > 2) {
     Require(
-        stats.speculative_window_staging_operations > 0 &&
-            stats.speculative_window_staging_bytes ==
-                stats.speculative_window_staging_operations *
+        stats.speculative_window_staging_operations == 0 &&
+            stats.speculative_window_staging_bytes == 0 &&
+            stats.speculative_window_direct_output_bindings > 0 &&
+            stats.speculative_window_direct_output_bytes ==
+                stats.speculative_window_direct_output_bindings *
                     stats.compact_verify_result_bytes,
-        "extended committed-prefix window did not stage compact results");
+        "extended committed-prefix window did not bind direct compact outputs");
   }
 }
 
@@ -608,37 +612,79 @@ void TestPrefillVerifyCoalescing(
 
 void TestExtendedSpeculativeWindow(
     const std::array<std::filesystem::path, 5>& model_paths) {
-  qwen35::dflash::IncrementalOmPaths paths{
+  {
+    qwen35::dflash::IncrementalOmPaths paths{
+        model_paths[0], model_paths[1], model_paths[2], model_paths[3],
+        model_paths[4]};
+    qwen35::dflash::AclIncrementalExecutor executor(std::move(paths));
+    qwen35::dflash::GenerationOptions options;
+    options.max_new_tokens = 66;
+    options.max_draft_tokens = 15;
+    options.dflash_sync_window = 8;
+    const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+        executor,
+        {10},
+        qwen35::dflash::GenerationMode::kOrdinary,
+        options);
+    const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+        executor,
+        {10},
+        qwen35::dflash::GenerationMode::kDFlash,
+        options);
+    Require(
+        ordinary.generated_token_ids == dflash.generated_token_ids &&
+            dflash.generated_token_ids.size() == options.max_new_tokens,
+        "extended speculative window changed exact generated tokens");
+    const auto& stats = executor.execution_stats();
+    Require(
+        stats.speculative_sync_windows == 1 &&
+            stats.speculative_synchronizations_elided == 3 &&
+            stats.speculative_d2h_operations_elided == 3 &&
+            stats.speculative_window_staging_operations == 0 &&
+            stats.speculative_window_staging_bytes == 0 &&
+            stats.speculative_window_direct_output_bindings == 4 &&
+            stats.speculative_window_direct_output_bytes ==
+                4 * stats.compact_verify_result_bytes,
+        "extended speculative window did not close four transactions in one barrier");
+    Require(
+        stats.decode_id_multi_token_carrier_hits > 0 &&
+            stats.decode_id_device_compaction_operations ==
+                stats.decode_id_multi_token_carrier_hits,
+        "ordinary decode did not consume the final staged multi-token carrier");
+  }
+
+  qwen35::dflash::IncrementalOmPaths cross_paths{
       model_paths[0], model_paths[1], model_paths[2], model_paths[3],
       model_paths[4]};
-  qwen35::dflash::AclIncrementalExecutor executor(std::move(paths));
-  qwen35::dflash::GenerationOptions options;
-  options.max_new_tokens = 58;
-  options.max_draft_tokens = 15;
-  options.dflash_sync_window = 8;
-  const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
-      executor,
-      {10},
-      qwen35::dflash::GenerationMode::kOrdinary,
-      options);
-  const auto dflash = qwen35::dflash::GenerateStatefulOnce(
-      executor,
+  qwen35::dflash::AclIncrementalExecutor cross_executor(
+      std::move(cross_paths));
+  qwen35::dflash::GenerationOptions cross_options;
+  cross_options.max_new_tokens = 70;
+  cross_options.max_draft_tokens = 7;
+  cross_options.dflash_sync_window = 8;
+  const auto cross_window = qwen35::dflash::GenerateStatefulOnce(
+      cross_executor,
       {10},
       qwen35::dflash::GenerationMode::kDFlash,
-      options);
+      cross_options);
+  std::vector<std::int64_t> expected_cross;
+  expected_cross.reserve(cross_options.max_new_tokens);
+  for (std::size_t index = 0;
+       index < cross_options.max_new_tokens; ++index) {
+    expected_cross.push_back(11 + static_cast<std::int64_t>(index));
+  }
   Require(
-      ordinary.generated_token_ids == dflash.generated_token_ids &&
-          dflash.generated_token_ids.size() == options.max_new_tokens,
-      "extended speculative window changed exact generated tokens");
-  const auto& stats = executor.execution_stats();
+      cross_window.generated_token_ids == expected_cross,
+      "a later window did not consume the prior staged compact carrier");
+  const auto& cross_stats = cross_executor.execution_stats();
   Require(
-      stats.speculative_sync_windows == 1 &&
-          stats.speculative_synchronizations_elided == 3 &&
-          stats.speculative_d2h_operations_elided == 3 &&
-          stats.speculative_window_staging_operations == 4 &&
-          stats.speculative_window_staging_bytes ==
-              4 * stats.compact_verify_result_bytes,
-      "extended speculative window did not close four transactions in one barrier");
+      cross_stats.speculative_sync_windows == 2 &&
+          cross_stats.speculative_synchronizations_elided == 7 &&
+          cross_stats.speculative_window_direct_output_bindings == 8 &&
+          cross_stats.speculative_window_direct_output_bytes ==
+              8 * cross_stats.compact_verify_result_bytes &&
+          cross_stats.speculative_window_staging_operations == 0,
+      "cross-window direct compact carrier accounting differs");
 }
 
 }  // namespace

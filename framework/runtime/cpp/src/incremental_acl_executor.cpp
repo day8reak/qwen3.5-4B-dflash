@@ -693,6 +693,8 @@ class AclIncrementalExecutor::Impl {
     committed_feature_rows_ = 0;
     committed_feature_rows_valid_ = false;
     decode_carrier_valid_ = false;
+    compact_carrier_is_staged_ = false;
+    compact_carrier_staging_index_ = 0;
     decode_carrier_row_ = 0;
     feature_source_ = FeatureSource::kNone;
     prefill_staging_index_ = 0;
@@ -869,10 +871,17 @@ class AclIncrementalExecutor::Impl {
     DatasetPlan* plan = nullptr;
     if (decode_carrier_valid_ && decode_carrier_token_id_ == input_token_id) {
       if (decode_carrier_row_ == 0) {
-        plan = &decode_carrier_plans_[target_state_index_];
+        plan = compact_carrier_is_staged_
+            ? &staged_decode_carrier_plans_[target_state_index_]
+                  [compact_carrier_staging_index_]
+            : &decode_carrier_plans_[target_state_index_];
       } else {
         CompactDecodeIdToAlignedInput(
-            target_state_index_, decode_carrier_row_);
+            target_state_index_,
+            compact_carrier_is_staged_
+                ? compact_carrier_staging_index_
+                : kMaxSpeculativeSyncWindow,
+            decode_carrier_row_);
         plan = &decode_upload_plans_[target_state_index_];
       }
       ++stats_.decode_id_device_carrier_hits;
@@ -965,9 +974,9 @@ class AclIncrementalExecutor::Impl {
       pending.push_back(EnqueueSpeculative(
           logical_proposal_counts[index],
           index != 0,
-          index == 0 ? 0 : logical_proposal_counts[index - 1] + 1));
-      StageCompactForSpeculativeWindow(
-          pending.back().compact_state_index, index);
+          index == 0 ? 0 : logical_proposal_counts[index - 1] + 1,
+          index == 0 ? kMaxSpeculativeSyncWindow : index - 1,
+          index));
     }
     DownloadStagedSpeculativeWindow(pending.size());
     Synchronize();
@@ -976,6 +985,11 @@ class AclIncrementalExecutor::Impl {
     std::vector<StatefulStep> result;
     result.reserve(pending.size());
     for (std::size_t index = 0; index < pending.size(); ++index) {
+      if (!pending[index].compact_is_staged ||
+          pending[index].compact_staging_index != index) {
+        throw std::logic_error(
+            "extended speculative window lost its direct output route");
+      }
       result.push_back(ReadCompactAndTrackCarrierFrom(
           speculative_window_compact_,
           kMaxSpeculativeSyncWindow,
@@ -990,16 +1004,31 @@ class AclIncrementalExecutor::Impl {
   struct PendingSpeculative {
     std::size_t model_executions = 0;
     std::size_t compact_state_index = 0;
+    bool compact_is_staged = false;
+    std::size_t compact_staging_index = 0;
   };
 
   PendingSpeculative EnqueueSpeculative(
       std::size_t logical_proposal_count,
       bool allow_pending_stream_work,
-      std::size_t pending_feature_upper_bound = 0) {
+      std::size_t pending_feature_upper_bound = 0,
+      std::size_t pending_compact_staging_index =
+          kMaxSpeculativeSyncWindow,
+      std::size_t output_compact_staging_index =
+          kMaxSpeculativeSyncWindow) {
     RequireReset();
     RequirePrefilled();
     RequireCompletedPrefill(allow_pending_stream_work);
     RequireProposalCount(logical_proposal_count);
+    if (pending_compact_staging_index > kMaxSpeculativeSyncWindow ||
+        output_compact_staging_index > kMaxSpeculativeSyncWindow) {
+      throw std::out_of_range("speculative compact route index is invalid");
+    }
+    if (!allow_pending_stream_work &&
+        pending_compact_staging_index != kMaxSpeculativeSyncWindow) {
+      throw std::logic_error(
+          "host-visible speculative step cannot name a pending carrier");
+    }
     std::size_t executions = 1;
     if (proposal_ready_) {
       if (prepared_proposal_count_ != logical_proposal_count) {
@@ -1035,13 +1064,31 @@ class AclIncrementalExecutor::Impl {
           feature_route = DraftFeatureRoute::kCommittedPrefix;
         }
       }
-      ExecuteDraft(FeatureSource::kVerify, feature_rows, feature_route);
+      const std::size_t compact_staging_index = allow_pending_stream_work
+          ? pending_compact_staging_index
+          : (compact_carrier_is_staged_
+                 ? compact_carrier_staging_index_
+                 : kMaxSpeculativeSyncWindow);
+      ExecuteDraft(
+          FeatureSource::kVerify,
+          feature_rows,
+          feature_route,
+          compact_staging_index);
       ++executions;
     }
     const std::size_t physical_rows = logical_proposal_count + 1;
+    const bool staged_output =
+        output_compact_staging_index < kMaxSpeculativeSyncWindow;
     DatasetPlan& target_plan = unified_target_step_
-        ? target_step_plans_.at(physical_rows - 1)[target_state_index_]
-        : verify_plans_[target_state_index_];
+        ? (staged_output
+               ? staged_target_step_plans_.at(physical_rows - 1)
+                     [target_state_index_][output_compact_staging_index]
+               : target_step_plans_.at(physical_rows - 1)
+                     [target_state_index_])
+        : (staged_output
+               ? staged_verify_plans_[target_state_index_]
+                     [output_compact_staging_index]
+               : verify_plans_[target_state_index_]);
     Execute(
         verify_,
         target_plan,
@@ -1052,10 +1099,18 @@ class AclIncrementalExecutor::Impl {
     if (unified_target_step_) {
       stats_.target_step_padded_rows_elided += verify_width_ - physical_rows;
     }
+    if (staged_output) {
+      ++stats_.speculative_window_direct_output_bindings;
+      stats_.speculative_window_direct_output_bytes += compact_verify_bytes_;
+    }
     target_state_index_ = 1 - target_state_index_;
     proposal_ready_ = false;
     feature_source_ = FeatureSource::kVerify;
-    return PendingSpeculative{executions, target_state_index_};
+    return PendingSpeculative{
+        executions,
+        target_state_index_,
+        staged_output,
+        staged_output ? output_compact_staging_index : 0};
   }
 
   enum class FeatureSource : std::size_t {
@@ -1605,11 +1660,13 @@ class AclIncrementalExecutor::Impl {
       target_step_dynamic_control_.Allocate(
           verify_.inputs.at(verify_.dynamic_input_index).bytes);
       target_step_plans_.resize(verify_width_);
+      staged_target_step_plans_.resize(verify_width_);
     }
 
     prefill_plans_.resize(stats_.prefill_staging_slots);
     prefill_draft_plans_.resize(stats_.prefill_staging_slots);
     verify_draft_plans_.resize(verify_width_);
+    staged_verify_draft_plans_.resize(verify_width_);
     if (state_reset_policy_ == IncrementalStateResetPolicy::kImmutableZero) {
       initial_draft_plans_.resize(stats_.prefill_staging_slots);
     }
@@ -1913,6 +1970,39 @@ class AclIncrementalExecutor::Impl {
     };
   }
 
+  BufferView StagedCompactView(
+      std::size_t staging_index,
+      std::size_t offset,
+      std::size_t bytes) const {
+    if (staging_index >= kMaxSpeculativeSyncWindow) {
+      throw std::out_of_range("speculative compact staging index is invalid");
+    }
+    if (offset > compact_slot_bytes_ ||
+        bytes > compact_slot_bytes_ - offset) {
+      throw std::out_of_range(
+          "speculative compact binding exceeds its staging slot");
+    }
+    const std::size_t slot_offset = staging_index * compact_slot_bytes_;
+    return BufferView{
+        static_cast<std::byte*>(speculative_window_compact_.device.data) +
+            slot_offset + offset,
+        bytes,
+    };
+  }
+
+  BufferView CarrierCompactView(
+      std::size_t target_state_index,
+      std::size_t staging_index,
+      std::size_t offset,
+      std::size_t bytes) const {
+    if (staging_index > kMaxSpeculativeSyncWindow) {
+      throw std::out_of_range("compact carrier route index is invalid");
+    }
+    return staging_index < kMaxSpeculativeSyncWindow
+        ? StagedCompactView(staging_index, offset, bytes)
+        : CompactView(target_state_index, offset, bytes);
+  }
+
   std::vector<BufferView> TargetInputs(
       const std::vector<BufferView>& prefix,
       std::size_t state_index) const {
@@ -1928,6 +2018,7 @@ class AclIncrementalExecutor::Impl {
     const auto build_draft = [this](
                                  DatasetPlan& plan,
                                  std::size_t target_state_index,
+                                 std::size_t compact_staging_index,
                                  const BufferView& features,
                                  const BufferView& committed_count,
                                  const std::vector<BufferView>& input_state,
@@ -1939,12 +2030,14 @@ class AclIncrementalExecutor::Impl {
           draft_,
           {features,
            committed_count,
-           CompactView(
+           CarrierCompactView(
                target_state_index,
+               compact_staging_index,
                compact_token_offset_,
                draft_.PublicInput(2).bytes),
-           CompactView(
+           CarrierCompactView(
                target_state_index,
+               compact_staging_index,
                compact_commit_offset_,
                draft_.PublicInput(3).bytes),
            ProposalCountView(),
@@ -1983,25 +2076,26 @@ class AclIncrementalExecutor::Impl {
              target_states_[next].tensors[3],
              target_states_[next].tensors[4]});
       }
-      const auto verify_outputs = [this, next]() {
+      const auto verify_outputs = [this, next](
+                                      std::size_t staging_index =
+                                          kMaxSpeculativeSyncWindow) {
+        const auto compact_output = [this, next, staging_index](
+                                        std::size_t offset,
+                                        std::size_t bytes) {
+          return CarrierCompactView(next, staging_index, offset, bytes);
+        };
         return std::vector<BufferView>{
-            CompactView(
-                next, compact_token_offset_, verify_.outputs[0].bytes),
-            CompactView(
-                next, compact_commit_offset_, verify_.outputs[1].bytes),
-            CompactView(
-                next, compact_drafted_offset_, verify_.outputs[2].bytes),
-            CompactView(
-                next, compact_accepted_offset_, verify_.outputs[3].bytes),
-            CompactView(
-                next, compact_rejected_offset_, verify_.outputs[4].bytes),
+            compact_output(compact_token_offset_, verify_.outputs[0].bytes),
+            compact_output(compact_commit_offset_, verify_.outputs[1].bytes),
+            compact_output(compact_drafted_offset_, verify_.outputs[2].bytes),
+            compact_output(compact_accepted_offset_, verify_.outputs[3].bytes),
+            compact_output(compact_rejected_offset_, verify_.outputs[4].bytes),
             target_states_[next].tensors[0],
             target_states_[next].tensors[1],
             prefill_features_.View(verify_.outputs[7].bytes),
             committed_input_count_.View(),
             target_states_[next].tensors[4],
-            CompactView(
-                next, compact_finished_offset_, verify_.outputs[10].bytes),
+            compact_output(compact_finished_offset_, verify_.outputs[10].bytes),
             target_states_[next].tensors[2],
             target_states_[next].tensors[3]};
       };
@@ -2010,13 +2104,14 @@ class AclIncrementalExecutor::Impl {
                                            DatasetPlan& plan,
                                            const BufferView& input_ids,
                                            std::size_t rows,
-                                           const BufferView& proposal_count) {
+                                           const BufferView& proposal_count,
+                                           std::size_t output_staging_index) {
           plan.Build(
               verify_,
               TargetInputs(
                   {input_ids, proposal_count, EosIdsView(), EosCountView()},
                   current),
-              verify_outputs(),
+              verify_outputs(output_staging_index),
               target_step_dynamic_control_.View());
           Check(
               aclmdlSetInputDynamicDims(
@@ -2031,19 +2126,41 @@ class AclIncrementalExecutor::Impl {
             decode_upload_plans_[current],
             decode_id_.View(),
             1,
-            TargetStepZeroCountView());
+            TargetStepZeroCountView(),
+            kMaxSpeculativeSyncWindow);
         build_target_step(
             decode_carrier_plans_[current],
             CompactView(
                 current, compact_token_offset_, sizeof(std::int64_t)),
             1,
-            TargetStepZeroCountView());
+            TargetStepZeroCountView(),
+            kMaxSpeculativeSyncWindow);
+        for (std::size_t staging = 0;
+             staging < kMaxSpeculativeSyncWindow; ++staging) {
+          build_target_step(
+              staged_decode_carrier_plans_[current][staging],
+              StagedCompactView(
+                  staging, compact_token_offset_, sizeof(std::int64_t)),
+              1,
+              TargetStepZeroCountView(),
+              kMaxSpeculativeSyncWindow);
+        }
         for (std::size_t rows = 2; rows <= verify_width_; ++rows) {
           build_target_step(
               target_step_plans_[rows - 1][current],
               verify_ids_.View(rows * sizeof(std::int64_t)),
               rows,
-              ProposalCountView());
+              ProposalCountView(),
+              kMaxSpeculativeSyncWindow);
+          for (std::size_t staging = 0;
+               staging < kMaxSpeculativeSyncWindow; ++staging) {
+            build_target_step(
+                staged_target_step_plans_[rows - 1][current][staging],
+                verify_ids_.View(rows * sizeof(std::int64_t)),
+                rows,
+                ProposalCountView(),
+                staging);
+          }
         }
       } else {
         const auto decode_outputs = [this, next]() {
@@ -2076,6 +2193,19 @@ class AclIncrementalExecutor::Impl {
                  EosIdsView(), EosCountView()},
                 current),
             decode_outputs());
+        for (std::size_t staging = 0;
+             staging < kMaxSpeculativeSyncWindow; ++staging) {
+          staged_decode_carrier_plans_[current][staging].Build(
+              decode_,
+              TargetInputs(
+                  {StagedCompactView(
+                       staging,
+                       compact_token_offset_,
+                       decode_.PublicInput(0).bytes),
+                   EosIdsView(), EosCountView()},
+                  current),
+              decode_outputs());
+        }
         verify_plans_[current].Build(
             verify_,
             TargetInputs(
@@ -2083,6 +2213,16 @@ class AclIncrementalExecutor::Impl {
                  EosCountView()},
                 current),
             verify_outputs());
+        for (std::size_t staging = 0;
+             staging < kMaxSpeculativeSyncWindow; ++staging) {
+          staged_verify_plans_[current][staging].Build(
+              verify_,
+              TargetInputs(
+                  {verify_ids_.View(), ProposalCountView(), EosIdsView(),
+                   EosCountView()},
+                  current),
+              verify_outputs(staging));
+        }
       }
       prefill_head_plans_[current].Build(
           prefill_head_,
@@ -2108,6 +2248,7 @@ class AclIncrementalExecutor::Impl {
           build_draft(
               verify_draft_plans_.at(rows - 1)[target][current],
               target,
+              kMaxSpeculativeSyncWindow,
               PrefillFeatureBatchView(),
               committed_input_count_.View(),
               draft_states_[current].tensors,
@@ -2115,11 +2256,31 @@ class AclIncrementalExecutor::Impl {
               verify_dynamic_control_.View(),
               draft_gear_verify_.at(rows - 1),
               "verify committed-prefix prebind");
+          if (draft_feature_policy_ ==
+                  IncrementalDraftFeaturePolicy::kCommittedPrefix ||
+              rows == verify_width_) {
+            for (std::size_t staging = 0;
+                 staging < kMaxSpeculativeSyncWindow; ++staging) {
+              build_draft(
+                  staged_verify_draft_plans_.at(rows - 1)
+                      [target][current][staging],
+                  target,
+                  staging,
+                  PrefillFeatureBatchView(),
+                  committed_input_count_.View(),
+                  draft_states_[current].tensors,
+                  draft_states_[next].tensors,
+                  verify_dynamic_control_.View(),
+                  draft_gear_verify_.at(rows - 1),
+                  "verify direct-staging carrier prebind");
+            }
+          }
         }
         for (std::size_t slot = 0; slot < prefill_draft_plans_.size(); ++slot) {
           build_draft(
               prefill_draft_plans_[slot][target][current],
               target,
+              kMaxSpeculativeSyncWindow,
               PrefillFeatureBatchView(),
               PrefillTotalCountView(),
               draft_states_[current].tensors,
@@ -2156,6 +2317,7 @@ class AclIncrementalExecutor::Impl {
           build_draft(
               initial_draft_plans_[slot][target],
               target,
+              kMaxSpeculativeSyncWindow,
               PrefillFeatureBatchView(),
               PrefillTotalCountView(),
               draft_zero_state_.tensors,
@@ -2255,7 +2417,9 @@ class AclIncrementalExecutor::Impl {
   void ExecuteDraft(
       FeatureSource source,
       std::size_t feature_rows,
-      DraftFeatureRoute feature_route) {
+      DraftFeatureRoute feature_route,
+      std::size_t compact_staging_index =
+          kMaxSpeculativeSyncWindow) {
     if (source == FeatureSource::kNone) {
       throw std::logic_error("invalid Draft feature source/gear");
     }
@@ -2270,6 +2434,11 @@ class AclIncrementalExecutor::Impl {
     if ((prefill_source && feature_route != DraftFeatureRoute::kPrefill) ||
         (!prefill_source && feature_route == DraftFeatureRoute::kPrefill)) {
       throw std::logic_error("Draft feature route does not match its source");
+    }
+    if (compact_staging_index > kMaxSpeculativeSyncWindow ||
+        (prefill_source &&
+         compact_staging_index != kMaxSpeculativeSyncWindow)) {
+      throw std::logic_error("Draft compact carrier route is invalid");
     }
     const bool use_immutable_zero =
         draft_reset_pending_ &&
@@ -2289,8 +2458,12 @@ class AclIncrementalExecutor::Impl {
           : &prefill_draft_plans_.at(gear_index)
                  [target_state_index_][draft_state_index_];
     } else {
-      plan = &verify_draft_plans_.at(feature_rows - 1)
-                  [target_state_index_][draft_state_index_];
+      plan = compact_staging_index < kMaxSpeculativeSyncWindow
+          ? &staged_verify_draft_plans_.at(feature_rows - 1)
+                 [target_state_index_][draft_state_index_]
+                 [compact_staging_index]
+          : &verify_draft_plans_.at(feature_rows - 1)
+                 [target_state_index_][draft_state_index_];
     }
     Execute(draft_, *plan, feature_rows);
     ++stats_.draft_propose_executions;
@@ -2339,12 +2512,14 @@ class AclIncrementalExecutor::Impl {
 
   void CompactDecodeIdToAlignedInput(
       std::size_t state_index,
+      std::size_t staging_index,
       std::size_t row) {
     if (row == 0 || row >= verify_width_) {
       throw std::out_of_range("decode carrier compaction row is invalid");
     }
-    const BufferView source = CompactView(
+    const BufferView source = CarrierCompactView(
         state_index,
+        staging_index,
         compact_token_offset_ + row * sizeof(std::int64_t),
         decode_id_.bytes);
     Check(
@@ -2441,32 +2616,6 @@ class AclIncrementalExecutor::Impl {
     ++stats_.speculative_d2h_operations_elided;
     stats_.speculative_d2h_padding_bytes +=
         compact_slot_bytes_ - compact_verify_bytes_;
-  }
-
-  void StageCompactForSpeculativeWindow(
-      std::size_t state_index,
-      std::size_t staging_index) {
-    if (state_index >= kCompactSlotCount ||
-        staging_index >= kMaxSpeculativeSyncWindow) {
-      throw std::out_of_range(
-          "speculative compact staging index is invalid");
-    }
-    const std::size_t source_offset = state_index * compact_slot_bytes_;
-    const std::size_t destination_offset = staging_index * compact_slot_bytes_;
-    Check(
-        aclrtMemcpyAsync(
-            static_cast<std::byte*>(speculative_window_compact_.device.data) +
-                destination_offset,
-            speculative_window_compact_.device.bytes - destination_offset,
-            static_cast<const std::byte*>(compact_.device.data) +
-                source_offset,
-            compact_verify_bytes_,
-            ACL_MEMCPY_DEVICE_TO_DEVICE,
-            stream_),
-        "aclrtMemcpyAsync(speculative compact device staging)");
-    stream_work_pending_ = true;
-    ++stats_.speculative_window_staging_operations;
-    stats_.speculative_window_staging_bytes += compact_verify_bytes_;
   }
 
   void DownloadStagedSpeculativeWindow(std::size_t transaction_count) {
@@ -2617,7 +2766,8 @@ class AclIncrementalExecutor::Impl {
         verify,
         model_executions,
         state_index);
-    return TrackCompactCarrier(verify, std::move(result));
+    return TrackCompactCarrier(
+        verify, std::move(result), true, state_index);
   }
 
   StatefulStep ReadCompactAndTrackCarrier(
@@ -2625,10 +2775,20 @@ class AclIncrementalExecutor::Impl {
       std::size_t model_executions,
       std::size_t state_index) {
     StatefulStep result = ReadCompact(verify, model_executions, state_index);
-    return TrackCompactCarrier(verify, std::move(result));
+    return TrackCompactCarrier(
+        verify, std::move(result), false, state_index);
   }
 
-  StatefulStep TrackCompactCarrier(bool verify, StatefulStep result) {
+  StatefulStep TrackCompactCarrier(
+      bool verify,
+      StatefulStep result,
+      bool compact_is_staged,
+      std::size_t compact_index) {
+    if ((compact_is_staged &&
+         compact_index >= kMaxSpeculativeSyncWindow) ||
+        (!compact_is_staged && compact_index >= kCompactSlotCount)) {
+      throw std::out_of_range("tracked compact carrier index is invalid");
+    }
     if (verify) {
       if (result.accepted_draft_tokens >= verify_width_) {
         throw std::runtime_error(
@@ -2637,6 +2797,8 @@ class AclIncrementalExecutor::Impl {
       committed_feature_rows_ = result.accepted_draft_tokens + 1;
       committed_feature_rows_valid_ = true;
     }
+    compact_carrier_is_staged_ = compact_is_staged;
+    compact_carrier_staging_index_ = compact_is_staged ? compact_index : 0;
     decode_carrier_valid_ =
         result.token_ids.size() == 1 ||
         decode_carrier_policy_ ==
@@ -2681,8 +2843,23 @@ class AclIncrementalExecutor::Impl {
       }
     }
     verify_draft_plans_.clear();
+    for (auto& by_rows : staged_verify_draft_plans_) {
+      for (auto& by_target : by_rows) {
+        for (auto& by_state : by_target) {
+          for (auto& plan : by_state) {
+            plan.Release();
+          }
+        }
+      }
+    }
+    staged_verify_draft_plans_.clear();
     for (auto& plan : verify_plans_) {
       plan.Release();
+    }
+    for (auto& by_state : staged_verify_plans_) {
+      for (auto& plan : by_state) {
+        plan.Release();
+      }
     }
     for (auto& by_state : target_step_plans_) {
       for (auto& plan : by_state) {
@@ -2690,8 +2867,21 @@ class AclIncrementalExecutor::Impl {
       }
     }
     target_step_plans_.clear();
+    for (auto& by_rows : staged_target_step_plans_) {
+      for (auto& by_state : by_rows) {
+        for (auto& plan : by_state) {
+          plan.Release();
+        }
+      }
+    }
+    staged_target_step_plans_.clear();
     for (auto& plan : decode_carrier_plans_) {
       plan.Release();
+    }
+    for (auto& by_state : staged_decode_carrier_plans_) {
+      for (auto& plan : by_state) {
+        plan.Release();
+      }
     }
     for (auto& plan : decode_upload_plans_) {
       plan.Release();
@@ -2840,12 +3030,28 @@ class AclIncrementalExecutor::Impl {
   std::vector<std::array<DatasetPlan, 2>> prefill_plans_;
   std::array<DatasetPlan, 2> decode_upload_plans_;
   std::array<DatasetPlan, 2> decode_carrier_plans_;
+  std::array<std::array<DatasetPlan, kMaxSpeculativeSyncWindow>, 2>
+      staged_decode_carrier_plans_;
   std::array<DatasetPlan, 2> verify_plans_;
+  std::array<std::array<DatasetPlan, kMaxSpeculativeSyncWindow>, 2>
+      staged_verify_plans_;
   std::vector<std::array<DatasetPlan, 2>> target_step_plans_;
+  std::vector<
+      std::array<
+          std::array<DatasetPlan, kMaxSpeculativeSyncWindow>,
+          2>>
+      staged_target_step_plans_;
   std::vector<std::array<std::array<DatasetPlan, 2>, 2>>
       prefill_draft_plans_;
   std::vector<std::array<std::array<DatasetPlan, 2>, 2>>
       verify_draft_plans_;
+  std::vector<
+      std::array<
+          std::array<
+              std::array<DatasetPlan, kMaxSpeculativeSyncWindow>,
+              2>,
+          2>>
+      staged_verify_draft_plans_;
   DatasetPlan initial_prefill_plan_;
   std::array<DatasetPlan, 2> prefill_head_plans_;
   std::vector<std::array<DatasetPlan, 2>> initial_draft_plans_;
@@ -2859,6 +3065,8 @@ class AclIncrementalExecutor::Impl {
   bool proposal_ready_ = false;
   std::size_t prepared_proposal_count_ = 0;
   bool decode_carrier_valid_ = false;
+  bool compact_carrier_is_staged_ = false;
+  std::size_t compact_carrier_staging_index_ = 0;
   std::size_t decode_carrier_row_ = 0;
   std::int64_t decode_carrier_token_id_ = 0;
   FeatureSource feature_source_ = FeatureSource::kNone;

@@ -571,10 +571,14 @@ void WriteReport(
       execution.speculative_window_staging_bytes !=
           execution.speculative_window_staging_operations *
               execution.compact_verify_result_bytes ||
-      execution.speculative_window_staging_operations >
+      execution.speculative_window_staging_operations != 0 ||
+      execution.speculative_window_direct_output_bytes !=
+          execution.speculative_window_direct_output_bindings *
+              execution.compact_verify_result_bytes ||
+      execution.speculative_window_direct_output_bindings >
           execution.target_verify_commit_executions ||
       (arguments.dflash_sync_window <= 2 &&
-       execution.speculative_window_staging_operations != 0) ||
+       execution.speculative_window_direct_output_bindings != 0) ||
       execution.speculative_window_staging_device_bytes !=
           executor.max_speculative_sync_window() *
               execution.compact_slot_bytes ||
@@ -671,7 +675,7 @@ void WriteReport(
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":9,\"status\":\"PASS\","
+         << "{\"schema_version\":10,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
          << (executor.unified_target_step() ? "four" : "five")
          << "-resident-OM paired model loop\","
@@ -877,8 +881,9 @@ void WriteReport(
          << "\"proposal_policy\":\"Draft-to-verify device carrier; no proposal D2H/H2D\","
          << "\"result_policy\":\"one logical compact result per complete "
             "transaction; a two-transaction DFlash window coalesces adjacent "
-            "ping-pong slots, while windows of three to eight stage each "
-            "452-byte result D2D into a 4 KiB arena before one D2H; an "
+            "ping-pong slots, while windows of three to eight bind each "
+            "452-byte Verify result directly into a 4 KiB staging arena "
+            "before one D2H, with no post-Verify staging D2D; an "
             "eligible final prefill "
             "and first verify may independently share one contiguous D2H; "
             "one barrier per completed prompt/decode window; no host-visible "
@@ -920,6 +925,10 @@ void WriteReport(
          << execution.speculative_window_staging_operations
          << ",\"speculative_window_staging_bytes\":"
          << execution.speculative_window_staging_bytes
+         << ",\"speculative_window_direct_output_bindings\":"
+         << execution.speculative_window_direct_output_bindings
+         << ",\"speculative_window_direct_output_bytes\":"
+         << execution.speculative_window_direct_output_bytes
          << ",\"speculative_window_staging_device_bytes\":"
          << execution.speculative_window_staging_device_bytes
          << ",\"speculative_window_staging_pinned_host_bytes\":"
