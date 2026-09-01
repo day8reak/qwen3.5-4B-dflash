@@ -36,7 +36,7 @@ NPU_DYNAMIC_QUANT_TORCH_OP = "npu::npu_dynamic_quant"
 NPU_QUANT_MATMUL_TORCH_OP = "npu::npu_quant_matmul"
 NPU_SCATTER_ND_UPDATE_TORCH_OP = "npu::npu_scatter_nd_update_"
 
-ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE = "FusedInferAttentionScore"
+ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE = "AdnFusedInferAttention"
 ADN_RMS_NORM_DEFAULT_GE_OP_TYPE = "RmsNorm"
 NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE = "CacheUpdate"
 NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE = "ChunkGatedDeltaRule"
@@ -63,6 +63,39 @@ _GDR_GE_PROTO_TOKENS = (
     ".ATTR(chunk_size,Int,64)",
     ".ATTR(output_final_state,Bool,false)",
     ".ATTR(use_qk_l2norm_in_kernel,Bool,false)",
+)
+_ADN_ATTENTION_GE_PROTO_BLOCK = re.compile(
+    r"REG_OP\s*\(\s*AdnFusedInferAttention\s*\)"
+    r"(?P<body>.*?)"
+    r"\.OP_END_FACTORY_REG\s*\(\s*AdnFusedInferAttention\s*\)",
+    re.DOTALL,
+)
+_ADN_ATTENTION_GE_PROTO_TOKENS = (
+    ".INPUT(query,",
+    ".DYNAMIC_INPUT(key,",
+    ".DYNAMIC_INPUT(value,",
+    ".OPTIONAL_INPUT(pse_shift,",
+    ".OPTIONAL_INPUT(atten_mask,",
+    ".OPTIONAL_INPUT(actual_seq_lengths_q,",
+    ".OPTIONAL_INPUT(actual_seq_lengths_kv,",
+    ".OPTIONAL_INPUT(dequant_scale1,",
+    ".OPTIONAL_INPUT(quant_scale1,",
+    ".OPTIONAL_INPUT(dequant_scale2,",
+    ".OPTIONAL_INPUT(quant_scale2,",
+    ".OPTIONAL_INPUT(quant_offset2,",
+    ".OPTIONAL_INPUT(antiquant_scale,",
+    ".OPTIONAL_INPUT(antiquant_offset,",
+    ".OPTIONAL_INPUT(block_table,",
+    ".OPTIONAL_INPUT(kv_padding_size,",
+    ".OPTIONAL_INPUT(all_seq_lengths_q,",
+    ".OPTIONAL_INPUT(actual_seq_lengths_q_back,",
+    ".OUTPUT(attention_out,",
+    ".REQUIRED_ATTR(num_heads,Int)",
+    ".ATTR(scale_value,Float,",
+    ".ATTR(input_layout,String,",
+    ".ATTR(num_key_value_heads,Int,",
+    ".ATTR(block_size,Int,",
+    ".ATTR(inner_precise,Int,",
 )
 _FAKE_REGISTRATION_LOCK = threading.Lock()
 _FUNCTIONAL_OP_REGISTRATION_LOCK = threading.Lock()
@@ -123,6 +156,146 @@ def _gdr_proto_headers(
         if entry.name in {"lib", "lib64"} and entry.parent.name == "op_api":
             add_root(entry.parent.parent, "LD_LIBRARY_PATH")
     return headers
+
+
+def _adn_attention_proto_headers(
+    ascend_custom_opp_path: str,
+    ld_library_path: str,
+) -> dict[Path, set[str]]:
+    headers: dict[Path, set[str]] = {}
+
+    def add_root(root: Path, source: str) -> None:
+        candidates = [
+            root / "op_proto" / "inc" / "adn_fused_infer_attention_proto.h",
+            root / "op_proto" / "inc" / "op_proto.h",
+        ]
+        if root.name == "vendors" and root.is_dir():
+            candidates.extend(
+                sorted(
+                    root.glob(
+                        "*/op_proto/inc/adn_fused_infer_attention_proto.h"
+                    )
+                )
+            )
+            candidates.extend(sorted(root.glob("*/op_proto/inc/op_proto.h")))
+        for candidate in candidates:
+            if candidate.is_file():
+                resolved = candidate.resolve()
+                headers.setdefault(resolved, set()).add(source)
+
+    for raw_entry in ascend_custom_opp_path.split(os.pathsep):
+        if raw_entry:
+            add_root(Path(raw_entry).expanduser(), "ASCEND_CUSTOM_OPP_PATH")
+    for raw_entry in ld_library_path.split(os.pathsep):
+        if not raw_entry:
+            continue
+        entry = Path(raw_entry).expanduser()
+        if entry.name in {"lib", "lib64"} and entry.parent.name == "op_api":
+            add_root(entry.parent.parent, "LD_LIBRARY_PATH")
+    return headers
+
+
+def validate_adn_attention_ge_prototype_environment(
+    *,
+    ascend_custom_opp_path: str | None = None,
+    ld_library_path: str | None = None,
+) -> dict[str, Any]:
+    """Require the receiver's exact 310P ADN attention prototype and kernel."""
+
+    ascend_path = (
+        os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+        if ascend_custom_opp_path is None
+        else ascend_custom_opp_path
+    )
+    library_path = (
+        os.environ.get("LD_LIBRARY_PATH", "")
+        if ld_library_path is None
+        else ld_library_path
+    )
+    if not ascend_path:
+        return {
+            "status": "NOT_CONFIGURED",
+            "ge_op_type": ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+            "reason": "ASCEND_CUSTOM_OPP_PATH is empty",
+        }
+
+    matches: list[tuple[Path, set[str], bytes, str]] = []
+    for header, sources in _adn_attention_proto_headers(
+        ascend_path,
+        library_path,
+    ).items():
+        payload = header.read_bytes()
+        text = payload.decode("utf-8", errors="replace")
+        block = _ADN_ATTENTION_GE_PROTO_BLOCK.search(text)
+        if block is not None:
+            matches.append((header, sources, payload, block.group("body")))
+
+    if not matches:
+        raise RuntimeError(
+            "AdnFusedInferAttention GE prototype is absent from the active "
+            "ASCEND_CUSTOM_OPP_PATH. Add the ADN package's "
+            "packages/vendors/<vendor> root before AIR export"
+        )
+    if len(matches) != 1:
+        locations = "; ".join(str(item[0]) for item in matches)
+        raise RuntimeError(
+            "multiple AdnFusedInferAttention GE prototypes are active: "
+            f"{locations}. Keep exactly one receiver ADN vendor root in "
+            "ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH"
+        )
+
+    header, sources, payload, body = matches[0]
+    if "ASCEND_CUSTOM_OPP_PATH" not in sources:
+        raise RuntimeError(
+            "AdnFusedInferAttention is visible only through LD_LIBRARY_PATH; "
+            "ATC also requires its vendor root in ASCEND_CUSTOM_OPP_PATH"
+        )
+    compact = re.sub(r"\s+", "", body)
+    positions = [
+        compact.find(token) for token in _ADN_ATTENTION_GE_PROTO_TOKENS
+    ]
+    missing = [
+        token
+        for token, position in zip(_ADN_ATTENTION_GE_PROTO_TOKENS, positions)
+        if position < 0
+    ]
+    if missing or positions != sorted(positions):
+        details = ", ".join(missing) if missing else "declaration order"
+        raise RuntimeError(
+            f"incompatible AdnFusedInferAttention GE prototype at {header}: "
+            f"{details}. Expected the locked query, dynamic key/value, 15 "
+            "optional inputs, one attention_out, and six attrs"
+        )
+
+    vendor_root = header.parents[2]
+    kernel_dir = (
+        vendor_root
+        / "op_impl"
+        / "ai_core"
+        / "tbe"
+        / "kernel"
+        / "ascend310p"
+        / "adn_fused_infer_attention"
+    )
+    kernel_objects = sorted(kernel_dir.glob("AdnFusedInferAttention_*.o"))
+    kernel_metadata = sorted(kernel_dir.glob("AdnFusedInferAttention_*.json"))
+    if not kernel_objects or not kernel_metadata:
+        raise RuntimeError(
+            "AdnFusedInferAttention prototype is active but its Ascend310P "
+            f"prebuilt .o/.json kernel pair is missing below {kernel_dir}"
+        )
+    return {
+        "status": "PASS",
+        "ge_op_type": ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+        "abi": "receiver-adn-attention-v1-named-inputs",
+        "prototype_path": str(header),
+        "prototype_sha256": hashlib.sha256(payload).hexdigest(),
+        "vendor_root": str(vendor_root),
+        "kernel_directory": str(kernel_dir),
+        "kernel_object_count": len(kernel_objects),
+        "kernel_metadata_count": len(kernel_metadata),
+        "environment_sources": sorted(sources),
+    }
 
 
 def validate_gdr_ge_prototype_environment(
@@ -286,7 +459,7 @@ def _fake_adn_fused_infer_attention(
     block_size: int = 0,
     inner_precise: int = 1,
 ) -> torch.Tensor:
-    """Mirror the supported FusedInferAttentionScore output metadata."""
+    """Mirror the receiver AdnFusedInferAttention output metadata."""
 
     del (
         pse_shift,
@@ -991,12 +1164,6 @@ def _require_ge_attrs(ge_api: Any, names: Sequence[str]) -> None:
         )
 
 
-def _static_lengths_match(left: Any, right: Any) -> bool:
-    if isinstance(left, (tuple, list)) and isinstance(right, (tuple, list)):
-        return tuple(left) == tuple(right)
-    return left is right
-
-
 def _ge_int64_tensor(ge_api: Any, value: Any) -> Any:
     if value is None or not isinstance(value, (tuple, list)):
         return value
@@ -1272,13 +1439,7 @@ def _register_framework_converter(
             meta_outputs: Any = None,
         ) -> Any:
             del meta_outputs
-            if all_seq_lengths_q is not None and not _static_lengths_match(
-                all_seq_lengths_q, actual_seq_lengths_q
-            ):
-                raise RuntimeError(
-                    "the recompute AIR route requires all_seq_lengths_q to equal "
-                    "actual_seq_lengths_q before lowering to FusedInferAttentionScore"
-                )
+            all_q = _ge_int64_tensor(ge_api, all_seq_lengths_q)
             actual_q = _ge_int64_tensor(ge_api, actual_seq_lengths_q)
             actual_kv = _ge_int64_tensor(ge_api, actual_seq_lengths_kv)
             session.converter_calls += 1
@@ -1290,7 +1451,7 @@ def _register_framework_converter(
                     "value": value,
                     "pse_shift": pse_shift,
                     "atten_mask": atten_mask,
-                    "actual_seq_lengths": actual_q,
+                    "actual_seq_lengths_q": actual_q,
                     "actual_seq_lengths_kv": actual_kv,
                     "dequant_scale1": dequant_scale1,
                     "quant_scale1": quant_scale1,
@@ -1300,41 +1461,31 @@ def _register_framework_converter(
                     "antiquant_scale": antiquant_scale,
                     "antiquant_offset": antiquant_offset,
                     "block_table": block_table,
-                    "query_padding_size": None,
                     "kv_padding_size": kv_padding_size,
-                    "key_antiquant_scale": None,
-                    "key_antiquant_offset": None,
-                    "value_antiquant_scale": None,
-                    "value_antiquant_offset": None,
-                    "key_shared_prefix": None,
-                    "value_shared_prefix": None,
-                    "actual_shared_prefix_len": None,
-                    "query_rope": None,
-                    "key_rope": None,
-                    "key_rope_antiquant_scale": None,
-                    "dequant_scale_query": None,
-                    "learnable_sink": None,
-                    "q_start_idx": None,
-                    "kv_start_idx": None,
+                    "all_seq_lengths_q": all_q,
+                    "actual_seq_lengths_q_back": None,
                 },
-                outputs=["attention_out", "softmax_lse"],
+                outputs=["attention_out"],
                 attrs={
                     "num_heads": ge_api.attr.Int(num_heads),
-                    "scale": ge_api.attr.Float(scale_value),
+                    "scale_value": ge_api.attr.Float(scale_value),
                     "input_layout": ge_api.attr.Str(input_layout),
                     "num_key_value_heads": ge_api.attr.Int(num_key_value_heads),
                     "inner_precise": ge_api.attr.Int(inner_precise),
                     "block_size": ge_api.attr.Int(block_size),
                 },
             )
-            if not isinstance(result, (tuple, list)) or len(result) != 2:
-                raise RuntimeError(
-                    "FusedInferAttentionScore GE IR must return attention_out and softmax_lse"
-                )
-            return result[0]
+            if isinstance(result, (tuple, list)):
+                if len(result) != 1:
+                    raise RuntimeError(
+                        "AdnFusedInferAttention GE IR must return exactly one "
+                        f"attention_out output; got {len(result)}"
+                    )
+                return result[0]
+            return result
 
-        converter.__name__ = "convert_npu_adn_fused_infer_attention_default"
-        session.converter_mode = "named-fused-infer-current-recompute-route"
+        converter.__name__ = "convert_adn_fused_infer_attention_310p"
+        session.converter_mode = "named-adn-attention-v1"
     else:  # pragma: no cover - registry and dispatch are kept exhaustive
         raise NotImplementedError(
             f"no framework converter is implemented for {adapter.torch_op}"
@@ -1469,5 +1620,6 @@ __all__ = [
     "CustomOpExportSession",
     "audit_custom_op_export",
     "prepare_custom_op_export",
+    "validate_adn_attention_ge_prototype_environment",
     "validate_gdr_ge_prototype_environment",
 ]

@@ -1,6 +1,6 @@
 {
-  "schema_version": 7,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v7",
+  "schema_version": 8,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v8",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -114,9 +114,17 @@
         "fake_meta_outputs": [
           "layout-derived attention output shape and receiver dtype rule"
         ],
-        "constraints": "allQLen is always passed through the SymInt[] all_seq_lengths_q frontend argument; optional Tensor pse_shift remains absent; current recompute lowering requires all_seq_lengths_q to equal actual_seq_lengths_q",
-        "default_ge_op_type": "FusedInferAttentionScore",
-        "converter": "framework mapping to registered GE IR",
+        "constraints": "allQLen is always passed through the SymInt[] all_seq_lengths_q frontend argument; optional Tensor pse_shift remains absent; all_seq_lengths_q, actual_seq_lengths_q, and actual_seq_lengths_kv are independently converted to INT64 GE tensors; actual_seq_lengths_q_back remains absent",
+        "ge_prototype": {
+          "op_type": "AdnFusedInferAttention",
+          "inputs": ["query"],
+          "dynamic_inputs": ["key", "value"],
+          "optional_inputs": ["pse_shift", "atten_mask", "actual_seq_lengths_q", "actual_seq_lengths_kv", "dequant_scale1", "quant_scale1", "dequant_scale2", "quant_scale2", "quant_offset2", "antiquant_scale", "antiquant_offset", "block_table", "kv_padding_size", "all_seq_lengths_q", "actual_seq_lengths_q_back"],
+          "outputs": ["attention_out"],
+          "attrs": ["num_heads", "scale_value", "input_layout", "num_key_value_heads", "block_size", "inner_precise"]
+        },
+        "default_ge_op_type": "AdnFusedInferAttention",
+        "converter": "framework named-input mapping to the receiver 310P ADN custom GE IR; one output",
         "minimum_occurrences": 1
       },
       {
@@ -149,6 +157,7 @@
     "custom_op_gate": "validate and propagate AIR custom_op_audit before ATC",
     "ge_ir_node_audit": "count both TorchAir dynamo.pbtxt op and type node fields; use the per-file maximum per GE type to avoid duplicate counting",
     "gdr_prototype_gate": "reject duplicate or legacy ChunkGatedDeltaRule prototypes from ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH before checkpoint load",
+    "adn_attention_prototype_gate": "require exactly one receiver AdnFusedInferAttention prototype in ASCEND_CUSTOM_OPP_PATH with the locked ABI and an Ascend310P prebuilt object/metadata pair before checkpoint load",
     "atc_mode": 0,
     "atc_framework": 1,
     "soc_policy": "exact 310P variant required; generic Ascend310P rejected"

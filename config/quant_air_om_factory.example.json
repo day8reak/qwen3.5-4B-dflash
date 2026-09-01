@@ -14,7 +14,7 @@
   "adn_rms_norm_ge_op_type": "RmsNorm",
   "npu_chunk_gated_delta_rule_ge_op_type": "ChunkGatedDeltaRule",
   "npu_cache_update_ge_op_type": "CacheUpdate",
-  "adn_fused_infer_attention_ge_op_type": "FusedInferAttentionScore",
+  "adn_fused_infer_attention_ge_op_type": "AdnFusedInferAttention",
   "npu_scatter_nd_update_ge_op_type": "ScatterNdUpdate",
   "name": "quant_dflash_recompute"
 }

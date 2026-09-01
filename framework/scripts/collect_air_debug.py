@@ -300,6 +300,27 @@ def _export_environment() -> dict[str, str]:
     }
 
 
+def _ge_prototype_preflight() -> dict[str, object]:
+    try:
+        from qwen35_dflash.ascend310p.custom_op_export import (
+            validate_adn_attention_ge_prototype_environment,
+            validate_gdr_ge_prototype_environment,
+        )
+    except BaseException as error:  # noqa: BLE001
+        return {"status": "IMPORT_ERROR", "error": repr(error)}
+
+    results: dict[str, object] = {"status": "COLLECTED"}
+    for name, validator in (
+        ("gdr", validate_gdr_ge_prototype_environment),
+        ("adn_attention", validate_adn_attention_ge_prototype_environment),
+    ):
+        try:
+            results[name] = validator()
+        except BaseException as error:  # noqa: BLE001
+            results[name] = {"status": "ERROR", "error": repr(error)}
+    return results
+
+
 def _run_export(
     *,
     factory: str,
@@ -465,6 +486,7 @@ def main() -> int:
     _write_json(report_root / "source-identity.json", source_records)
     _write_json(report_root / "python-stack.json", _python_stack())
     _write_json(report_root / "operator-dispatch.json", _operator_dispatch())
+    _write_json(report_root / "ge-prototypes.json", _ge_prototype_preflight())
     _write_json(
         report_root / "environment.json",
         {

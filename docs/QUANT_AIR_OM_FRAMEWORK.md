@@ -100,7 +100,7 @@ schema/Meta 预检，但不能虚构一次图命中。
 | `npu.adn_rms_norm.default` | 输出 0 与 input 同 shape/dtype；输出 1 为 `[*input.shape[:-1],1]` FP32 | `RmsNorm` | 框架注册 | required |
 | `npu.npu_chunk_gated_delta_rule.default` | output 为 value shape/query dtype；final state 为 initial-state shape/FP32 | `ChunkGatedDeltaRule` | 框架注册 | required |
 | `qwen35_dflash.npu_cache_update.default` | 返回同 shape/dtype/device 的非 alias 更新值 | `CacheUpdate` | 框架注册 | required |
-| `npu.adn_fused_infer_attention.default` | 按 layout 推导；当前 packed `BNSD` 路径保持 query shape/FP16 | `FusedInferAttentionScore` | 框架映射 | required |
+| `npu.adn_fused_infer_attention.default` | 按 layout 推导；当前 packed `BNSD` 路径保持 query shape/FP16 | `AdnFusedInferAttention` | 框架映射 | required |
 | `npu.npu_scatter_nd_update_.default` | 返回同一个 `Tensor(a!)`，不能丢失写 alias | `ScatterNdUpdate` | TorchAir builtin | optional（仅 `forward1`） |
 
 GDR 的模型合同是 Q/K/V `[B,S,32,128]` FP16、g `[B,S,32]` FP32、beta
@@ -118,11 +118,14 @@ attrs: chunk_size, output_final_state, use_qk_l2norm_in_kernel
 
 不能把 PyTorch schema 的十个参数按 positional 顺序直接传给 GE，否则
 `effective_length` 会落到 `initial_state` 位置，`chunk_size` 会落到 Tensor 输入位置。
-`adn_fused_infer_attention` 的当前重算 lowering 还要求
-`all_seq_lengths_q == actual_seq_lengths_q`，不满足时在生成错误 AIR 前直接失败。
-`allQLen` 是 `SymInt[]` 序列长度，两个 HIAI modeling 文件在 eager 和 AIR 路径都把它传给
-`all_seq_lengths_q`。当前路线没有 PSE tensor，因此 `pse_shift` 保持 `None`；不能为了通过类型
-检查把长度列表转换成 Tensor 后塞进 `pse_shift`。
+receiver 的 310P attention 包注册的是 `AdnFusedInferAttention`，不是 CANN A2 路径的
+`FusedInferAttentionScore`。它使用 dynamic `key/value`、15 个 optional inputs、单一
+`attention_out` 输出以及 `scale_value` attr。converter 按该原型绑定 named inputs，并将前端
+三个 `SymInt[]` 长度参数分别构造成 INT64 GE Tensor：`all_seq_lengths_q`、
+`actual_seq_lengths_q`、`actual_seq_lengths_kv`；不能把三者折叠为一个输入。当前前端没有
+`actual_seq_lengths_q_back`，所以该 optional input 保持 `None`。两个 HIAI modeling 文件在
+eager 和 AIR 路径都把 `allQLen` 传给 `all_seq_lengths_q`；当前路线没有 PSE tensor，因此
+`pse_shift` 也保持 `None`。
 
 Fake/Meta 不执行任何算子数值，正式 eager、AIR 和 OM 也不会执行 Fake。若 torch-npu 已有 Meta，
 框架先运行 shape/dtype/alias 探针并复用；只有缺失时才调用 `torch.library.register_fake`。任何 schema
@@ -216,6 +219,8 @@ gear。
 8. receiver 的 `models/export_model_wrapper_qwen3_5.py`。
 9. `ASCEND_CUSTOM_OPP_PATH` 和 `LD_LIBRARY_PATH` 中只有一套
    `ChunkGatedDeltaRule`，且其 `op_proto.h` 包含 `effective_length` v2 输入。
+10. `ASCEND_CUSTOM_OPP_PATH` 中包含一套完整 ADN vendor，其 prototype 注册
+    `AdnFusedInferAttention`，并带有 Ascend310P `.o/.json` 预编译 kernel。
 
 禁止用 CPU fallback 代替设备结论。仓库不保存 checkpoint、量化权重、AIR、OM、编译缓存、
 日志或性能报告。
@@ -237,6 +242,8 @@ export REPO_ROOT=/ABSOLUTE/PATH/qwen3.5-4B-dflash
 export MODEL_PYTHON=/ABSOLUTE/PATH/python3
 export AI_RUN_DIR=/ABSOLUTE/PATH/quant-air-om-run
 export PYTHONPATH="$REPO_ROOT/framework/python:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export ADN_OPP=/ABSOLUTE/PATH/adn_fa_and_norm/packages/vendors/customize
+export ASCEND_CUSTOM_OPP_PATH="$ADN_OPP${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
 mkdir -p "$AI_RUN_DIR"
 cd "$REPO_ROOT"
 ```
@@ -260,18 +267,24 @@ atc --version
 
 任何 import、设备或 ATC 失败都应先修环境；不要让导出流程自动降级到 CPU。
 
-在加载权重前单独检查 GDR GE 原型：
+在加载权重前单独检查 GDR 和 ADN GE 原型：
 
 ```bash
 "$MODEL_PYTHON" - <<'PY'
 from qwen35_dflash.ascend310p.custom_op_export import (
+    validate_adn_attention_ge_prototype_environment,
     validate_gdr_ge_prototype_environment,
 )
 
-result = validate_gdr_ge_prototype_environment()
-print(result)
-assert result["status"] == "PASS"
-assert result["abi"] == "effective-length-v2-named-inputs"
+gdr = validate_gdr_ge_prototype_environment()
+adn = validate_adn_attention_ge_prototype_environment()
+print("GDR", gdr)
+print("ADN", adn)
+assert gdr["status"] == "PASS"
+assert gdr["abi"] == "effective-length-v2-named-inputs"
+assert adn["status"] == "PASS"
+assert adn["ge_op_type"] == "AdnFusedInferAttention"
+assert adn["abi"] == "receiver-adn-attention-v1-named-inputs"
 PY
 ```
 
@@ -279,6 +292,10 @@ PY
 `ChunkGatedDeltaRule`，会在加载 checkpoint 前失败并列出两个 `op_proto.h`。必须同时从
 `ASCEND_CUSTOM_OPP_PATH` 和 `LD_LIBRARY_PATH` 移除旧 vendor 根；不要只依赖路径先后顺序，
 也不要删除不属于当前用户的安装目录。
+ADN 检查还会确认 prototype 的完整输入/输出/attr 顺序以及
+`op_impl/ai_core/tbe/kernel/ascend310p/adn_fused_infer_attention` 下至少一对
+`AdnFusedInferAttention_*.o/.json`。若当前 `ASCEND_CUSTOM_OPP_PATH` 只有 GDR、QuantMatmul
+等 vendor 而没有 ADN，导出器会在加载 4B 权重前给出明确错误。
 
 ## 4. 锁定外部模型和量化输入
 
@@ -324,7 +341,7 @@ cp config/quant_air_om_factory.example.json "$AI_RUN_DIR/factory.json"
   "adn_rms_norm_ge_op_type": "RmsNorm",
   "npu_chunk_gated_delta_rule_ge_op_type": "ChunkGatedDeltaRule",
   "npu_cache_update_ge_op_type": "CacheUpdate",
-  "adn_fused_infer_attention_ge_op_type": "FusedInferAttentionScore",
+  "adn_fused_infer_attention_ge_op_type": "AdnFusedInferAttention",
   "npu_scatter_nd_update_ge_op_type": "ScatterNdUpdate",
   "name": "quant_dflash_recompute"
 }
@@ -398,7 +415,8 @@ NPU 机器上即使只有直接拷贝的源码、没有 `.git`，也可以执行
 
 采集器不调用 Git，也不复制 checkpoint、量化权重、AIR 或 OM。它会记录关键源码 SHA256 并附带
 这些小型源码文件的快照，同时收集 Python/package/CANN/NPU 身份、七个前端算子的真实 schema
-与 dispatch table、脱敏后的 factory 配置、完整 Dynamo 导出日志和已有的 JSON/log/pbtxt 诊断。
+与 dispatch table、GDR/ADN prototype 及 kernel 预检结果 `ge-prototypes.json`、脱敏后的 factory
+配置、完整 Dynamo 导出日志和已有的 JSON/log/pbtxt 诊断。
 即使 AIR 导出失败，也会先在 `--output-dir` 生成 `air-debug-*.tar.gz`，随后返回原导出退出码；
 把该压缩包回传即可。若日志过大，可增加 `--no-dynamo-logs`，但第一次失败建议保留默认完整日志。
 
@@ -464,7 +482,7 @@ expected = {
         "CacheUpdate", 1, "framework-registered-ge-ir"
     ),
     "npu.adn_fused_infer_attention.default": (
-        "FusedInferAttentionScore", 1, "framework-registered-ge-ir"
+        "AdnFusedInferAttention", 1, "framework-registered-ge-ir"
     ),
     "npu.npu_scatter_nd_update_.default": (
         "ScatterNdUpdate", 0, "torchair-builtin"
@@ -488,7 +506,7 @@ PY
 还可以直接检查 TorchAir 的可读 GE 图：
 
 ```bash
-rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV4444|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|FusedInferAttentionScore|ScatterNdUpdate)"' \
+rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV4444|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|AdnFusedInferAttention|ScatterNdUpdate)"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
 ```
 
@@ -498,6 +516,12 @@ rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV4444|RmsNorm|ChunkG
 if rg -n '(type|op): "QuantBatchMatmulV3"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"; then
   echo "FAIL: stale QuantBatchMatmulV3 lowering" >&2
+  exit 1
+fi
+
+if rg -n '(type|op): "FusedInferAttentionScore"' \
+  "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"; then
+  echo "FAIL: stale A2 FusedInferAttentionScore lowering" >&2
   exit 1
 fi
 ```
@@ -742,7 +766,8 @@ assert report["ordinary"]["stable_generated_token_ids"] == \
 | `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |
 | `TorchAir IR contains 0 QuantBatchMatmulV4444 nodes for npu.npu_quant_matmul.default`，同时图中仍有 `QuantBatchMatmulV3` | receiver TorchAir 的内置 V3 converter 与旧项目 converter 注册在同一个 FX target 上，内置项仍被采用 | 更新本分支并重新导出到空目录；确认 audit target 已变为 `qwen35_dflash.npu_quant_matmul_v4444.default`，图中有 V4444 且无 V3 |
 | ATC 报 `QuantBatchMatmulV3` unsupported 或 FP32 scale 不匹配 | 旧 factory/builtin converter 生成了 CANN V3，而 receiver 实际安装 V4444 | 把现有 `factory.json` 改为 `QuantBatchMatmulV4444`，重新生成 AIR；确认图中有 V4444 且没有 V3 |
-| `No supported Ops kernel and engine ... FusedInferAttentionScore`（Ascend310P3） | AIR 使用的 A2 attention GE type 在 310P3 没有可用 kernel；与 QuantMatmul 是两个独立阻塞项 | 采集 ADN attention 自定义包的 `REG_OP` 原型、host 注册和 kernel 注册名，再按真实 ABI 改 lowering；不能只换字符串或假定 `PromptFlashAttention` 的 310P GQA 能力 |
+| `No supported Ops kernel and engine ... FusedInferAttentionScore`（Ascend310P3） | 旧 AIR 把 receiver 的 ADN 前端错误 lower 成 A2 GE type；真实 310P 包注册的是 `AdnFusedInferAttention` | 更新本分支和现有 `factory.json`，把完整 ADN vendor 加入 `ASCEND_CUSTOM_OPP_PATH`，重新导出到空目录；确认图中只有 `AdnFusedInferAttention` 再跑 ATC |
+| `AdnFusedInferAttention GE prototype is absent from the active ASCEND_CUSTOM_OPP_PATH` | PyTorch/LD 能加载 ADN op_api，但 ATC 的 OPP 搜索路径里没有对应 prototype/kernel vendor | 把 ADN 安装包的 `packages/vendors/<vendor>` 根加入 `ASCEND_CUSTOM_OPP_PATH`；不要只加入 `op_api/lib` |
 | `pse_shift` 期望 `Optional[Tensor]` 但收到 `[64]` / `immutable_list` | 旧版 modeling 在 export 路径把 `allQLen` 长度列表误接到了 PSE 输入，尚未进入 Fake/converter | 更新本分支；确认两个 modeling 文件均传 `all_seq_lengths_q=allQLen` 且不构造伪 PSE Tensor |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |

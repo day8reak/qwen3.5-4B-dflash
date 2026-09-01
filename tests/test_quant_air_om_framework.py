@@ -44,6 +44,7 @@ from qwen35_dflash.ascend310p.custom_op_export import (
     _validate_npu_quant_matmul_meta,
     audit_custom_op_export,
     prepare_custom_op_export,
+    validate_adn_attention_ge_prototype_environment,
     validate_gdr_ge_prototype_environment,
 )
 from qwen35_dflash.ascend310p.exporter import export_air_bundle
@@ -281,6 +282,128 @@ def _write_gdr_ge_prototype(root: Path, *, effective_length: bool) -> Path:
         encoding="utf-8",
     )
     return header
+
+
+def _write_adn_attention_ge_package(
+    root: Path,
+    *,
+    include_actual_q_back: bool = True,
+    include_kernel: bool = True,
+) -> Path:
+    header = (
+        root
+        / "op_proto"
+        / "inc"
+        / "adn_fused_infer_attention_proto.h"
+    )
+    header.parent.mkdir(parents=True)
+    actual_q_back = (
+        "    .OPTIONAL_INPUT(actual_seq_lengths_q_back, "
+        "ge::TensorType::ALL())\n"
+        if include_actual_q_back
+        else ""
+    )
+    header.write_text(
+        "REG_OP(AdnFusedInferAttention)\n"
+        "    .INPUT(query, ge::TensorType::ALL())\n"
+        "    .DYNAMIC_INPUT(key, ge::TensorType::ALL())\n"
+        "    .DYNAMIC_INPUT(value, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(pse_shift, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(atten_mask, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(actual_seq_lengths_q, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(actual_seq_lengths_kv, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(dequant_scale1, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(quant_scale1, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(dequant_scale2, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(quant_scale2, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(quant_offset2, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(antiquant_scale, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(antiquant_offset, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(block_table, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(kv_padding_size, ge::TensorType::ALL())\n"
+        "    .OPTIONAL_INPUT(all_seq_lengths_q, ge::TensorType::ALL())\n"
+        f"{actual_q_back}"
+        "    .OUTPUT(attention_out, ge::TensorType::ALL())\n"
+        "    .REQUIRED_ATTR(num_heads, Int)\n"
+        "    .ATTR(scale_value, Float, 1)\n"
+        '    .ATTR(input_layout, String, "BSH")\n'
+        "    .ATTR(num_key_value_heads, Int, 0)\n"
+        "    .ATTR(block_size, Int, 0)\n"
+        "    .ATTR(inner_precise, Int, 1)\n"
+        "    .OP_END_FACTORY_REG(AdnFusedInferAttention);\n",
+        encoding="utf-8",
+    )
+    if include_kernel:
+        kernel_dir = (
+            root
+            / "op_impl"
+            / "ai_core"
+            / "tbe"
+            / "kernel"
+            / "ascend310p"
+            / "adn_fused_infer_attention"
+        )
+        kernel_dir.mkdir(parents=True)
+        (kernel_dir / "AdnFusedInferAttention_test.o").write_bytes(b"kernel")
+        (kernel_dir / "AdnFusedInferAttention_test.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+    return header
+
+
+def test_adn_attention_ge_preflight_accepts_receiver_310p_package(
+    tmp_path: Path,
+) -> None:
+    vendor = tmp_path / "adn"
+    header = _write_adn_attention_ge_package(vendor)
+
+    result = validate_adn_attention_ge_prototype_environment(
+        ascend_custom_opp_path=str(vendor),
+        ld_library_path=str(vendor / "op_api" / "lib"),
+    )
+
+    assert result["status"] == "PASS"
+    assert result["ge_op_type"] == "AdnFusedInferAttention"
+    assert result["abi"] == "receiver-adn-attention-v1-named-inputs"
+    assert result["prototype_path"] == str(header.resolve())
+    assert len(result["prototype_sha256"]) == 64
+    assert result["kernel_object_count"] == 1
+    assert result["kernel_metadata_count"] == 1
+    assert result["environment_sources"] == [
+        "ASCEND_CUSTOM_OPP_PATH",
+        "LD_LIBRARY_PATH",
+    ]
+
+
+def test_adn_attention_ge_preflight_rejects_missing_active_package(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(RuntimeError, match="absent from the active"):
+        validate_adn_attention_ge_prototype_environment(
+            ascend_custom_opp_path=str(tmp_path / "other_vendor"),
+            ld_library_path="",
+        )
+
+
+def test_adn_attention_ge_preflight_rejects_schema_or_kernel_drift(
+    tmp_path: Path,
+) -> None:
+    stale = tmp_path / "stale_adn"
+    _write_adn_attention_ge_package(stale, include_actual_q_back=False)
+    with pytest.raises(RuntimeError, match="incompatible AdnFusedInferAttention"):
+        validate_adn_attention_ge_prototype_environment(
+            ascend_custom_opp_path=str(stale),
+            ld_library_path="",
+        )
+
+    missing_kernel = tmp_path / "missing_kernel"
+    _write_adn_attention_ge_package(missing_kernel, include_kernel=False)
+    with pytest.raises(RuntimeError, match="prebuilt .o/.json kernel pair"):
+        validate_adn_attention_ge_prototype_environment(
+            ascend_custom_opp_path=str(missing_kernel),
+            ld_library_path="",
+        )
 
 
 def test_gdr_ge_prototype_preflight_accepts_one_effective_length_v2(
@@ -640,6 +763,11 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         for session in sessions
         if session.spec.torch_op == FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP
     )
+    attention_session = next(
+        session
+        for session in sessions
+        if session.spec.torch_op == ADN_FUSED_INFER_ATTENTION_TORCH_OP
+    )
     torchair.converters[operations["npu_chunk_gated_delta_rule"]](
         query,
         key,
@@ -664,13 +792,16 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         pertoken_scale=pertoken_scale,
         output_dtype=torch.float16,
     )
+    attention_mask, block_table = object(), object()
     torchair.converters[operations["adn_fused_infer_attention"]](
         placeholder,
         [placeholder],
         [placeholder],
-        all_seq_lengths_q=[3],
+        atten_mask=attention_mask,
+        all_seq_lengths_q=[5],
         actual_seq_lengths_q=[3],
         actual_seq_lengths_kv=[64],
+        block_table=block_table,
         num_heads=16,
         scale_value=0.125,
         input_layout="BNSD",
@@ -752,6 +883,44 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
     assert quant_matmul_session.converter_mode == (
         "named-quant-batch-matmul-v4444-fp16"
     )
+    attention_call = next(
+        call
+        for call in torchair.ge.calls
+        if call[0] == ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE
+    )
+    assert attention_call[1] == ()
+    assert attention_call[2] == {
+        "inputs": {
+            "query": placeholder,
+            "key": [placeholder],
+            "value": [placeholder],
+            "pse_shift": None,
+            "atten_mask": attention_mask,
+            "actual_seq_lengths_q": ("const", [3], "DT_INT64"),
+            "actual_seq_lengths_kv": ("const", [64], "DT_INT64"),
+            "dequant_scale1": None,
+            "quant_scale1": None,
+            "dequant_scale2": None,
+            "quant_scale2": None,
+            "quant_offset2": None,
+            "antiquant_scale": None,
+            "antiquant_offset": None,
+            "block_table": block_table,
+            "kv_padding_size": None,
+            "all_seq_lengths_q": ("const", [5], "DT_INT64"),
+            "actual_seq_lengths_q_back": None,
+        },
+        "outputs": ["attention_out"],
+        "attrs": {
+            "num_heads": ("int", 16),
+            "scale_value": ("float", 0.125),
+            "input_layout": ("str", "BNSD"),
+            "num_key_value_heads": ("int", 4),
+            "inner_precise": ("int", 2),
+            "block_size": ("int", 64),
+        },
+    }
+    assert attention_session.converter_mode == "named-adn-attention-v1"
 
 
 def test_gdr_fake_keeps_frontend_operator_in_strict_export() -> None:
@@ -1189,6 +1358,7 @@ def test_air_export_audits_retained_adn_rms_norm(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     monkeypatch.setenv("AI_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("ASCEND_CUSTOM_OPP_PATH", raising=False)
     torchair = _FakeTorchAir()
 
     def factory(config: object) -> tuple[AirGraphSpec, ...]:
@@ -1218,6 +1388,11 @@ def test_air_export_audits_retained_adn_rms_norm(
     audit = graph["custom_op_audit"][0]
     standard_override = graph["standard_op_overrides"][0]
     assert result["schema_version"] == 3
+    assert result["environment"]["adn_attention_ge_prototype"] == {
+        "status": "NOT_CONFIGURED",
+        "ge_op_type": "AdnFusedInferAttention",
+        "reason": "ASCEND_CUSTOM_OPP_PATH is empty",
+    }
     assert audit["status"] == "PASS"
     assert audit["torch_target"] == "npu.adn_rms_norm.default"
     assert audit["ge_op_type"] == "RmsNorm"
@@ -1791,7 +1966,7 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
         ),
         "qwen35_dflash.npu_cache_update.default": ("CacheUpdate", 1),
         "npu.adn_fused_infer_attention.default": (
-            "FusedInferAttentionScore",
+            "AdnFusedInferAttention",
             1,
         ),
         "npu.npu_scatter_nd_update_.default": ("ScatterNdUpdate", 0),

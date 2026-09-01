@@ -52,17 +52,25 @@ def test_collector_runs_from_a_plain_source_copy_without_git(
         source_name = next(
             name for name in names if name.endswith("/source-identity.json")
         )
+        prototype_name = next(
+            name for name in names if name.endswith("/ge-prototypes.json")
+        )
         summary_member = stream.extractfile(summary_name)
         source_member = stream.extractfile(source_name)
+        prototype_member = stream.extractfile(prototype_name)
         assert summary_member is not None
         assert source_member is not None
+        assert prototype_member is not None
         summary = json.load(summary_member)
         source_identity = json.load(source_member)
+        prototypes = json.load(prototype_member)
 
     assert summary["status"] == "COLLECTED"
     assert summary["uses_git_metadata"] is False
     assert summary["copies_model_weights"] is False
     assert summary["export"]["status"] == "SKIPPED"
+    assert prototypes["status"] == "COLLECTED"
+    assert set(prototypes) == {"status", "gdr", "adn_attention"}
     source_paths = {item["path"] for item in source_identity}
     assert "models/modeling_qwen3_5_hiai_nd.py" in source_paths
     assert "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py" in source_paths

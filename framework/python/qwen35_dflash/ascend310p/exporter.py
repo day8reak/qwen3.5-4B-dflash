@@ -15,6 +15,7 @@ from .contracts import AirGraphSpec
 from .custom_op_export import (
     audit_custom_op_export,
     prepare_custom_op_export,
+    validate_adn_attention_ge_prototype_environment,
     validate_gdr_ge_prototype_environment,
 )
 from .standard_op_export import (
@@ -94,6 +95,9 @@ def export_air_bundle(
             ) from error
 
     gdr_ge_prototype = validate_gdr_ge_prototype_environment()
+    adn_attention_ge_prototype = (
+        validate_adn_attention_ge_prototype_environment()
+    )
 
     # The receiver TorchAir release registers aten.softplus.default but its
     # converter raises NotImplementedError.  Override it before Dynamo traces
@@ -189,6 +193,7 @@ def export_air_bundle(
             "torch_npu": _module_version("torch_npu"),
             "torchair": str(getattr(torchair, "__version__", "unknown")),
             "gdr_ge_prototype": gdr_ge_prototype,
+            "adn_attention_ge_prototype": adn_attention_ge_prototype,
         },
         "graphs": graphs,
     }
