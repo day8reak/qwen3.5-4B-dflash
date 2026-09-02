@@ -50,7 +50,7 @@ from .dflash_v1.dflash_target_features import (
     DFlashFeatureCollector,
     QWEN35_4B_DFLASH_TARGET_FEATURES,
 )
-from .modeling_qwen3_5_hiai_nd import QLinear, _cache_update_for_export
+from .modeling_qwen3_5_hiai_nd import QLinear, _npu_cache_update
 
 if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -733,20 +733,17 @@ class Qwen3_5Attention(nn.Module):
         )
         return output_matrix.reshape(b, n, s, d)
 
-    def update(
-        self, new_k, cache_position, past_key_value, *, export_flag=False
-    ):
+    def update(self, new_k, cache_position, past_key_value):
         b, s, n, d = new_k.shape
         block_idx = cache_position[0] // self.block_size
         offset_in_block = (cache_position[0] % self.block_size).to(torch.int32)
         target_blocks = block_idx.reshape(1).to(torch.int32)
         k_flattened = new_k.reshape(b, s, -1, 16)
-        return _cache_update_for_export(
+        return _npu_cache_update(
             past_key_value.to(new_k.device),
             k_flattened[0, :, :, :].to(torch.float16),
             target_blocks,
             offset_in_block,
-            export_flag=export_flag,
         )
 
     def update_dflash(
@@ -757,7 +754,6 @@ class Qwen3_5Attention(nn.Module):
         *,
         target_blocks=None,
         offsets_in_block=None,
-        export_flag=False,
     ):
         """Correctness fallback for a K+1 write that may cross cache blocks.
 
@@ -807,12 +803,11 @@ class Qwen3_5Attention(nn.Module):
         for token_index in range(sequence_length):
             target_block = target_blocks[token_index : token_index + 1]
             offset_in_block = offsets_in_block[token_index]
-            updated_cache = _cache_update_for_export(
+            updated_cache = _npu_cache_update(
                 updated_cache,
                 flattened[0, token_index : token_index + 1].to(torch.float16),
                 target_block,
                 offset_in_block,
-                export_flag=export_flag,
             )
         return updated_cache
 
@@ -829,7 +824,6 @@ class Qwen3_5Attention(nn.Module):
         dflash_cache_target_blocks: Optional[torch.Tensor] = None,
         dflash_cache_offsets: Optional[torch.Tensor] = None,
         allQLen=0,
-        export_flag=False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
@@ -859,13 +853,11 @@ class Qwen3_5Attention(nn.Module):
                 key_states,
                 cache_position,
                 past_key_values[0],
-                export_flag=export_flag,
             ).to(query_states.device)
             value_states = self.update(
                 value_states,
                 cache_position,
                 past_key_values[1],
-                export_flag=export_flag,
             ).to(query_states.device)
         else:
             _require_dflash_accepted_tokens(
@@ -880,7 +872,6 @@ class Qwen3_5Attention(nn.Module):
                 past_key_values[0],
                 target_blocks=dflash_cache_target_blocks,
                 offsets_in_block=dflash_cache_offsets,
-                export_flag=export_flag,
             ).to(query_states.device)
             value_states = self.update_dflash(
                 value_states,
@@ -888,7 +879,6 @@ class Qwen3_5Attention(nn.Module):
                 past_key_values[1],
                 target_blocks=dflash_cache_target_blocks,
                 offsets_in_block=dflash_cache_offsets,
-                export_flag=export_flag,
             ).to(query_states.device)
         past_key_values = (key_states, value_states)
         attention_mask = attention_mask.to(torch.float16)
@@ -944,7 +934,6 @@ class Qwen3_5Attention(nn.Module):
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         allQLen=0,
-        export_flag=False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Retain the receiver's alternate attention implementation unchanged."""
@@ -1380,7 +1369,6 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         layer_idx=None,
         allQLen=0,
         token_count=0,
-        export_flag=False,
         accepted_tokens: Optional[torch.Tensor] = None,
         gdr_effective_length: Optional[torch.Tensor] = None,
         dflash_cache_target_blocks: Optional[torch.Tensor] = None,
@@ -1409,7 +1397,6 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 dflash_cache_target_blocks=dflash_cache_target_blocks,
                 dflash_cache_offsets=dflash_cache_offsets,
                 allQLen=allQLen,
-                export_flag=export_flag,
                 **kwargs,
             )
         else:
@@ -1497,7 +1484,6 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         new_kv_cache_pos=None,
         allQLen=0,
         token_count=0,
-        export_flag=False,
         output_dflash_features: bool = False,
         accepted_tokens: Optional[torch.Tensor] = None,
         gdr_effective_length: Optional[torch.Tensor] = None,
@@ -1587,7 +1573,6 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 layer_idx=idx,
                 allQLen=allQLen,
                 token_count=token_count,
-                export_flag=export_flag,
                 accepted_tokens=accepted_tokens,
                 gdr_effective_length=gdr_effective_length,
                 dflash_cache_target_blocks=dflash_cache_target_blocks,
@@ -1648,7 +1633,6 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         new_kv_cache_pos=None,
         allQLen=0,
         token_count=0,
-        export_flag=False,
         output_dflash_features: bool = False,
         dflash_skip_lm_head: bool = False,
         dflash_last_token_only: bool = False,
@@ -1666,7 +1650,6 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             new_kv_cache_pos=new_kv_cache_pos,
             allQLen=allQLen,
             token_count=token_count,
-            export_flag=export_flag,
             output_dflash_features=output_dflash_features,
             accepted_tokens=accepted_tokens,
             gdr_effective_length=gdr_effective_length,

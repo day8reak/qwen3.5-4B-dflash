@@ -172,7 +172,6 @@ def assert_gdr_effective_length_source_contract() -> None:
     assert [argument.arg for argument in update_dflash.args.kwonlyargs] == [
         "target_blocks",
         "offsets_in_block",
-        "export_flag",
     ]
     token_loop = next(
         node for node in ast.walk(update_dflash) if isinstance(node, ast.For)

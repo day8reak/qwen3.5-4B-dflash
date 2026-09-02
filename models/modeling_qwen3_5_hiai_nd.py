@@ -62,7 +62,7 @@ def _npu_quant_matmul_with_export_frontend(
     *,
     pertoken_scale: torch.Tensor,
     output_dtype: torch.dtype,
-    export_flag: bool,
+    use_v4444_frontend: bool,
 ) -> torch.Tensor:
     """Keep the quant eager ABI and AIR V4444 frontend separated.
 
@@ -75,7 +75,7 @@ def _npu_quant_matmul_with_export_frontend(
     receiver.
     """
 
-    if export_flag:
+    if use_v4444_frontend:
         namespace = getattr(torch.ops, "qwen35_dflash", None)
         packet = (
             None
@@ -104,23 +104,28 @@ def _npu_quant_matmul_with_export_frontend(
     )
 
 
-def _cache_update_for_export(
+def _npu_cache_update(
     input: torch.Tensor,
     updates: torch.Tensor,
     target_block: torch.Tensor,
     offset_in_block: torch.Tensor,
-    *,
-    export_flag: bool,
 ) -> torch.Tensor:
-    """Use an AOT-safe functional frontend only for the AIR graph route."""
+    """Keep eager mutation while capturing one copy-free AIR dataflow."""
 
-    if export_flag:
-        return torch.ops.qwen35_dflash.npu_cache_update.default(
-            input,
-            updates,
-            target_block,
-            offset_in_block,
+    if torch.compiler.is_compiling():
+        namespace = getattr(torch.ops, "qwen35_dflash", None)
+        packet = (
+            None
+            if namespace is None
+            else getattr(namespace, "npu_cache_update", None)
         )
+        operation = None if packet is None else getattr(packet, "default", None)
+        if operation is None:
+            raise RuntimeError(
+                "AIR CacheUpdate requires the registered "
+                "qwen35_dflash::npu_cache_update frontend"
+            )
+        return operation(input, updates, target_block, offset_in_block)
     torch_npu.npu_cache_update_(
         input,
         updates,
@@ -203,7 +208,7 @@ class QLinear(nn.Module):
             self.scale.to(x.device),
             pertoken_scale=pertoken_scale,
             output_dtype=torch.float16,
-            export_flag=export_frontend,
+            use_v4444_frontend=export_frontend,
         )
         return npu_out.to(torch.float16)
 
@@ -556,20 +561,17 @@ class Qwen3_5Attention(nn.Module):
         )
         return output_matrix.reshape(b, n, s, d)
 
-    def update(
-        self, new_k, cache_position, past_key_value, *, export_flag=False
-    ):
+    def update(self, new_k, cache_position, past_key_value):
         b, s, n, d = new_k.shape
         block_idx = cache_position[0] // self.block_size
         offset_in_block = (cache_position[0] % self.block_size).to(torch.int32)
         target_blocks = block_idx.reshape(1).to(torch.int32)
         k_flattened = new_k.reshape(b, s, -1, 16)
-        return _cache_update_for_export(
+        return _npu_cache_update(
             past_key_value.to(new_k.device),
             k_flattened[0, :, :, :].to(torch.float16),
             target_blocks,
             offset_in_block,
-            export_flag=export_flag,
         )
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -582,7 +584,6 @@ class Qwen3_5Attention(nn.Module):
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         allQLen=0,
-        export_flag=False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
@@ -611,13 +612,11 @@ class Qwen3_5Attention(nn.Module):
             key_states,
             cache_position,
             past_key_values[0],
-            export_flag=export_flag,
         ).to(query_states.device)
         value_states = self.update(
             value_states,
             cache_position,
             past_key_values[1],
-            export_flag=export_flag,
         ).to(query_states.device)
         past_key_values = (key_states, value_states)
         attention_mask = attention_mask.to(torch.float16)
@@ -673,7 +672,6 @@ class Qwen3_5Attention(nn.Module):
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         allQLen=0,
-        export_flag=False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Retain the receiver's alternate attention implementation unchanged."""
@@ -1026,7 +1024,6 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         layer_idx=None,
         allQLen=0,
         token_count=0,
-        export_flag=False,
         gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Tuple]:
@@ -1048,7 +1045,6 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 past_key_values=past_key_values,
                 cache_position=new_kv_cache_pos,
                 allQLen=allQLen,
-                export_flag=export_flag,
                 **kwargs,
             )
         else:
@@ -1131,7 +1127,6 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         new_kv_cache_pos=None,
         allQLen=0,
         token_count=0,
-        export_flag=False,
         output_dflash_features: bool = False,
         gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -1171,7 +1166,6 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 layer_idx=idx,
                 allQLen=allQLen,
                 token_count=token_count,
-                export_flag=export_flag,
                 gdr_effective_length=gdr_effective_length,
                 **kwargs,
             )
@@ -1222,7 +1216,6 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         new_kv_cache_pos=None,
         allQLen=0,
         token_count=0,
-        export_flag=False,
         output_dflash_features: bool = False,
         gdr_effective_length: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -1237,7 +1230,6 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             new_kv_cache_pos=new_kv_cache_pos,
             allQLen=allQLen,
             token_count=token_count,
-            export_flag=export_flag,
             output_dflash_features=output_dflash_features,
             gdr_effective_length=gdr_effective_length,
             **kwargs,

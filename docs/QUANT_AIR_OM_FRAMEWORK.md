@@ -167,12 +167,15 @@ attrs: dtype=DT_FLOAT16(1), transpose_x1=false, transpose_x2=false, group_size=0
 `x2=[2560,8192]`、`scale=[8192]`、`pertoken_scale=[64]`。torch-npu 要求
 `pertoken_scale.shape[0] == x1.shape[-2]`（M 维）；不能把 batch 与 M 相乘后写成 `[B*M]`。
 
-receiver 的原始 `npu.npu_cache_update_` 使用 `Tensor(a!) -> Tensor(a!)` 原地 ABI。PyTorch
-AOTAutograd 不能 functionalize 带返回 alias 的非 ATen 算子，所以 AIR 专用 modeling 路径通过
-无 alias 前端 `qwen35_dflash.npu_cache_update.default` 表达“旧 cache 输入 -> 新 cache 输出”，
-再精确 lowering 为一个 `CacheUpdate` GE 节点。普通 eager 路径仍直接调用原始原地算子，不增加
-clone 或额外 NPU launch；rollback 多行写在 AIR 路径中显式串接每一行的更新输出。设置
-`keep_inference_input_mutations=True` 不能解除非 ATen 算子“返回值带 alias”的限制。
+receiver 的原始 `npu.npu_cache_update_` 使用 `Tensor(a!) -> Tensor(a!)` 原地 ABI。模型公开
+forward 现在不再逐层携带 `export_flag`；一个内部 `_npu_cache_update` helper 在普通 eager 中严格调用
+原始算子，在 active Dynamo capture 中自动选择无 alias 前端
+`qwen35_dflash.npu_cache_update.default`（“旧 cache 输入 -> 新 cache 输出”），再精确 lowering 为一个
+`CacheUpdate` GE 节点。这样 eager 不增加 clone 或额外 NPU launch，AIR/AOT 图也不产生整个 KV
+cache 的 `aten.copy`。rollback 多行写显式串接每一行的更新输出。旧 export driver 的
+Functionalize+`copy_` 方案虽然能绕过 alias 报错，但每个 CacheUpdate 都会在 AOT 图留下一个大
+Tensor copy；本框架因此只借鉴它的无 alias frontend，不复制这部分实现。仅设置
+`keep_inference_input_mutations=True` 也不能解除非 ATen 算子“返回值带 alias”的限制。
 
 `CacheUpdate` 的 GE 原型不是按前端 Python 参数名解析，而是固定为：
 
@@ -190,7 +193,23 @@ attrs: none
 自动回退：指定 IR 未注册、converter 没有命中，或 `dynamo.pbtxt` 中 required type 数为 0，
 导出都会失败，不会生成伪 PASS manifest。
 
-### 2.2 TorchAir 标准算子精确补丁
+### 2.2 为什么原模型看起来没有导出适配也能生成 AIR
+
+receiver 的 `models/export_model_wrapper_qwen3_5.py` 只负责逐层执行并展平输出 state，因此单看
+wrapper 确实看不到导出适配。但与它配套的 `export_glm_model_qwen3_5.py` 在调用
+`torchair.dynamo_export` 前已经注册了 RMSNorm、attention、CacheUpdate、GDR 的 Meta 和 GE
+converter，并为原地 CacheUpdate 定义了 functional frontend 与 Functionalize 实现。也就是说，
+原路线同样依赖导出适配，只是适配位于 export driver，而不是 modeling 文件。
+
+本框架沿用“导出准备统一注册 Fake/converter”的分层方式并补强 schema、alias、GE prototype 与
+图节点审计；CacheUpdate 由模型内部 helper 在捕获期间无参数地自动选路，以避免旧 Functionalize
+方案生成的大 Tensor copy。不能直接复制旧脚本的全部定义：旧 GDR schema 没有 quant 分支新增的
+`effective_length`，旧 attention converter 通过 `pse_shift` 临时转运 `allQLen`，且旧脚本没有解决
+当前环境把 QuantMatmul 降为 V3 的冲突。
+配套 `inference.py` 只是 eager runner（`compiled_model = model_wrapper`），也不能用来证明 AIR
+无需 Fake、Functionalize 或 converter。
+
+### 2.3 TorchAir 标准算子精确补丁
 
 目标环境的 TorchAir 虽然注册了 `torch.ops.aten.softplus.default`，对应 converter 却会主动抛出
 `NotImplementedError`。模型的 Gated DeltaNet 在公共 `forward()` 中通过 `F.softplus` 计算
@@ -394,10 +413,12 @@ cmake --build "$AI_RUN_DIR/build/cpp-host" --parallel
 ctest --test-dir "$AI_RUN_DIR/build/cpp-host" --output-on-failure
 ```
 
-通过标准：所有 Python 测试和两个 CTest 都通过。框架专项测试会以 strict `torch.export`
-确认七个前端 target 可保留，其中 cache/scatter 还会检查 writable alias；这仍然只验证
-FakeTensor/图捕获元数据，不执行算子数值。fake ACL 测试会编译生产 `acl_executor.cpp`，但只证明
-host 侧 buffer、调用顺序、scheduler 和 JSON 门禁。
+通过标准：所有 Python 测试和两个 CTest 都通过。框架专项测试会检查源算子的 schema/Fake/alias，
+并以 strict `torch.export` 和 AOTAutograd 确认 CacheUpdate 连续写直接捕获为相同数量的
+`qwen35_dflash.npu_cache_update.default`，图中不存在源 alias op 或 `aten.copy`；普通 eager 仍必须
+保持原地更新。其余前端 target 也必须保留。这仍然只验证 FakeTensor/图捕获元数据，不执行 NPU
+算子数值。fake ACL 测试会编译生产 `acl_executor.cpp`，但只证明 host 侧 buffer、调用顺序、
+scheduler 和 JSON 门禁。
 
 ### 5.2 量化 PyTorch 图探针
 
@@ -1041,7 +1062,7 @@ rg --files "$PROF_DIR" | \
 | `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
 | `aclnnQuantMatmulV4 failed, error code is 161002`，并提示 `Scale dtype should be UINT64 or INT64, actual dtype is DT_FLOAT` | 当前进程解析到了官方或另一套同名 `aclnnQuantMatmulV4`，没有进入支持 FP32 weight scale 和 per-token scale 的自定义 V4444 wrapper；同一环境下原 `quant` 分支也会失败 | 不要修改模型 scale。确认 `customize_quantMatmul/op_api/lib` 位于 `LD_LIBRARY_PATH` 最前、完整 vendor 位于 `ASCEND_CUSTOM_OPP_PATH`，排除同名旧包后新起 Python 进程；用 `/proc/<PID>/maps` 或 `LD_DEBUG=bindings` 核对实际加载的 `libcust_opapi.so` |
 | `aclnnQuantMatmulV4 failed, error code is 561103`，并提示 `Cannot find bin ... int8/ND/int8/ND/int64/ND/float16/ND` | 旧框架对 `quant` 分支的 FP32 scale 错误调用了 `npu_trans_quant_param`，形成 V4444 注册表不存在的 `INT8 + INT8 + INT64` 组合 | 更新本分支；普通 eager 应与 `quant@28f93e7` 一样直接传 FP32 weight scale 和 FP32 per-token scale，AIR 继续走私有 FP32-scale frontend。不要用 `.to(torch.uint64)` 或 `.to(torch.int64)` 数值强转 |
-| `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 旧版 AIR 路径把 `Tensor(a!) -> Tensor(a!)` 直接交给 AOTAutograd；Fake 正确也无法 functionalize | 更新本分支；确认 FX target 为 `qwen35_dflash.npu_cache_update.default`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
+| `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 导出前没有准备私有 CacheUpdate frontend，或实际 modeling 仍显式进入了源 alias op | 更新本分支并在新 Python 进程导出；FX/AOT target 应为 `qwen35_dflash.npu_cache_update.default`，不应含 `npu.npu_cache_update_.default` 或 `aten.copy`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
 | `ERR03005 GRAPH internal error`，`Original traceback` 指向 `qwen35_dflash.npu_cache_update.default`，Meta 单测通过 | 旧 converter 把前端 snake_case 参数按 positional 传入，但 GE `CacheUpdate` 原型要求 `x/updates/targetBlock/offsetInBlock -> x` | 更新本分支；确认 AIR manifest 中该算子的 `converter_mode` 为 `named-cache-update-x-v1` |
 | `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |
 | `TorchAir IR contains 0 QuantBatchMatmulV4444 nodes for npu.npu_quant_matmul.default`，同时图中仍有 `QuantBatchMatmulV3` | receiver TorchAir 的内置 V3 converter 与旧项目 converter 注册在同一个 FX target 上，内置项仍被采用 | 更新本分支并重新导出到空目录；确认 audit target 已变为 `qwen35_dflash.npu_quant_matmul_v4444.default`，图中有 V4444 且无 V3 |

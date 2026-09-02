@@ -204,7 +204,6 @@ class _ExplicitTargetGraph(nn.Module):
             # extent and relies on the explicit causal mask/logical cursor.
             # Exact equivalence remains a mandatory real-device gate.
             allQLen=[self.kv_cache_max_len],
-            export_flag=True,
             output_dflash_features=output_features,
             accepted_tokens=accepted,
             gdr_effective_length=gdr_effective_length,

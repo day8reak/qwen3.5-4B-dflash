@@ -397,7 +397,6 @@ class QuantFullPrefixExportTarget(nn.Module):
             allQLen=[sequence_length],
             output_dflash_features=True,
             gdr_effective_length=gdr_effective_length,
-            export_flag=True,
         )
         # The locked rollback/non-rollback receiver both expose the same
         # feature-enabled tensor tuple.  Avoid the eager bridge's generic

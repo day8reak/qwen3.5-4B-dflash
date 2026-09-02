@@ -575,7 +575,6 @@ class _FakeExecutionModel(nn.Module):
         object.__setattr__(self, "embedding", embedding)
         object.__setattr__(self, "lm_head", lm_head)
         self.last_gdr_effective_length: torch.Tensor | None = None
-        self.last_export_flag: bool | None = None
 
     def forward(
         self,
@@ -588,7 +587,7 @@ class _FakeExecutionModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del input_ids
         assert output_dflash_features is True
-        self.last_export_flag = bool(kwargs.pop("export_flag"))
+        assert "export_flag" not in kwargs
         self.last_gdr_effective_length = gdr_effective_length.detach().clone()
         return self.lm_head(inputs_embeds), torch.cat(
             (inputs_embeds, inputs_embeds), dim=-1
@@ -1233,7 +1232,7 @@ def test_qlinear_helper_captures_private_v4444_frontend(
                 scale,
                 pertoken_scale=pertoken_scale,
                 output_dtype=torch.float16,
-                export_flag=True,
+                use_v4444_frontend=True,
             )
 
     exported = torch.export.export(
@@ -1414,7 +1413,7 @@ def test_quant_matmul_helper_preserves_float_scale_at_eager_boundary(
         scale,
         pertoken_scale=torch.ones(2, dtype=torch.float32),
         output_dtype=torch.float16,
-        export_flag=False,
+        use_v4444_frontend=False,
     )
 
     assert result.shape == (2, 3)
@@ -1546,8 +1545,10 @@ def test_quant_matmul_meta_rejects_flattened_batch_times_m_scale() -> None:
         )
 
 
-def test_functional_cache_update_survives_aot_and_keeps_ge_custom_op() -> None:
-    _ensure_target_test_schema("npu_cache_update_")
+def test_native_cache_update_uses_copy_free_frontend_for_air_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_update = _ensure_target_test_schema("npu_cache_update_")
     _ensure_cache_update_cpu_impl()
     scatter_update = _ensure_target_test_schema("npu_scatter_nd_update_")
     torchair = _FakeTorchAir()
@@ -1566,7 +1567,25 @@ def test_functional_cache_update_survives_aot_and_keeps_ge_custom_op() -> None:
         ),
         torchair,
     )
-    cache_update = torch.ops.qwen35_dflash.npu_cache_update.default
+    fake_torch_npu = ModuleType("torch_npu")
+    fake_torch_npu.__spec__ = importlib.machinery.ModuleSpec(
+        "torch_npu",
+        loader=None,
+    )
+    fake_torch_npu.npu_cache_update_ = cache_update
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+    modeling = importlib.import_module("models.modeling_qwen3_5_hiai_nd")
+    monkeypatch.setattr(modeling, "torch_npu", fake_torch_npu)
+
+    eager_cache = torch.zeros(4, dtype=torch.float32)
+    eager_result = modeling._npu_cache_update(
+        eager_cache,
+        torch.ones_like(eager_cache),
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros((), dtype=torch.int32),
+    )
+    assert eager_result is eager_cache
+    torch.testing.assert_close(eager_cache, torch.ones_like(eager_cache))
 
     class UsesCacheUpdate(nn.Module):
         def forward(
@@ -1576,7 +1595,11 @@ def test_functional_cache_update_survives_aot_and_keeps_ge_custom_op() -> None:
             block: torch.Tensor,
             offset: torch.Tensor,
         ) -> torch.Tensor:
-            return cache_update(cache, updates, block, offset)
+            cache = modeling._npu_cache_update(cache, updates, block, offset)
+            cache = modeling._npu_cache_update(
+                cache, updates + 1, block, offset
+            )
+            return cache
 
     class UsesScatterUpdate(nn.Module):
         def forward(
@@ -1598,15 +1621,15 @@ def test_functional_cache_update_survives_aot_and_keeps_ge_custom_op() -> None:
         ),
         strict=True,
     )
-    eager_cache = torch.zeros(4, dtype=torch.float32)
-    aot_targets: set[str] = set()
+    compiled_input = torch.zeros(4, dtype=torch.float32)
+    aot_targets: list[str] = []
 
     def capture_aot_graph(
         graph: torch.fx.GraphModule,
         example_inputs: list[torch.Tensor],
     ):
         del example_inputs
-        aot_targets.update(str(node.target) for node in graph.graph.nodes)
+        aot_targets.extend(str(node.target) for node in graph.graph.nodes)
         return graph.forward
 
     from torch._dynamo.backends.common import aot_autograd
@@ -1617,15 +1640,17 @@ def test_functional_cache_update_survives_aot_and_keeps_ge_custom_op() -> None:
         fullgraph=True,
     )
     compiled_result = compiled_cache_update(
-        eager_cache,
-        torch.ones_like(eager_cache),
+        compiled_input,
+        torch.ones_like(compiled_input),
         torch.zeros(1, dtype=torch.int32),
         torch.zeros((), dtype=torch.int32),
     )
-    torch.testing.assert_close(compiled_result, torch.ones_like(eager_cache))
-    torch.testing.assert_close(eager_cache, torch.zeros_like(eager_cache))
-    assert "qwen35_dflash.npu_cache_update.default" in aot_targets
+    expected = torch.full_like(compiled_input, 2)
+    torch.testing.assert_close(compiled_result, expected)
+    torch.testing.assert_close(compiled_input, torch.zeros_like(compiled_input))
+    assert aot_targets.count("qwen35_dflash.npu_cache_update.default") == 2
     assert "npu.npu_cache_update_.default" not in aot_targets
+    assert "aten.copy.default" not in aot_targets
     scatter_export = torch.export.export(
         UsesScatterUpdate(),
         (
@@ -1640,6 +1665,7 @@ def test_functional_cache_update_survives_aot_and_keeps_ge_custom_op() -> None:
     }
     assert "qwen35_dflash.npu_cache_update.default" in cache_targets
     assert "npu.npu_cache_update_.default" not in cache_targets
+    assert "aten.copy.default" not in cache_targets
     assert "npu.npu_scatter_nd_update_.default" in {
         str(node.target) for node in scatter_export.graph.nodes
     }
@@ -1833,10 +1859,9 @@ def test_quant_target_adapter_bypasses_eager_guards_and_sync() -> None:
     assert target.execution.last_gdr_effective_length is not None
     assert target.execution.last_gdr_effective_length.dtype == torch.int16
     assert target.execution.last_gdr_effective_length.tolist() == [2]
-    assert target.execution.last_export_flag is True
 
 
-def test_both_hiai_models_route_only_air_cache_updates_through_functional_op() -> None:
+def test_both_hiai_models_hide_the_copy_free_cache_export_route() -> None:
     ordinary = (ROOT / "models" / "modeling_qwen3_5_hiai_nd.py").read_text(
         encoding="utf-8"
     )
@@ -1844,13 +1869,14 @@ def test_both_hiai_models_route_only_air_cache_updates_through_functional_op() -
         ROOT / "models" / "modeling_qwen3_5_hiai_nd_dflash_rollback.py"
     ).read_text(encoding="utf-8")
 
-    assert "def _cache_update_for_export(" in ordinary
-    assert "torch.ops.qwen35_dflash.npu_cache_update.default(" in ordinary
+    assert "def _npu_cache_update(" in ordinary
+    assert "torch.compiler.is_compiling()" in ordinary
+    assert "torch.ops.qwen35_dflash.npu_cache_update.default(" not in ordinary
     assert "torch_npu.npu_cache_update_(" in ordinary
-    assert ordinary.count("export_flag=export_flag") >= 3
-    assert "QLinear, _cache_update_for_export" in rollback
-    assert rollback.count("_cache_update_for_export(") >= 2
-    assert rollback.count("export_flag=export_flag") >= 6
+    assert "export_flag=export_flag" not in ordinary
+    assert "QLinear, _npu_cache_update" in rollback
+    assert rollback.count("_npu_cache_update(") >= 2
+    assert "export_flag=export_flag" not in rollback
 
 
 def test_both_hiai_models_route_query_lengths_to_attention_length_abi() -> None:
