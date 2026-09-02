@@ -1033,6 +1033,7 @@ rg --files "$PROF_DIR" | \
 | 找不到 `export_model_wrapper_qwen3_5.py` | receiver 路径错误 | 修正 `receiver_models_dir` |
 | QLinear coverage mismatch | 量化权重与 Target topology 不同 | 核对 YAML、checkpoint revision 和 quant artifact |
 | `torch_npu`/TorchAir import 失败 | 环境不匹配 | 使用与 CANN/驱动匹配的声明环境 |
+| 模型加载阶段 `BatchMatMul4` / `507014 AICore timeout`，同步 traceback 落在 `_set_cos_sin_cache` | tied `lm_head.weight` 触发 Transformers 补缺初始化，旧 modeling 又在已迁移到 NPU 后重复构建 `max_position_embeddings` 长度的 RoPE cache；与 prompt 长度、DFlash decode 和 block table 无关 | 更新本分支并新起 Python 进程；设置 `ASCEND_LAUNCH_BLOCKING=1` 复验，日志不得再出现 `_initialize_missing_keys -> _init_weights -> _set_cos_sin_cache`。超时后的旧 NPU context 不可继续复用 |
 | `unsupported operator: npu.<op>.default` | 七算子预检未运行、实际代码不是本分支，或 receiver 新增了第八个算子 | 核对远端提交、`PYTHONPATH`；已覆盖清单见 2.1，不能用 modeling Tensor fallback 掩盖 |
 | `schema drifted from the locked export contract` | torch-npu/receiver 算子签名与当前锁不一致 | 记录 dispatcher schema；按真实版本更新 schema、Fake、converter 和测试，不能跳过校验 |
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |

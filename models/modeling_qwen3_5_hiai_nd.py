@@ -1161,13 +1161,11 @@ class Qwen3_5PreTrainedModel(PreTrainedModel):
             )
         elif isinstance(module, Qwen3_5RMSNorm):
             nn.init.zeros_(module.weight)
-        elif "RotaryEmbedding" in module.__class__.__name__ and hasattr(
-            module, "_set_cos_sin_cache"
-        ):
-            module._set_cos_sin_cache(
-                seq_len=module.max_seq_len_cached,
-                device=module.inv_freq.device,
-            )
+        # Qwen3_5RotaryEmbedding1 constructs its non-persistent cache in
+        # __init__.  from_pretrained may revisit _init_weights after moving the
+        # model to NPU when a tied checkpoint key is absent.  Rebuilding the
+        # max-position cache here would launch an unnecessary large NPU
+        # BatchMatMul and can time out before inference starts.
         elif hasattr(module, "_rebuild_block_table") and hasattr(
             module, "block_table"
         ):

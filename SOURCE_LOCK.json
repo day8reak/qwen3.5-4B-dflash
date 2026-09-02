@@ -1,15 +1,15 @@
 {
   "schema_version": 6,
   "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback with the original GDR effective-length ABI and optional Target-only W8A8 dynamic quantization configured by the original inference YAML",
-  "package_revision": "r11",
-  "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-chunk-prefill-gdr-effective-length-air-functional-cache-update-private-v4444-eager-encoded-scale-attention-length-abi",
+  "package_revision": "r12",
+  "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-chunk-prefill-gdr-effective-length-air-functional-cache-update-private-v4444-eager-encoded-scale-attention-length-abi-load-safe-rope-init",
   "package_layout": {
     "version": 6,
     "canonical_package": "models.dflash_v1",
     "canonical_source_directory": "models/dflash_v1",
     "hiai_source_file": "models/modeling_qwen3_5_hiai_nd.py",
-    "hiai_source_sha256": "1685fd101bb1bce2417d4d17026a1b81ac2b68f28dee0c1db748c3f53edff68e",
-    "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime; export_flag routes CacheUpdate through an AOT-safe functional frontend while ordinary eager keeps the receiver's original mutable op; QLinear defaults to ordinary eager, resolves npu_trans_quant_param from either the torch_npu wrapper or its dispatcher op, converts its preserved FP32 scale once and caches the encoded INT64/UINT64 buffer, and the final eager helper independently rejects bypass by encoding any remaining FP32 scale; the AIR factory flag can select the project-private float-scale V4444 frontend only during an active Dynamo capture and has exact QLinear coverage, so it cannot leak into a later eager invocation; fused attention routes allQLen SymInt[] through all_seq_lengths_q in both eager and AIR while pse_shift remains absent",
+    "hiai_source_sha256": "03ee9eaab5d8d41f93e5bc88dce5d9971578763af3dbfd1666cfd92c13216825",
+    "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime; weight initialization never rebuilds the max-position RoPE cache after device placement; export_flag routes CacheUpdate through an AOT-safe functional frontend while ordinary eager keeps the receiver's original mutable op; QLinear defaults to ordinary eager, resolves npu_trans_quant_param from either the torch_npu wrapper or its dispatcher op, converts its preserved FP32 scale once and caches the encoded INT64/UINT64 buffer, and the final eager helper independently rejects bypass by encoding any remaining FP32 scale; the AIR factory flag can select the project-private float-scale V4444 frontend only during an active Dynamo capture and has exact QLinear coverage, so it cannot leak into a later eager invocation; fused attention routes allQLen SymInt[] through all_seq_lengths_q in both eager and AIR while pse_shift remains absent",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
     "hiai_bridge_sha256": "0a9c125b571fe0d2e673d769742e12bea89a6ee2a8d768d7b3e6435fc79ea5cf",
@@ -121,11 +121,11 @@
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
     "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
     "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
-    "hiai_modeling_sha256": "c1c588e91c38afd9cb32151883f20cbcdfd20f3306a17c399188cc8ee676aefb",
+    "hiai_modeling_sha256": "b7b7d51d46aa8945b7356ea0db264c63a76b8a6a5d74a08d40868f9f184269cb",
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
     "wrapper_sha256": "a62e4a554cd566194455a993e37dd0bc045579424d99c85e789dd241b1408020",
     "shared_qlinear_source_file": "models/modeling_qwen3_5_hiai_nd.py",
-    "shared_qlinear_source_sha256": "1685fd101bb1bce2417d4d17026a1b81ac2b68f28dee0c1db748c3f53edff68e",
+    "shared_qlinear_source_sha256": "03ee9eaab5d8d41f93e5bc88dce5d9971578763af3dbfd1666cfd92c13216825",
     "policy": "persistent ordinary and DFlash sessions; prefill restores the original multi-token GDR route with 64-row real-token chunks, INT16[B] call-local effective length, and no padding commit; only the final real prompt row executes the LM head; T=K+1 transactional verification uses the unchanged GDR-MTP ABI; optional Target W8A8 reuses the original QLinear while the Draft stays FP16; ordinary eager resolves npu_trans_quant_param from the public wrapper or dispatcher op, caches its encoded scale and has a final INT64/UINT64 helper guard before calling the original NPU QuantMatmul, while the AIR factory flag selects the collision-free project-private FP32-scale V4444 frontend only during active Dynamo capture; fused attention always passes allQLen through the SymInt[] all_seq_lengths_q ABI and leaves optional Tensor pse_shift absent; incremental Draft KV cache; no historical-prefix replay during verify; strict-greedy zero token mismatch"
   },
   "npu_benchmark": {
