@@ -64,13 +64,15 @@ def _npu_quant_matmul_with_export_frontend(
     output_dtype: torch.dtype,
     export_flag: bool,
 ) -> torch.Tensor:
-    """Keep eager ACLNN and AIR V4444 scale ABIs strictly separated.
+    """Keep the quant eager ABI and AIR V4444 frontend separated.
 
     The private export frontend must retain the checkpoint's FP32 scale so its
-    TorchAir converter can lower the V4444 contract.  The eager ACLNN route on
-    the receiver accepts only the encoded INT64/UINT64 representation.  Keep
-    this conversion at the final eager boundary as well as in ``QLinear`` so a
-    direct helper caller cannot accidentally forward an FP32 scale to ACLNN.
+    TorchAir converter can lower the V4444 contract.  Ordinary eager execution
+    must preserve the authoritative ``quant`` branch call ABI as well: INT8
+    activation, INT8 weight, FP32 weight scale, and FP32 per-token scale.  Do
+    not pre-encode the weight scale with ``npu_trans_quant_param`` here; that
+    produces an INT64 carrier which has no INT8-weight V4444 kernel row on the
+    receiver.
     """
 
     if export_flag:
@@ -93,67 +95,12 @@ def _npu_quant_matmul_with_export_frontend(
             pertoken_scale=pertoken_scale,
             output_dtype=output_dtype,
         )
-    eager_scale = _encode_eager_npu_quant_scale(scale)
     return torch_npu.npu_quant_matmul(
         x1,
         x2,
-        eager_scale,
+        scale,
         pertoken_scale=pertoken_scale,
         output_dtype=output_dtype,
-    )
-
-
-def _encode_eager_npu_quant_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Encode one FP32 scale for the receiver's ACLNN QuantMatmulV4 ABI."""
-
-    if scale.dtype == torch.int64 or str(scale.dtype) == "torch.uint64":
-        return scale
-    if scale.dtype != torch.float32:
-        raise TypeError(
-            "eager QLinear scale must be FP32 or an encoded INT64/UINT64 Tensor"
-        )
-    converter = _resolve_eager_npu_quant_scale_converter()
-    encoded = converter(scale.contiguous())
-    if not isinstance(encoded, torch.Tensor):
-        raise TypeError("npu_trans_quant_param must return one Tensor")
-    if encoded.dtype != torch.int64 and str(encoded.dtype) != "torch.uint64":
-        raise TypeError(
-            "npu_trans_quant_param must return an INT64/UINT64 Tensor, got "
-            f"{encoded.dtype}"
-        )
-    if tuple(encoded.shape) != tuple(scale.shape):
-        raise ValueError(
-            "npu_trans_quant_param changed the quant scale shape from "
-            f"{tuple(scale.shape)} to {tuple(encoded.shape)}"
-        )
-    return encoded
-
-
-def _resolve_eager_npu_quant_scale_converter() -> Callable[..., torch.Tensor]:
-    """Resolve both public torch-npu spellings of TransQuantParam.
-
-    Receiver images have exposed this exact operator either as the top-level
-    ``torch_npu.npu_trans_quant_param`` wrapper or only through its dispatcher
-    packet.  AIR capture never calls this resolver: its V4444 frontend must
-    continue to consume the checkpoint's FP32 scale.
-    """
-
-    converter = getattr(torch_npu, "npu_trans_quant_param", None)
-    if callable(converter):
-        return converter
-    namespace = getattr(torch.ops, "npu", None)
-    packet = (
-        None
-        if namespace is None
-        else getattr(namespace, "npu_trans_quant_param", None)
-    )
-    operation = None if packet is None else getattr(packet, "default", None)
-    if callable(operation):
-        return operation
-    raise RuntimeError(
-        "this torch_npu build lacks both torch_npu.npu_trans_quant_param and "
-        "torch.ops.npu.npu_trans_quant_param.default required by the "
-        "Ascend310P ACLNN QuantMatmulV4 eager route"
     )
 
 
@@ -228,8 +175,6 @@ class QLinear(nn.Module):
         super().__init__()
         self.register_buffer("W_q", W_q)
         self.register_buffer("scale", scale)
-        self.register_buffer("_eager_encoded_scale", None, persistent=False)
-        self._eager_encoded_scale_source_version = -1
         self._quant_matmul_export_mode = False
         self.idx = idx
 
@@ -248,36 +193,14 @@ class QLinear(nn.Module):
             self._quant_matmul_export_mode and torch.compiler.is_compiling()
         )
 
-    def _eager_scale(self, device: torch.device) -> torch.Tensor:
-        scale = self.scale.to(device).contiguous()
-        if scale.dtype == torch.int64 or str(scale.dtype) == "torch.uint64":
-            return scale
-        source_version = int(getattr(self.scale, "_version", -1))
-        cached = self._eager_encoded_scale
-        if (
-            cached is None
-            or cached.device != scale.device
-            or tuple(cached.shape) != tuple(scale.shape)
-            or self._eager_encoded_scale_source_version != source_version
-        ):
-            cached = _encode_eager_npu_quant_scale(scale)
-            self._eager_encoded_scale = cached
-            self._eager_encoded_scale_source_version = source_version
-        return cached
-
     def forward(self, x):
         x_quant, pertoken_scale = torch_npu.npu_dynamic_quant(x)
         pertoken_scale = pertoken_scale.reshape(-1).to(torch.float32)
         export_frontend = self._use_quant_matmul_export_frontend()
-        scale = (
-            self.scale.to(x.device)
-            if export_frontend
-            else self._eager_scale(x.device)
-        )
         npu_out = _npu_quant_matmul_with_export_frontend(
             x_quant,
             self.W_q.to(x.device),
-            scale,
+            self.scale.to(x.device),
             pertoken_scale=pertoken_scale,
             output_dtype=torch.float16,
             export_flag=export_frontend,

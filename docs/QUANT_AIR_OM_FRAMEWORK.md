@@ -140,15 +140,15 @@ W8A8 matmul 不再把 `npu.npu_quant_matmul.default` 直接交给项目 converte
 “私有 op 是否已经注册”隐式选路：每个 `QLinear` 默认固定走 eager，AIR factory 加载量化 Target
 后才显式打开 export mode，并核对打开的 QLinear 数量与量化审计中的 `qlinear_count` 完全一致；
 该 mode 还必须同时处于 active Dynamo capture 才能选中私有前端，因此一次导出后同一对象再做
-普通 eager 调用也不会把 FP32 scale 误送进 ACLNN。
+普通 eager 调用也不会误走项目私有 export frontend。
 
-量化文件中的权重 scale 继续保留为 FP32，这是 AIR/`QuantBatchMatmulV4444` 需要的输入；普通
-Ascend310P ACLNN V4 eager 路径则在第一次调用每个 QLinear 时使用
-`torch_npu.npu_trans_quant_param` 生成 INT64/UINT64 编码 scale，并缓存为 non-persistent buffer；
-最终 eager helper 会再次检查 dtype，使绕过 `QLinear._eager_scale()` 的调用也不能把 FP32 直传
-ACLNN。后续 token 不会重复转换，FP32 原值也不会被覆盖。因此同一份权重同时满足直接
-`torch_npu` 推理和 AIR/OM 导出，且在同一 Python 进程中先导出再 eager 也不会串路。310P3
-receiver 安装的是
+量化文件中的权重 scale 继续保留为 FP32。普通 eager 严格复用 `quant` 分支已经验证过的调用
+合同：`INT8 activation + INT8 weight + FP32 weight scale + FP32 per-token scale`。这里不能先调用
+`npu_trans_quant_param`；该接口在 eager 返回 INT64 carrier，而 receiver 的 V4444 注册表没有
+`INT8 + INT8 + INT64` 这一列，预编码会在 `GetWorkspace` 阶段形成找不到 binary 的 integral
+key。AIR 则只在 active Dynamo capture 中使用项目私有 frontend，仍消费同一份 FP32 scale。
+因此直接 `torch_npu` 推理和 AIR/OM 导出保持相同量化参数语义，同时不会因私有 op 注册状态或
+残留 factory flag 串路。310P3 receiver 安装的是
 `QuantBatchMatmulV4444`，其 GE 输入顺序
 `x1,x2,scale,offset,bias,pertoken_scale` 与 PyTorch 前端的
 `x1,x2,scale,offset,pertoken_scale,bias` 不同，因此框架按名称绑定六个输入，并显式写入：
@@ -234,6 +234,9 @@ gear。
    `ChunkGatedDeltaRule`，且其 `op_proto.h` 包含 `effective_length` v2 输入。
 10. `ASCEND_CUSTOM_OPP_PATH` 中包含一套完整 ADN vendor，其 prototype 注册
     `AdnFusedInferAttention`，并带有 Ascend310P `.o/.json` 预编译 kernel。
+11. `ASCEND_CUSTOM_OPP_PATH` 中包含完整 `QuantBatchMatmulV4444` vendor，且它的
+    `op_api/lib/libcust_opapi.so` 在 `LD_LIBRARY_PATH` 中优先于冲突实现；其 ops-info 必须包含
+    `INT8 + INT8 + FP32 scale -> FP16`。修改环境变量后必须启动新的 Python 进程。
 
 禁止用 CPU fallback 代替设备结论。仓库不保存 checkpoint、量化权重、AIR、OM、编译缓存、
 日志或性能报告。
@@ -256,7 +259,10 @@ export MODEL_PYTHON=/ABSOLUTE/PATH/python3
 export AI_RUN_DIR=/ABSOLUTE/PATH/quant-air-om-run
 export PYTHONPATH="$REPO_ROOT/framework/python:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export ADN_OPP=/ABSOLUTE/PATH/adn_fa_and_norm/packages/vendors/customize
-export ASCEND_CUSTOM_OPP_PATH="$ADN_OPP${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+export QMM_OPP=/ABSOLUTE/PATH/vendors/customize_quantMatmul
+export QMM_OPAPI="$QMM_OPP/op_api/lib"
+export LD_LIBRARY_PATH="$QMM_OPAPI${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ASCEND_CUSTOM_OPP_PATH="$QMM_OPP:$ADN_OPP${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
 mkdir -p "$AI_RUN_DIR"
 cd "$REPO_ROOT"
 ```
@@ -272,12 +278,7 @@ print("torch", torch.__version__)
 print("torch_npu", getattr(torch_npu, "__version__", "unknown"))
 print("torchair", getattr(torchair, "__version__", "unknown"))
 print("npu_available", torch.npu.is_available())
-public_trans = getattr(torch_npu, "npu_trans_quant_param", None)
-packet = getattr(getattr(torch.ops, "npu", None), "npu_trans_quant_param", None)
-dispatch_trans = None if packet is None else getattr(packet, "default", None)
-print("npu_trans_quant_param.public", callable(public_trans))
-print("npu_trans_quant_param.dispatch", callable(dispatch_trans))
-assert callable(public_trans) or callable(dispatch_trans)
+print("npu_quant_matmul.schema", torch.ops.npu.npu_quant_matmul.default._schema)
 PY
 
 npu-smi info
@@ -1038,7 +1039,8 @@ rg --files "$PROF_DIR" | \
 | `schema drifted from the locked export contract` | torch-npu/receiver 算子签名与当前锁不一致 | 记录 dispatcher schema；按真实版本更新 schema、Fake、converter 和测试，不能跳过校验 |
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
 | `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
-| `aclnnQuantMatmulV4 failed, error code is 161002`，并提示 `Scale dtype should be UINT64 or INT64, actual dtype is DT_FLOAT` | 普通 eager 把量化文件中的 FP32 scale 直接交给当前 310P ACLNN V4；这不是权重文件损坏，远程 quant 加载器本来也会保留 FP32 | 确认当前提交包含 eager helper 的 `npu_trans_quant_param` 防线和 active-Dynamo export gate；普通 eager 会从顶层 wrapper 或 dispatcher op 解析转换器，一次性编码并缓存 scale，AIR 仍保留 FP32。不要用 `.to(torch.int64)` 做数值截断，也不要把 AIR 图改成 encoded-scale ABI；`operator-dispatch.json` 应包含 `npu::npu_trans_quant_param` |
+| `aclnnQuantMatmulV4 failed, error code is 161002`，并提示 `Scale dtype should be UINT64 or INT64, actual dtype is DT_FLOAT` | 当前进程解析到了官方或另一套同名 `aclnnQuantMatmulV4`，没有进入支持 FP32 weight scale 和 per-token scale 的自定义 V4444 wrapper；同一环境下原 `quant` 分支也会失败 | 不要修改模型 scale。确认 `customize_quantMatmul/op_api/lib` 位于 `LD_LIBRARY_PATH` 最前、完整 vendor 位于 `ASCEND_CUSTOM_OPP_PATH`，排除同名旧包后新起 Python 进程；用 `/proc/<PID>/maps` 或 `LD_DEBUG=bindings` 核对实际加载的 `libcust_opapi.so` |
+| `aclnnQuantMatmulV4 failed, error code is 561103`，并提示 `Cannot find bin ... int8/ND/int8/ND/int64/ND/float16/ND` | 旧框架对 `quant` 分支的 FP32 scale 错误调用了 `npu_trans_quant_param`，形成 V4444 注册表不存在的 `INT8 + INT8 + INT64` 组合 | 更新本分支；普通 eager 应与 `quant@28f93e7` 一样直接传 FP32 weight scale 和 FP32 per-token scale，AIR 继续走私有 FP32-scale frontend。不要用 `.to(torch.uint64)` 或 `.to(torch.int64)` 数值强转 |
 | `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 旧版 AIR 路径把 `Tensor(a!) -> Tensor(a!)` 直接交给 AOTAutograd；Fake 正确也无法 functionalize | 更新本分支；确认 FX target 为 `qwen35_dflash.npu_cache_update.default`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
 | `ERR03005 GRAPH internal error`，`Original traceback` 指向 `qwen35_dflash.npu_cache_update.default`，Meta 单测通过 | 旧 converter 把前端 snake_case 参数按 positional 传入，但 GE `CacheUpdate` 原型要求 `x/updates/targetBlock/offsetInBlock -> x` | 更新本分支；确认 AIR manifest 中该算子的 `converter_mode` 为 `named-cache-update-x-v1` |
 | `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |

@@ -52,9 +52,10 @@ Target modeling 的七个 NPU 自定义算子数值路径保持不变：`npu_dyn
 schema，并校验已有 Meta 或在缺失时注册精确 Fake；原位 cache/scatter 的 writable alias 也属于
 合同。QuantMatmul 的 AIR 路径使用项目私有 functional frontend，避免与 receiver TorchAir
 注册在源 target 上的 V3 builtin converter 冲突，并精确 lowering 为 V4444；普通 eager 为
-ACLNN V4 一次性编码并缓存 INT64/UINT64 scale，最终 helper 也会阻止 FP32 直达 ACLNN；AIR 只在
-active Dynamo capture 中保留原始 FP32 scale，两条路径不会因私有 op 的注册状态或残留 factory
-flag 串路。Attention 则按 receiver 的真实 310P prototype lower 为单输出
-`AdnFusedInferAttention`，并在加载权重前验证 ADN vendor、原型和预编译 kernel；不会再生成
+与可运行的 `quant` 分支完全一致，保留 INT8 activation、INT8 weight、FP32 weight scale 和
+FP32 per-token scale；它不会调用 `npu_trans_quant_param` 生成与 INT8 weight 不匹配的 INT64
+carrier。AIR 只在 active Dynamo capture 中切换到项目私有 FP32-scale frontend，两条路径不会因
+私有 op 的注册状态或残留 factory flag 串路。Attention 则按 receiver 的真实 310P prototype
+lower 为单输出 `AdnFusedInferAttention`，并在加载权重前验证 ADN vendor、原型和预编译 kernel；不会再生成
 310P3 无 kernel 的 A2 `FusedInferAttentionScore`。最终 `dynamo.pbtxt` 节点计数和 converter 审计写入
 `air-manifest.json`，不会通过 Tensor 公式替换绕过自定义算子。

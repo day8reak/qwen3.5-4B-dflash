@@ -1,6 +1,6 @@
 {
-  "schema_version": 24,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v24",
+  "schema_version": 25,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v25",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -57,7 +57,7 @@
           "broadcast batch + [x1[-2], x2[-1]], requested output dtype, input device"
         ],
         "default_ge_op_type": "QuantBatchMatmulV4444",
-        "constraints": "private functional AIR frontend avoids the receiver TorchAir builtin V3 converter registered on the source target and consumes the original FP32 weight scale; ordinary eager is explicitly isolated, encodes FP32 scale once with torch_npu.npu_trans_quant_param, caches the INT64/UINT64 result, and then calls the source op",
+        "constraints": "private functional AIR frontend avoids the receiver TorchAir builtin V3 converter registered on the source target and consumes the original FP32 weight scale; ordinary eager is explicitly isolated and preserves the authoritative quant branch ABI of INT8 activation, INT8 weight, FP32 weight scale, and FP32 per-token scale without npu_trans_quant_param pre-encoding",
         "converter": "framework registered GE IR on the private target; named receiver ABI; FP16 dtype=DT_FLOAT16; group_size=0",
         "minimum_occurrences": 1
       },
