@@ -38,7 +38,7 @@ NPU_QUANT_MATMUL_TORCH_OP = "npu::npu_quant_matmul"
 NPU_SCATTER_ND_UPDATE_TORCH_OP = "npu::npu_scatter_nd_update_"
 
 ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE = "AdnFusedInferAttention"
-ADN_RMS_NORM_DEFAULT_GE_OP_TYPE = "RmsNorm"
+ADN_RMS_NORM_DEFAULT_GE_OP_TYPE = "AdnRmsNorm"
 NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE = "CacheUpdate"
 NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE = "ChunkGatedDeltaRule"
 NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE = "GatedDeltaRuleMTP"
@@ -1278,8 +1278,12 @@ def _register_framework_converter(
         return custom_op(spec.ge_op_type, *args)
 
     if adapter.torch_op == ADN_RMS_NORM_TORCH_OP:
-        if call_mode == "named-only":
-            _require_ge_attrs(ge_api, ("Float",))
+        if spec.ge_op_type != ADN_RMS_NORM_DEFAULT_GE_OP_TYPE:
+            raise RuntimeError(
+                "adn_rms_norm currently has an exact named lowering only to "
+                f"{ADN_RMS_NORM_DEFAULT_GE_OP_TYPE}"
+            )
+        _require_ge_attrs(ge_api, ("Float",))
 
         def converter(
             input: Any,
@@ -1289,20 +1293,20 @@ def _register_framework_converter(
         ) -> Any:
             del meta_outputs
             session.converter_calls += 1
-            if call_mode == "registered-ir-positional":
-                return custom_op(spec.ge_op_type, input, gamma, epsilon)
-            if spec.ge_op_type != ADN_RMS_NORM_DEFAULT_GE_OP_TYPE:
-                raise RuntimeError(
-                    "named-only TorchAir can lower adn_rms_norm only to RmsNorm"
-                )
-            return custom_op(
+            result = custom_op(
                 spec.ge_op_type,
-                inputs={"x": input, "gamma": gamma},
+                inputs={"self": input, "gamma": gamma},
                 outputs=["y", "rstd"],
                 attrs={"epsilon": ge_api.attr.Float(epsilon)},
             )
+            if not isinstance(result, (tuple, list)) or len(result) != 2:
+                raise RuntimeError(
+                    "AdnRmsNorm GE IR must return exactly y and rstd"
+                )
+            return result
 
         converter.__name__ = "convert_npu_adn_rms_norm_default"
+        session.converter_mode = "named-adn-rms-norm-v1"
     elif adapter.torch_op == NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP:
         if spec.ge_op_type != NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE:
             raise RuntimeError(

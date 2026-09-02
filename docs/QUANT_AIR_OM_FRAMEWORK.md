@@ -99,11 +99,24 @@ schema/Meta 预检，但不能虚构一次图命中。
 | --- | --- | --- | --- | --- |
 | `npu.npu_dynamic_quant.default` | INT8 输出与 input 同 shape；FP32 scale 为 `input.shape[:-1]` | `DynamicQuant` | TorchAir builtin | required |
 | `qwen35_dflash.npu_quant_matmul_v4444.default` | broadcast batch + `[M,N]`，当前调用输出 FP16 | `QuantBatchMatmulV4444` | 框架注册 | required |
-| `npu.adn_rms_norm.default` | 输出 0 与 input 同 shape/dtype；输出 1 为 `[*input.shape[:-1],1]` FP32 | `RmsNorm` | 框架注册 | required |
+| `npu.adn_rms_norm.default` | 输出 0 与 input 同 shape/dtype；输出 1 为 `[*input.shape[:-1],1]` FP32 | `AdnRmsNorm` | 框架注册 | required |
 | `npu.npu_chunk_gated_delta_rule.default` | output 为 value shape/query dtype；final state 为 initial-state shape/FP32 | `ChunkGatedDeltaRule` | 框架注册 | required |
 | `qwen35_dflash.npu_cache_update.default` | 返回同 shape/dtype/device 的非 alias 更新值 | `CacheUpdate` | 框架注册 | required |
 | `npu.adn_fused_infer_attention.default` | 按 layout 推导；当前 packed `BNSD` 路径保持 query shape/FP16 | `AdnFusedInferAttention` | 框架映射 | required |
 | `npu.npu_scatter_nd_update_.default` | 返回同一个 `Tensor(a!)`，不能丢失写 alias | `ScatterNdUpdate` | TorchAir builtin | optional（仅 `forward1`） |
+
+这里的 `AdnRmsNorm` 不是通用 CANN `RmsNorm`。receiver 原导出器明确调用
+`custom_op("AdnRmsNorm", inputs={"self": ..., "gamma": ...},
+outputs=["y", "rstd"], attrs={"epsilon": ...})`，所以 factory、converter 和图审计必须使用同一
+名称及 named ABI，不能以一个自洽但错误的 `RmsNorm` 测试替代 receiver 合同。其余名称分别由
+receiver converter（`ChunkGatedDeltaRule`、`CacheUpdate`、`AdnFusedInferAttention`）、310P
+receiver 量化包（`QuantBatchMatmulV4444`）和 TorchAir builtin converter（`DynamicQuant`、
+`ScatterNdUpdate`）核对。增量 verify 用到的第八个前端不属于重算图七项，其 GE type 单独锁定为
+`GatedDeltaRuleMTP`。
+
+这些 `*_ge_op_type` 字段是显式可审计的锁值，不是自由重命名入口；任一值偏离上表都会在加载
+4B checkpoint 前失败。需要支持另一套 receiver 时，应连同其 GE prototype、converter named
+ABI、图节点审计和真机 ATC 证据一起版本化，不能只改 JSON 字符串。
 
 GDR 的模型合同是 Q/K/V `[B,S,32,128]` FP16、g `[B,S,32]` FP32、beta
 `[B,S,32]` FP16、`effective_length [B]` INT16、initial/final state
@@ -377,8 +390,9 @@ cp config/quant_air_om_factory.example.json "$AI_RUN_DIR/factory.json"
   "device": "npu:0",
   "npu_dynamic_quant_ge_op_type": "DynamicQuant",
   "npu_quant_matmul_ge_op_type": "QuantBatchMatmulV4444",
-  "adn_rms_norm_ge_op_type": "RmsNorm",
+  "adn_rms_norm_ge_op_type": "AdnRmsNorm",
   "npu_chunk_gated_delta_rule_ge_op_type": "ChunkGatedDeltaRule",
+  "npu_gated_delta_rule_mtp_ge_op_type": "GatedDeltaRuleMTP",
   "npu_cache_update_ge_op_type": "CacheUpdate",
   "adn_fused_infer_attention_ge_op_type": "AdnFusedInferAttention",
   "npu_scatter_nd_update_ge_op_type": "ScatterNdUpdate",
@@ -515,7 +529,7 @@ expected = {
     "qwen35_dflash.npu_quant_matmul_v4444.default": (
         "QuantBatchMatmulV4444", 1, "framework-registered-ge-ir"
     ),
-    "npu.adn_rms_norm.default": ("RmsNorm", 1, "framework-registered-ge-ir"),
+    "npu.adn_rms_norm.default": ("AdnRmsNorm", 1, "framework-registered-ge-ir"),
     "npu.npu_chunk_gated_delta_rule.default": (
         "ChunkGatedDeltaRule", 1, "framework-registered-ge-ir"
     ),
@@ -547,13 +561,19 @@ PY
 还可以直接检查 TorchAir 的可读 GE 图：
 
 ```bash
-rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV4444|RmsNorm|ChunkGatedDeltaRule|CacheUpdate|AdnFusedInferAttention|ScatterNdUpdate)"' \
+rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV4444|AdnRmsNorm|ChunkGatedDeltaRule|CacheUpdate|AdnFusedInferAttention|ScatterNdUpdate)"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
 ```
 
 并确认旧类型没有残留：
 
 ```bash
+if rg -n '(type|op): "RmsNorm"' \
+  "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"; then
+  echo "FAIL: receiver requires AdnRmsNorm, not RmsNorm" >&2
+  exit 1
+fi
+
 if rg -n '(type|op): "QuantBatchMatmulV3"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"; then
   echo "FAIL: stale QuantBatchMatmulV3 lowering" >&2
@@ -1059,6 +1079,7 @@ rg --files "$PROF_DIR" | \
 | `unsupported operator: npu.<op>.default` | 七算子预检未运行、实际代码不是本分支，或 receiver 新增了第八个算子 | 核对远端提交、`PYTHONPATH`；已覆盖清单见 2.1，不能用 modeling Tensor fallback 掩盖 |
 | `schema drifted from the locked export contract` | torch-npu/receiver 算子签名与当前锁不一致 | 记录 dispatcher schema；按真实版本更新 schema、Fake、converter 和测试，不能跳过校验 |
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
+| `RmsNorm` unsupported、或图审计找不到 `AdnRmsNorm` | factory/旧 converter 使用了通用 GE 名称，但 receiver 注册的是 `AdnRmsNorm(self,gamma)->(y,rstd)` | 把 `adn_rms_norm_ge_op_type` 改为 `AdnRmsNorm`，更新本分支后重新生成空 AIR bundle；不要复用旧 AIR |
 | `the pertoken_scale 1st dim value must be x1 m dim value` | 旧版框架的 QuantMatmul Meta 探针误用了 `[B*M]` scale；不是 NPU kernel 失败 | 更新本分支；确认 `x1=[1,M,K]` 时探针和模型都传 `pertoken_scale=[M]` |
 | `aclnnQuantMatmulV4 failed, error code is 161002`，并提示 `Scale dtype should be UINT64 or INT64, actual dtype is DT_FLOAT` | 当前进程解析到了官方或另一套同名 `aclnnQuantMatmulV4`，没有进入支持 FP32 weight scale 和 per-token scale 的自定义 V4444 wrapper；同一环境下原 `quant` 分支也会失败 | 不要修改模型 scale。确认 `customize_quantMatmul/op_api/lib` 位于 `LD_LIBRARY_PATH` 最前、完整 vendor 位于 `ASCEND_CUSTOM_OPP_PATH`，排除同名旧包后新起 Python 进程；用 `/proc/<PID>/maps` 或 `LD_DEBUG=bindings` 核对实际加载的 `libcust_opapi.so` |
 | `aclnnQuantMatmulV4 failed, error code is 561103`，并提示 `Cannot find bin ... int8/ND/int8/ND/int64/ND/float16/ND` | 旧框架对 `quant` 分支的 FP32 scale 错误调用了 `npu_trans_quant_param`，形成 V4444 注册表不存在的 `INT8 + INT8 + INT64` 组合 | 更新本分支；普通 eager 应与 `quant@28f93e7` 一样直接传 FP32 weight scale 和 FP32 per-token scale，AIR 继续走私有 FP32-scale frontend。不要用 `.to(torch.uint64)` 或 `.to(torch.int64)` 数值强转 |

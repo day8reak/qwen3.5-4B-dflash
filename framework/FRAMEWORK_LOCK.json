@@ -1,6 +1,6 @@
 {
-  "schema_version": 26,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v26",
+  "schema_version": 27,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v27",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -68,8 +68,13 @@
           "input shape/dtype/device",
           "input.shape[:-1] + [1], float32, input device"
         ],
-        "default_ge_op_type": "RmsNorm",
-        "converter": "framework registered GE IR",
+        "ge_prototype": {
+          "inputs": ["self", "gamma"],
+          "outputs": ["y", "rstd"],
+          "attrs": ["epsilon"]
+        },
+        "default_ge_op_type": "AdnRmsNorm",
+        "converter": "framework registered GE IR with receiver names self/gamma -> y/rstd and epsilon attr",
         "minimum_occurrences": 1
       },
       {
@@ -155,6 +160,7 @@
   "compiler": {
     "exporter": "TorchAir dynamo_export",
     "custom_op_gate": "validate and propagate AIR custom_op_audit before ATC",
+    "ge_operator_type_gate": "lock receiver/TorchAir names to DynamicQuant, QuantBatchMatmulV4444, AdnRmsNorm, ChunkGatedDeltaRule, CacheUpdate, AdnFusedInferAttention and ScatterNdUpdate for the recompute graph; incremental verify substitutes GatedDeltaRuleMTP for ChunkGatedDeltaRule",
     "ge_ir_node_audit": "count both TorchAir dynamo.pbtxt op and type node fields; use the per-file maximum per GE type to avoid duplicate counting",
     "gdr_prototype_gate": "reject duplicate or legacy ChunkGatedDeltaRule prototypes from ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH before checkpoint load",
     "adn_attention_prototype_gate": "require exactly one receiver AdnFusedInferAttention prototype in ASCEND_CUSTOM_OPP_PATH with the locked ABI and an Ascend310P prebuilt object/metadata pair before checkpoint load",

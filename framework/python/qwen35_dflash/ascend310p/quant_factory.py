@@ -405,86 +405,94 @@ class QuantFullPrefixExportTarget(nn.Module):
         return logits, features
 
 
+def _locked_ge_op_type(
+    config: Mapping[str, Any],
+    key: str,
+    expected: str,
+) -> str:
+    actual = config.get(key, expected)
+    if not isinstance(actual, str) or actual != expected:
+        raise ValueError(
+            f"{key} must be {expected!r} for the locked receiver GE ABI; "
+            f"got {actual!r}"
+        )
+    return actual
+
+
 def _target_custom_op_exports(
     config: Mapping[str, Any],
     *,
     mtp: bool,
 ) -> tuple[CustomOpExportSpec, ...]:
+    chunk_gdr_ge_op_type = _locked_ge_op_type(
+        config,
+        "npu_chunk_gated_delta_rule_ge_op_type",
+        NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+    )
+    mtp_gdr_ge_op_type = _locked_ge_op_type(
+        config,
+        "npu_gated_delta_rule_mtp_ge_op_type",
+        NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+    )
     gdr = (
         CustomOpExportSpec(
             torch_op=NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
-            ge_op_type=str(
-                config.get(
-                    "npu_gated_delta_rule_mtp_ge_op_type",
-                    NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
-                )
-            ),
+            ge_op_type=mtp_gdr_ge_op_type,
         )
         if mtp
         else CustomOpExportSpec(
             torch_op=NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
-            ge_op_type=str(
-                config.get(
-                    "npu_chunk_gated_delta_rule_ge_op_type",
-                    NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
-                )
-            ),
+            ge_op_type=chunk_gdr_ge_op_type,
         )
     )
     return (
         CustomOpExportSpec(
             torch_op=NPU_DYNAMIC_QUANT_TORCH_OP,
-            ge_op_type=str(
-                config.get(
-                    "npu_dynamic_quant_ge_op_type",
-                    NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
-                )
+            ge_op_type=_locked_ge_op_type(
+                config,
+                "npu_dynamic_quant_ge_op_type",
+                NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
             ),
         ),
         CustomOpExportSpec(
             torch_op=FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
-            ge_op_type=str(
-                config.get(
-                    "npu_quant_matmul_ge_op_type",
-                    NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
-                )
+            ge_op_type=_locked_ge_op_type(
+                config,
+                "npu_quant_matmul_ge_op_type",
+                NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
             ),
         ),
         CustomOpExportSpec(
             torch_op=ADN_RMS_NORM_TORCH_OP,
-            ge_op_type=str(
-                config.get(
-                    "adn_rms_norm_ge_op_type",
-                    ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
-                )
+            ge_op_type=_locked_ge_op_type(
+                config,
+                "adn_rms_norm_ge_op_type",
+                ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
             ),
         ),
         gdr,
         CustomOpExportSpec(
             torch_op=FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
-            ge_op_type=str(
-                config.get(
-                    "npu_cache_update_ge_op_type",
-                    NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
-                )
+            ge_op_type=_locked_ge_op_type(
+                config,
+                "npu_cache_update_ge_op_type",
+                NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
             ),
         ),
         CustomOpExportSpec(
             torch_op=ADN_FUSED_INFER_ATTENTION_TORCH_OP,
-            ge_op_type=str(
-                config.get(
-                    "adn_fused_infer_attention_ge_op_type",
-                    ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
-                )
+            ge_op_type=_locked_ge_op_type(
+                config,
+                "adn_fused_infer_attention_ge_op_type",
+                ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
             ),
         ),
         CustomOpExportSpec(
             torch_op=NPU_SCATTER_ND_UPDATE_TORCH_OP,
-            ge_op_type=str(
-                config.get(
-                    "npu_scatter_nd_update_ge_op_type",
-                    NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
-                )
+            ge_op_type=_locked_ge_op_type(
+                config,
+                "npu_scatter_nd_update_ge_op_type",
+                NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
             ),
             minimum_occurrences=0,
         ),

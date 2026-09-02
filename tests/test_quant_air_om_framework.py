@@ -60,6 +60,7 @@ from qwen35_dflash.ascend310p.quant_factory import (
     QUANT_BASE_REVISION,
     QuantFullPrefixExportTarget,
     _enable_target_quant_matmul_export_mode,
+    _target_custom_op_exports,
     create_quant_recompute_graph,
 )
 from qwen35_dflash.ascend310p.standard_op_export import (
@@ -270,7 +271,7 @@ class _FakeTorchAir:
         root = Path(export_path)
         (root / f"{export_name}.air").write_bytes(b"air")
         (root / "dynamo.pbtxt").write_text(
-            'op {\n  name: "rms"\n  type: "RmsNorm"\n}\n'
+            'op {\n  name: "rms"\n  type: "AdnRmsNorm"\n}\n'
             'op {\n  name: "softplus"\n  type: "SoftplusV2"\n}\n',
             encoding="utf-8",
         )
@@ -772,6 +773,11 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         for session in sessions
         if session.spec.torch_op == NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP
     )
+    rms_session = next(
+        session
+        for session in sessions
+        if session.spec.torch_op == ADN_RMS_NORM_TORCH_OP
+    )
     cache_session = next(
         session
         for session in sessions
@@ -786,6 +792,13 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         session
         for session in sessions
         if session.spec.torch_op == ADN_FUSED_INFER_ATTENTION_TORCH_OP
+    )
+    rms_input, rms_gamma = object(), object()
+    torchair.converters[operations["adn_rms_norm"]](
+        rms_input,
+        rms_gamma,
+        1e-6,
+        meta_outputs=(placeholder, placeholder),
     )
     torchair.converters[operations["npu_chunk_gated_delta_rule"]](
         query,
@@ -832,10 +845,23 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         call[0] for call in torchair.ge.calls
     } >= {
         ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+        ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
         NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
         NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
         NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
     }
+    rms_call = next(
+        call
+        for call in torchair.ge.calls
+        if call[0] == ADN_RMS_NORM_DEFAULT_GE_OP_TYPE
+    )
+    assert rms_call[1] == ()
+    assert rms_call[2] == {
+        "inputs": {"self": rms_input, "gamma": rms_gamma},
+        "outputs": ["y", "rstd"],
+        "attrs": {"epsilon": ("float", 1e-6)},
+    }
+    assert rms_session.converter_mode == "named-adn-rms-norm-v1"
     gdr_call = next(
         call
         for call in torchair.ge.calls
@@ -940,6 +966,61 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         },
     }
     assert attention_session.converter_mode == "named-adn-attention-v1"
+
+
+def test_locked_ge_operator_type_names_match_receiver_and_torchair() -> None:
+    assert {
+        ADN_RMS_NORM_TORCH_OP: ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+        ADN_FUSED_INFER_ATTENTION_TORCH_OP: (
+            ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE
+        ),
+        NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP: (
+            NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE
+        ),
+        NPU_GATED_DELTA_RULE_MTP_TORCH_OP: (
+            NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE
+        ),
+        FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP: (
+            NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE
+        ),
+        FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP: (
+            NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE
+        ),
+        NPU_DYNAMIC_QUANT_TORCH_OP: NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
+        NPU_SCATTER_ND_UPDATE_TORCH_OP: (
+            NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE
+        ),
+    } == {
+        "npu::adn_rms_norm": "AdnRmsNorm",
+        "npu::adn_fused_infer_attention": "AdnFusedInferAttention",
+        "npu::npu_chunk_gated_delta_rule": "ChunkGatedDeltaRule",
+        "npu::npu_gated_delta_rule_mtp": "GatedDeltaRuleMTP",
+        "qwen35_dflash::npu_cache_update": "CacheUpdate",
+        "qwen35_dflash::npu_quant_matmul_v4444": "QuantBatchMatmulV4444",
+        "npu::npu_dynamic_quant": "DynamicQuant",
+        "npu::npu_scatter_nd_update_": "ScatterNdUpdate",
+    }
+
+
+@pytest.mark.parametrize(
+    ("config_key", "mtp"),
+    (
+        ("npu_dynamic_quant_ge_op_type", False),
+        ("npu_quant_matmul_ge_op_type", False),
+        ("adn_rms_norm_ge_op_type", False),
+        ("npu_chunk_gated_delta_rule_ge_op_type", False),
+        ("npu_gated_delta_rule_mtp_ge_op_type", True),
+        ("npu_cache_update_ge_op_type", False),
+        ("adn_fused_infer_attention_ge_op_type", False),
+        ("npu_scatter_nd_update_ge_op_type", False),
+    ),
+)
+def test_locked_ge_operator_type_names_reject_factory_overrides(
+    config_key: str,
+    mtp: bool,
+) -> None:
+    with pytest.raises(ValueError, match=f"{config_key} must be"):
+        _target_custom_op_exports({config_key: "WrongGeType"}, mtp=mtp)
 
 
 def test_gdr_fake_keeps_frontend_operator_in_strict_export() -> None:
@@ -1729,7 +1810,7 @@ def test_air_export_audits_retained_adn_rms_norm(
     }
     assert audit["status"] == "PASS"
     assert audit["torch_target"] == "npu.adn_rms_norm.default"
-    assert audit["ge_op_type"] == "RmsNorm"
+    assert audit["ge_op_type"] == "AdnRmsNorm"
     assert audit["converter_calls"] == 1
     assert audit["ge_node_occurrences"] == 1
     assert standard_override["status"] == "PASS"
@@ -1740,7 +1821,7 @@ def test_air_export_audits_retained_adn_rms_norm(
     assert standard_override["lowering"] == (
         "one GE node per call; beta and threshold preserved"
     )
-    assert torchair.ge.calls[0][0] == "RmsNorm"
+    assert torchair.ge.calls[0][0] == "AdnRmsNorm"
     assert any(
         item["path"].endswith("dynamo.pbtxt")
         for item in graph["payload_files"]
@@ -1800,7 +1881,7 @@ def test_compiler_rejects_incomplete_declared_custom_op_audit() -> None:
             "custom_op_export_contracts": [
                 {
                     "torch_target": "npu.adn_rms_norm.default",
-                    "ge_op_type": "RmsNorm",
+                    "ge_op_type": "AdnRmsNorm",
                     "minimum_occurrences": 1,
                 },
                 {
@@ -1814,7 +1895,7 @@ def test_compiler_rejects_incomplete_declared_custom_op_audit() -> None:
             {
                 "status": "PASS",
                 "torch_target": "npu.adn_rms_norm.default",
-                "ge_op_type": "RmsNorm",
+                "ge_op_type": "AdnRmsNorm",
                 "minimum_occurrences": 1,
                 "converter_policy": "framework-registered-ge-ir",
                 "converter_calls": 1,
@@ -2015,7 +2096,7 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
     air = graph_dir / "quant_dflash_recompute.air"
     air.write_bytes(b"quant-air")
     pbtxt = graph_dir / "dynamo.pbtxt"
-    pbtxt.write_text('op { type: "RmsNorm" }\n', encoding="utf-8")
+    pbtxt.write_text('op { type: "AdnRmsNorm" }\n', encoding="utf-8")
     manifest = {
         "schema_version": 3,
         "artifact_kind": "qwen35-dflash-torchair-bundle",
@@ -2030,7 +2111,7 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
                     "custom_op_export_contracts": [
                         {
                             "torch_target": "npu.adn_rms_norm.default",
-                            "ge_op_type": "RmsNorm",
+                            "ge_op_type": "AdnRmsNorm",
                         },
                         {
                             "torch_target": "npu.npu_scatter_nd_update_.default",
@@ -2043,7 +2124,7 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
                     {
                         "status": "PASS",
                         "torch_target": "npu.adn_rms_norm.default",
-                        "ge_op_type": "RmsNorm",
+                        "ge_op_type": "AdnRmsNorm",
                         "minimum_occurrences": 1,
                         "converter_policy": "framework-registered-ge-ir",
                         "converter_calls": 1,
@@ -2293,7 +2374,7 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
             "QuantBatchMatmulV4444",
             1,
         ),
-        "npu.adn_rms_norm.default": ("RmsNorm", 1),
+        "npu.adn_rms_norm.default": ("AdnRmsNorm", 1),
         "npu.npu_chunk_gated_delta_rule.default": (
             "ChunkGatedDeltaRule",
             1,
