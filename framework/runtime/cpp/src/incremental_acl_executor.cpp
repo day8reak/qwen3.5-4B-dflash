@@ -115,7 +115,7 @@ struct TensorSpec {
 };
 
 TensorSpec ReadTensorSpec(
-    const aclmdlDesc* description,
+    aclmdlDesc* description,
     std::size_t index,
     bool input) {
   aclmdlIODims dimensions{};

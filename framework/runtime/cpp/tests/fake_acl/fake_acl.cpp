@@ -818,14 +818,14 @@ aclDataType aclmdlGetOutputDataType(
 }
 
 std::size_t aclmdlGetInputSizeByIndex(
-    const aclmdlDesc* description, std::size_t index) {
+    aclmdlDesc* description, std::size_t index) {
   return description != nullptr && index < Inputs(description->role).size()
       ? Bytes(Inputs(description->role)[index])
       : 0;
 }
 
 std::size_t aclmdlGetOutputSizeByIndex(
-    const aclmdlDesc* description, std::size_t index) {
+    aclmdlDesc* description, std::size_t index) {
   return description != nullptr && index < Outputs(description->role).size()
       ? Bytes(Outputs(description->role)[index])
       : 0;

@@ -117,10 +117,10 @@ aclDataType aclmdlGetOutputDataType(
     const aclmdlDesc* description,
     std::size_t index);
 std::size_t aclmdlGetInputSizeByIndex(
-    const aclmdlDesc* description,
+    aclmdlDesc* description,
     std::size_t index);
 std::size_t aclmdlGetOutputSizeByIndex(
-    const aclmdlDesc* description,
+    aclmdlDesc* description,
     std::size_t index);
 aclError aclmdlGetInputIndexByName(
     const aclmdlDesc* description,

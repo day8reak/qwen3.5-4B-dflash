@@ -1,14 +1,26 @@
 #include "qwen35_dflash/generation.hpp"
 #include "qwen35_dflash/incremental_acl_executor.hpp"
 
+#include <acl/acl.h>
+
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
+
+using AclModelSizeQuery = std::size_t (*)(aclmdlDesc*, std::size_t);
+static_assert(
+    std::is_same_v<decltype(&aclmdlGetInputSizeByIndex), AclModelSizeQuery>,
+    "fake ACL input-size ABI must match CANN 9.0");
+static_assert(
+    std::is_same_v<decltype(&aclmdlGetOutputSizeByIndex), AclModelSizeQuery>,
+    "fake ACL output-size ABI must match CANN 9.0");
 
 namespace {
 
