@@ -232,11 +232,13 @@ converter，并为原地 CacheUpdate 定义了 functional frontend 与 Functiona
 
 ### 2.3 TorchAir 标准算子精确补丁
 
-目标环境的 TorchAir 虽然注册了 `torch.ops.aten.softplus.default`，对应 converter 却会主动抛出
-`NotImplementedError`。模型的 Gated DeltaNet 在公共 `forward()` 中通过 `F.softplus` 计算
-FP32 gate，因此框架在 `dynamo_export` 前覆盖该 converter，并精确生成一个 GE
-`SoftplusV2` 节点。`beta` 和 `threshold` 必须是有限的编译期数值，并原样写入 GE Float 属性；
-当前模型使用 PyTorch 默认值 `1.0` 和 `20.0`。
+目标环境的 TorchAir 版本行为并不一致：旧版本为 `torch.ops.aten.softplus.default` 注册的
+converter 会抛出 `NotImplementedError`，新版本可能已自行降成 `SoftplusV2`，且其延迟导入顺序
+可能覆盖框架先注册的 converter。模型的 Gated DeltaNet 在公共 `forward()` 中通过
+`F.softplus` 计算 FP32 gate，因此框架仍在 `dynamo_export` 前注册精确 converter，并以导出后的
+GE IR 是否保留 `SoftplusV2` 作为最终门禁。框架 converter 实际命中时，`beta` 和 `threshold`
+必须是有限的编译期数值并原样写入 GE Float 属性；当前模型使用 PyTorch 默认值 `1.0` 和
+`20.0`。
 
 这不是近似替换，也不会改两个 modeling 文件的 eager 数学。不要把它展开为
 `maximum + log1p + exp + abs`：展开会增加图节点，并且不再直接保留 PyTorch Softplus 的
@@ -247,8 +249,11 @@ rg -n 'type: "SoftplusV2"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
 ```
 
-至少应命中一次；`air-manifest.json` 的 `standard_op_overrides` 同时记录本图 converter 调用数。
-七个 NPU 自定义算子的 Fake、converter 和保留门禁仍由上一节独立执行。
+包含 Target Gated DeltaNet 的图至少应命中一次；四图中的 `target-prefill-head` 不经过 Target
+decoder，所以其合法最小值是 0。`air-manifest.json` 的 `standard_op_overrides` 会逐图记录
+`minimum_occurrences`、GE 节点数、converter 调用数和实际采用的 converter policy。这样不会因
+新 TorchAir 已生成正确 `SoftplusV2` 但框架计数器为 0 而误判，也不会放过需要 Softplus 的图中
+节点真正丢失的情况。七个 NPU 自定义算子的 Fake、converter 和保留门禁仍由上一节独立执行。
 
 如果 `S=64`，则 `prompt_tokens + generated_tokens` 不能超过 64。需要更长上下文时重新编译
 `S=128/256/...`。当前重算路径的延迟随 `S` 增大，因此先使用能够覆盖验证 workload 的最小
@@ -558,6 +563,18 @@ assert all(
 audits = [item for graph in data["graphs"] for item in graph["custom_op_audit"]]
 assert audits
 for item in audits:
+    assert item["status"] == "PASS"
+    assert item["ge_node_occurrences"] >= item["minimum_occurrences"]
+standard = {
+    graph["name"]: graph["standard_op_overrides"][0]
+    for graph in data["graphs"]
+}
+assert standard["target-prefill-head"]["minimum_occurrences"] == 0
+for name in (
+    "target-prefill", "target-decode1", "fused-speculative-step"
+):
+    assert standard[name]["minimum_occurrences"] == 1
+for item in standard.values():
     assert item["status"] == "PASS"
     assert item["ge_node_occurrences"] >= item["minimum_occurrences"]
 ge_types = {item["ge_op_type"] for item in audits}
@@ -1147,6 +1164,7 @@ rg --files "$PROF_DIR" | \
 | `Found a custom (non-ATen) operator whose output has alias annotations`，随后 `Original traceback` 指向 `npu_cache_update_` | 导出前没有准备私有 CacheUpdate frontend，或实际 modeling 仍显式进入了源 alias op | 更新本分支并在新 Python 进程导出；FX/AOT target 应为 `qwen35_dflash.npu_cache_update.default`，不应含 `npu.npu_cache_update_.default` 或 `aten.copy`，且 `dynamo.pbtxt` 仍包含 `CacheUpdate` |
 | `ERR03005 GRAPH internal error`，`Original traceback` 指向 `qwen35_dflash.npu_cache_update.default`，Meta 单测通过 | 旧 converter 把前端 snake_case 参数按 positional 传入，但 GE `CacheUpdate` 原型要求 `x/updates/targetBlock/offsetInBlock -> x` | 更新本分支；确认 AIR manifest 中该算子的 `converter_mode` 为 `named-cache-update-x-v1` |
 | `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |
+| 权重保存到 `699/699` 后报 `aten.softplus.default converter did not run` | 旧审计把“框架 converter 调用次数”误当成每张图的成功条件；新 TorchAir 可能已自行生成正确 `SoftplusV2`，而 `target-prefill-head` 本来就没有 Softplus | 更新本分支并改用新的空 bundle 目录重新导出；逐图检查 `standard_op_overrides`，Target/GDR 图要求 `minimum_occurrences=1`，prefill head 为 0；若 Target 图的 `ge_node_occurrences` 仍为 0，才是真正的 lowering 失败 |
 | `TorchAir IR contains 0 QuantBatchMatmulV4444 nodes for npu.npu_quant_matmul.default`，同时图中仍有 `QuantBatchMatmulV3` | receiver TorchAir 的内置 V3 converter 与旧项目 converter 注册在同一个 FX target 上，内置项仍被采用 | 更新本分支并重新导出到空目录；确认 audit target 已变为 `qwen35_dflash.npu_quant_matmul_v4444.default`，图中有 V4444 且无 V3 |
 | ATC 报 `QuantBatchMatmulV3` unsupported 或 FP32 scale 不匹配 | 旧 factory/builtin converter 生成了 CANN V3，而 receiver 实际安装 V4444 | 把现有 `factory.json` 改为 `QuantBatchMatmulV4444`，重新生成 AIR；确认图中有 V4444 且没有 V3 |
 | `No supported Ops kernel and engine ... FusedInferAttentionScore`（Ascend310P3） | 旧 AIR 把 receiver 的 ADN 前端错误 lower 成 A2 GE type；真实 310P 包注册的是 `AdnFusedInferAttention` | 更新本分支和现有 `factory.json`，把完整 ADN vendor 加入 `ASCEND_CUSTOM_OPP_PATH`，重新导出到空目录；确认图中只有 `AdnFusedInferAttention` 再跑 ATC |

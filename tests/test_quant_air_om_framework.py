@@ -50,7 +50,10 @@ from qwen35_dflash.ascend310p.custom_op_export import (
     validate_adn_attention_ge_prototype_environment,
     validate_gdr_ge_prototype_environment,
 )
-from qwen35_dflash.ascend310p.exporter import export_air_bundle
+from qwen35_dflash.ascend310p.exporter import (
+    _softplus_minimum_occurrences,
+    export_air_bundle,
+)
 from qwen35_dflash.ascend310p.input_manifest import (
     build_quant_input_manifest,
     verify_quant_input_manifest,
@@ -569,6 +572,200 @@ def test_aten_softplus_audit_accepts_op_field_without_double_counting(
         relative_to=tmp_path,
     )
     assert audit["ge_node_occurrences"] == 2
+    assert audit["minimum_occurrences"] == 1
+    assert audit["converter_policy"] == "framework-registered-ge-ir"
+
+
+def test_aten_softplus_audit_accepts_existing_ge_lowering_without_counter(
+    tmp_path: Path,
+) -> None:
+    session = prepare_aten_softplus_export(_FakeTorchAir())
+    graph_dir = tmp_path / "air" / "target-prefill"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "dynamo.pbtxt").write_text(
+        'op {\n  name: "softplus"\n  type: "SoftplusV2"\n}\n',
+        encoding="utf-8",
+    )
+
+    audit = audit_aten_softplus_export(
+        session,
+        graph_dir,
+        calls_before=0,
+        relative_to=tmp_path,
+        minimum_occurrences=1,
+    )
+
+    assert audit["status"] == "PASS"
+    assert audit["converter_calls"] == 0
+    assert audit["ge_node_occurrences"] == 1
+    assert audit["converter_policy"] == "torchair-existing-ge-ir"
+    assert audit["observed_in_graph"] is True
+
+
+def test_aten_softplus_audit_accepts_split_head_without_softplus(
+    tmp_path: Path,
+) -> None:
+    session = prepare_aten_softplus_export(_FakeTorchAir())
+    graph_dir = tmp_path / "air" / "target-prefill-head"
+    graph_dir.mkdir(parents=True)
+    (graph_dir / "dynamo.pbtxt").write_text(
+        'op {\n  name: "head"\n  type: "MatMul"\n}\n',
+        encoding="utf-8",
+    )
+
+    audit = audit_aten_softplus_export(
+        session,
+        graph_dir,
+        calls_before=0,
+        relative_to=tmp_path,
+        minimum_occurrences=0,
+    )
+
+    assert audit["status"] == "PASS"
+    assert audit["minimum_occurrences"] == 0
+    assert audit["converter_policy"] == "not-present-in-graph"
+    assert audit["observed_in_graph"] is False
+
+
+def test_softplus_requirement_follows_gdr_graph_contract() -> None:
+    base = {
+        "role": "test",
+        "model": nn.Identity(),
+        "example_args": (torch.ones(1),),
+    }
+    head = AirGraphSpec(name="head", custom_ops=(), **base)
+    target = AirGraphSpec(
+        name="target",
+        custom_ops=(
+            CustomOpExportSpec(
+                torch_op=NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+                ge_op_type=NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+            ),
+        ),
+        **base,
+    )
+    verify = AirGraphSpec(
+        name="verify",
+        custom_ops=(
+            CustomOpExportSpec(
+                torch_op=NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
+                ge_op_type=NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+            ),
+        ),
+        **base,
+    )
+
+    assert _softplus_minimum_occurrences(head) == 0
+    assert _softplus_minimum_occurrences(target) == 1
+    assert _softplus_minimum_occurrences(verify) == 1
+
+
+def test_four_graph_export_accepts_audited_existing_softplus_lowering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("AI_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("ASCEND_CUSTOM_OPP_PATH", raising=False)
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    torchair = _FakeTorchAir()
+
+    def dynamo_export(
+        *args: object,
+        model: nn.Module,
+        export_path: str,
+        export_name: str,
+        dynamic: bool,
+        **kwargs: object,
+    ) -> None:
+        del args, model, dynamic, kwargs
+        root = Path(export_path)
+        (root / f"{export_name}.air").write_bytes(b"air")
+        ge_type = (
+            "MatMul"
+            if export_name == "target-prefill-head"
+            else ATEN_SOFTPLUS_GE_OP_TYPE
+        )
+        (root / "dynamo.pbtxt").write_text(
+            f'op {{\n  name: "node"\n  type: "{ge_type}"\n}}\n',
+            encoding="utf-8",
+        )
+
+    torchair.dynamo_export = dynamo_export
+    monkeypatch.setattr(
+        "qwen35_dflash.ascend310p.exporter.prepare_custom_op_export",
+        lambda spec, module: (spec, module),
+    )
+    monkeypatch.setattr(
+        "qwen35_dflash.ascend310p.exporter.audit_custom_op_export",
+        lambda sessions, graph_dir, relative_to: [],
+    )
+
+    chunk_gdr = CustomOpExportSpec(
+        torch_op=NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+        ge_op_type=NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+    )
+    mtp_gdr = CustomOpExportSpec(
+        torch_op=NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
+        ge_op_type=NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+    )
+
+    def factory(config: object) -> tuple[AirGraphSpec, ...]:
+        del config
+        return tuple(
+            AirGraphSpec(
+                name=name,
+                role=name,
+                model=nn.Identity(),
+                example_args=(torch.ones(1),),
+                custom_ops=custom_ops,
+            )
+            for name, custom_ops in (
+                ("target-prefill", (chunk_gdr,)),
+                ("target-prefill-head", ()),
+                ("target-decode1", (chunk_gdr,)),
+                ("fused-speculative-step", (mtp_gdr,)),
+            )
+        )
+
+    result = export_air_bundle(
+        factory,
+        {},
+        run_dir / "four-air",
+        torchair_module=torchair,
+    )
+
+    audits = {
+        graph["name"]: graph["standard_op_overrides"][0]
+        for graph in result["graphs"]
+    }
+    assert list(audits) == [
+        "target-prefill",
+        "target-prefill-head",
+        "target-decode1",
+        "fused-speculative-step",
+    ]
+    assert {
+        name: audit["minimum_occurrences"]
+        for name, audit in audits.items()
+    } == {
+        "target-prefill": 1,
+        "target-prefill-head": 0,
+        "target-decode1": 1,
+        "fused-speculative-step": 1,
+    }
+    assert audits["target-prefill-head"]["converter_policy"] == (
+        "not-present-in-graph"
+    )
+    assert all(
+        audits[name]["converter_policy"] == "torchair-existing-ge-ir"
+        for name in (
+            "target-prefill",
+            "target-decode1",
+            "fused-speculative-step",
+        )
+    )
 
 
 class _FakeExecutionModel(nn.Module):
@@ -1819,10 +2016,15 @@ def test_air_export_audits_retained_adn_rms_norm(
     assert standard_override["status"] == "PASS"
     assert standard_override["torch_target"] == ATEN_SOFTPLUS_TORCH_TARGET
     assert standard_override["ge_op_type"] == ATEN_SOFTPLUS_GE_OP_TYPE
+    assert standard_override["minimum_occurrences"] == 0
     assert standard_override["converter_calls"] == 1
+    assert standard_override["converter_policy"] == (
+        "framework-registered-ge-ir"
+    )
     assert standard_override["ge_node_occurrences"] == 1
     assert standard_override["lowering"] == (
-        "one GE node per call; beta and threshold preserved"
+        "required GE SoftplusV2 nodes retained; framework-emitted nodes "
+        "preserve beta and threshold"
     )
     assert torchair.ge.calls[0][0] == "AdnRmsNorm"
     assert any(

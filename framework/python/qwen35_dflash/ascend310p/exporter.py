@@ -13,6 +13,8 @@ import torch
 
 from .contracts import AirGraphSpec
 from .custom_op_export import (
+    NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+    NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
     audit_custom_op_export,
     prepare_custom_op_export,
     validate_adn_attention_ge_prototype_environment,
@@ -23,6 +25,14 @@ from .standard_op_export import (
     prepare_aten_softplus_export,
 )
 from .utils import atomic_write_json, file_record, require_run_output, resolve_callable
+
+
+_SOFTPLUS_CONSUMER_TORCH_OPS = frozenset(
+    {
+        NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+        NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
+    }
+)
 
 
 @contextmanager
@@ -97,6 +107,18 @@ def _set_input_dim_gears(spec: AirGraphSpec, torchair: Any) -> None:
         )
 
 
+def _softplus_minimum_occurrences(spec: AirGraphSpec) -> int:
+    """Return whether this graph executes a Target Gated DeltaNet path."""
+
+    return int(
+        any(
+            item.minimum_occurrences > 0
+            and item.torch_op in _SOFTPLUS_CONSUMER_TORCH_OPS
+            for item in spec.custom_ops
+        )
+    )
+
+
 def export_air_bundle(
     factory: str | Callable[[Mapping[str, Any]], Sequence[AirGraphSpec]],
     factory_config: Mapping[str, Any],
@@ -123,9 +145,10 @@ def export_air_bundle(
         validate_adn_attention_ge_prototype_environment()
     )
 
-    # The receiver TorchAir release registers aten.softplus.default but its
-    # converter raises NotImplementedError.  Override it before Dynamo traces
-    # the model, preserving PyTorch beta/threshold semantics as one GE node.
+    # Receiver TorchAir releases either leave aten.softplus.default
+    # unimplemented or lower it themselves. Register the exact override before
+    # tracing, then audit the serialized GE outcome rather than relying only on
+    # which converter won the release-specific registration order.
     softplus_export = prepare_aten_softplus_export(torchair)
 
     # Import TorchAir before invoking the factory. The production factory loads
@@ -168,6 +191,7 @@ def export_air_bundle(
             graph_dir,
             calls_before=softplus_calls_before,
             relative_to=root,
+            minimum_occurrences=_softplus_minimum_occurrences(spec),
         )
 
         air_files = sorted(graph_dir.glob("*.air"))

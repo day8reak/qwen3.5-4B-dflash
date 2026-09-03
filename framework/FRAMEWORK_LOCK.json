@@ -1,6 +1,6 @@
 {
-  "schema_version": 27,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v27",
+  "schema_version": 28,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v28",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -151,8 +151,9 @@
         "source": "torch.nn.functional.softplus",
         "default_ge_op_type": "SoftplusV2",
         "attributes": {"beta": 1.0, "threshold": 20.0},
-        "converter": "framework exact one-node override",
-        "reason": "receiver TorchAir registers the frontend converter but raises NotImplementedError"
+        "converter": "framework exact one-node override with serialized GE-IR outcome audit",
+        "minimum_occurrences_policy": "1 for graphs declaring a required ChunkGatedDeltaRule or GatedDeltaRuleMTP path; 0 for graphs without Target Gated DeltaNet execution",
+        "reason": "old receiver TorchAir converters raise NotImplementedError while newer lazy registries may already emit the same SoftplusV2 node; the GE result is authoritative and a nonzero framework call count remains a consistency gate"
       }
     ],
     "state_policy": "recompute committed prefix"
