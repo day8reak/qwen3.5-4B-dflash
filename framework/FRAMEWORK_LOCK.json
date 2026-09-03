@@ -1,6 +1,6 @@
 {
-  "schema_version": 29,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v29",
+  "schema_version": 30,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v30",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -166,6 +166,19 @@
         "slice_count": 4,
         "semantics": "exact [B,T,C,Kc] state after each current verify row; accepted slot, GDR ABI and external OM ABI unchanged",
         "reason": "receiver TorchAir registers aten.unfold.default with a NotImplementedError converter"
+      },
+      {
+        "source": "EOS truncation and strict-greedy acceptance prefixes in ExactAcceptCommitStateGraph",
+        "forbidden_frontends": [
+          "aten.amin.default",
+          "aten.min.dim",
+          "aten.cumprod.default"
+        ],
+        "replacement": "two fixed-width INT32 Cumsum prefix scans plus supported boolean elementwise and Sum operations",
+        "maximum_proposal_width": 15,
+        "scan_count": 2,
+        "semantics": "first scan retains the requested proposal prefix through the first valid EOS inclusive; second scan retains only rows before the first Target mismatch; committed tokens, selected state slot and external OM ABI unchanged",
+        "reason": "receiver TorchAir leaves aten.amin.default, aten.min.dim and aten.cumprod.default converters unimplemented while aten.cumsum.default lowers to GE Cumsum"
       }
     ],
     "state_policy": "recompute committed prefix"

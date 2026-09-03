@@ -105,33 +105,35 @@ class ExactAcceptCommitStateGraph(nn.Module):
             eos_token_ids,
             eos_token_count,
         ) & within_requested
-        eos_sentinel = torch.full_like(positions, width)
-        first_eos = torch.where(proposal_is_eos, positions, eos_sentinel).amin(
-            dim=1
+        # TorchAir does not lower aten.amin or aten.cumprod on the receiver
+        # toolchain.  Keep both prefix decisions in supported INT32 Cumsum
+        # form.  Before the first EOS cumulative_eos == 0 == eos_bits, and at
+        # the first EOS it is 1 == 1; every later row differs.  Consequently
+        # drafted_mask contains exactly the requested prefix through its first
+        # EOS (inclusive), without a host read or a reduction-min operation.
+        eos_bits = proposal_is_eos.to(torch.int32)
+        cumulative_eos = torch.cumsum(
+            eos_bits,
+            dim=1,
+            dtype=torch.int32,
         )
-        drafted_count = torch.minimum(
-            logical_limit.squeeze(1),
-            first_eos + proposal_is_eos.any(dim=1).to(first_eos.dtype),
-        )
+        drafted_mask = within_requested & cumulative_eos.eq(eos_bits)
+        drafted_count = drafted_mask.to(torch.int32).sum(dim=1)
 
         matches = proposal_ids.eq(target_top1[:, :width])
-        comparable = positions < drafted_count.reshape(batch_size, 1)
-        prefix_match = torch.cumprod(
-            (matches | ~comparable).to(torch.int32),
+        mismatch_bits = (drafted_mask & ~matches).to(torch.int32)
+        cumulative_mismatches = torch.cumsum(
+            mismatch_bits,
             dim=1,
-        ).to(torch.bool)
-        accepted_count = (
-            prefix_match & comparable
-        ).to(torch.int32).sum(dim=1)
-        accepted_count = torch.minimum(
-            accepted_count,
-            drafted_count.to(torch.int32),
+            dtype=torch.int32,
         )
+        accepted_mask = drafted_mask & cumulative_mismatches.eq(0)
+        accepted_count = accepted_mask.to(torch.int32).sum(dim=1)
         rejected_count = drafted_count.to(torch.int32) - accepted_count
 
         accepted_eos = (
             proposal_is_eos
-            & (positions < accepted_count.reshape(batch_size, 1))
+            & accepted_mask
         ).any(dim=1)
         correction = torch.gather(
             target_top1,

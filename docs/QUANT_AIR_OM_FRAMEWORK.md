@@ -268,6 +268,19 @@ rollback Target 需要为当前 `T=K+1` 行返回逐行 causal-conv state。PyTo
 `state_length`。导出后若仍见 `aten.unfold.default`，说明执行的不是本分支源码；必须新起 Python
 进程并输出到新的空 AIR bundle，不能复用失败目录。
 
+### 2.5 DFlash transaction tail 的 AIR 前缀扫描
+
+四图中的 `fused-speculative-step` 在设备端完成 EOS 截断、严格贪心最长前缀验收和状态 slot
+选择。receiver TorchAir 对 `aten.amin.default`、`aten.min.dim` 和 `aten.cumprod.default` 都没有
+可用 converter，所以不能把 `.amin(dim=1)` 仅机械替换成 `torch.min(..., dim=1).values`，也不能
+继续用 `cumprod` 计算连续匹配前缀。
+
+当前实现使用两次固定宽度 INT32 `torch.cumsum`：第一次得到“截至首个有效 EOS（含 EOS）”的
+drafted mask，第二次得到“首个 Target mismatch 之前”的 accepted mask，再用 TorchAir 已支持的
+布尔逐元素运算与 `sum` 得到计数。proposal 最大宽度仍为 15；token、EOS、选中 Target state
+slot、GDR ABI、AIR/OM 输入输出 tensor ABI 均不变。源码导出测试明确禁止上述三个 unsupported
+frontend，并要求图中存在 `aten.cumsum.default`。
+
 如果 `S=64`，则 `prompt_tokens + generated_tokens` 不能超过 64。需要更长上下文时重新编译
 `S=128/256/...`。当前重算路径的延迟随 `S` 增大，因此先使用能够覆盖验证 workload 的最小
 gear。
@@ -1179,6 +1192,7 @@ rg --files "$PROF_DIR" | \
 | `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |
 | 权重保存到 `699/699` 后报 `aten.softplus.default converter did not run` | 旧审计把“框架 converter 调用次数”误当成每张图的成功条件；新 TorchAir 可能已自行生成正确 `SoftplusV2`，而 `target-prefill-head` 本来就没有 Softplus | 更新本分支并改用新的空 bundle 目录重新导出；逐图检查 `standard_op_overrides`，Target/GDR 图要求 `minimum_occurrences=1`，prefill head 为 0；若 Target 图的 `ge_node_occurrences` 仍为 0，才是真正的 lowering 失败 |
 | `ERR03007 GRAPH feature not supported`，`Original traceback` 指向 `history.unfold(...)[..., 1:, :]` | rollback causal-conv state-bank 使用了 TorchAir 未实现的 `aten.unfold.default` converter | 更新本分支、新起 Python 进程并导出到新的空 bundle；新图使用固定 Kc=4 的四个 Slice 加 Pack，且不改变 GDR/custom-op ABI。若堆栈仍指向 `.unfold`，先核对实际 `modeling_qwen3_5_hiai_nd_dflash_rollback.py` 的 SHA256 |
+| `ERR03007 GRAPH feature not supported`，`Original traceback` 指向 `incremental.py` 的 `.amin(dim=1)` 或 `torch.cumprod` | 四图 `fused-speculative-step` 的设备端 transaction tail 使用了 receiver TorchAir 未实现的 `aten.amin.default` / `aten.cumprod.default`；改成 `torch.min(...).values` 也会命中未实现的 `aten.min.dim` | 更新本分支、新起 Python 进程，从 `export-air` 开始输出到新的空 AIR bundle；v30 使用两次 INT32 Cumsum 精确保留 EOS 与 mismatch 前缀，不改变 token、state 或 OM ABI。不要继续 ATC 编译旧 AIR |
 | `TorchAir IR contains 0 QuantBatchMatmulV4444 nodes for npu.npu_quant_matmul.default`，同时图中仍有 `QuantBatchMatmulV3` | receiver TorchAir 的内置 V3 converter 与旧项目 converter 注册在同一个 FX target 上，内置项仍被采用 | 更新本分支并重新导出到空目录；确认 audit target 已变为 `qwen35_dflash.npu_quant_matmul_v4444.default`，图中有 V4444 且无 V3 |
 | ATC 报 `QuantBatchMatmulV3` unsupported 或 FP32 scale 不匹配 | 旧 factory/builtin converter 生成了 CANN V3，而 receiver 实际安装 V4444 | 把现有 `factory.json` 改为 `QuantBatchMatmulV4444`，重新生成 AIR；确认图中有 V4444 且没有 V3 |
 | `No supported Ops kernel and engine ... FusedInferAttentionScore`（Ascend310P3） | 旧 AIR 把 receiver 的 ADN 前端错误 lower 成 A2 GE type；真实 310P 包注册的是 `AdnFusedInferAttention` | 更新本分支和现有 `factory.json`，把完整 ADN vendor 加入 `ASCEND_CUSTOM_OPP_PATH`，重新导出到空目录；确认图中只有 `AdnFusedInferAttention` 再跑 ATC |

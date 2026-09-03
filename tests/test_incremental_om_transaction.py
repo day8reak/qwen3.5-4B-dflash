@@ -84,6 +84,8 @@ def _reference(
         ([11, 12, 13], [11, 90, 13, 14], 3, (90,)),
         ([11, 777, 778], [11, 12, 13, 14], 1, ()),
         ([11, 12, 13], [11, 12, 13, 14], 2, ()),
+        ([11, 12, 13], [99, 12, 13, 14], 0, ()),
+        ([11, 11, 13], [11, 11, 13, 14], 3, (11,)),
     ],
 )
 def test_exact_accept_commit_and_state_selection(
@@ -180,6 +182,16 @@ def test_transaction_tail_is_torch_export_capture_safe() -> None:
     assert len(captured) == len(eager) == 11
     for actual, expected in zip(captured, eager):
         torch.testing.assert_close(actual, expected)
+
+    exported_targets = {
+        node.target
+        for node in exported.graph_module.graph.nodes
+        if node.op == "call_function"
+    }
+    assert torch.ops.aten.cumsum.default in exported_targets
+    assert torch.ops.aten.amin.default not in exported_targets
+    assert torch.ops.aten.min.dim not in exported_targets
+    assert torch.ops.aten.cumprod.default not in exported_targets
 
 
 def test_proposal_width_validation() -> None:
