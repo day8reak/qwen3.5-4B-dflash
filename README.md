@@ -14,9 +14,11 @@ Qwen3.5 DFlash port，不是 z-lab/dflash 全部 generation API 的逐行复制�
 `framework/quant-air-om` 分支在这份 `quant` 实现上增加了独立部署层：用现有 W8A8 Target
 和 FP16 Draft 导出 TorchAir AIR，通过 ATC 生成 OM，并由 C++ AscendCL runner 加载 OM、
 循环生成 token。入口和完整验证方法见
-[基于 quant 的 AIR/OM/C++ 框架](docs/QUANT_AIR_OM_FRAMEWORK.md)。第一版 OM 使用静态完整前缀
-重算来冻结功能 ABI；AIR 入口会预检并保留 Target modeling 的七个 torch-npu 自定义算子，
-现有 persistent rollback 仍是后续增量 OM 状态 ABI 的语义基线。
+[基于 quant 的 AIR/OM/C++ 框架](docs/QUANT_AIR_OM_FRAMEWORK.md)。`run-e2e-cpp` 默认生成并常驻
+运行四个物理 OM：`target-prefill`、`target-prefill-head`、`target-decode1` 和
+`fused-speculative-step`；后者精确串接 Draft proposal 与固定 T16 Target verify。单图完整前缀
+重算 factory 仍保留为诊断基线。AIR 入口会预检并保留 Target、Draft verify 所需的全部
+torch-npu 自定义算子，包括 GDR 的 INT16 `effective_length` ABI。
 
 ## 当前实现
 

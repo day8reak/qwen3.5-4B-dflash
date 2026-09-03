@@ -212,8 +212,19 @@ def resolve_cpp_runner(path: str | Path) -> Path:
     return executable
 
 
-def preflight_cpp_runner(path: str | Path) -> Path:
-    """Prove that the target binary and its dynamic AscendCL deps can start."""
+def preflight_cpp_runner(
+    path: str | Path,
+    *,
+    state_policy: str | None = None,
+) -> Path:
+    """Prove that the expected runner family and its dynamic deps can start."""
+
+    if state_policy not in {
+        None,
+        RECOMPUTE_STATE_POLICY,
+        INCREMENTAL_STATE_POLICY,
+    }:
+        raise ValueError(f"unknown C++ runner state policy: {state_policy!r}")
 
     executable = resolve_cpp_runner(path)
     result = subprocess.run(
@@ -223,21 +234,34 @@ def preflight_cpp_runner(path: str | Path) -> Path:
         stderr=subprocess.STDOUT,
         text=True,
     )
-    if (
-        result.returncode != 0
-        or not any(
-            marker in result.stdout
-            for marker in (
-                "qwen35_dflash_acl_runner",
-                "qwen35_dflash_incremental_acl_runner",
-            )
+    output = result.stdout or ""
+    known_runner = any(
+        marker in output
+        for marker in (
+            "Usage: qwen35_dflash_acl_runner ",
+            "Usage: qwen35_dflash_incremental_acl_runner ",
         )
-        or "--progress true|false" not in result.stdout
-    ):
+    )
+    required_fragments = ["--progress true|false"]
+    if state_policy == RECOMPUTE_STATE_POLICY:
+        required_fragments.extend(
+            ["Usage: qwen35_dflash_acl_runner ", "--model PATH"]
+        )
+    elif state_policy == INCREMENTAL_STATE_POLICY:
+        required_fragments.extend(
+            [
+                "Usage: qwen35_dflash_incremental_acl_runner ",
+                "--target-prefill PATH",
+                "--measurement-protocol MODE",
+            ]
+        )
+    missing = [item for item in required_fragments if item not in output]
+    if result.returncode != 0 or not known_runner or missing:
         raise RuntimeError(
-            "C++ ACL runner cannot start or does not support live progress; "
+            "C++ ACL runner cannot start or is the wrong runner family for "
+            f"state_policy={state_policy!r}; missing_help_contract={missing}. "
             "rebuild it from the current framework source: "
-            f"exit={result.returncode}, output={result.stdout!r}"
+            f"exit={result.returncode}, output={output!r}"
         )
     return executable
 
@@ -484,8 +508,10 @@ def build_cpp_runner(
         raise RuntimeError(
             "C++ build succeeded but produced no incremental ACL runner"
         )
-    preflight_cpp_runner(runner)
-    preflight_cpp_runner(incremental_runner)
+    preflight_cpp_runner(runner, state_policy=RECOMPUTE_STATE_POLICY)
+    preflight_cpp_runner(
+        incremental_runner, state_policy=INCREMENTAL_STATE_POLICY
+    )
     payload = {
         "schema_version": 2,
         "status": "PASS",
@@ -1949,7 +1975,9 @@ def run_cpp_pair(
         om_record = dict(graph["om"])
         artifacts = {str(graph["name"]): str(om_record["sha256"])}
     _progress(progress, "stage=validate-manifest-and-om-done")
-    executable = preflight_cpp_runner(runner)
+    executable = preflight_cpp_runner(
+        runner, state_policy=identity["state_policy"]
+    )
     raw_path = require_run_output(raw_output)
     log_path = require_run_output(log_output)
     if raw_path.exists() or log_path.exists():
@@ -1994,14 +2022,14 @@ def run_cpp_pair(
         "3",
         "--repetitions",
         "10",
-        "--measurement-protocol",
-        "evidence",
         "--device-id",
         str(int(device_id)),
     ])
     if incremental:
         command.extend(
             [
+                "--measurement-protocol",
+                "evidence",
                 "--state-reset-policy",
                 identity["state_reset_policy"],
                 "--decode-carrier-policy",

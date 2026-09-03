@@ -70,7 +70,10 @@ from qwen35_dflash.ascend310p.standard_op_export import (
     prepare_aten_softplus_export,
 )
 from qwen35_dflash.ascend310p.utils import sha256_file
-from qwen35_dflash.ascend310p.workflow import DEFAULT_GRAPH_FACTORY
+from qwen35_dflash.ascend310p.workflow import (
+    DEFAULT_CPP_GRAPH_FACTORY,
+    DEFAULT_GRAPH_FACTORY,
+)
 from models.dflash_v1 import dflash_ascend310p_ops as golden_ops
 
 
@@ -1909,6 +1912,9 @@ def test_compiler_rejects_incomplete_declared_custom_op_audit() -> None:
 
 def test_default_factory_is_quant_branch_factory() -> None:
     assert DEFAULT_GRAPH_FACTORY.endswith("quant_factory:create_quant_recompute_graph")
+    assert DEFAULT_CPP_GRAPH_FACTORY.endswith(
+        "quant_factory:create_quant_fused_speculative_step_graphs"
+    )
     assert QUANT_BASE_REVISION == "28f93e784a2beed87020a80bd93c8788754eab1c"
 
 

@@ -21,7 +21,11 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
 `APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE`：可以实现，但还不能冒充已经生成、真机验证或达到性能
 目标的 OM。
 
-## 1. 五 OM 基线与四物理 OM 统一 Target-step 候选
+当前 `run-e2e-cpp` 的默认 graph factory 已明确为 fused 四物理 OM；这是为了避免遗漏 `--factory`
+时又生成单个 `quant_dflash_recompute.om`，不等于性能候选已经激活。Python `run-e2e` 和显式
+`create_quant_recompute_graph` 仍保留单图诊断语义。
+
+## 1. 五 OM 基线与两种四物理 OM 候选
 
 四个逻辑角色是：
 
@@ -421,10 +425,14 @@ FP16、capacity=2048 时，arena payload 是 `32*64*20480*2 = 83,886,080` bytes�
 `weight(target-prefill) + weight(target-prefill-head)` 与拆分前 prefill 的体量相符、完整集合能同时
 load，才能把“总权重基本持平”作为真机结论。
 
-### 5.2 生成五个 AIR/OM
+### 5.2 生成五 OM 对照和两种四 OM 候选
 
 沿用量化 factory 配置，但生产 context 容量应按真实 workload 设置，例如 2048；必须是 64 的
 倍数。`eos_table_width` 必须能容纳 tokenizer 的全部 EOS ID：
+
+若只执行当前主路线，可直接复制
+`config/quant_air_om_fused_factory.example.json`，填写外部路径后跳到 5.2.2。下面先保留五 OM
+对照命令，便于判断 Draft→verify 物理边界是否确实是瓶颈。
 
 ```json
 {
@@ -674,6 +682,13 @@ cp config/quant_air_om_incremental_runner.example.json \
 集合的输入/输出顺序和 OM SHA-256；runner 自身会再次校验 hash。加载后再从真实 OM description
 校验 dtype、shape、state 对齐、完整 N=1..16 动态档和从 N=64 开始的 prompt 档。任何一层不符
 都会停止，不能进入时延比较。fused manifest 不会向 runner 传独立 Draft/verify 参数。
+
+runner 与配置必须成对：所有多 OM manifest 都使用
+`qwen35_dflash_incremental_acl_runner` + `incremental-explicit-state-v2`。单图
+`qwen35_dflash_acl_runner` 不支持 `--measurement-protocol` 和 role 参数。当前控制面会读取
+`--help` 并在 checkpoint/AIR/OM 处理前拒绝错误 family；若仍看到
+`qwen35_dflash_acl_runner: unknown option --measurement-protocol`，说明运行的是更新前的 Python
+控制面或命令显式选错了二进制，不是 OM 内部执行失败。
 
 直接检查关键门禁：
 

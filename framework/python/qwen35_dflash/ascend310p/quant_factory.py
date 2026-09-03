@@ -9,10 +9,10 @@ second target implementation:
 * the YAML-declared INT8 embedding and FP32 scales feed the Target;
 * ``models.dflash_v1.modeling_dflash.DFlashDraftModel`` remains FP16.
 
-The first OM route is a fixed-gear, full-prefix recompute graph.  It is the
-smallest state-safe ABI that a C/C++ AscendCL host can call directly.  The
-existing quant rollback implementation remains the semantic/performance
-reference for a later explicit-state incremental OM suite.
+The fixed-gear full-prefix recompute graph remains the simplest diagnostic
+baseline.  The production C++ workflow selects the four-resident-OM fused
+speculative topology, while all routes reuse the same quant branch model and
+custom-operator export contracts.
 """
 
 from __future__ import annotations

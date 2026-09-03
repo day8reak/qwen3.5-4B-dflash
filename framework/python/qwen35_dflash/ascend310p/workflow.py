@@ -13,6 +13,8 @@ from typing import Any, Mapping, Sequence
 from transformers import AutoTokenizer
 
 from .cpp_runtime import (
+    INCREMENTAL_STATE_POLICY,
+    RECOMPUTE_STATE_POLICY,
     preflight_cpp_runner,
     run_cpp_pair,
     validate_cpp_runner_options,
@@ -38,8 +40,33 @@ from .utils import (
 )
 
 
-DEFAULT_GRAPH_FACTORY = (
+QUANT_RECOMPUTE_GRAPH_FACTORY = (
     "qwen35_dflash.ascend310p.quant_factory:create_quant_recompute_graph"
+)
+QUANT_INCREMENTAL_GRAPH_FACTORY = (
+    "qwen35_dflash.ascend310p.quant_factory:"
+    "create_quant_incremental_state_graphs"
+)
+QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY = (
+    "qwen35_dflash.ascend310p.quant_factory:"
+    "create_quant_unified_target_step_graphs"
+)
+QUANT_FUSED_SPECULATIVE_STEP_GRAPH_FACTORY = (
+    "qwen35_dflash.ascend310p.quant_factory:"
+    "create_quant_fused_speculative_step_graphs"
+)
+DEFAULT_GRAPH_FACTORY = QUANT_RECOMPUTE_GRAPH_FACTORY
+DEFAULT_CPP_GRAPH_FACTORY = QUANT_FUSED_SPECULATIVE_STEP_GRAPH_FACTORY
+BUILTIN_QUANT_GRAPH_FACTORIES = frozenset(
+    {
+        QUANT_RECOMPUTE_GRAPH_FACTORY,
+        QUANT_INCREMENTAL_GRAPH_FACTORY,
+        QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY,
+        QUANT_FUSED_SPECULATIVE_STEP_GRAPH_FACTORY,
+    }
+)
+MULTI_OM_GRAPH_FACTORIES = frozenset(
+    BUILTIN_QUANT_GRAPH_FACTORIES - {QUANT_RECOMPUTE_GRAPH_FACTORY}
 )
 DEFAULT_BACKEND_FACTORY = (
     "qwen35_dflash.ascend310p.recompute_backend:create_backend"
@@ -132,7 +159,7 @@ def preflight_target_pipeline(
     atc_path = resolve_atc_executable(atc_bin)
     preflight_log = _run_declared_target_preflight()
     _require_importable("torchair", "AIR export")
-    if factory == DEFAULT_GRAPH_FACTORY:
+    if factory in BUILTIN_QUANT_GRAPH_FACTORIES:
         device = str(factory_config.get("device", "")).strip().lower()
         if device != "npu" and not device.startswith("npu:"):
             raise ValueError(
@@ -506,8 +533,21 @@ def run_cpp_target_pipeline(
 ) -> dict[str, Any]:
     """Build the selected OM topology and run paired 3+10 in the C++ ACL path."""
 
-    validate_cpp_runner_options(runner_options, device_id)
-    runner_path = preflight_cpp_runner(runner)
+    runner_identity = validate_cpp_runner_options(runner_options, device_id)
+    state_policy = str(runner_identity["state_policy"])
+    if factory == QUANT_RECOMPUTE_GRAPH_FACTORY:
+        expected_state_policy = RECOMPUTE_STATE_POLICY
+    elif factory in MULTI_OM_GRAPH_FACTORIES:
+        expected_state_policy = INCREMENTAL_STATE_POLICY
+    else:
+        expected_state_policy = state_policy
+    if state_policy != expected_state_policy:
+        raise ValueError(
+            "C++ graph factory and runner state_policy select different OM "
+            f"topologies: factory={factory!r}, state_policy={state_policy!r}, "
+            f"expected={expected_state_policy!r}"
+        )
+    runner_path = preflight_cpp_runner(runner, state_policy=state_policy)
     bundle_root = require_run_output(bundle_dir)
     report_root = require_run_output(report_dir)
     if (

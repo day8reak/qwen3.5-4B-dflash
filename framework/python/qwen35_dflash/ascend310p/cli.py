@@ -29,6 +29,7 @@ from .utils import (
 )
 from .workflow import (
     DEFAULT_BACKEND_FACTORY,
+    DEFAULT_CPP_GRAPH_FACTORY,
     DEFAULT_GRAPH_FACTORY,
     load_tokenizer,
     run_cpp_target_pipeline,
@@ -520,7 +521,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="export/compile and run paired 3+10 in the C++ AscendCL hot path",
     )
     run_e2e_cpp.add_argument(
-        "--factory", default=DEFAULT_GRAPH_FACTORY, help="module:function graph factory"
+        "--factory",
+        default=DEFAULT_CPP_GRAPH_FACTORY,
+        help="module:function graph factory (default: fused four-OM topology)",
     )
     run_e2e_cpp.add_argument("--factory-config", type=Path, required=True)
     run_e2e_cpp.add_argument("--bundle-dir", type=Path, required=True)

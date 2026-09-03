@@ -3,7 +3,7 @@
   "cann": "REPLACE_WITH_CANN_VERSION",
   "driver": "REPLACE_WITH_DRIVER_VERSION",
   "firmware": "REPLACE_WITH_FIRMWARE_VERSION",
-  "runtime": "AscendCL C++ five-graph-resident-OM",
+  "runtime": "AscendCL C++ multi-OM resident runtime",
   "state_policy": "incremental-explicit-state-v2",
   "state_reset_policy": "async-memset",
   "decode_carrier_policy": "last-token-d2d",

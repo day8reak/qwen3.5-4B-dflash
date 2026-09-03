@@ -27,36 +27,44 @@ AIR graph + 外置权重文件 + air-manifest.json
         │
         │ atc --mode=0 --framework=1 --soc_version=<精确型号>
         ▼
-quant_dflash_recompute.om + deployment-manifest.json
+target-prefill.om + target-prefill-head.om + target-decode1.om
+                 + fused-speculative-step.om + deployment-manifest.json
         │
         │ C++17 / AscendCL
         ▼
-加载一次 OM → ordinary/DFlash 多轮调用 → 生成 token → EOS/长度停止
+四个 OM 各加载一次 → device-resident 状态机 → 生成 token → EOS/长度停止
 ```
 
-第一版冻结的是静态完整前缀重算 ABI。它能够由 OM 完成完整的 logits/Top1 推理，并由 C++
-循环连续生成 token；但它尚未把 `quant` 分支的 persistent rollback cache、GDR state bank 和
-Draft KV cache 变成显式 OM 输入/输出。因此：
+当前 C++ 主部署路线是四物理 OM 的精确融合投机拓扑：prefill body/head 分离、ordinary decode
+独立，Draft proposal 与固定 `T=16` Target verify 合并为一个物理 OM。Target/Draft KV、GDR、
+conv state 和 compact carrier 都是显式、常驻 device 的状态。静态完整前缀重算图仍保留，但只用作
+最小 correctness/单图诊断基线，不再是 `run-e2e-cpp` 的默认产物。因此：
 
 - “是否真的调用 OM 生成完整 token 序列”可以验证；
 - “是否达到闭源增量推理框架时延”必须在真实设备测量，当前不能预先声称；
-- 如果 OM 执行时间主要消耗在完整前缀重算，下一阶段应拆成 prefill/decode/verify/draft
-  增量 OM，而不是继续微调 Python。
+- fused 4-OM 必须先通过 ordinary greedy 的 token/EOS 零差异、完整常驻集合显存以及未开启
+  profiling 的同机 3+10 时延门禁，才能从候选提升为正式性能结论。
 
 这里必须区分“当前分支实际产物”和“最终低时延拓扑”：
 
 | 阶段 | 逻辑图 | 物理 OM 数 | 当前状态 |
 | --- | --- | ---: | --- |
-| 当前可验证基线 | Target 全前缀 + Draft proposal 整图 | 每个静态 `S` gear 1 个 | 已接入 AIR/ATC/C++ |
-| 低时延候选 | 四个逻辑角色：prefill、decode、verify、draft；当前把 prefill 再物理拆成 body/head | 当前 5 个 | 已实现代码/Fake-ACL；仍需真实 AIR/ATC、显存、零差异和时延门禁 |
+| C++ 主部署候选 | prefill body/head、ordinary decode、Draft+固定 T16 verify supergraph | 4 个 | 默认生成；代码/Fake-ACL 已验证，真机门禁待执行 |
+| 可选对照候选 | prefill body/head、decode、draft、verify 分离 | 5 个 | 显式 factory 可生成，用于定位融合边界收益 |
+| 单图诊断基线 | Target 全前缀 + Draft proposal 整图 | 1 个 | 显式 factory 可生成，不用于最终低时延结论 |
 
 `verify` 不能与 ordinary `decode` 共用一个含糊的状态合同：前者一次计算最多 16 个 provisional
 row，并只按接受数提交一个 GDN/conv state-bank 槽；后者固定提交单个 row。用户口头所说的
-“prefill、decode、draft 三类”在逻辑上因此落为上述四个角色。当前为满足“非末 prompt chunk
+“prefill、decode、draft 三类”在逻辑上因此落为上述四个角色。为满足“非末 prompt chunk
 不执行完整 LM head”的热路径约束，`target-prefill` body 输出 device-resident `last_hidden`，只在
-最后一个 chunk 调用 `target-prefill-head`，所以物理产物为五个 OM。
+最后一个 chunk 调用 `target-prefill-head`；再把 Draft 与固定 T16 verify 合并后，主路线最终是
+四个物理 OM。
 
 ## 2. 冻结 ABI
+
+本节首先记录仍保留的单图重算诊断 ABI。fused 4-OM 的每个 role、状态 tensor、动态 gear 和
+commit/rollback 合同见 [增量 OM 与 C++ 高性能路线](INCREMENTAL_OM_PERFORMANCE.md)；主流程
+生成与运行命令从第 4 节开始全部使用该 4-OM ABI。
 
 图名为 `quant_dflash_recompute`，batch 固定为 1：
 
@@ -173,7 +181,7 @@ attrs: dtype=DT_FLOAT16(1), transpose_x1=false, transpose_x2=false, group_size=0
 
 当前模型调用合同锁定 `output_dtype=torch.float16`、`group_sizes=None`；其他组合会在 AIR
 导出时直接失败，不能静默生成一个可能选错 kernel 的 OM。已有运行目录中的
-`factory.json` 也必须把 `npu_quant_matmul_ge_op_type` 从
+`factory-fused.json` 也必须把 `npu_quant_matmul_ge_op_type` 从
 `QuantBatchMatmulV3` 改为 `QuantBatchMatmulV4444`。
 
 `npu_quant_matmul` 的预检使用实际 W8A8 路径代表形状：`x1=[1,64,2560]`、
@@ -201,7 +209,7 @@ attrs: none
 因此 converter 使用 named inputs/output，并显式完成 `input -> x`、`target_block -> targetBlock`、
 `offset_in_block -> offsetInBlock` 映射；不能再把四个前端参数交给 positional 自动解析。
 
-七个预期 GE type 都在 `factory.json` 中显式锁定。builtin converter 和当前 fused-attention 精确
+预期 GE type 都在 `factory-fused.json` 中显式锁定。builtin converter 和当前 fused-attention 精确
 映射必须使用表中的 type；GDR 当前只允许上述 `ChunkGatedDeltaRule` v2 named ABI。该值不会
 自动回退：指定 IR 未注册、converter 没有命中，或 `dynamo.pbtxt` 中 required type 数为 0，
 导出都会失败，不会生成伪 PASS manifest。
@@ -371,10 +379,11 @@ bridge 和 rollback 源码 hash；任意字节变化都会失败。
 复制并编辑 factory 配置：
 
 ```bash
-cp config/quant_air_om_factory.example.json "$AI_RUN_DIR/factory.json"
+cp config/quant_air_om_fused_factory.example.json \
+  "$AI_RUN_DIR/factory-fused.json"
 ```
 
-`factory.json` 示例：
+`factory-fused.json` 示例：
 
 ```json
 {
@@ -383,8 +392,9 @@ cp config/quant_air_om_factory.example.json "$AI_RUN_DIR/factory.json"
   "quant_config": "/ABSOLUTE/PATH/qwen3.5.yaml",
   "input_manifest": "/ABSOLUTE/PATH/quant-air-om-run/quant-input-manifest.json",
   "receiver_models_dir": "/ABSOLUTE/PATH/qwen35-runtime/models",
-  "max_sequence_length": 64,
-  "example_sequence_length": 2,
+  "max_sequence_length": 2048,
+  "example_sequence_length": 64,
+  "eos_table_width": 4,
   "pad_token_id": 0,
   "dtype": "float16",
   "device": "npu:0",
@@ -395,10 +405,14 @@ cp config/quant_air_om_factory.example.json "$AI_RUN_DIR/factory.json"
   "npu_gated_delta_rule_mtp_ge_op_type": "GatedDeltaRuleMTP",
   "npu_cache_update_ge_op_type": "CacheUpdate",
   "adn_fused_infer_attention_ge_op_type": "AdnFusedInferAttention",
-  "npu_scatter_nd_update_ge_op_type": "ScatterNdUpdate",
-  "name": "quant_dflash_recompute"
+  "npu_scatter_nd_update_ge_op_type": "ScatterNdUpdate"
 }
 ```
+
+`max_sequence_length` 可按实际容量调整，但必须为 64 的正整数倍且不超过 GDR INT16
+`effective_length` 上限。`eos_table_width` 必须能容纳 tokenizer 的全部 EOS ID。若只需要复现单图
+诊断基线，才复制 `config/quant_air_om_factory.example.json` 并显式选择
+`create_quant_recompute_graph`。
 
 `receiver_models_dir` 用于补齐 `models.export_model_wrapper_qwen3_5`。量化分支本身仍提供
 HIAI modeling、QLinear、DFlash 和 bridge；receiver wrapper 只复用原工程的加载和设备初始化。
@@ -440,7 +454,7 @@ scheduler 和 JSON 门禁。
 
 ```bash
 "$MODEL_PYTHON" -m qwen35_dflash.ascend310p probe-pytorch \
-  --factory-config "$AI_RUN_DIR/factory.json" \
+  --factory-config "$AI_RUN_DIR/factory-fused.json" \
   --input-token-ids 1,2,3,4 \
   --output "$AI_RUN_DIR/reports/pytorch-probe.json"
 ```
@@ -455,8 +469,9 @@ scheduler 和 JSON 门禁。
 - `draft_top1` shape 为 `[1,15]`；
 - 输出 token ID 非负且小于词表大小。
 
-这个探针仍不是 OM 证据，但能在耗时导出之前发现 checkpoint、量化 topology、embedding、
-Draft 或 receiver ABI 错误。
+`probe-pytorch` 是集成重算语义探针，即使传入 fused 配置也只执行诊断图，不决定后续会生成几个
+OM。它仍不是 OM 证据，但能在耗时导出之前发现 checkpoint、量化 topology、embedding、Draft
+或 receiver ABI 错误。
 
 ### 5.3 从拷贝源码目录采集完整 AIR 诊断
 
@@ -464,7 +479,10 @@ NPU 机器上即使只有直接拷贝的源码、没有 `.git`，也可以执行
 
 ```bash
 "$MODEL_PYTHON" framework/scripts/collect_air_debug.py \
-  --factory-config "$AI_RUN_DIR/factory.json" \
+  --factory \
+    qwen35_dflash.ascend310p.quant_factory:create_quant_fused_speculative_step_graphs \
+  --factory-config "$AI_RUN_DIR/factory-fused.json" \
+  --bundle-dir "$AI_RUN_DIR/artifacts/air-debug-fused" \
   --output-dir "$AI_RUN_DIR/reports"
 ```
 
@@ -478,26 +496,30 @@ NPU 机器上即使只有直接拷贝的源码、没有 `.git`，也可以执行
 ## 6. 生成 AIR
 
 ```bash
+export FUSED_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-fused"
+
 "$MODEL_PYTHON" -m qwen35_dflash.ascend310p export-air \
-  --factory qwen35_dflash.ascend310p.quant_factory:create_quant_recompute_graph \
-  --factory-config "$AI_RUN_DIR/factory.json" \
-  --bundle-dir "$AI_RUN_DIR/artifacts/quant-dflash"
+  --factory \
+    qwen35_dflash.ascend310p.quant_factory:create_quant_fused_speculative_step_graphs \
+  --factory-config "$AI_RUN_DIR/factory-fused.json" \
+  --bundle-dir "$FUSED_BUNDLE"
 ```
 
 预期生成：
 
 ```text
-$AI_RUN_DIR/artifacts/quant-dflash/
+$FUSED_BUNDLE/
 ├── air-manifest.json
 └── air/
-    └── quant_dflash_recompute/
-        ├── quant_dflash_recompute.air
-        ├── dynamo.pbtxt
-        └── TorchAir 生成的外置权重/辅助文件
+    ├── target-prefill/target-prefill.air
+    ├── target-prefill-head/target-prefill-head.air
+    ├── target-decode1/target-decode1.air
+    └── fused-speculative-step/fused-speculative-step.air
 ```
 
-导出器要求每个图恰好一个 `.air`，并把所有 payload 的大小和 SHA-256 写入
-`air-manifest.json`。检查：
+每个目录还会包含 `dynamo.pbtxt`、外置权重和辅助文件。导出器要求每个 role 恰好一个 `.air`，
+并把所有 payload 的大小和 SHA-256 写入 `air-manifest.json`。下面的门禁会同时检查：恰好四图、
+动态 Draft 输入 gear、显式 `effective_length`、融合边界和所有声明的自定义算子节点：
 
 ```bash
 "$MODEL_PYTHON" - <<'PY'
@@ -505,92 +527,79 @@ import json
 import os
 from pathlib import Path
 
-root = Path(os.environ["AI_RUN_DIR"]) / "artifacts" / "quant-dflash"
+root = Path(os.environ["FUSED_BUNDLE"])
 data = json.loads((root / "air-manifest.json").read_text())
 assert data["status"] == "PASS"
 assert data["schema_version"] == 3
 gdr_proto = data["environment"]["gdr_ge_prototype"]
 assert gdr_proto["status"] == "PASS"
 assert gdr_proto["abi"] == "effective-length-v2-named-inputs"
-assert len(data["graphs"]) == 1
-graph = data["graphs"][0]
-assert graph["name"] == "quant_dflash_recompute"
-assert graph["input_names"] == ["input_ids", "attention_mask"]
-assert graph["output_names"] == ["target_top1", "draft_top1"]
-assert graph["metadata"]["quant_branch_base_revision"] == \
+expected_names = [
+    "target-prefill",
+    "target-prefill-head",
+    "target-decode1",
+    "fused-speculative-step",
+]
+assert [graph["name"] for graph in data["graphs"]] == expected_names
+graphs = {graph["name"]: graph for graph in data["graphs"]}
+assert graphs["target-prefill"]["input_names"][1] == "effective_length"
+fused = graphs["fused-speculative-step"]
+capacity = fused["metadata"]["kv_cache_max_len"]
+assert fused["dynamic"] is True
+assert fused["input_dim_gears"]["0"]["1"] == \
+    list(range(1, 17)) + list(range(64, capacity + 1, 64))
+assert fused["metadata"]["verify_input_ids_externalized"] is False
+assert fused["metadata"]["target_verify_rows"] == 16
+assert all(
+    graph["metadata"]["quant_branch_base_revision"] ==
     "28f93e784a2beed87020a80bd93c8788754eab1c"
-assert graph["metadata"]["gdr_effective_length_contract"] == \
-    "INT16[B] call-local valid rows derived from attention_mask"
-assert graph["metadata"]["target_quant_mode"] == "w8a8_dynamic"
-audit = graph["custom_op_audit"]
-assert len(audit) == 7
-expected = {
-    "npu.npu_dynamic_quant.default": ("DynamicQuant", 1, "torchair-builtin"),
-    "qwen35_dflash.npu_quant_matmul_v4444.default": (
-        "QuantBatchMatmulV4444", 1, "framework-registered-ge-ir"
-    ),
-    "npu.adn_rms_norm.default": ("AdnRmsNorm", 1, "framework-registered-ge-ir"),
-    "npu.npu_chunk_gated_delta_rule.default": (
-        "ChunkGatedDeltaRule", 1, "framework-registered-ge-ir"
-    ),
-    "qwen35_dflash.npu_cache_update.default": (
-        "CacheUpdate", 1, "framework-registered-ge-ir"
-    ),
-    "npu.adn_fused_infer_attention.default": (
-        "AdnFusedInferAttention", 1, "framework-registered-ge-ir"
-    ),
-    "npu.npu_scatter_nd_update_.default": (
-        "ScatterNdUpdate", 0, "torchair-builtin"
-    ),
-}
-for item in audit:
-    ge_type, minimum, policy = expected[item["torch_target"]]
+    for graph in data["graphs"]
+)
+audits = [item for graph in data["graphs"] for item in graph["custom_op_audit"]]
+assert audits
+for item in audits:
     assert item["status"] == "PASS"
-    assert item["ge_op_type"] == ge_type
-    assert item["minimum_occurrences"] == minimum
-    assert item["converter_policy"] == policy
-    assert item["ge_node_occurrences"] >= minimum
-    if policy == "torchair-builtin":
-        assert item["converter_calls"] is None
-    else:
-        assert item["converter_calls"] >= minimum
-print("AIR manifest gate: PASS")
+    assert item["ge_node_occurrences"] >= item["minimum_occurrences"]
+ge_types = {item["ge_op_type"] for item in audits}
+assert {
+    "DynamicQuant", "QuantBatchMatmulV4444", "AdnRmsNorm",
+    "ChunkGatedDeltaRule", "GatedDeltaRuleMTP", "CacheUpdate",
+    "AdnFusedInferAttention", "ScatterNdUpdate",
+} <= ge_types
+print("fused four-OM AIR manifest gate: PASS")
 PY
 ```
 
 还可以直接检查 TorchAir 的可读 GE 图：
 
 ```bash
-rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV4444|AdnRmsNorm|ChunkGatedDeltaRule|CacheUpdate|AdnFusedInferAttention|ScatterNdUpdate)"' \
-  "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
+rg -n '(type|op): "(SoftplusV2|DynamicQuant|QuantBatchMatmulV4444|AdnRmsNorm|ChunkGatedDeltaRule|GatedDeltaRuleMTP|CacheUpdate|AdnFusedInferAttention|ScatterNdUpdate)"' \
+  "$FUSED_BUNDLE"/air/*/dynamo.pbtxt
 ```
 
 并确认旧类型没有残留：
 
 ```bash
-if rg -n '(type|op): "RmsNorm"' \
-  "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"; then
+if rg -n '(type|op): "RmsNorm"' "$FUSED_BUNDLE"/air/*/dynamo.pbtxt; then
   echo "FAIL: receiver requires AdnRmsNorm, not RmsNorm" >&2
   exit 1
 fi
 
-if rg -n '(type|op): "QuantBatchMatmulV3"' \
-  "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"; then
+if rg -n '(type|op): "QuantBatchMatmulV3"' "$FUSED_BUNDLE"/air/*/dynamo.pbtxt; then
   echo "FAIL: stale QuantBatchMatmulV3 lowering" >&2
   exit 1
 fi
 
 if rg -n '(type|op): "FusedInferAttentionScore"' \
-  "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"; then
+  "$FUSED_BUNDLE"/air/*/dynamo.pbtxt; then
   echo "FAIL: stale A2 FusedInferAttentionScore lowering" >&2
   exit 1
 fi
 ```
 
-前六个 required type 至少应各命中一次；固定重算图不经过 `forward1` 时，`ScatterNdUpdate` 可以
-不出现。这里检查的是 AIR 内部 GE type，`npu.*.default` 前端 FX 名称不会原样作为 GE type
-出现。`air-manifest.json` 对框架 converter 同时记录调用数和 GE 节点数；TorchAir builtin 没有被
-框架包装，所以其 `converter_calls` 为 `null`，只以 schema/Meta 探针和最终 GE 节点作为门禁。
+这里检查的是 AIR 内部 GE type，`npu.*.default` 前端 FX 名称不会原样作为 GE type 出现。
+`air-manifest.json` 对框架 converter 同时记录调用数和 GE 节点数；TorchAir builtin 没有被框架
+包装，所以其 `converter_calls` 为 `null`，只以 schema/Meta 探针和最终 GE 节点作为门禁。
 不同 TorchAir 版本会把 `dynamo.pbtxt` 的节点类型写成 `type: "..."` 或 `op: "..."`。审计器
 同时识别两种字段；同一文件、同一 GE type 取两者较大的计数，不能相加后把一个物理节点算两次。
 
@@ -605,7 +614,7 @@ AIR、伪文件或 CPU export 替代。若仍出现 `does not support running wi
 
 ```bash
 "$MODEL_PYTHON" -m qwen35_dflash.ascend310p compile-om \
-  --air-manifest "$AI_RUN_DIR/artifacts/quant-dflash/air-manifest.json" \
+  --air-manifest "$FUSED_BUNDLE/air-manifest.json" \
   --atc /ABSOLUTE/PATH/atc \
   --soc-version Ascend310P3
 ```
@@ -614,18 +623,21 @@ AIR、伪文件或 CPU export 替代。若仍出现 `does not support running wi
 
 ```text
 atc --mode=0 --framework=1 \
-    --model=<quant_dflash_recompute.air> \
-    --output=<.../quant_dflash_recompute> \
+    --model=<每个 role 对应的 .air> \
+    --output=<.../om/role-name> \
     --soc_version=<精确 310P variant>
 ```
 
 禁止使用模糊的 `Ascend310P`。成功后得到：
 
 ```text
-$AI_RUN_DIR/artifacts/quant-dflash/
+$FUSED_BUNDLE/
 ├── deployment-manifest.json
 └── om/
-    └── quant_dflash_recompute.om
+    ├── target-prefill.om
+    ├── target-prefill-head.om
+    ├── target-decode1.om
+    └── fused-speculative-step.om
 ```
 
 编译器在调用 ATC 前重新核验 AIR 与所有外置 payload 的 hash；ATC 成功后记录 OM hash、ATC
@@ -637,12 +649,30 @@ $AI_RUN_DIR/artifacts/quant-dflash/
 
 ```bash
 "$MODEL_PYTHON" -m qwen35_dflash.ascend310p build-om \
-  --factory qwen35_dflash.ascend310p.quant_factory:create_quant_recompute_graph \
-  --factory-config "$AI_RUN_DIR/factory.json" \
-  --bundle-dir "$AI_RUN_DIR/artifacts/quant-dflash" \
+  --factory \
+    qwen35_dflash.ascend310p.quant_factory:create_quant_fused_speculative_step_graphs \
+  --factory-config "$AI_RUN_DIR/factory-fused.json" \
+  --bundle-dir "$FUSED_BUNDLE" \
   --atc /ABSOLUTE/PATH/atc \
   --soc-version Ascend310P3
 ```
+
+确认不是误走单图 factory：
+
+```bash
+jq -e '
+  (.graphs | length == 4) and
+  ([.graphs[].name] == [
+    "target-prefill", "target-prefill-head", "target-decode1",
+    "fused-speculative-step"
+  ]) and
+  ([.graphs[].om.path] | all(endswith(".om")))
+' "$FUSED_BUNDLE/deployment-manifest.json"
+```
+
+如果这里只得到 `quant_dflash_recompute.om`，说明命令仍显式使用了
+`create_quant_recompute_graph`，或复用了旧 bundle；换一个空的 `$FUSED_BUNDLE` 并按上面的
+factory 重跑。不能把单图 manifest 交给多 OM runner。
 
 ## 8. 构建 C++ AscendCL runner
 
@@ -657,20 +687,19 @@ $AI_RUN_DIR/artifacts/quant-dflash/
 生产 runner 使用：
 
 - `aclInit`、`aclrtSetDevice`、显式 context/stream；
-- `aclmdlLoadFromFile`，进程内只加载一次 OM；
+- `aclmdlLoadFromFileWithMem`，四个 role 在进程启动时各加载一次，共享串行 workspace；
 - `aclrtMallocHost` pinned host buffer；
 - 持久化 device buffer 和 dataset；
 - 默认把所有显式 device 分配编译为 `normal-only`；可在独立目录构建 `huge-first` 精确候选，
   两种 runner 都把策略写入报告；
-- 第一次调用完整上传两个输入；之后保留 device mirror，只上传相对上次调用变化的连续区间；
-- Target `[1,S]` 只下载当前 prefix 尾部最多 `K+1` 行，覆盖 prefill/proposal 的最后一行和
-  verify 的 anchor 到最后 proposal；Draft 的 K 个 ID 仍完整下载；
-- 每轮排队 ranged H2D、`aclmdlExecuteAsync`、sliced D2H；
-- 每次 OM 调用只做一次 `aclrtSynchronizeStream`；
+- Target/Draft KV、GDR/conv state、feature 和 proposal carrier 保持 device-resident；
+- prompt 以 64-row body 分块，仅末 chunk 执行一次 head；ordinary 后续只执行 decode1；
+- DFlash 每个物理 fused 调用依次完成 Draft proposal、固定 T16 Target verify 和精确 commit；
+- 每个同步窗口只下载 compact commit 结果，不把完整 state 搬回 host；
 - token 调度、DFlash 接受/correction/bonus、EOS 都在 C++17 中完成。
 
-这不改变两输入/两输出 OM ABI，也不改变 Target/Draft 数学。它只减少当前重算基线的
-host/device 传输；OM 内部仍计算完整静态输出，完整前缀重算也仍是结构性主瓶颈。
+融合只删除 Draft→verify 的一次物理模型 launch 和跨模型 carrier 边界，不改变 Target/Draft
+数学、greedy 接受规则或 fixed-T16 verify 工作量。
 
 生产二进制通常位于：
 
@@ -679,9 +708,11 @@ $AI_RUN_DIR/build/cpp-release/qwen35_dflash_acl_runner
 $AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner
 ```
 
-第一个二进制运行单一重计算 OM 基线；第二个二进制运行已批准、尚待真机提升的五图、统一
-Target-step 四图或 fused speculative-step 四图常驻 OM 候选。`build-cpp` 会同时构建并 host-test
-两者。各拓扑的导出 factory、runner 配置、直接运行、report 门禁、同二进制
+主流程必须使用第二个 `qwen35_dflash_incremental_acl_runner`。第一个二进制只运行单一重计算
+OM 基线；第二个二进制运行五图、统一 Target-step 四图或 fused speculative-step 四图常驻 OM
+候选。`build-cpp` 会同时构建并 host-test 两者，控制面会按 `state_policy` 严格核对二进制的
+`--help` 合同，runner 选错会在加载 checkpoint/AIR/OM 前失败。各拓扑的导出 factory、runner
+配置、直接运行、report 门禁、同二进制
 `one-token-h2d`/`last-token-d2d` A/B 和 msprof 命令见
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5 节。runner 配置中的 `decode_carrier_policy` 只改变
 C++ buffer/copy 路由，不要求重新生成 AIR 或 OM；`dflash_sync_window=1..8` 同样不改 AIR/OM
@@ -707,20 +738,24 @@ INT32 零值，slot 为 960 bytes，ordinary T=1 直接绑定该零值，不再�
 复制并填写真实运行时身份：
 
 ```bash
-cp config/quant_air_om_runner.example.json "$AI_RUN_DIR/runner.json"
+cp config/quant_air_om_incremental_runner.example.json \
+  "$AI_RUN_DIR/runner-fused.json"
 ```
 
 `device_model` 必须写具体产品和 310P variant；`cann`、`driver`、`firmware` 必须来自当前
-设备，不能保留 `REPLACE_*`。
+设备，不能保留 `REPLACE_*`。还必须保留
+`"state_policy": "incremental-explicit-state-v2"`；不要使用单图示例里的
+`recompute-committed-prefixes`。
 
 运行：
 
 ```bash
 "$MODEL_PYTHON" -m qwen35_dflash.ascend310p infer-cpp \
   --deployment-manifest \
-    "$AI_RUN_DIR/artifacts/quant-dflash/deployment-manifest.json" \
-  --runner "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_acl_runner" \
-  --runner-config "$AI_RUN_DIR/runner.json" \
+    "$FUSED_BUNDLE/deployment-manifest.json" \
+  --runner \
+    "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+  --runner-config "$AI_RUN_DIR/runner-fused.json" \
   --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --chat \
@@ -732,16 +767,17 @@ cp config/quant_air_om_runner.example.json "$AI_RUN_DIR/runner.json"
 
 这条命令中 Python 只负责一次 tokenizer、启动 runner 和最后 detokenize。进入 runner 后：
 
-1. C++ 校验 OM SHA-256；
-2. C++ 加载 OM；
+1. 控制面校验四个 role、输入/输出 ABI 和 OM SHA-256；
+2. C++ 再校验 hash 并常驻加载四个 OM；
 3. C++ 运行 ordinary greedy 3 次 warmup + 10 次测量；
 4. C++ 运行 DFlash strict-greedy 3 次 warmup + 10 次测量；
-5. 每轮生成都反复调用 OM，直到 EOS 或 `max_new_tokens`；
+5. ordinary 调 prefill/head/decode1，DFlash 调 prefill/head/fused step，直到 EOS 或长度上限；
 6. C++ 比较 ordinary 与 DFlash token IDs、EOS/stop reason；
 7. 任一 token 不一致立即失败。
 
-所以它不是“Python 算完 token、C++ 只读结果”，而是 C++ 的 token 循环实际调用 OM 完成
-Target/Draft 推理。
+所以它不是“Python 算完 token、C++ 只读结果”，而是 C++ 的 token 循环实际调用四个 OM 完成
+Target/Draft 推理。`qwen35_dflash_acl_runner` 只认识 `--model` 单图 ABI；把它与 fused manifest
+混用会被新的 preflight 直接拒绝。
 
 该命令默认把控制面和 C++ runner 进度实时输出到终端，同时逐行刷新到
 `$AI_RUN_DIR/log/<报告名>-cpp-runner.log`。典型输出如下：
@@ -763,12 +799,15 @@ Target/Draft 推理。
 
 ```bash
 "$MODEL_PYTHON" -m qwen35_dflash.ascend310p run-e2e-cpp \
-  --factory-config "$AI_RUN_DIR/factory.json" \
+  --factory \
+    qwen35_dflash.ascend310p.quant_factory:create_quant_fused_speculative_step_graphs \
+  --factory-config "$AI_RUN_DIR/factory-fused.json" \
   --bundle-dir "$AI_RUN_DIR/e2e/artifacts" \
   --atc /ABSOLUTE/PATH/atc \
   --soc-version Ascend310P3 \
-  --runner "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_acl_runner" \
-  --runner-config "$AI_RUN_DIR/runner.json" \
+  --runner \
+    "$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner" \
+  --runner-config "$AI_RUN_DIR/runner-fused.json" \
   --model-dir /ABSOLUTE/PATH/Qwen3.5-4B \
   --prompt "请用一句话解释为什么天空是蓝色的。" \
   --chat \
@@ -781,6 +820,9 @@ Target/Draft 推理。
 它依次执行真实设备 preflight、AIR、ATC、OM hash gate、C++ paired generation 和最终
 summary。任何阶段失败都不会伪造后续 PASS。
 
+当前代码中 `run-e2e-cpp` 即使省略 `--factory` 也默认选择上述 fused 4-OM factory；文档仍显式写出
+该参数，便于从日志直接确认拓扑。Python `run-e2e` 的默认值仍是单图重算 factory，两者不要混淆。
+
 ## 11. 如何判定框架“能用”
 
 ### 11.1 功能 PASS
@@ -789,7 +831,16 @@ summary。任何阶段失败都不会伪造后续 PASS。
 
 ```python
 assert report["status"] == "PASS"
+assert report["runner_id"] == "qwen35-dflash-ascendcl-cpp-incremental-v3"
 assert report["cpu_fallback"] is False
+assert report["backend_metadata"]["state_policy"] == \
+       "incremental-explicit-state-v2"
+assert report["abi"]["physical_topology"] == \
+       "split-prefill-head-four-resident-fused-speculative-step-v1"
+assert {item["role"] for item in report["models"]} == {
+    "target-prefill", "target-prefill-head", "target-decode1",
+    "fused-speculative-step",
+}
 assert report["ordinary_parity"]["status"] == "PASS"
 assert report["ordinary_parity"]["token_id_mismatches"] == 0
 assert report["ordinary_parity"]["eos_mismatches"] == 0
@@ -800,11 +851,15 @@ assert report["dflash"]["repetitions"] == 10
 assert report["ordinary"]["stable_generated_token_ids"] == \
        report["dflash"]["stable_generated_token_ids"]
 io = report["execution_io_counters"]
-assert io["model_executions"] == io["stream_synchronizations"]
-assert io["host_to_device_bytes"] <= io["full_host_to_device_bytes"]
-assert io["device_to_host_bytes"] <= io["full_device_to_host_bytes"]
-assert io["maximum_target_elements_per_call"] <= \
-       report["abi"]["draft_width"] + 1
+assert io["model_executions"] == sum(
+    io[name] for name in (
+        "target_prefill_executions", "target_prefill_head_executions",
+        "target_decode1_executions", "fused_speculative_step_executions",
+    )
+)
+assert io["draft_to_verify_model_launches_elided"] == \
+       io["fused_speculative_step_executions"]
+assert io["stream_synchronizations"] <= io["model_executions"]
 ```
 
 此外检查：
@@ -812,24 +867,26 @@ assert io["maximum_target_elements_per_call"] <= \
 - 报告中的 OM SHA-256 与 `deployment-manifest.json` 一致；
 - device/cann/driver/firmware 与 `npu-smi` 和当前软件栈一致；
 - 10 次输出 token 和 stop reason 完全稳定；
-- prompt token 数加最大输出数不超过静态 gear；
+- prompt token 数不超过 `abi.sequence_capacity`，每轮 proposal 不超过 15；
 - 没有 CPU fallback、mock、fake ACL 或 simulation 标记。
-- `execution_io_counters` 的 avoided 字节严格等于 full-equivalent 减 actual；如果真机 msprof
-  的 Memcpy API 仍显示每轮完整 `S` 传输，说明实际 runner/source 与报告身份不一致。
+- 四个 `models[].sha256` 与同一份 deployment manifest 一致；
+- `execution_io_counters` 中 prefill、decode、fused execution 之和与物理 model execution 闭合；
+  如果真机 msprof 显示每轮完整 state H2D/D2H，说明实际 runner/source 与报告身份不一致。
 
 直接查看本次传输缩减量：
 
 ```bash
-jq '.execution_io_counters | {
-  model_executions,
-  stream_synchronizations,
-  host_to_device_bytes,
-  full_host_to_device_bytes,
-  host_to_device_bytes_avoided,
-  device_to_host_bytes,
-  full_device_to_host_bytes,
-  device_to_host_bytes_avoided,
-  maximum_target_elements_per_call
+jq '{
+  runner_id,
+  topology: .abi.physical_topology,
+  models: [.models[] | {role, model_id, sha256}],
+  executions: .execution_io_counters | {
+    model_executions, target_prefill_executions,
+    target_prefill_head_executions, target_decode1_executions,
+    fused_speculative_step_executions,
+    draft_to_verify_model_launches_elided, stream_synchronizations
+  },
+  ordinary_parity
 }' "$AI_RUN_DIR/reports/cpp-infer.json"
 ```
 
@@ -881,13 +938,14 @@ jq '.execution_io_counters | {
 
 ### 11.4 用 msprof 单独分析当前 OM
 
-先明确采样边界：本小节使用默认
-`create_quant_recompute_graph` factory，所以每个静态 gear 只生成一个
-`quant_dflash_recompute.om`，Target 全前缀和 Draft proposal 在同一张图里。因此这里的
-msprof 只能回答重计算基线 OM 中每个算子、device task 和 AscendCL API 的耗时，不能从这张
-集成图强行拆出 prefill/decode/verify/draft 的模型级时延。
+主路线必须 profile 同一次 fused bundle 中的四个常驻 OM：`target-prefill`、
+`target-prefill-head`、`target-decode1`、`fused-speculative-step`。使用
+[增量 OM 与 C++ 高性能路线](INCREMENTAL_OM_PERFORMANCE.md) 第 5.7 节的完整命令；它以
+`qwen35_dflash_incremental_acl_runner --measurement-protocol profile` 运行真实状态机，并把运行时
+model ID、每次物理执行 role/gear、AscendCL API 次数与 msprof CSV 关联。不能分别用随机 state
+直接调用四个 OM 后把结果当作端到端性能。
 
-分支同时提供五图基线 `create_quant_incremental_state_graphs`、四物理 OM 动态候选
+分支还提供五图基线 `create_quant_incremental_state_graphs`、四物理 OM 动态候选
 `create_quant_unified_target_step_graphs`、四物理 OM Draft+verify 精确融合候选
 `create_quant_fused_speculative_step_graphs` 和同一个常驻 OM C++ runner。生成后，应使用
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节对应拓扑的完整状态机 msprof 命令，并按
@@ -921,8 +979,11 @@ runner/OM/input 做未 profile 的 3+10 A/B，msprof API timeline 仅用于解�
 不能靠文件顺序猜测 OM 角色。采集完成后运行
 `python -m qwen35_dflash.ascend310p analyze-msprof`；完整命令、输入约束和判定规则见
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节。分析器会拒绝只导出单个 model/iteration 的
-不完整结果、重复执行记录以及 ACL API 次数不闭合的报告。单张
-`quant_dflash_recompute.om` 仍按本小节后续手工流程分析，不能伪装成四图或五图角色级结果。
+不完整结果、重复执行记录以及 ACL API 次数不闭合的报告。
+
+下面的手工流程仅用于可选的单图 `quant_dflash_recompute.om` 诊断基线：Target 全前缀和 Draft
+proposal 在同一张图里，只能回答整图算子/device task/API 耗时，不能拆出四个模型级 role，也
+不能替代上面的 fused 4-OM profile。
 
 正式时延基线仍然使用 11.3 中未开 profiling 的 3 次 warmup + 10 次
 measurement 报告。下面的 msprof 命令只做瓶颈定位，采集器引入的开销不能算入
@@ -1060,9 +1121,9 @@ rg --files "$PROF_DIR" | \
 6. 若整张静态图的物理工作量才是主导，则进入第 13 节的增量状态 ABI，继续优化
    C++ 控制面不会消除全前缀重算。
 
-当前五图增量候选应使用 `qwen35_dflash_incremental_acl_runner` 运行完整状态机，并按
-`target-prefill`、`target-prefill-head`、`target-decode1`、`draft-propose`、
-`target-verify-commit` 的 model ID 分组；完整命令见
+多 OM 候选应使用 `qwen35_dflash_incremental_acl_runner` 运行完整状态机。主 fused 路线按
+`target-prefill`、`target-prefill-head`、`target-decode1`、`fused-speculative-step` 的 model ID
+分组；五图对照再使用独立 `draft-propose` 与 `target-verify-commit`。完整命令见
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节。不要拿只接受集成图 2 input/2 output ABI 的
 `qwen35_dflash_acl_runner` 改文件名运行这些状态 OM，也不要用随机零 state 作为性能或正确性
 证据。
@@ -1098,14 +1159,17 @@ rg --files "$PROF_DIR" | \
 | generic `Ascend310P` rejected | SoC 身份不精确 | 从设备/ATC 支持列表填写真实 variant |
 | OM input/output count mismatch | 导出 ABI 漂移 | 必须恢复 2 input/2 output INT64 合同或版本化新 ABI |
 | C++ OM hash mismatch | OM 被替换或 manifest 错配 | 使用同一次 build 的 OM 和 deployment manifest |
+| `qwen35_dflash_acl_runner: unknown option --measurement-protocol` | 旧控制面把仅多 OM runner 支持的参数传给了单 OM runner，或选择了错误二进制 | 更新本分支；fused/五图/统一四图必须使用 `qwen35_dflash_incremental_acl_runner`。新 preflight 会在权重导出前拒绝这种组合 |
+| 期望多 OM 但只生成 `quant_dflash_recompute.om` | 命令省略/写错 factory，仍选择单图重算路线，或查看的是旧 bundle | 使用 `create_quant_fused_speculative_step_graphs` 和新的空 bundle；按第 7 节确认 manifest 恰好四个 role |
 | `ValueError: invalid literal for int() with base 10: 'input_ids'` | Python tokenizer 返回 `BatchEncoding`/Mapping，旧控制面误把字段名当 token ID 遍历；此时尚未启动 C++ runner | 更新本分支后重跑同一 `infer-cpp`；无需重新生成 AIR/OM，命令中的重复 `--chat`、`--max-new-tokens` 和 `--max-draft-tokens` 各保留一次 |
 | ordinary/DFlash token mismatch | 接受、correction、pad 或图语义错误 | 停止性能测试，定位首个 token 分叉 |
 | 延迟明显慢于闭源 | 完整前缀重算成为主瓶颈 | profile 后进入增量 OM state ABI，不要只优化 Python |
 
-## 13. 下一性能阶段
+## 13. 性能验证与后续候选
 
 当前 C++ 已消除 Python token 热循环、重复 OM load、重复 host/device buffer 分配和多余 stream
-同步，并实现了五图基线与四物理 OM 统一 Target-step 候选。若真实 profile 显示 OM 计算主导，
+同步，并实现了五图基线、四物理 OM 统一 Target-step 候选和作为 C++ 默认 factory 的 fused
+四物理 OM 候选。若真实 profile 显示 OM 计算主导，
 应基于 `quant` 已有 rollback 语义比较这些**逻辑角色**：
 
 1. `target-prefill.om`：分块 prompt body，不含 LM head；
@@ -1125,7 +1189,7 @@ NPU，后续调用只处理新增 token：
 
 | 路径 | 每次物理工作 | 性能含义 |
 | --- | --- | --- |
-| 当前集成重算 OM | 对静态 `S` 重算 Target 全前缀，并同时计算 Draft | 生成 1 个 token 也会重做历史行；不需要 Draft 时也付出 Draft 代价 |
+| 单图诊断重算 OM | 对静态 `S` 重算 Target 全前缀，并同时计算 Draft | 生成 1 个 token 也会重做历史行；不需要 Draft 时也付出 Draft 代价 |
 | `target_prefill_64.om` | prompt 分块只执行一次，产生 Target KV/GDR/conv state | 历史 prompt 不再在每个 decode 轮次重算 |
 | `target-prefill-head.om` | 只消费最后一个 `[1,1,H]` hidden | 非末 64-row chunk 不再计算完整词表投影 |
 | `target_decode_1.om` | 处理 1 个新 token，读写常驻 Target state | ordinary/correction 路径的 query 长度从 `S` 降为 1 |
@@ -1157,7 +1221,9 @@ NPU，后续调用只处理新增 token：
 msprof、候选集合内存/load 和状态搬运审计，再做未 profiling 的端到端 3+10，最后与同身份闭源
 基线比较。
 
-这一步是新的状态 ABI，不能在没有真实 baseline 和 state-branch 测试时悄悄替换当前功能基线。
+代码默认选择 fused factory 只代表交付拓扑已明确，不代表性能候选已经通过真机提升门禁。在没有
+真实 baseline、state-branch、完整显存和零差异证据前，报告中的候选状态仍必须保持
+`APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE`。
 
 ## 14. 官方接口依据
 

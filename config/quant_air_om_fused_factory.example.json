@@ -1,0 +1,21 @@
+{
+  "target_dir": "/ABSOLUTE/PATH/Qwen3.5-4B",
+  "draft_dir": "/ABSOLUTE/PATH/Qwen3.5-4B-DFlash",
+  "quant_config": "/ABSOLUTE/PATH/qwen3.5.yaml",
+  "input_manifest": "/ABSOLUTE/RUN/PATH/quant-input-manifest.json",
+  "receiver_models_dir": "/ABSOLUTE/PATH/qwen35-runtime/models",
+  "max_sequence_length": 2048,
+  "example_sequence_length": 64,
+  "eos_table_width": 4,
+  "pad_token_id": 0,
+  "dtype": "float16",
+  "device": "npu:0",
+  "npu_dynamic_quant_ge_op_type": "DynamicQuant",
+  "npu_quant_matmul_ge_op_type": "QuantBatchMatmulV4444",
+  "adn_rms_norm_ge_op_type": "AdnRmsNorm",
+  "npu_chunk_gated_delta_rule_ge_op_type": "ChunkGatedDeltaRule",
+  "npu_gated_delta_rule_mtp_ge_op_type": "GatedDeltaRuleMTP",
+  "npu_cache_update_ge_op_type": "CacheUpdate",
+  "adn_fused_infer_attention_ge_op_type": "AdnFusedInferAttention",
+  "npu_scatter_nd_update_ge_op_type": "ScatterNdUpdate"
+}

@@ -796,7 +796,11 @@ def test_build_cpp_runner_keeps_policy_specific_logs_with_build(
     build = tmp_path / "build-huge-first"
     report = tmp_path / "reports" / "build-huge-first.json"
     monkeypatch.setenv("AI_RUN_DIR", str(tmp_path))
-    monkeypatch.setattr(cpp_runtime, "preflight_cpp_runner", lambda _: None)
+    monkeypatch.setattr(
+        cpp_runtime,
+        "preflight_cpp_runner",
+        lambda _, *, state_policy=None: None,
+    )
     captured: list[list[str]] = []
 
     def fake_run(
@@ -1395,7 +1399,15 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
     runner = run_root / "fake-incremental-runner"
     runner.write_text("fake", encoding="utf-8")
     runner.chmod(0o755)
-    monkeypatch.setattr(cpp_runtime, "preflight_cpp_runner", lambda _: runner)
+    preflight_policies: list[str | None] = []
+
+    def fake_preflight(
+        _: str | Path, *, state_policy: str | None = None
+    ) -> Path:
+        preflight_policies.append(state_policy)
+        return runner
+
+    monkeypatch.setattr(cpp_runtime, "preflight_cpp_runner", fake_preflight)
     captured: dict[str, list[str]] = {}
 
     def execute(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
@@ -1432,6 +1444,7 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
         execute=execute,
     )
     command = captured["command"]
+    assert preflight_policies == [INCREMENTAL_STATE_POLICY]
     for role in _INCREMENTAL_GRAPH_ABI:
         assert f"--{role}" in command
         assert f"--{role}-sha256" in command
