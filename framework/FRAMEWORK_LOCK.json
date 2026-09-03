@@ -1,6 +1,6 @@
 {
-  "schema_version": 28,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v28",
+  "schema_version": 29,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v29",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -154,6 +154,18 @@
         "converter": "framework exact one-node override with serialized GE-IR outcome audit",
         "minimum_occurrences_policy": "1 for graphs declaring a required ChunkGatedDeltaRule or GatedDeltaRuleMTP path; 0 for graphs without Target Gated DeltaNet execution",
         "reason": "old receiver TorchAir converters raise NotImplementedError while newer lazy registries may already emit the same SoftplusV2 node; the GE result is authoritative and a nonzero framework call count remains a consistency gate"
+      }
+    ],
+    "standard_operator_decompositions": [
+      {
+        "source": "Tensor.unfold in torch_dflash_causal_conv1d_mtp",
+        "forbidden_frontend": "aten.unfold.default",
+        "replacement": "Kc static StridedSliceV2 columns plus Pack and Transpose",
+        "locked_qwen35_kc": 4,
+        "maximum_verify_rows": 16,
+        "slice_count": 4,
+        "semantics": "exact [B,T,C,Kc] state after each current verify row; accepted slot, GDR ABI and external OM ABI unchanged",
+        "reason": "receiver TorchAir registers aten.unfold.default with a NotImplementedError converter"
       }
     ],
     "state_policy": "recompute committed prefix"

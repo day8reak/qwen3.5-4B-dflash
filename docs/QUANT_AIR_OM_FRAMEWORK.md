@@ -255,6 +255,19 @@ decoder，所以其合法最小值是 0。`air-manifest.json` 的 `standard_op_o
 新 TorchAir 已生成正确 `SoftplusV2` 但框架计数器为 0 而误判，也不会放过需要 Softplus 的图中
 节点真正丢失的情况。七个 NPU 自定义算子的 Fake、converter 和保留门禁仍由上一节独立执行。
 
+### 2.4 DFlash causal-conv state-bank 的 AIR 分解
+
+rollback Target 需要为当前 `T=K+1` 行返回逐行 causal-conv state。PyTorch eager 的
+`Tensor.unfold` 能直接产生滑动窗口，但 TorchAir 注册的 `aten.unfold.default` converter 会抛出
+`NotImplementedError`，因此不能进入 AIR。框架改为完全等价的 Kc 列切片：第 `k` 列取
+`history[..., 1+k:1+k+T]`，再经 `torch.stack(..., dim=-1)` 和 permute 得到
+`[B,T,C,Kc]`。Qwen3.5 固定 `Kc=4`，所以每层是四个 Slice 加一个 Pack，不是旧实现的最多十六个
+逐 row Slice；数值、accepted slot、GDR ABI 和外部 OM tensor ABI 都不变。
+
+源码门禁禁止 `torch_dflash_causal_conv1d_mtp` 再出现 `unfold`，并要求切片循环上界是
+`state_length`。导出后若仍见 `aten.unfold.default`，说明执行的不是本分支源码；必须新起 Python
+进程并输出到新的空 AIR bundle，不能复用失败目录。
+
 如果 `S=64`，则 `prompt_tokens + generated_tokens` 不能超过 64。需要更长上下文时重新编译
 `S=128/256/...`。当前重算路径的延迟随 `S` 增大，因此先使用能够覆盖验证 workload 的最小
 gear。
@@ -1165,6 +1178,7 @@ rg --files "$PROF_DIR" | \
 | `ERR03005 GRAPH internal error`，`Original traceback` 指向 `qwen35_dflash.npu_cache_update.default`，Meta 单测通过 | 旧 converter 把前端 snake_case 参数按 positional 传入，但 GE `CacheUpdate` 原型要求 `x/updates/targetBlock/offsetInBlock -> x` | 更新本分支；确认 AIR manifest 中该算子的 `converter_mode` 为 `named-cache-update-x-v1` |
 | `TorchAir IR contains 0 DynamicQuant nodes`，但 `dynamo.pbtxt` 明确含 `op: "DynamicQuant"` | 旧审计器只识别 `type:` 字段；AIR 和权重保存实际上已经完成 | 更新本分支；不要把 DynamicQuant 改为 optional，确认 manifest 中 `ge_node_occurrences >= 1` |
 | 权重保存到 `699/699` 后报 `aten.softplus.default converter did not run` | 旧审计把“框架 converter 调用次数”误当成每张图的成功条件；新 TorchAir 可能已自行生成正确 `SoftplusV2`，而 `target-prefill-head` 本来就没有 Softplus | 更新本分支并改用新的空 bundle 目录重新导出；逐图检查 `standard_op_overrides`，Target/GDR 图要求 `minimum_occurrences=1`，prefill head 为 0；若 Target 图的 `ge_node_occurrences` 仍为 0，才是真正的 lowering 失败 |
+| `ERR03007 GRAPH feature not supported`，`Original traceback` 指向 `history.unfold(...)[..., 1:, :]` | rollback causal-conv state-bank 使用了 TorchAir 未实现的 `aten.unfold.default` converter | 更新本分支、新起 Python 进程并导出到新的空 bundle；新图使用固定 Kc=4 的四个 Slice 加 Pack，且不改变 GDR/custom-op ABI。若堆栈仍指向 `.unfold`，先核对实际 `modeling_qwen3_5_hiai_nd_dflash_rollback.py` 的 SHA256 |
 | `TorchAir IR contains 0 QuantBatchMatmulV4444 nodes for npu.npu_quant_matmul.default`，同时图中仍有 `QuantBatchMatmulV3` | receiver TorchAir 的内置 V3 converter 与旧项目 converter 注册在同一个 FX target 上，内置项仍被采用 | 更新本分支并重新导出到空目录；确认 audit target 已变为 `qwen35_dflash.npu_quant_matmul_v4444.default`，图中有 V4444 且无 V3 |
 | ATC 报 `QuantBatchMatmulV3` unsupported 或 FP32 scale 不匹配 | 旧 factory/builtin converter 生成了 CANN V3，而 receiver 实际安装 V4444 | 把现有 `factory.json` 改为 `QuantBatchMatmulV4444`，重新生成 AIR；确认图中有 V4444 且没有 V3 |
 | `No supported Ops kernel and engine ... FusedInferAttentionScore`（Ascend310P3） | 旧 AIR 把 receiver 的 ADN 前端错误 lower 成 A2 GE type；真实 310P 包注册的是 `AdnFusedInferAttention` | 更新本分支和现有 `factory.json`，把完整 ADN vendor 加入 `ASCEND_CUSTOM_OPP_PATH`，重新导出到空目录；确认图中只有 `AdnFusedInferAttention` 再跑 ATC |

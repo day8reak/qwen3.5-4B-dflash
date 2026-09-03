@@ -185,8 +185,52 @@ def assert_gdr_effective_length_source_contract() -> None:
     assert repeated_division == []
 
 
+def assert_causal_conv_air_source_contract() -> None:
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "torch_dflash_causal_conv1d_mtp"
+    )
+    unsupported_unfold = [
+        node
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "unfold"
+    ]
+    assert unsupported_unfold == []
+    stack_calls = [
+        node
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "torch"
+        and node.func.attr == "stack"
+    ]
+    assert len(stack_calls) == 1
+    comprehensions = [
+        node
+        for node in ast.walk(stack_calls[0])
+        if isinstance(node, ast.comprehension)
+    ]
+    assert len(comprehensions) == 1
+    iterator = comprehensions[0].iter
+    assert (
+        isinstance(iterator, ast.Call)
+        and isinstance(iterator.func, ast.Name)
+        and iterator.func.id == "range"
+        and len(iterator.args) == 1
+        and isinstance(iterator.args[0], ast.Name)
+        and iterator.args[0].id == "state_length"
+    )
+
+
 def main() -> None:
     assert_gdr_effective_length_source_contract()
+    assert_causal_conv_air_source_contract()
     helper = load_helpers()
     assert helper["DFLASH_BLOCK_SIZE"] == 16
     assert helper["DFLASH_MAX_PROPOSALS"] == 15
@@ -255,7 +299,7 @@ def main() -> None:
     # Give every previous slot a distinct identity so selection mistakes are
     # visible, then compare the vectorized convolution with a token loop for
     # the MTP sizes used by the device operator.
-    for tokens in (2, 5, 16):
+    for tokens in range(1, helper["DFLASH_MAX_VERIFY_TOKENS"] + 1):
         conv_bank = torch.randn(2, tokens, 3, 4, dtype=torch.float32)
         recurrent_bank = torch.randn(2, tokens, 2, 3, 4, dtype=torch.float32)
         hidden = torch.randn(2, 3, tokens, dtype=torch.float32)
@@ -305,6 +349,35 @@ def main() -> None:
             rtol=0,
             atol=0,
         )
+
+    class _CausalConvExportProbe(torch.nn.Module):
+        def forward(self, hidden, state, conv_weight, conv_bias, accepted_count):
+            return conv(
+                hidden,
+                state,
+                conv_weight,
+                conv_bias,
+                accepted_count,
+                "silu",
+            )
+
+    verify_tokens = torch.export.Dim("verify_tokens", min=1, max=16)
+    exported = torch.export.export(
+        _CausalConvExportProbe(),
+        (
+            torch.empty(1, 12, 8, device="meta"),
+            torch.empty(1, 12, 4, device="meta"),
+            torch.empty(12, 4, device="meta"),
+            torch.empty(12, device="meta"),
+            torch.empty(1, dtype=torch.int8, device="meta"),
+        ),
+        dynamic_shapes=({2: verify_tokens}, None, None, None, None),
+    )
+    exported_targets = [node.target for node in exported.graph.nodes]
+    assert torch.ops.aten.unfold.default not in exported_targets
+    assert exported_targets.count(torch.ops.aten.stack.default) == 1
+    # One convolution-output slice plus exactly Kc=4 state-column slices.
+    assert exported_targets.count(torch.ops.aten.slice.Tensor) == 5
 
     rebased_conv, rebased_recurrent = rebase(
         next_bank,

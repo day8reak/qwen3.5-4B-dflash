@@ -139,9 +139,11 @@ causal_conv1d_mtp(
 | output | `[B,Cg,T]` | FP16 |
 | next conv bank | `[B,T,Cg,Kc]` | FP16 |
 
-当前 `torch_dflash_causal_conv1d_mtp` 已实现相同语义，输入在 NPU 时没有 CPU fallback，但会形成
-gather、concat/unfold、depthwise conv、activation 和中间 tensor。新算子必须逐 row、逐 state
-slot 对齐该 golden，并与 GDR、KV、feature 使用同一个 accepted count。
+当前 `torch_dflash_causal_conv1d_mtp` 已实现相同语义，输入在 NPU 时没有 CPU fallback。state-bank
+使用 Kc 列切片加 Pack 构造；Qwen3.5 固定 Kc=4，因此图中只有四个 Slice，不使用 TorchAir
+未实现 converter 的 `aten.unfold.default`，也不退回 T 个逐 row Slice。该路径仍会形成 gather、
+concat、depthwise conv、activation 和中间 tensor。新算子必须逐 row、逐 state slot 对齐该
+golden，并与 GDR、KV、feature 使用同一个 accepted count。
 
 五 OM incremental graph 已经持久化选中的 scalar conv state，因此该路径直接消费
 `[B,Cg,Kc]`，不再先复制 24 份 T=16 input bank，也不执行 24 次 previous-slot gather；原始

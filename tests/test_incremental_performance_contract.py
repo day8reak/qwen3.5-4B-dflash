@@ -335,9 +335,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 28
+    assert framework_lock["schema_version"] == 29
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v28"
+        "qwen3.5-4b-quant-air-om-ascendcl-v29"
     )
     assert deployment["schema_version"] == 2
     assert performance["schema_version"] == 6
@@ -347,6 +347,13 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert "once-per-verify-v1" in framework_lock["runtime"][
         "incremental_verify_cache_indices"
     ]
+    decomposition = framework_lock["graph"][
+        "standard_operator_decompositions"
+    ][0]
+    assert decomposition["forbidden_frontend"] == "aten.unfold.default"
+    assert decomposition["locked_qwen35_kc"] == 4
+    assert decomposition["slice_count"] == 4
+    assert "GDR ABI" in decomposition["semantics"]
     assert "ping-pong" in framework_lock["runtime"][
         "incremental_decode_device_carrier"
     ]

@@ -333,14 +333,20 @@ def torch_dflash_causal_conv1d_mtp(
         groups=channels,
     )
     output = F.silu(convolution[:, :, -sequence_length:])
-    # ``unfold`` creates every rolling Kc window in one tensor operation.  Drop
-    # window zero (the round-start state) so slot i remains the state after
-    # consuming input rows 0..i.  This replaces T Python slices plus stack.
-    next_state_bank = (
-        history.unfold(-1, state_length, 1)[..., 1:, :]
-        .permute(0, 2, 1, 3)
-        .contiguous()
-    )
+    # TorchAir has no converter for ``aten.unfold.default``.  Build the same
+    # rolling windows from Kc column slices instead: for state offset k, take
+    # history[1+k : 1+k+T] across every output row, then pack Kc columns.  The
+    # locked Qwen3.5 Kc is 4, so this emits four Slice nodes rather than the T
+    # (up to 16) slices used by the older row-wise decomposition.
+    next_state_bank = torch.stack(
+        [
+            history[
+                :, :, state_offset + 1 : state_offset + 1 + sequence_length
+            ]
+            for state_offset in range(state_length)
+        ],
+        dim=-1,
+    ).permute(0, 2, 1, 3).contiguous()
     return output.to(hidden_states.dtype), next_state_bank.to(hidden_states.dtype)
 
 
