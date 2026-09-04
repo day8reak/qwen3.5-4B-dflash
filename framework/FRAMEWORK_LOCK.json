@@ -1,6 +1,6 @@
 {
-  "schema_version": 30,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v30",
+  "schema_version": 31,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v31",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -185,6 +185,7 @@
   },
   "compiler": {
     "exporter": "TorchAir dynamo_export",
+    "dynamic_external_weight_mapping_gate": "for every dynamic graph, replace captured parameter placeholders only by GraphDef Data.index == runtime input index; never index GraphDef.op by the runtime ordinal; fail if the receiver private ABI drifts, the indexed Data is absent/RefData, the conversion is not invoked, or converted/used counts differ; restore TorchAir immediately after each export and record per-graph manifest evidence",
     "custom_op_gate": "validate and propagate AIR custom_op_audit before ATC",
     "ge_operator_type_gate": "lock receiver/TorchAir names to DynamicQuant, QuantBatchMatmulV4444, AdnRmsNorm, ChunkGatedDeltaRule, CacheUpdate, AdnFusedInferAttention and ScatterNdUpdate for the recompute graph; incremental verify substitutes GatedDeltaRuleMTP for ChunkGatedDeltaRule",
     "ge_ir_node_audit": "count both TorchAir dynamo.pbtxt op and type node fields; use the per-file maximum per GE type to avoid duplicate counting",

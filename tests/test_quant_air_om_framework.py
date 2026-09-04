@@ -2002,6 +2002,10 @@ def test_air_export_audits_retained_adn_rms_norm(
     standard_override = graph["standard_op_overrides"][0]
     assert result["schema_version"] == 3
     assert graph["input_dim_gears"] == {"0": {"0": [1, 2]}}
+    assert graph["torchair_external_weight_mapping"]["status"] == (
+        "NOT_APPLICABLE_TEST_DOUBLE"
+    )
+    assert graph["torchair_external_weight_mapping"]["required"] is True
     assert torchair.dim_gear_calls[0][1] == {0: [1, 2]}
     assert result["environment"]["adn_attention_ge_prototype"] == {
         "status": "NOT_CONFIGURED",

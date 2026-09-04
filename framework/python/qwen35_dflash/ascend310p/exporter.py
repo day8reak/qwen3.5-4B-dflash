@@ -24,6 +24,7 @@ from .standard_op_export import (
     audit_aten_softplus_export,
     prepare_aten_softplus_export,
 )
+from .torchair_compat import index_safe_external_weight_conversion
 from .utils import atomic_write_json, file_record, require_run_output, resolve_callable
 
 
@@ -178,7 +179,14 @@ def export_air_bundle(
         if spec.compiler_config is not None:
             call_kwargs["config"] = spec.compiler_config
         call_kwargs.update(dict(spec.example_kwargs))
-        with torch.inference_mode(), _working_directory(graph_dir):
+        with (
+            torch.inference_mode(),
+            _working_directory(graph_dir),
+            index_safe_external_weight_conversion(
+                torchair,
+                required=bool(spec.dynamic),
+            ) as external_weight_mapping,
+        ):
             torchair.dynamo_export(*spec.example_args, **call_kwargs)
 
         custom_op_audit = audit_custom_op_export(
@@ -225,6 +233,9 @@ def export_air_bundle(
                     for name, item in spec.example_kwargs.items()
                 },
                 "metadata": dict(spec.metadata),
+                "torchair_external_weight_mapping": (
+                    external_weight_mapping.as_manifest_record()
+                ),
                 "standard_op_overrides": [softplus_audit],
                 "custom_op_audit": custom_op_audit,
                 "air": air_record,
