@@ -14,11 +14,13 @@ import torch
 from .contracts import AirGraphSpec
 from .custom_op_export import (
     NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+    NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
     NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
     audit_custom_op_export,
     prepare_custom_op_export,
     validate_adn_attention_ge_prototype_environment,
     validate_gdr_ge_prototype_environment,
+    validate_gdr_mtp_ge_prototype_environment,
 )
 from .standard_op_export import (
     audit_aten_softplus_export,
@@ -165,6 +167,20 @@ def export_air_bundle(
     # expensive and memory-heavy operation starts.
     factory_callable = resolve_callable(factory)
     specs = _normalize_specs(factory_callable(dict(factory_config)))
+    requires_gdr_mtp = any(
+        custom_op.torch_op == NPU_GATED_DELTA_RULE_MTP_TORCH_OP
+        for spec in specs
+        for custom_op in spec.custom_ops
+    )
+    gdr_mtp_ge_prototype = (
+        validate_gdr_mtp_ge_prototype_environment()
+        if requires_gdr_mtp
+        else {
+            "status": "NOT_REQUIRED",
+            "ge_op_type": NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+            "reason": "no graph declares npu::npu_gated_delta_rule_mtp",
+        }
+    )
     root.mkdir(parents=True, exist_ok=True)
     air_root = root / "air"
     air_root.mkdir()
@@ -269,6 +285,7 @@ def export_air_bundle(
             "torch_npu": _module_version("torch_npu"),
             "torchair": str(getattr(torchair, "__version__", "unknown")),
             "gdr_ge_prototype": gdr_ge_prototype,
+            "gdr_mtp_ge_prototype": gdr_mtp_ge_prototype,
             "adn_attention_ge_prototype": adn_attention_ge_prototype,
         },
         "graphs": graphs,

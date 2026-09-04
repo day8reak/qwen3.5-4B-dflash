@@ -76,7 +76,12 @@ def test_collector_runs_from_a_plain_source_copy_without_git(
     assert summary["copies_model_weights"] is False
     assert summary["export"]["status"] == "SKIPPED"
     assert prototypes["status"] == "COLLECTED"
-    assert set(prototypes) == {"status", "gdr", "adn_attention"}
+    assert set(prototypes) == {
+        "status",
+        "gdr",
+        "gdr_mtp",
+        "adn_attention",
+    }
     source_paths = {item["path"] for item in source_identity}
     assert "models/modeling_qwen3_5_hiai_nd.py" in source_paths
     assert "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py" in source_paths

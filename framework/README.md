@@ -46,9 +46,10 @@ C++ 调用 OM 完成 token 推理，但尚未把 `quant` 分支已有的 persist
 OM 输入，而是在 AIR 图内从 `attention_mask` 计算有效前缀长度；静态物理 gear 与逻辑有效
 行数因此可以分别为 64 和 37。
 
-Target modeling 的七个 NPU 自定义算子数值路径保持不变：`npu_dynamic_quant`、
+Target modeling 的八个 NPU 自定义算子数值路径保持不变：`npu_dynamic_quant`、
 `npu_quant_matmul`、`adn_rms_norm`、`npu_chunk_gated_delta_rule`、`npu_cache_update_`、
-`adn_fused_infer_attention` 和 `npu_scatter_nd_update_`。AIR 导出前，框架逐个锁定 dispatcher
+`adn_fused_infer_attention`、`npu_scatter_nd_update_` 和 verify 专用的
+`npu_gated_delta_rule_mtp`。AIR 导出前，框架逐个锁定 dispatcher
 schema，并校验已有 Meta 或在缺失时注册精确 Fake；原位 cache/scatter 的 writable alias 也属于
 合同。QuantMatmul 的 AIR 路径使用项目私有 functional frontend，避免与 receiver TorchAir
 注册在源 target 上的 V3 builtin converter 冲突，并精确 lowering 为 V4444；普通 eager 为

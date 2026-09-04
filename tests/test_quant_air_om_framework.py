@@ -50,6 +50,7 @@ from qwen35_dflash.ascend310p.custom_op_export import (
     prepare_custom_op_export,
     validate_adn_attention_ge_prototype_environment,
     validate_gdr_ge_prototype_environment,
+    validate_gdr_mtp_ge_prototype_environment,
 )
 from qwen35_dflash.ascend310p.exporter import (
     _softplus_minimum_occurrences,
@@ -313,6 +314,33 @@ def _write_gdr_ge_prototype(root: Path, *, effective_length: bool) -> Path:
     return header
 
 
+def _write_gdr_mtp_ge_prototype(
+    root: Path,
+    *,
+    second_output: str = "last_recurrent_state",
+) -> Path:
+    header = root / "op_proto" / "inc" / "gated_delta_rule_mtp_proto.h"
+    header.parent.mkdir(parents=True)
+    header.write_text(
+        "REG_OP(GatedDeltaRuleMTP)\n"
+        "    .INPUT(query, ge::TensorType::ALL())\n"
+        "    .INPUT(key, ge::TensorType::ALL())\n"
+        "    .INPUT(value, ge::TensorType::ALL())\n"
+        "    .INPUT(g, ge::TensorType::ALL())\n"
+        "    .INPUT(beta, ge::TensorType::ALL())\n"
+        "    .INPUT(initial_state, ge::TensorType::ALL())\n"
+        "    .INPUT(accepted_tokens, ge::TensorType::ALL())\n"
+        "    .OUTPUT(core_attn, ge::TensorType::ALL())\n"
+        f"    .OUTPUT({second_output}, ge::TensorType::ALL())\n"
+        "    .ATTR(chunk_size, Int, 64)\n"
+        "    .ATTR(output_final_state, Bool, false)\n"
+        "    .ATTR(use_qk_l2norm_in_kernel, Bool, false)\n"
+        "    .OP_END_FACTORY_REG(GatedDeltaRuleMTP);\n",
+        encoding="utf-8",
+    )
+    return header
+
+
 def _write_adn_attention_ge_package(
     root: Path,
     *,
@@ -480,6 +508,41 @@ def test_gdr_ge_prototype_preflight_rejects_legacy_abi(
     with pytest.raises(RuntimeError, match="incompatible ChunkGatedDeltaRule"):
         validate_gdr_ge_prototype_environment(
             ascend_custom_opp_path=str(legacy),
+            ld_library_path="",
+        )
+
+
+def test_gdr_mtp_ge_prototype_preflight_accepts_receiver_named_abi(
+    tmp_path: Path,
+) -> None:
+    vendor = tmp_path / "gdr_mtp"
+    header = _write_gdr_mtp_ge_prototype(vendor)
+
+    result = validate_gdr_mtp_ge_prototype_environment(
+        ascend_custom_opp_path=str(vendor),
+        ld_library_path=str(vendor / "op_api" / "lib"),
+    )
+
+    assert result["status"] == "PASS"
+    assert result["ge_op_type"] == "GatedDeltaRuleMTP"
+    assert result["abi"] == "receiver-gdr-mtp-v1-named-io"
+    assert result["prototype_path"] == str(header.resolve())
+    assert len(result["prototype_sha256"]) == 64
+    assert result["environment_sources"] == [
+        "ASCEND_CUSTOM_OPP_PATH",
+        "LD_LIBRARY_PATH",
+    ]
+
+
+def test_gdr_mtp_ge_prototype_preflight_rejects_state_bank_output(
+    tmp_path: Path,
+) -> None:
+    stale = tmp_path / "stale_gdr_mtp"
+    _write_gdr_mtp_ge_prototype(stale, second_output="state_bank")
+
+    with pytest.raises(RuntimeError, match="last_recurrent_state"):
+        validate_gdr_mtp_ge_prototype_environment(
+            ascend_custom_opp_path=str(stale),
             ld_library_path="",
         )
 
@@ -1277,7 +1340,7 @@ def test_gdr_fake_keeps_frontend_operator_in_strict_export() -> None:
     assert "npu.npu_chunk_gated_delta_rule.default" in targets
 
 
-def test_gdr_mtp_fake_and_named_converter_preserve_state_bank_node() -> None:
+def test_gdr_mtp_fake_and_named_converter_preserve_registered_outputs() -> None:
     operation = _ensure_target_test_schema("npu_gated_delta_rule_mtp")
     torchair = _FakeTorchAir()
     session = prepare_custom_op_export(
@@ -1342,14 +1405,16 @@ def test_gdr_mtp_fake_and_named_converter_preserve_state_bank_node() -> None:
             "initial_state": placeholders[5],
             "accepted_tokens": placeholders[6],
         },
-        "outputs": ["core_attn", "state_bank"],
+        "outputs": ["core_attn", "last_recurrent_state"],
         "attrs": {
             "chunk_size": ("int", 64),
             "output_final_state": ("bool", True),
             "use_qk_l2norm_in_kernel": ("bool", True),
         },
     }
-    assert session.converter_mode == "named-gdr-mtp-state-bank-v1"
+    assert session.converter_mode == (
+        "named-gdr-mtp-last-recurrent-state-v1"
+    )
 
 
 def test_fused_attention_fake_keeps_frontend_operator_in_strict_export() -> None:
@@ -2013,6 +2078,11 @@ def test_air_export_audits_retained_adn_rms_norm(
         "status": "NOT_CONFIGURED",
         "ge_op_type": "AdnFusedInferAttention",
         "reason": "ASCEND_CUSTOM_OPP_PATH is empty",
+    }
+    assert result["environment"]["gdr_mtp_ge_prototype"] == {
+        "status": "NOT_REQUIRED",
+        "ge_op_type": "GatedDeltaRuleMTP",
+        "reason": "no graph declares npu::npu_gated_delta_rule_mtp",
     }
     assert audit["status"] == "PASS"
     assert audit["torch_target"] == "npu.adn_rms_norm.default"

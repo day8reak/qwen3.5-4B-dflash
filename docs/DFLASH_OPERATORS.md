@@ -16,8 +16,9 @@
   能力，再根据 profile 决定。
 - 当前高价值性能候选：Draft/Target full-vocab Top-1、Draft GQA、W8A8 dynamic-quant+matmul
   dispatch 融合。
-- `framework/quant-air-om` 的导出预检覆盖当前 Target modeling 出现的七个前端算子：四个缺
-  Meta 的 receiver 算子补精确 Fake，三个已有 Meta 的 torch-npu 算子校验后复用；AIR 中仍需
+- `framework/quant-air-om` 的导出预检覆盖当前 Target modeling 出现的八个前端算子，包括
+  verify 专用 `GatedDeltaRuleMTP`；缺 Meta 的 receiver 算子补精确 Fake，已有 Meta 的
+  torch-npu 算子校验后复用；AIR 中仍需
   逐 type 审计 GE 节点。这只解决 FakeTensor/图保留，不替代这里要求的真实算子数值与性能证据。
 
 因此，“完整官方 generation 功能”不能仅靠新增算子完成；“当前 NPU 路线不再依赖 conv

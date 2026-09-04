@@ -100,8 +100,8 @@ modeling 中的 torch_npu.<op> 或 AIR 专用 qwen35_dflash::<op>
 对应 GE/AIR 节点（dynamo.pbtxt 必须可审计）
 ```
 
-当前锁定的七个算子如下。`required` 表示当前完整前缀重算图必须实际出现，`optional` 表示仍做
-schema/Meta 预检，但不能虚构一次图命中。
+当前锁定的八个算子如下。`required` 表示当前完整前缀重算图必须实际出现，`optional` 表示仍做
+schema/Meta 预检，但不能虚构一次图命中；GDR-MTP 仅在四 OM 的融合 verify 图中 required。
 
 | 前端 FX target | Fake/Meta 输出合同 | 默认 GE type | converter | 当前图 |
 | --- | --- | --- | --- | --- |
@@ -109,6 +109,7 @@ schema/Meta 预检，但不能虚构一次图命中。
 | `qwen35_dflash.npu_quant_matmul_v4444.default` | broadcast batch + `[M,N]`，当前调用输出 FP16 | `QuantBatchMatmulV4444` | 框架注册 | required |
 | `npu.adn_rms_norm.default` | 输出 0 与 input 同 shape/dtype；输出 1 为 `[*input.shape[:-1],1]` FP32 | `AdnRmsNorm` | 框架注册 | required |
 | `npu.npu_chunk_gated_delta_rule.default` | output 为 value shape/query dtype；final state 为 initial-state shape/FP32 | `ChunkGatedDeltaRule` | 框架注册 | required |
+| `npu.npu_gated_delta_rule_mtp.default` | output 为 value shape/query dtype；state bank 为 initial-state shape/FP32 | `GatedDeltaRuleMTP` | 框架注册 | required（仅 `fused-speculative-step`） |
 | `qwen35_dflash.npu_cache_update.default` | 返回同 shape/dtype/device 的非 alias 更新值 | `CacheUpdate` | 框架注册 | required |
 | `npu.adn_fused_infer_attention.default` | 按 layout 推导；当前 packed `BNSD` 路径保持 query shape/FP16 | `AdnFusedInferAttention` | 框架映射 | required |
 | `npu.npu_scatter_nd_update_.default` | 返回同一个 `Tensor(a!)`，不能丢失写 alias | `ScatterNdUpdate` | TorchAir builtin | optional（仅 `forward1`） |
@@ -119,8 +120,8 @@ outputs=["y", "rstd"], attrs={"epsilon": ...})`，所以 factory、converter 和
 名称及 named ABI，不能以一个自洽但错误的 `RmsNorm` 测试替代 receiver 合同。其余名称分别由
 receiver converter（`ChunkGatedDeltaRule`、`CacheUpdate`、`AdnFusedInferAttention`）、310P
 receiver 量化包（`QuantBatchMatmulV4444`）和 TorchAir builtin converter（`DynamicQuant`、
-`ScatterNdUpdate`）核对。增量 verify 用到的第八个前端不属于重算图七项，其 GE type 单独锁定为
-`GatedDeltaRuleMTP`。
+`ScatterNdUpdate`）核对。增量 verify 的 GDR-MTP 前端使用独立 GE type
+`GatedDeltaRuleMTP`，不出现在单图重算路线中。
 
 这些 `*_ge_op_type` 字段是显式可审计的锁值，不是自由重命名入口；任一值偏离上表都会在加载
 4B checkpoint 前失败。需要支持另一套 receiver 时，应连同其 GE prototype、converter named
@@ -138,6 +139,19 @@ inputs: query, key, value, g, beta, initial_state, effective_length
 outputs: core_attn, last_recurrent_state
 attrs: chunk_size, output_final_state, use_qk_l2norm_in_kernel
 ```
+
+GDR-MTP 的模型语义把第二个返回值称为 state bank，但 GE 原型的注册输出名仍必须严格使用
+`last_recurrent_state`，不能在 converter 中写成 `state_bank`：
+
+```text
+inputs: query, key, value, g, beta, initial_state, accepted_tokens
+outputs: core_attn, last_recurrent_state
+attrs: chunk_size, output_final_state, use_qk_l2norm_in_kernel
+```
+
+当前生产调用显式传入 `chunk_size=64, output_final_state=True,
+use_qk_l2norm_in_kernel=True`；REG_OP 中两个布尔 attr 的 `false` 只是省略 attr 时的 GE 默认值，
+不能据此改变模型调用合同。
 
 不能把 PyTorch schema 的十个参数按 positional 顺序直接传给 GE，否则
 `effective_length` 会落到 `initial_state` 位置，`chunk_size` 会落到 Tensor 输入位置。
@@ -253,7 +267,7 @@ rg -n 'type: "SoftplusV2"' \
 decoder，所以其合法最小值是 0。`air-manifest.json` 的 `standard_op_overrides` 会逐图记录
 `minimum_occurrences`、GE 节点数、converter 调用数和实际采用的 converter policy。这样不会因
 新 TorchAir 已生成正确 `SoftplusV2` 但框架计数器为 0 而误判，也不会放过需要 Softplus 的图中
-节点真正丢失的情况。七个 NPU 自定义算子的 Fake、converter 和保留门禁仍由上一节独立执行。
+节点真正丢失的情况。八个 NPU 自定义算子的 Fake、converter 和保留门禁仍由上一节独立执行。
 
 ### 2.4 DFlash causal-conv state-bank 的 AIR 分解
 
@@ -387,28 +401,33 @@ atc --version
 
 任何 import、设备或 ATC 失败都应先修环境；不要让导出流程自动降级到 CPU。
 
-在加载权重前单独检查 GDR 和 ADN GE 原型：
+在加载权重前单独检查普通 GDR、GDR-MTP 和 ADN GE 原型：
 
 ```bash
 "$MODEL_PYTHON" - <<'PY'
 from qwen35_dflash.ascend310p.custom_op_export import (
     validate_adn_attention_ge_prototype_environment,
     validate_gdr_ge_prototype_environment,
+    validate_gdr_mtp_ge_prototype_environment,
 )
 
 gdr = validate_gdr_ge_prototype_environment()
+gdr_mtp = validate_gdr_mtp_ge_prototype_environment()
 adn = validate_adn_attention_ge_prototype_environment()
 print("GDR", gdr)
+print("GDR-MTP", gdr_mtp)
 print("ADN", adn)
 assert gdr["status"] == "PASS"
 assert gdr["abi"] == "effective-length-v2-named-inputs"
+assert gdr_mtp["status"] == "PASS"
+assert gdr_mtp["abi"] == "receiver-gdr-mtp-v1-named-io"
 assert adn["status"] == "PASS"
 assert adn["ge_op_type"] == "AdnFusedInferAttention"
 assert adn["abi"] == "receiver-adn-attention-v1-named-inputs"
 PY
 ```
 
-导出器也会自动执行同一检查。若两个环境变量指向两套同名
+导出器也会自动执行这些检查；GDR-MTP 检查只在 graph specs 声明该算子时启用。若两个环境变量指向两套同名
 `ChunkGatedDeltaRule`，会在加载 checkpoint 前失败并列出两个 `op_proto.h`。必须同时从
 `ASCEND_CUSTOM_OPP_PATH` 和 `LD_LIBRARY_PATH` 移除旧 vendor 根；不要只依赖路径先后顺序，
 也不要删除不属于当前用户的安装目录。
@@ -547,8 +566,9 @@ NPU 机器上即使只有直接拷贝的源码、没有 `.git`，也可以执行
 ```
 
 采集器不调用 Git，也不复制 checkpoint、量化权重、AIR 或 OM。它会记录关键源码 SHA256 并附带
-这些小型源码文件的快照，同时收集 Python/package/CANN/NPU 身份、七个前端算子的真实 schema
-与 dispatch table、GDR/ADN prototype 及 kernel 预检结果 `ge-prototypes.json`、脱敏后的 factory
+这些小型源码文件的快照，同时收集 Python/package/CANN/NPU 身份、八个前端算子的真实 schema
+与 dispatch table、普通 GDR/GDR-MTP/ADN prototype 及 kernel 预检结果
+`ge-prototypes.json`、脱敏后的 factory
 配置、完整 Dynamo 导出日志和已有的 JSON/log/pbtxt 诊断。
 即使 AIR 导出失败，也会先在 `--output-dir` 生成 `air-debug-*.tar.gz`，随后返回原导出退出码；
 把该压缩包回传即可。若日志过大，可增加 `--no-dynamo-logs`，但第一次失败建议保留默认完整日志。
@@ -594,6 +614,9 @@ assert data["schema_version"] == 3
 gdr_proto = data["environment"]["gdr_ge_prototype"]
 assert gdr_proto["status"] == "PASS"
 assert gdr_proto["abi"] == "effective-length-v2-named-inputs"
+gdr_mtp_proto = data["environment"]["gdr_mtp_ge_prototype"]
+assert gdr_mtp_proto["status"] == "PASS"
+assert gdr_mtp_proto["abi"] == "receiver-gdr-mtp-v1-named-io"
 expected_names = [
     "target-prefill",
     "target-prefill-head",
@@ -685,7 +708,7 @@ fi
 
 如果 `dynamo_export` 报 graph break，应保留完整 TorchAir 日志并定位首个不支持节点；不能用空
 AIR、伪文件或 CPU export 替代。若仍出现 `does not support running with fake tensors`，先看错误中
-的完整 `npu.<op>.default`：本分支会预检上述七个 target，出现第八个算子表示 receiver 源码/算子
+的完整 `npu.<op>.default`：本分支会预检上述八个 target，出现第九个算子表示 receiver 源码/算子
 包已经漂移，需要先锁定它的真实 schema、输出元数据和 GE IR，不能套用已有 Fake 合同。
 
 ## 7. AIR 编译成 OM
@@ -1217,7 +1240,7 @@ rg --files "$PROF_DIR" | \
 | QLinear coverage mismatch | 量化权重与 Target topology 不同 | 核对 YAML、checkpoint revision 和 quant artifact |
 | `torch_npu`/TorchAir import 失败 | 环境不匹配 | 使用与 CANN/驱动匹配的声明环境 |
 | 模型加载阶段 `BatchMatMul4` / `507014 AICore timeout`，同步 traceback 落在 `_set_cos_sin_cache` | tied `lm_head.weight` 触发 Transformers 补缺初始化，旧 modeling 又在已迁移到 NPU 后重复构建 `max_position_embeddings` 长度的 RoPE cache；与 prompt 长度、DFlash decode 和 block table 无关 | 更新本分支并新起 Python 进程；设置 `ASCEND_LAUNCH_BLOCKING=1` 复验，日志不得再出现 `_initialize_missing_keys -> _init_weights -> _set_cos_sin_cache`。超时后的旧 NPU context 不可继续复用 |
-| `unsupported operator: npu.<op>.default` | 七算子预检未运行、实际代码不是本分支，或 receiver 新增了第八个算子 | 核对远端提交、`PYTHONPATH`；已覆盖清单见 2.1，不能用 modeling Tensor fallback 掩盖 |
+| `unsupported operator: npu.<op>.default` | 八算子预检未运行、实际代码不是本分支，或 receiver 新增了第九个算子 | 核对远端提交、`PYTHONPATH`；已覆盖清单见 2.1，不能用 modeling Tensor fallback 掩盖 |
 | `schema drifted from the locked export contract` | torch-npu/receiver 算子签名与当前锁不一致 | 记录 dispatcher schema；按真实版本更新 schema、Fake、converter 和测试，不能跳过校验 |
 | `Meta contract mismatch` / `lost input alias` | 上游 Meta 或本地 Fake 与真实 shape/dtype/原位语义不一致 | 停止导出，先以算子包实现和实机输出重新冻结合同 |
 | `RmsNorm` unsupported、或图审计找不到 `AdnRmsNorm` | factory/旧 converter 使用了通用 GE 名称，但 receiver 注册的是 `AdnRmsNorm(self,gamma)->(y,rstd)` | 把 `adn_rms_norm_ge_op_type` 改为 `AdnRmsNorm`，更新本分支后重新生成空 AIR bundle；不要复用旧 AIR |
@@ -1236,6 +1259,7 @@ rg --files "$PROF_DIR" | \
 | ATC 报 `QuantBatchMatmulV3` unsupported 或 FP32 scale 不匹配 | 旧 factory/builtin converter 生成了 CANN V3，而 receiver 实际安装 V4444 | 把现有 `factory.json` 改为 `QuantBatchMatmulV4444`，重新生成 AIR；确认图中有 V4444 且没有 V3 |
 | `No supported Ops kernel and engine ... FusedInferAttentionScore`（Ascend310P3） | 旧 AIR 把 receiver 的 ADN 前端错误 lower 成 A2 GE type；真实 310P 包注册的是 `AdnFusedInferAttention` | 更新本分支和现有 `factory.json`，把完整 ADN vendor 加入 `ASCEND_CUSTOM_OPP_PATH`，重新导出到空目录；确认图中只有 `AdnFusedInferAttention` 再跑 ATC |
 | `AdnFusedInferAttention GE prototype is absent from the active ASCEND_CUSTOM_OPP_PATH` | PyTorch/LD 能加载 ADN op_api，但 ATC 的 OPP 搜索路径里没有对应 prototype/kernel vendor | 把 ADN 安装包的 `packages/vendors/<vendor>` 根加入 `ASCEND_CUSTOM_OPP_PATH`；不要只加入 `op_api/lib` |
+| `GatedDeltaRuleMTP` 在 eager 的 T16/T17 测试通过，但 AIR/ATC 报 `Template constraint` | eager ABI 可用不代表手写 TorchAir named converter 与 GE `REG_OP` 一致；旧 converter 把第二个输出错误命名为 `state_bank` | 更新本分支，从空目录重新导出四个 AIR；确认 manifest 中 `gdr_mtp_ge_prototype.abi=receiver-gdr-mtp-v1-named-io`，再重新 ATC。不要改 T16、state shape 或清理大范围缓存 |
 | `pse_shift` 期望 `Optional[Tensor]` 但收到 `[64]` / `immutable_list` | 旧版 modeling 在 export 路径把 `allQLen` 长度列表误接到了 PSE 输入，尚未进入 Fake/converter | 更新本分支；确认两个 modeling 文件均传 `all_seq_lengths_q=allQLen` 且不构造伪 PSE Tensor |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |

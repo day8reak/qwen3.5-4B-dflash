@@ -66,6 +66,26 @@ _GDR_GE_PROTO_TOKENS = (
     ".ATTR(output_final_state,Bool,false)",
     ".ATTR(use_qk_l2norm_in_kernel,Bool,false)",
 )
+_GDR_MTP_GE_PROTO_BLOCK = re.compile(
+    r"REG_OP\s*\(\s*GatedDeltaRuleMTP\s*\)"
+    r"(?P<body>.*?)"
+    r"\.OP_END_FACTORY_REG\s*\(\s*GatedDeltaRuleMTP\s*\)",
+    re.DOTALL,
+)
+_GDR_MTP_GE_PROTO_TOKENS = (
+    ".INPUT(query,",
+    ".INPUT(key,",
+    ".INPUT(value,",
+    ".INPUT(g,",
+    ".INPUT(beta,",
+    ".INPUT(initial_state,",
+    ".INPUT(accepted_tokens,",
+    ".OUTPUT(core_attn,",
+    ".OUTPUT(last_recurrent_state,",
+    ".ATTR(chunk_size,Int,64)",
+    ".ATTR(output_final_state,Bool,false)",
+    ".ATTR(use_qk_l2norm_in_kernel,Bool,false)",
+)
 _ADN_ATTENTION_GE_PROTO_BLOCK = re.compile(
     r"REG_OP\s*\(\s*AdnFusedInferAttention\s*\)"
     r"(?P<body>.*?)"
@@ -140,9 +160,9 @@ def _gdr_proto_headers(
     headers: dict[Path, set[str]] = {}
 
     def add_root(root: Path, source: str) -> None:
-        candidates = [root / "op_proto" / "inc" / "op_proto.h"]
+        candidates = sorted((root / "op_proto" / "inc").glob("*.h"))
         if root.name == "vendors" and root.is_dir():
-            candidates.extend(sorted(root.glob("*/op_proto/inc/op_proto.h")))
+            candidates.extend(sorted(root.glob("*/op_proto/inc/*.h")))
         for candidate in candidates:
             if candidate.is_file():
                 resolved = candidate.resolve()
@@ -374,6 +394,85 @@ def validate_gdr_ge_prototype_environment(
         "status": "PASS",
         "ge_op_type": NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
         "abi": "effective-length-v2-named-inputs",
+        "prototype_path": str(header),
+        "prototype_sha256": hashlib.sha256(payload).hexdigest(),
+        "environment_sources": sorted(sources),
+    }
+
+
+def validate_gdr_mtp_ge_prototype_environment(
+    *,
+    ascend_custom_opp_path: str | None = None,
+    ld_library_path: str | None = None,
+) -> dict[str, Any]:
+    """Require the receiver's exact ``GatedDeltaRuleMTP`` named GE ABI."""
+
+    ascend_path = (
+        os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+        if ascend_custom_opp_path is None
+        else ascend_custom_opp_path
+    )
+    library_path = (
+        os.environ.get("LD_LIBRARY_PATH", "")
+        if ld_library_path is None
+        else ld_library_path
+    )
+    if not ascend_path and not library_path:
+        return {
+            "status": "NOT_CONFIGURED",
+            "ge_op_type": NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+            "reason": "ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH are empty",
+        }
+
+    matches: list[tuple[Path, set[str], bytes, str]] = []
+    for header, sources in _gdr_proto_headers(
+        ascend_path,
+        library_path,
+    ).items():
+        payload = header.read_bytes()
+        text = payload.decode("utf-8", errors="replace")
+        block = _GDR_MTP_GE_PROTO_BLOCK.search(text)
+        if block is not None:
+            matches.append((header, sources, payload, block.group("body")))
+
+    if not matches:
+        raise RuntimeError(
+            "GatedDeltaRuleMTP GE prototype is absent from the active "
+            "ASCEND_CUSTOM_OPP_PATH. Add the GDR-MTP package's "
+            "packages/vendors/<vendor> root before AIR export"
+        )
+    if len(matches) != 1:
+        locations = "; ".join(str(item[0]) for item in matches)
+        raise RuntimeError(
+            "multiple GatedDeltaRuleMTP GE prototypes are active: "
+            f"{locations}. Keep exactly one receiver GDR-MTP vendor root in "
+            "ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH"
+        )
+
+    header, sources, payload, body = matches[0]
+    if "ASCEND_CUSTOM_OPP_PATH" not in sources:
+        raise RuntimeError(
+            "GatedDeltaRuleMTP is visible only through LD_LIBRARY_PATH; ATC "
+            "also requires its vendor root in ASCEND_CUSTOM_OPP_PATH"
+        )
+    compact = re.sub(r"\s+", "", body)
+    positions = [compact.find(token) for token in _GDR_MTP_GE_PROTO_TOKENS]
+    missing = [
+        token
+        for token, position in zip(_GDR_MTP_GE_PROTO_TOKENS, positions)
+        if position < 0
+    ]
+    if missing or positions != sorted(positions):
+        details = ", ".join(missing) if missing else "declaration order"
+        raise RuntimeError(
+            f"incompatible GatedDeltaRuleMTP GE prototype at {header}: "
+            f"{details}. Expected seven named inputs, core_attn and "
+            "last_recurrent_state outputs, and three attrs"
+        )
+    return {
+        "status": "PASS",
+        "ge_op_type": NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
+        "abi": "receiver-gdr-mtp-v1-named-io",
         "prototype_path": str(header),
         "prototype_sha256": hashlib.sha256(payload).hexdigest(),
         "environment_sources": sorted(sources),
@@ -1415,7 +1514,7 @@ def _register_framework_converter(
                     "initial_state": initial_state,
                     "accepted_tokens": accepted_tokens,
                 },
-                outputs=["core_attn", "state_bank"],
+                outputs=["core_attn", "last_recurrent_state"],
                 attrs={
                     "chunk_size": ge_api.attr.Int(chunk_size),
                     "output_final_state": ge_api.attr.Bool(
@@ -1428,12 +1527,13 @@ def _register_framework_converter(
             )
             if not isinstance(result, (tuple, list)) or len(result) != 2:
                 raise RuntimeError(
-                    "GatedDeltaRuleMTP GE IR must return core_attn and state_bank"
+                    "GatedDeltaRuleMTP GE IR must return core_attn and "
+                    "last_recurrent_state"
                 )
             return result
 
         converter.__name__ = "convert_npu_gated_delta_rule_mtp_default"
-        session.converter_mode = "named-gdr-mtp-state-bank-v1"
+        session.converter_mode = "named-gdr-mtp-last-recurrent-state-v1"
     elif adapter.torch_op == FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP:
         if spec.ge_op_type != NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE:
             raise RuntimeError(
@@ -1766,4 +1866,5 @@ __all__ = [
     "prepare_custom_op_export",
     "validate_adn_attention_ge_prototype_environment",
     "validate_gdr_ge_prototype_environment",
+    "validate_gdr_mtp_ge_prototype_environment",
 ]

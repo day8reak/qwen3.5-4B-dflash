@@ -335,9 +335,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 32
+    assert framework_lock["schema_version"] == 33
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v32"
+        "qwen3.5-4b-quant-air-om-ascendcl-v33"
     )
     assert deployment["schema_version"] == 2
     assert performance["schema_version"] == 6

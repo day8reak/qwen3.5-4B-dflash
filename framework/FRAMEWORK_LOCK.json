@@ -1,6 +1,6 @@
 {
-  "schema_version": 32,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v32",
+  "schema_version": 33,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v33",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -96,6 +96,23 @@
         "minimum_occurrences": 1
       },
       {
+        "frontend": "npu.npu_gated_delta_rule_mtp.default",
+        "frontend_schema": "npu::npu_gated_delta_rule_mtp(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, Tensor initial_state, Tensor accepted_tokens, int chunk_size=64, bool output_final_state=True, bool use_qk_l2norm_in_kernel=True) -> (Tensor, Tensor)",
+        "fake_meta_outputs": [
+          "value shape, query dtype/device",
+          "initial_state shape, float32, input device"
+        ],
+        "constraints": "locked fused verify route uses T=1..16, accepted_tokens int8[B], FP32 state bank, chunk_size=64, output_final_state=true and use_qk_l2norm_in_kernel=true; exactly one matching GE prototype may be active",
+        "ge_prototype": {
+          "inputs": ["query", "key", "value", "g", "beta", "initial_state", "accepted_tokens"],
+          "outputs": ["core_attn", "last_recurrent_state"],
+          "attrs": ["chunk_size", "output_final_state", "use_qk_l2norm_in_kernel"]
+        },
+        "default_ge_op_type": "GatedDeltaRuleMTP",
+        "converter": "framework named-input/output GE IR; model state-bank semantics map to the registered last_recurrent_state output name",
+        "minimum_occurrences_policy": "1 only for graphs declaring the fused GDR-MTP verify path"
+      },
+      {
         "frontend": "qwen35_dflash.npu_cache_update.default",
         "frontend_schema": "qwen35_dflash::npu_cache_update(Tensor input, Tensor updates, Tensor target_block, Tensor offset_in_block) -> Tensor",
         "source_frontend": "npu.npu_cache_update_.default",
@@ -144,7 +161,7 @@
         "optional_reason": "forward1 is not selected by the fixed recompute graph"
       }
     ],
-    "custom_operator_preservation_gate": "all seven schemas and Meta contracts must validate; CacheUpdate eager mutation must match the source while strict export and AOT capture the same number of private no-alias calls with no source alias op or aten.copy; required paths need their declared dynamo.pbtxt GE-node counts, and framework converters also need matching call counts",
+    "custom_operator_preservation_gate": "all eight schemas and Meta contracts must validate; CacheUpdate eager mutation must match the source while strict export and AOT capture the same number of private no-alias calls with no source alias op or aten.copy; required paths need their declared dynamo.pbtxt GE-node counts, and framework converters also need matching call counts",
     "standard_operator_overrides": [
       {
         "frontend": "aten.softplus.default",
@@ -190,6 +207,7 @@
     "ge_operator_type_gate": "lock receiver/TorchAir names to DynamicQuant, QuantBatchMatmulV4444, AdnRmsNorm, ChunkGatedDeltaRule, CacheUpdate, AdnFusedInferAttention and ScatterNdUpdate for the recompute graph; incremental verify substitutes GatedDeltaRuleMTP for ChunkGatedDeltaRule",
     "ge_ir_node_audit": "count both TorchAir dynamo.pbtxt op and type node fields; use the per-file maximum per GE type to avoid duplicate counting",
     "gdr_prototype_gate": "reject duplicate or legacy ChunkGatedDeltaRule prototypes from ASCEND_CUSTOM_OPP_PATH and LD_LIBRARY_PATH before checkpoint load",
+    "gdr_mtp_prototype_gate": "when graph specs declare GatedDeltaRuleMTP, require exactly one active prototype whose seven inputs, core_attn/last_recurrent_state outputs and three attrs match the receiver ABI",
     "adn_attention_prototype_gate": "require exactly one receiver AdnFusedInferAttention prototype in ASCEND_CUSTOM_OPP_PATH with the locked ABI and an Ascend310P prebuilt object/metadata pair before checkpoint load",
     "atc_mode": 0,
     "atc_framework": 1,

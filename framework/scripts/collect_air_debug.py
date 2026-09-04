@@ -313,6 +313,7 @@ def _ge_prototype_preflight() -> dict[str, object]:
         from qwen35_dflash.ascend310p.custom_op_export import (
             validate_adn_attention_ge_prototype_environment,
             validate_gdr_ge_prototype_environment,
+            validate_gdr_mtp_ge_prototype_environment,
         )
     except BaseException as error:  # noqa: BLE001
         return {"status": "IMPORT_ERROR", "error": repr(error)}
@@ -320,6 +321,7 @@ def _ge_prototype_preflight() -> dict[str, object]:
     results: dict[str, object] = {"status": "COLLECTED"}
     for name, validator in (
         ("gdr", validate_gdr_ge_prototype_environment),
+        ("gdr_mtp", validate_gdr_mtp_ge_prototype_environment),
         ("adn_attention", validate_adn_attention_ge_prototype_environment),
     ):
         try:
