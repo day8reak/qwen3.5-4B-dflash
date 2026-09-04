@@ -132,7 +132,11 @@ def test_external_weight_conversion_uses_data_index_not_op_position() -> None:
     graph = _interleaved_dynamic_graph()
     weight = torch.ones((2, 3), dtype=torch.float16)
     runtime = torch.zeros((1,), dtype=torch.float16)
-    audit = ExternalWeightMappingAudit(required=True, status="ARMED")
+    audit = ExternalWeightMappingAudit(
+        required=True,
+        status="ARMED",
+        torchair_runtime_type="test.fake",
+    )
 
     result = _convert_data_to_const_by_index(
         export_utils,
@@ -164,7 +168,11 @@ def test_external_weight_conversion_fails_before_partial_graph_mutation() -> Non
     graph = _interleaved_dynamic_graph()
     graph.op[1].attr["index"].i = 9
     weight = torch.ones((2, 3), dtype=torch.float16)
-    audit = ExternalWeightMappingAudit(required=True, status="ARMED")
+    audit = ExternalWeightMappingAudit(
+        required=True,
+        status="ARMED",
+        torchair_runtime_type="test.fake",
+    )
 
     with pytest.raises(RuntimeError, match="no matching indexed Data node"):
         _convert_data_to_const_by_index(
@@ -180,12 +188,15 @@ def test_external_weight_conversion_fails_before_partial_graph_mutation() -> Non
     assert graph.op[1].type == "Data"
 
 
+@pytest.mark.parametrize("use_proxy", [False, True])
 def test_dynamic_export_patch_is_scoped_audited_and_restored(
     monkeypatch: pytest.MonkeyPatch,
+    use_proxy: bool,
 ) -> None:
-    torchair = ModuleType("torchair")
+    torchair = SimpleNamespace() if use_proxy else ModuleType("torchair")
     export_utils = _fake_export_utils()
     original = export_utils._convert_data_to_const
+    monkeypatch.setitem(sys.modules, "torchair", torchair)
     monkeypatch.setitem(
         sys.modules,
         "torchair._utils.export_utils",
@@ -211,6 +222,9 @@ def test_dynamic_export_patch_is_scoped_audited_and_restored(
     assert audit.converter_calls == 1
     assert audit.used_weight_inputs == 1
     assert audit.converted_weight_inputs == 1
+    assert audit.torchair_runtime_type == (
+        "types.SimpleNamespace" if use_proxy else "builtins.module"
+    )
     assert audit.as_manifest_record()["mapping_key"] == (
         "GraphDef Data.index == runtime input index"
     )

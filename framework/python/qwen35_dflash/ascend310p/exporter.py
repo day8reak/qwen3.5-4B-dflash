@@ -133,6 +133,14 @@ def export_air_bundle(
     if root.exists() and any(root.iterdir()):
         raise FileExistsError(f"AIR bundle directory is not empty: {root}")
     torchair = torchair_module
+    explicit_test_double = bool(
+        torchair_module is not None
+        and getattr(
+            torchair_module,
+            "_qwen35_dflash_explicit_test_double",
+            False,
+        )
+    )
     if torchair is None:
         try:
             torchair = importlib.import_module("torchair")
@@ -185,6 +193,7 @@ def export_air_bundle(
             index_safe_external_weight_conversion(
                 torchair,
                 required=bool(spec.dynamic),
+                explicit_test_double=explicit_test_double,
             ) as external_weight_mapping,
         ):
             torchair.dynamo_export(*spec.example_args, **call_kwargs)

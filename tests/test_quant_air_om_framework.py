@@ -23,6 +23,7 @@ if str(FRAMEWORK_PYTHON) not in sys.path:
 from qwen35_dflash.ascend310p.compiler import (
     _validate_extra_args,
     _validated_custom_op_audit,
+    _validated_external_weight_mapping,
     compile_air_bundle,
 )
 from qwen35_dflash.ascend310p.contracts import AirGraphSpec, CustomOpExportSpec
@@ -233,6 +234,7 @@ class _FakeTorchAirGe:
 
 class _FakeTorchAir:
     __version__ = "test"
+    _qwen35_dflash_explicit_test_double = True
 
     def __init__(self) -> None:
         self.ge = _FakeTorchAirGe()
@@ -2003,7 +2005,7 @@ def test_air_export_audits_retained_adn_rms_norm(
     assert result["schema_version"] == 3
     assert graph["input_dim_gears"] == {"0": {"0": [1, 2]}}
     assert graph["torchair_external_weight_mapping"]["status"] == (
-        "NOT_APPLICABLE_TEST_DOUBLE"
+        "NOT_APPLICABLE_EXPLICIT_TEST_DOUBLE"
     )
     assert graph["torchair_external_weight_mapping"]["required"] is True
     assert torchair.dim_gear_calls[0][1] == {0: [1, 2]}
@@ -2114,6 +2116,108 @@ def test_compiler_rejects_incomplete_declared_custom_op_audit() -> None:
     }
     with pytest.raises(ValueError, match="every declared contract"):
         _validated_custom_op_audit(graph)
+
+
+def _passing_external_weight_mapping() -> dict[str, object]:
+    return {
+        "status": "PASS",
+        "required": True,
+        "policy": "data-index-v1",
+        "mapping_key": "GraphDef Data.index == runtime input index",
+        "converter_calls": 1,
+        "used_weight_inputs": 699,
+        "converted_weight_inputs": 699,
+    }
+
+
+def test_compiler_accepts_passing_dynamic_external_weight_mapping() -> None:
+    mapping = _passing_external_weight_mapping()
+    assert _validated_external_weight_mapping(
+        {
+            "dynamic": True,
+            "torchair_external_weight_mapping": mapping,
+        }
+    ) == mapping
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        (
+            {
+                "status": "NOT_APPLICABLE_EXPLICIT_TEST_DOUBLE",
+                "converter_calls": 0,
+                "used_weight_inputs": 0,
+                "converted_weight_inputs": 0,
+            },
+            "not passing",
+        ),
+        ({"converted_weight_inputs": 698}, "counts are invalid"),
+        ({"policy": "positional-op-index"}, "policy drifted"),
+    ],
+)
+def test_compiler_rejects_unproven_dynamic_external_weight_mapping(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    mapping = _passing_external_weight_mapping()
+    mapping.update(updates)
+    with pytest.raises(ValueError, match=message):
+        _validated_external_weight_mapping(
+            {
+                "dynamic": True,
+                "torchair_external_weight_mapping": mapping,
+            }
+        )
+
+
+def test_compiler_rejects_missing_dynamic_external_weight_mapping() -> None:
+    with pytest.raises(ValueError, match="requires a passing"):
+        _validated_external_weight_mapping({"dynamic": True})
+
+
+def test_compiler_allows_legacy_static_graph_without_mapping_audit() -> None:
+    assert _validated_external_weight_mapping({"dynamic": False}) is None
+
+
+def test_compile_rejects_skipped_dynamic_mapping_before_atc_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    bundle = run_dir / "bundle"
+    bundle.mkdir(parents=True)
+    manifest_path = bundle / "air-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "artifact_kind": "qwen35-dflash-torchair-bundle",
+                "status": "PASS",
+                "graphs": [
+                    {
+                        "name": "fused-speculative-step",
+                        "dynamic": True,
+                        "torchair_external_weight_mapping": {
+                            "status": "NOT_APPLICABLE_TEST_DOUBLE",
+                            "required": True,
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_RUN_DIR", str(run_dir))
+
+    with pytest.raises(ValueError, match="not passing"):
+        compile_air_bundle(
+            manifest_path,
+            soc_version="Ascend310P3",
+            atc_bin=None,
+        )
+
+    assert not (bundle / "om").exists()
 
 
 def test_default_factory_is_quant_branch_factory() -> None:

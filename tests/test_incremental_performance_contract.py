@@ -335,9 +335,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 31
+    assert framework_lock["schema_version"] == 32
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v31"
+        "qwen3.5-4b-quant-air-om-ascendcl-v32"
     )
     assert deployment["schema_version"] == 2
     assert performance["schema_version"] == 6
@@ -368,6 +368,12 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
         "dynamic_external_weight_mapping_gate"
     ]
     assert "never index GraphDef.op" in framework_lock["compiler"][
+        "dynamic_external_weight_mapping_gate"
+    ]
+    assert "import identity" in framework_lock["compiler"][
+        "dynamic_external_weight_mapping_gate"
+    ]
+    assert "compile-om reject" in framework_lock["compiler"][
         "dynamic_external_weight_mapping_gate"
     ]
     assert "ping-pong" in framework_lock["runtime"][

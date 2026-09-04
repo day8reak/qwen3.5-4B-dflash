@@ -20,7 +20,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import importlib
 import inspect
-from types import ModuleType
 from threading import RLock
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -40,6 +39,7 @@ class ExternalWeightMappingAudit:
 
     required: bool
     status: str
+    torchair_runtime_type: str
     policy: str = "data-index-v1"
     converter_calls: int = 0
     used_weight_inputs: int = 0
@@ -70,6 +70,7 @@ class ExternalWeightMappingAudit:
         return {
             "status": self.status,
             "required": self.required,
+            "torchair_runtime_type": self.torchair_runtime_type,
             "policy": self.policy,
             "mapping_key": "GraphDef Data.index == runtime input index",
             "converter_calls": self.converter_calls,
@@ -224,39 +225,54 @@ def index_safe_external_weight_conversion(
     torchair: Any,
     *,
     required: bool,
+    explicit_test_double: bool = False,
 ) -> Iterator[ExternalWeightMappingAudit]:
     """Patch one dynamic export and restore TorchAir immediately afterwards."""
+
+    runtime_type = f"{type(torchair).__module__}.{type(torchair).__qualname__}"
 
     if not required:
         audit = ExternalWeightMappingAudit(
             required=False,
             status="NOT_REQUIRED_STATIC_GRAPH",
+            torchair_runtime_type=runtime_type,
         )
         yield audit
         return
 
-    # Repository tests intentionally pass a light-weight object instead of an
-    # importable TorchAir module.  Production export always imports the module
-    # before factory/model loading and must pass the strict path below.
-    if not isinstance(torchair, ModuleType):
+    # Only a caller that explicitly injected the repository's marked test
+    # double may bypass receiver internals.  Never infer this from Python type:
+    # receiver distributions may expose the canonical package through a lazy
+    # module proxy rather than types.ModuleType.
+    if explicit_test_double:
         audit = ExternalWeightMappingAudit(
             required=True,
-            status="NOT_APPLICABLE_TEST_DOUBLE",
+            status="NOT_APPLICABLE_EXPLICIT_TEST_DOUBLE",
+            torchair_runtime_type=runtime_type,
         )
         yield audit
         return
 
-    module_name = getattr(torchair, "__name__", "")
-    if module_name != "torchair":
+    try:
+        canonical_torchair = importlib.import_module("torchair")
+    except ImportError as error:
         raise RuntimeError(
-            "dynamic AIR export requires the canonical torchair module; "
-            f"observed {module_name!r}"
+            "dynamic AIR export cannot import the canonical torchair package"
+        ) from error
+    if torchair is not canonical_torchair:
+        raise RuntimeError(
+            "dynamic AIR export received a non-canonical TorchAir object; "
+            "injectable test doubles must carry the repository test marker"
         )
 
     export_utils = importlib.import_module("torchair._utils.export_utils")
     _validate_export_utils(export_utils)
     original = export_utils._convert_data_to_const
-    audit = ExternalWeightMappingAudit(required=True, status="ARMED")
+    audit = ExternalWeightMappingAudit(
+        required=True,
+        status="ARMED",
+        torchair_runtime_type=runtime_type,
+    )
 
     def convert_data_to_const(inputs, export_graph, file_path, weight_name):
         return _convert_data_to_const_by_index(

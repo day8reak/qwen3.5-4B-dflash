@@ -297,6 +297,19 @@ GDR ABI 和 OM tensor ABI 均不改变。如果 receiver 私有函数 ABI 漂移
 `RefData`、补丁未被调用或转换计数不一致，导出直接失败，不能留下可继续编译的伪成功 bundle。
 `air-manifest.json` 的每张图会记录 `torchair_external_weight_mapping`；动态图必须为 `PASS`。
 
+v31 曾用 `isinstance(torchair, types.ModuleType)` 自动推断 test double；receiver 发行包可以用 lazy
+module proxy 暴露规范的 `torchair` 包，因此真实导出会被误记为
+`NOT_APPLICABLE_TEST_DOUBLE` 并跳过修复。v32 改为比较 `importlib.import_module("torchair")` 返回的
+规范对象身份，不再假设具体 Python 类型；只有测试代码显式注入且带仓库 test marker 的 double
+才能跳过 receiver 私有函数。`compile-om` 还会在创建 OM 目录、启动第一个 ATC 之前检查所有
+动态图：状态必须为 `PASS`，converter 至少调用一次，并且 `converted=used>0`。因此不能再把
+未修复的动态图 AIR 编译到一半。
+
+这里的 `target_dir` 仍应指向可被 Transformers 加载的原始 HF checkpoint。W8A8 参数由
+`quant_config` 中的 `quanted_pth`、量化 embedding weight/scale 注入；不要把 `target_dir` 直接
+改成只含量化产物的目录。正常外置权重最终就是 `FileConstant`，错误不在这个 op type 本身，而在
+它是否替换了与自身 `Data.index` 对应的 parameter placeholder。
+
 如果 `S=64`，则 `prompt_tokens + generated_tokens` 不能超过 64。需要更长上下文时重新编译
 `S=128/256/...`。当前重算路径的延迟随 `S` 增大，因此先使用能够覆盖验证 workload 的最小
 gear。
@@ -1217,7 +1230,8 @@ rg --files "$PROF_DIR" | \
 | 权重保存到 `699/699` 后报 `aten.softplus.default converter did not run` | 旧审计把“框架 converter 调用次数”误当成每张图的成功条件；新 TorchAir 可能已自行生成正确 `SoftplusV2`，而 `target-prefill-head` 本来就没有 Softplus | 更新本分支并改用新的空 bundle 目录重新导出；逐图检查 `standard_op_overrides`，Target/GDR 图要求 `minimum_occurrences=1`，prefill head 为 0；若 Target 图的 `ge_node_occurrences` 仍为 0，才是真正的 lowering 失败 |
 | `ERR03007 GRAPH feature not supported`，`Original traceback` 指向 `history.unfold(...)[..., 1:, :]` | rollback causal-conv state-bank 使用了 TorchAir 未实现的 `aten.unfold.default` converter | 更新本分支、新起 Python 进程并导出到新的空 bundle；新图使用固定 Kc=4 的四个 Slice 加 Pack，且不改变 GDR/custom-op ABI。若堆栈仍指向 `.unfold`，先核对实际 `modeling_qwen3_5_hiai_nd_dflash_rollback.py` 的 SHA256 |
 | `ERR03007 GRAPH feature not supported`，`Original traceback` 指向 `incremental.py` 的 `.amin(dim=1)` 或 `torch.cumprod` | 四图 `fused-speculative-step` 的设备端 transaction tail 使用了 receiver TorchAir 未实现的 `aten.amin.default` / `aten.cumprod.default`；改成 `torch.min(...).values` 也会命中未实现的 `aten.min.dim` | 更新本分支、新起 Python 进程，从 `export-air` 开始输出到新的空 AIR bundle；v30 使用两次 INT32 Cumsum 精确保留 EOS 与 mismatch 前缀，不改变 token、state 或 OM ABI。不要继续 ATC 编译旧 AIR |
-| 只有 `fused-speculative-step` 在 ATC InferShape 失败，首个 `Pack` 两个输入分别是 `[2560,20480]` FP16 `FileConstant/Gather` 与 `[]` INT64 Const，并报 `PackInferShape: the input shape dims should be equal` | receiver TorchAir 的旧外置权重逻辑把运行时 parameter 序号当成 `GraphDef.op` 位置；动态图 shape helper 插在 `Data` 之间后，名为 `Gather` 的 shape 节点被误覆盖成 `draft_fc_weight`，不是模型代码在 stack 权重和标量 | 更新到 v31、新起 Python 进程，从 `export-air` 开始写入新的空 bundle；确认 fused 图的 `torchair_external_weight_mapping.status=PASS` 且 converted=used>0，再重新 `compile-om`。旧 `fused-speculative-step.air` 已损坏，不能只重跑 ATC；四个 AIR/OM 必须来自同一新 manifest |
+| 真实 `export-air` 的 `torchair_external_weight_mapping.status=NOT_APPLICABLE_TEST_DOUBLE`、calls/used/converted 都为 0 | v31 用 `types.ModuleType` 判断 test double，把 receiver 的真实 TorchAir module proxy 误分类；这不表示 factory、`target_dir` 或量化权重是假的 | 更新到 v32并新起 Python 进程，从 `export-air` 写入新 bundle。v32 以规范 import identity 识别 TorchAir；若动态图审计不是 `PASS`，导出/`compile-om` 必须在 ATC 前失败 |
+| 只有 `fused-speculative-step` 在 ATC InferShape 失败，首个 `Pack` 两个输入分别是 `[2560,20480]` FP16 `FileConstant/Gather` 与 `[]` INT64 Const，并报 `PackInferShape: the input shape dims should be equal` | receiver TorchAir 的旧外置权重逻辑把运行时 parameter 序号当成 `GraphDef.op` 位置；动态图 shape helper 插在 `Data` 之间后，名为 `Gather` 的 shape 节点被误覆盖成 `draft_fc_weight`，不是模型代码在 stack 权重和标量 | 更新到 v32、新起 Python 进程，从 `export-air` 开始写入新的空 bundle；确认 fused 图的 `torchair_external_weight_mapping.status=PASS` 且 converted=used>0，再重新 `compile-om`。旧 `fused-speculative-step.air` 已损坏，不能只重跑 ATC；四个 AIR/OM 必须来自同一新 manifest |
 | `TorchAir IR contains 0 QuantBatchMatmulV4444 nodes for npu.npu_quant_matmul.default`，同时图中仍有 `QuantBatchMatmulV3` | receiver TorchAir 的内置 V3 converter 与旧项目 converter 注册在同一个 FX target 上，内置项仍被采用 | 更新本分支并重新导出到空目录；确认 audit target 已变为 `qwen35_dflash.npu_quant_matmul_v4444.default`，图中有 V4444 且无 V3 |
 | ATC 报 `QuantBatchMatmulV3` unsupported 或 FP32 scale 不匹配 | 旧 factory/builtin converter 生成了 CANN V3，而 receiver 实际安装 V4444 | 把现有 `factory.json` 改为 `QuantBatchMatmulV4444`，重新生成 AIR；确认图中有 V4444 且没有 V3 |
 | `No supported Ops kernel and engine ... FusedInferAttentionScore`（Ascend310P3） | 旧 AIR 把 receiver 的 ADN 前端错误 lower 成 A2 GE type；真实 310P 包注册的是 `AdnFusedInferAttention` | 更新本分支和现有 `factory.json`，把完整 ADN vendor 加入 `ASCEND_CUSTOM_OPP_PATH`，重新导出到空目录；确认图中只有 `AdnFusedInferAttention` 再跑 ATC |

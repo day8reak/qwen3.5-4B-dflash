@@ -189,6 +189,54 @@ def _validated_custom_op_audit(graph: Mapping[str, Any]) -> list[dict[str, Any]]
     return result
 
 
+def _validated_external_weight_mapping(
+    graph: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Reject a dynamic AIR graph whose parameter mapping was not applied."""
+
+    raw = graph.get("torchair_external_weight_mapping")
+    if not bool(graph.get("dynamic", False)):
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise TypeError("AIR external-weight mapping audit must be an object")
+        if (
+            raw.get("status") != "NOT_REQUIRED_STATIC_GRAPH"
+            or raw.get("required") is not False
+        ):
+            raise ValueError(
+                "static AIR graph has an invalid external-weight mapping audit"
+            )
+        return dict(raw)
+
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            "dynamic AIR graph requires a passing external-weight mapping audit"
+        )
+    if raw.get("status") != "PASS" or raw.get("required") is not True:
+        raise ValueError(
+            "dynamic AIR graph external-weight mapping audit is not passing"
+        )
+    if raw.get("policy") != "data-index-v1" or raw.get("mapping_key") != (
+        "GraphDef Data.index == runtime input index"
+    ):
+        raise ValueError(
+            "dynamic AIR graph external-weight mapping policy drifted"
+        )
+    converter_calls = int(raw.get("converter_calls", 0))
+    used_weight_inputs = int(raw.get("used_weight_inputs", 0))
+    converted_weight_inputs = int(raw.get("converted_weight_inputs", 0))
+    if (
+        converter_calls < 1
+        or used_weight_inputs < 1
+        or converted_weight_inputs != used_weight_inputs
+    ):
+        raise ValueError(
+            "dynamic AIR graph external-weight mapping counts are invalid"
+        )
+    return dict(raw)
+
+
 def compile_air_bundle(
     air_manifest_path: str | Path,
     *,
@@ -207,6 +255,16 @@ def compile_air_bundle(
         raise ValueError("AIR manifest is not passing")
     if air_manifest.get("artifact_kind") != "qwen35-dflash-torchair-bundle":
         raise ValueError("unexpected AIR artifact kind")
+    raw_graphs = air_manifest.get("graphs")
+    if not isinstance(raw_graphs, list) or not raw_graphs:
+        raise ValueError("AIR manifest contains no graph entries")
+    validated_graphs: list[tuple[Mapping[str, Any], dict[str, Any] | None]] = []
+    for graph in raw_graphs:
+        if not isinstance(graph, Mapping):
+            raise TypeError("AIR graph manifest entry must be an object")
+        validated_graphs.append(
+            (graph, _validated_external_weight_mapping(graph))
+        )
     exact_soc_version = validate_soc_version(soc_version)
     atc_path = resolve_atc_executable(atc_bin)
 
@@ -221,9 +279,7 @@ def compile_air_bundle(
     log_root.mkdir(parents=True, exist_ok=True)
 
     compiled: list[dict[str, Any]] = []
-    for graph in air_manifest.get("graphs", []):
-        if not isinstance(graph, Mapping):
-            raise TypeError("AIR graph manifest entry must be an object")
+    for graph, external_weight_mapping in validated_graphs:
         name = str(graph["name"])
         custom_op_audit = _validated_custom_op_audit(graph)
         air_record = graph["air"]
@@ -267,21 +323,24 @@ def compile_air_bundle(
             raise AtcCompileError(
                 f"ATC returned success but produced no non-empty OM for {name!r}; log={log_path}"
             )
-        compiled.append(
-            {
-                "name": name,
-                "role": graph["role"],
-                "input_names": list(graph.get("input_names", [])),
-                "output_names": list(graph.get("output_names", [])),
-                "dynamic": bool(graph.get("dynamic", False)),
-                "input_dim_gears": dict(graph.get("input_dim_gears", {})),
-                "custom_op_audit": custom_op_audit,
-                "air": dict(air_record),
-                "om": file_record(om_path, relative_to=root),
-                "atc_command": command,
-                "atc_log": str(log_path.relative_to(run_dir)),
-            }
-        )
+        compiled_graph = {
+            "name": name,
+            "role": graph["role"],
+            "input_names": list(graph.get("input_names", [])),
+            "output_names": list(graph.get("output_names", [])),
+            "dynamic": bool(graph.get("dynamic", False)),
+            "input_dim_gears": dict(graph.get("input_dim_gears", {})),
+            "custom_op_audit": custom_op_audit,
+            "air": dict(air_record),
+            "om": file_record(om_path, relative_to=root),
+            "atc_command": command,
+            "atc_log": str(log_path.relative_to(run_dir)),
+        }
+        if external_weight_mapping is not None:
+            compiled_graph["torchair_external_weight_mapping"] = (
+                external_weight_mapping
+            )
+        compiled.append(compiled_graph)
 
     deployment = {
         "schema_version": 1,
