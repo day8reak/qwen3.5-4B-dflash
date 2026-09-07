@@ -250,6 +250,47 @@ TensorSpec ReadDynamicControlSpec(
   return result;
 }
 
+std::string DescribeModelIo(aclmdlDesc* description) {
+  // Diagnostics must also accept scalar/unknown metadata. Never pass it
+  // through ReadTensorSpec or walk more than the fixed ACL dimension array.
+  std::ostringstream message;
+  for (const bool input : {true, false}) {
+    const std::size_t count = input
+        ? aclmdlGetNumInputs(description)
+        : aclmdlGetNumOutputs(description);
+    message << "\n  " << (input ? "input" : "output") << "_count=" << count;
+    for (std::size_t index = 0; index < count; ++index) {
+      aclmdlIODims dims{};
+      const aclError code = input
+          ? aclmdlGetInputDims(description, index, &dims)
+          : aclmdlGetOutputDims(description, index, &dims);
+      message << "\n  " << (input ? "input" : "output") << '[' << index
+              << "] dims_status=" << code;
+      if (code != ACL_SUCCESS) {
+        continue;
+      }
+      dims.name[sizeof(dims.name) - 1] = '\0';
+      message << " name='" << dims.name << "' dimCount=" << dims.dimCount
+              << " dtype=" << static_cast<int>(input
+                  ? aclmdlGetInputDataType(description, index)
+                  : aclmdlGetOutputDataType(description, index))
+              << " bytes=" << (input
+                  ? aclmdlGetInputSizeByIndex(description, index)
+                  : aclmdlGetOutputSizeByIndex(description, index))
+              << " shape=[";
+      for (std::size_t axis = 0; axis < std::min(dims.dimCount, std::size_t{128});
+           ++axis) {
+        if (axis != 0) {
+          message << ',';
+        }
+        message << dims.dims[axis];
+      }
+      message << ']';
+    }
+  }
+  return message.str();
+}
+
 bool SameTensor(const TensorSpec& first, const TensorSpec& second) {
   return first.dtype == second.dtype && first.shape == second.shape &&
          first.bytes == second.bytes;
@@ -343,10 +384,20 @@ struct ModelSession {
     const std::size_t output_count = aclmdlGetNumOutputs(description);
     if (require_dynamic_gears) {
       std::size_t index = 0;
-      Check(
-          aclmdlGetInputIndexByName(
-              description, kDynamicTensorName, &index),
-          role + ": aclmdlGetInputIndexByName(dynamic dims)");
+      const aclError status = aclmdlGetInputIndexByName(
+          description, kDynamicTensorName, &index);
+      if (status != ACL_SUCCESS) {
+        throw std::runtime_error(
+            role + ": dynamic execution contract mismatch: this runner requires "
+            "an ATC discrete-gear OM with ascend_mbatch_shape_data, but "
+            "aclmdlGetInputIndexByName returned " + std::to_string(status) +
+            ". TorchAir dynamic=True AIR can use dynamic Shape inputs and "
+            "does not imply this control tensor exists. AIR framework=1 "
+            "cannot be repaired by adding --dynamic_dims or setting "
+            "dynamic=False. Inspect the actual tensor/scalar ABI before "
+            "implementing aclmdlSetDatasetTensorDesc bindings." +
+            DescribeModelIo(description));
+      }
       if (index >= input_count) {
         throw std::runtime_error(role + ": dynamic input index is invalid");
       }

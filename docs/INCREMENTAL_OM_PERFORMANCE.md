@@ -478,15 +478,19 @@ jq -r '.graphs[] | [.name,.role,.om.path,.om.sha256] | @tsv' \
 输出必须恰好包含 `target-prefill`、`target-prefill-head`、`target-decode1`、
 `draft-propose`、`target-verify-commit` 五个物理 role。导出/ATC 仍会按每个 graph 的合同检查
 自定义节点，不能把它们
-静默分解成普通 Tensor 子图。`draft-propose` 的 gear 由 exporter 在调用
-`torchair.dynamo_export` 前对第 0 个输入执行 `torchair.inference.set_dim_gears`；不要给
-`--framework=1` 的 AIR→OM ATC 命令额外拼 `--dynamic_dims`。生成 OM 后，C++ 启动会要求
+静默分解成普通 Tensor 子图。exporter 在调用 `torchair.dynamo_export` 前对第 0 个输入执行
+`torchair.inference.set_dim_gears`，但该调用仅说明前端声明，不能证明 AIR/OM 含分档控制输入。
+不要给 `--framework=1` 的 AIR→OM ATC 命令额外拼 `--dynamic_dims`，CANN 明确不支持此组合。
+当前 C++ 仅实现分档接口，启动会要求
 `N=1..16` 和从 64 到 `max_sequence_length` 的每个 64 倍数都能由
-`aclmdlGetInputDynamicDims` 查询到，缺一档就直接失败。
+`aclmdlGetInputDynamicDims` 查询到，缺一档就直接失败。2026-09-07 receiver AIR/OM
+未满足这一执行合同；参见[动态 Shape 接口故障说明](QUANT_AIR_OM_FRAMEWORK.md#121-动态-shape-air-与分档-om-的接口不匹配尚未闭环)。
+本节构建命令不能当成设备集成已经通过的证据。
 
 AscendCL 的
 [`aclmdlGetInputSizeByIndex`](https://www.hiascend.com/document/detail/en/canncommercial/850/API/appdevgapi/aclcppdevg_03_1451.html)
-约束明确说明：shape 含 `-1` 的动态输入会返回 0。runner 不把这个 0 当作损坏 OM，而是按
+约束明确说明：shape 含 `-1` 的动态输入会返回 0。对于已经确认使用分档接口的 OM，runner
+不把这个 0 当作损坏 OM，而是按
 [`aclmdlGetInputDynamicDims`](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_1468.html)
 给出的“所有公开输入 rank 之和”的 flattened gear 顺序校验静态维度，并以全部 gear 中的最大
 dense bytes 建立有界分配；静态输入、输出或未声明动态 gear 的零字节仍直接失败。OM 文件名也
@@ -535,7 +539,8 @@ PYTHONPATH="$PWD/framework/python:$PWD" "$MODEL_PYTHON" -m pytest -q \
 #### 5.2.1 生成四物理 OM 的统一 Target-step 候选
 
 使用同一个 factory 配置、checkpoint、量化文件和 receiver，只替换 factory 名；不要给 ATC
-手写 `--dynamic_dims`，16 档由 TorchAir AIR 中的 gear 合同携带：
+手写 `--dynamic_dims`。16 档是当前 runner 的要求，不是已验证由 TorchAir AIR 携带的属性；
+仍须完成上文实际 OM 动态接口和物理输入绑定检查：
 
 ```bash
 export UNIFIED_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-unified-target-step"

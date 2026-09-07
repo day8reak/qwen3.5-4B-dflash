@@ -39,6 +39,13 @@ struct Spec {
   const char* name;
 };
 
+bool MissingDynamicControl(Role role) {
+  const char* enabled =
+      std::getenv("QWEN35_DFLASH_FAKE_MISSING_DYNAMIC_CONTROL");
+  return role == Role::kFusedSpeculativeStep && enabled != nullptr &&
+         std::string(enabled) == "1";
+}
+
 constexpr std::size_t kSequenceLength = 32;
 constexpr std::size_t kIncrementalSequenceLength = 128;
 constexpr std::size_t kIntegratedDraftWidth = 15;
@@ -800,10 +807,12 @@ aclError aclmdlGetInputDims(
     dimensions->dimCount = 0;
   } else if (status == ACL_SUCCESS &&
              std::string(spec.name) == "ascend_mbatch_shape_data") {
-    // CANN exposes this synthetic dynamic-gear control input as an opaque
-    // buffer: its byte size is valid, while aclmdlGetInputDims may report no
-    // ordinary model dimensions.
+    // Exercise opaque control metadata; this fixture is not evidence that
+    // any particular real OM exposes the same descriptor.
     dimensions->dimCount = 0;
+    if (MissingDynamicControl(description->role)) {
+      std::strcpy(dimensions->name, "lifted_float_scalar");
+    }
   }
   return status;
 }
@@ -820,6 +829,10 @@ aclError aclmdlGetOutputDims(
 
 aclDataType aclmdlGetInputDataType(
     const aclmdlDesc* description, std::size_t index) {
+  if (description != nullptr && MissingDynamicControl(description->role) &&
+      index + 1 == Inputs(description->role).size()) {
+    return ACL_DOUBLE;
+  }
   return description != nullptr && index < Inputs(description->role).size()
       ? Inputs(description->role)[index].dtype
       : ACL_DT_UNDEFINED;
@@ -838,6 +851,10 @@ std::size_t aclmdlGetInputSizeByIndex(
     return 0;
   }
   const auto& spec = Inputs(description->role)[index];
+  if (MissingDynamicControl(description->role) &&
+      std::string(spec.name) == "ascend_mbatch_shape_data") {
+    return sizeof(double);
+  }
   const char* force_zero_static =
       std::getenv("QWEN35_DFLASH_FAKE_ZERO_STATIC_INPUT");
   if (description->role == Role::kTargetPrefill && index == 0 &&
@@ -864,6 +881,10 @@ aclError aclmdlGetInputIndexByName(
     std::size_t* index) {
   if (description == nullptr || name == nullptr || index == nullptr) {
     return 1;
+  }
+  if (MissingDynamicControl(description->role) &&
+      std::string(name) == "ascend_mbatch_shape_data") {
+    return 100000;
   }
   const auto& inputs = Inputs(description->role);
   for (std::size_t candidate = 0; candidate < inputs.size(); ++candidate) {

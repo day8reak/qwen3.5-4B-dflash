@@ -1236,6 +1236,54 @@ rg --files "$PROF_DIR" | \
 
 ## 12. 常见失败定位
 
+### 12.1 动态 Shape AIR 与分档 OM 的接口不匹配（尚未闭环）
+
+2026-09-07 的最新 receiver 输出推翻了此前“零维一定是内部动态控制输入、只重编 runner
+即可解决”的定位。已观察到：
+
+- fused 的 `aclmdlGetInputIndexByName("ascend_mbatch_shape_data")` 返回 `100000`。
+- `dynamo.pbtxt` 列出 48 个 Data/RefData：第 0 项为 `[s58,20480]` FP16，
+  其中还有 33 个零维 FP64 Data。符号维度 `s58` 本身就是动态图证据，不能据控制输入缺失
+  把 `dynamic` 改成 `false`。
+- `FusedSpeculativeStepStateGraph.forward` 的逻辑合同是 15 个 tensor 输入，feature 为
+  `[1,N,H]`。AIR 的输入数量、顺序、rank 均不能直接当成这个 Python 合同；manifest 的
+  `input_names` 是逻辑名称，并没有证明导出后的物理绑定。
+
+[CANN 的 `--dynamic_dims` 约束](https://www.hiascend.com/document/detail/en/canncommercial/800/devaids/atc/atlasatcparam_16_0020.html)
+明确禁止它与 `--framework=1` 同用。TorchAir `dynamic=True` 和 `set_dim_gears` 调用
+也不能证明生成的 AIR/OM 含 ATC 分档控制输入。当前 runner 只实现了通过
+`ascend_mbatch_shape_data` / `aclmdlSetInputDynamicDims` 选择分档的动态执行路径，
+尚未实现另一套
+[动态 Shape 执行接口](https://www.hiascend.com/document/detail/zh/canncommercial/800/developmentguide/appdevg/aclcppdevg/aclcppdevg_000044.html)
+所需的 `aclmdlSetDatasetTensorDesc`、实际 scalar/tensor 绑定及输出描述处理。
+
+固定 T16 指 Target verify 行数；Draft feature 的 N 还要覆盖增量提交和 prompt 引导。
+不能用 `dynamic=False`、忽略额外 Data、填零标量、伪造 manifest 或去掉 rank 校验绕过。
+这些 FP64 输入的来源和值尚未锁定，不能仅凭 dtype 认定它们全是 shape 参数或可冻结常量。
+AIR Data 清单也不等于 ATC 最终 OM 清单，需先取得实际 OM 描述再决定修复/重导边界。
+
+更新源码后，在原 CANN/自定义 OPP 环境中执行下面的只读检查。保持 `FUSED_BUNDLE` 指向
+现有 bundle，`AI_RUN_DIR` 指向当前活动 run；输出文件名必须尚不存在。检查只加载一个 OM
+并读取元数据，不执行推理，不依赖 torch/pyACL/protobuf，也无需重新导出 AIR、编译 OM 或
+重新构建 C++：
+
+```bash
+"$MODEL_PYTHON" framework/scripts/inspect_om_io.py \
+  --deployment-manifest "$FUSED_BUNDLE/deployment-manifest.json" \
+  --role fused-speculative-step \
+  --device-id 0 \
+  --output "$AI_RUN_DIR/reports/fused-om-io.json"
+```
+
+报告先核对已有 OM 的大小和 SHA256，再保留所有输入/输出的 index、name、rank、dtype、
+bytes、shape 以及 dynamic 查询返回码，包括零维、零字节和失败的查询。
+`OBSERVED` 仅表示采集完成，不是模型运行或精度 PASS。加载会占用设备内存；请在前一个
+失败 runner 退出后运行。分享终端完整 JSON 即可，不需要上传约 8.9 GB 的 OM。
+
+runner `1.21.1` 同时在缺少控制输入时打印完整 I/O 元数据，但这是诊断补丁，
+不宣称解决当前 AIR 的执行。下一步是依据实际 ABI 修复导出绑定与动态 Shape 运行路径，
+再验证 ordinary/DFlash 零 token-ID mismatch；当前设备集成仍未通过。
+
 | 失败 | 含义 | 处理 |
 | --- | --- | --- |
 | input manifest hash mismatch | 权重、量化文件或 wrapper 已变化 | 先确认变化是否预期；重新冻结，不要跳过校验 |
@@ -1264,8 +1312,8 @@ rg --files "$PROF_DIR" | \
 | `AdnFusedInferAttention GE prototype is absent from the active ASCEND_CUSTOM_OPP_PATH` | PyTorch/LD 能加载 ADN op_api，但 ATC 的 OPP 搜索路径里没有对应 prototype/kernel vendor | 把 ADN 安装包的 `packages/vendors/<vendor>` 根加入 `ASCEND_CUSTOM_OPP_PATH`；不要只加入 `op_api/lib` |
 | `GatedDeltaRuleMTP` 在 eager 的 T16/T17 测试通过，但 AIR/ATC 报 `Template constraint` | eager ABI 可用不代表手写 TorchAir named converter 与 GE `REG_OP` 一致；旧 converter 把第二个输出错误命名为 `state_bank` | 更新本分支，从空目录重新导出四个 AIR；确认 manifest 中 `gdr_mtp_ge_prototype.abi=receiver-gdr-mtp-v1-named-io`，再重新 ATC。不要改 T16、state shape 或清理大范围缓存 |
 | ATC 返回 0 且目录已有 `<role>_linux_aarch64.om`，但 `compile-om` 报 `produced no non-empty OM` | v33 及更早只检查 `<role>.om`，没有识别 ATC 的 host 架构后缀 | 更新到 v34；在当前 run 自己拥有的空 OM 输出目录中重跑 `compile-om`。新 deployment manifest 会记录实际带后缀路径；不要 rename 后再伪造 manifest，也不要删除其他 run 的产物 |
-| 四个 OM 校验通过，前三个 load 完成，`fused-speculative-step` 在 `model-load-start` 后报 `OM tensor has an invalid dtype or byte size` | 动态模型的 `target_feature_tail=[1,-1,H]` 合法使 `aclmdlGetInputSizeByIndex` 返回 0；旧 runner 在查询 gear 前把 0 当成损坏 OM | 更新到 v34并只重新构建 C++ runner；无需重导 AIR 或重编 OM。新 runner 从所有 flattened dynamic gears 推导最大 dense bytes，仍会拒绝 undefined dtype、静态零字节 tensor、非法/溢出 gear，并在错误中打印 role/index/name/dtype/bytes/shape |
-| 上一项修复后，前三个 load 完成，但 `fused-speculative-step` 在 `model-load-start` 后报 `OM tensor has an invalid dimension count` | CANN 可把内部动态档位控制输入 `ascend_mbatch_shape_data` 暴露为有有效 buffer size、但 `aclmdlGetInputDims.dimCount=0` 的 opaque 输入；v34 在按固定名称识别它之前先套用了普通 tensor 的 1..128 rank 校验 | 更新到 v35（runner `1.21.0`）并只重新构建 C++ runner；AIR、OM 和 deployment manifest 均可复用。v35 先按 CANN 固定名称隔离该内部控制 buffer，只有它可省略普通 shape/dtype 元数据；普通输入和所有输出仍必须为 1..128 维，错误会打印 role/index/name/实际 dimCount |
+| 四个 OM 校验通过，前三个 load 完成，`fused-speculative-step` 在 `model-load-start` 后报 `OM tensor has an invalid dtype or byte size` | 含 `-1` 的输入合法返回 0 bytes；但这不证明当前 OM 使用分档接口 | v34 的最大 gear 分配只适用于实际存在 gears 的 OM。先执行 12.1 的实际 I/O 检查；不能再承诺只重编 runner 即可修复当前 AIR |
+| 后续报 `OM tensor has an invalid dimension count` 或 `aclmdlGetInputIndexByName(dynamic dims) failed with ACL error 100000` | v35 对零维来源的判断证据不足；最新 AIR 含符号维度和额外零维 FP64 Data，runner 的物理输入/动态执行合同未匹配 | 按 12.1 采集真实 OM I/O；不要改 `dynamic=False` 或给 AIR ATC 加 `--dynamic_dims`。`1.21.1` 仅增强诊断，完整运行修复仍待实际输入绑定证据 |
 | `pse_shift` 期望 `Optional[Tensor]` 但收到 `[64]` / `immutable_list` | 旧版 modeling 在 export 路径把 `allQLen` 长度列表误接到了 PSE 输入，尚未进入 Fake/converter | 更新本分支；确认两个 modeling 文件均传 `all_seq_lengths_q=allQLen` 且不构造伪 PSE Tensor |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |
