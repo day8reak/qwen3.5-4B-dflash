@@ -1,7 +1,8 @@
-"""One prefill, Draft, verify or joint round through the msprof dynamic CLI.
+"""Independent first-round stage windows through the msprof dynamic CLI.
 
 The wrapper attaches msprof after warmup and exports after acknowledged stop/quit.
 Warmups rebuild the same first-round state and never start the collector.
+The all mode reuses loaded models and collects each stage into its own directory.
 This is a diagnostic protocol, not the whole-generation latency benchmark.
 """
 
@@ -9,8 +10,11 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import hashlib
 import os
 from pathlib import Path
+
+import torch
 
 from .dflash_rollback_decode import (
     _input_ids,
@@ -19,7 +23,10 @@ from .dflash_rollback_decode import (
     _normalize_proposals,
     _top1_rows,
 )
-from .msprof_cli import COLLECTOR, CONTROL_FD_ENV, PROFILE_STAGES, MsprofStageProfiler
+from .msprof_cli import (
+    COLLECTOR, CONTROL_FD_ENV, PROFILE_STAGES, SINGLE_STAGES,
+    MsprofStageProfiler, captured_calls,
+)
 from .target_quant import (
     TARGET_EMBEDDING_SCALE_PATH_ENV,
     TARGET_EMBEDDING_WEIGHT_PATH_ENV,
@@ -51,13 +58,36 @@ STAGE_SCOPES = {
         "and Target verify including first-round state-bank preparation; "
         "excludes prefill, prompt feature projection, Target Top1, accept and commit"
     ),
+    "feature-project": (
+        "one prompt Target-to-Draft fc + hidden_norm projection using real prefill "
+        "features; excludes Target prefill, output validation and fingerprint transfer"
+    ),
+    "verify-input": (
+        "one Draft proposal normalization including token-ID readback and EOS "
+        "truncation, plus verify block construction/upload; excludes Draft and verify"
+    ),
+    "target-top1": (
+        "one post-verify Target finite-value check, argmax and token-ID readback; "
+        "excludes Target LM head (inside verify) and prefill anchor Top1"
+    ),
+    "accept-commit": (
+        "one acceptance comparison, zero-accept speculation disable and adapter "
+        "commit including next-round feature projection when speculation remains "
+        "enabled; excludes Target Top1 and state-bank selection deferred to next verify"
+    ),
+    "decode-round": (
+        "one complete first Draft/verify transaction: prefix tensor, Draft, verify "
+        "input preparation, Target verify, Target Top1, acceptance and commit; "
+        "excludes prefill, prompt projection/anchor Top1, outer generation-loop "
+        "bookkeeping, output callbacks and detokenization"
+    ),
 }
 
 
 def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--profile-stage", choices=PROFILE_STAGES,
-        help="NPU diagnostic: collect one prefill, Draft, verify or joint Draft+verify round",
+        help="NPU diagnostic: collect one selected stage, or all stages separately in one process",
     )
     parser.add_argument("--profile-output", help="new directory for raw msprof data")
     parser.add_argument(
@@ -130,7 +160,7 @@ def profile_one_stage(
     eos_token_ids, warmup: int, profiler: MsprofStageProfiler,
 ) -> dict[str, object]:
     """Replay the real bootstrap; never shorten K using max_new_tokens."""
-    if stage not in PROFILE_STAGES or warmup < 0:
+    if stage not in SINGLE_STAGES or warmup < 0:
         raise ValueError("invalid stage or warmup count")
     if not 2 <= block_size <= adapter.max_block_size:
         raise ValueError("invalid profile block_size")
@@ -150,54 +180,71 @@ def profile_one_stage(
             anchor = _top1_rows(output, expected_rows=None, source="profile prefill")[-1]
             return {"anchor_token_id": anchor}
 
+        if stage == "feature-project":
+            output = adapter.target.begin_rollback(prompt_ids)
+            _, features = adapter._validated_output(output, rows=None, features=True)
+            if features is None or features.shape[1] != len(prompt):
+                raise RuntimeError("prefill did not return complete prompt features")
+            features = features.detach()
+            with torch.inference_mode(), capture("feature-project"):
+                projected = adapter.draft.project_target_hidden(features)
+            # Validate repeatability outside the window, including values rather
+            # than only comparing the projected tensor's shape.
+            fingerprint = hashlib.sha256(
+                projected.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+            return {
+                "projection_shape": list(projected.shape),
+                "projection_dtype": str(projected.dtype),
+                "projection_sha256": fingerprint,
+            }
+
         output = adapter.begin_rollback(prompt_ids)
         anchor = _top1_rows(output, expected_rows=None, source="profile bootstrap")[-1]
         if anchor in eos:
             raise RuntimeError("prefill anchor is EOS; no Draft/verify round to profile")
-        prefix_ids = _input_ids([*prompt, anchor], device)
         try:
-            # Exactly one of these scopes collects. The joint mode retains one
-            # uninterrupted window, without a new barrier between Draft/verify.
-            with capture("draft-verify"):
-                with capture("draft"):
-                    raw_proposals = adapter.propose_rollback(prefix_ids, block_size - 1)
-                proposals = _normalize_proposals(
-                    raw_proposals,
-                    proposal_limit=block_size - 1, eos_token_ids=eos,
-                )
-                if not proposals:
-                    raise RuntimeError("Draft returned no proposals; no Draft/verify capture")
-                if stage != "draft":
-                    block = [anchor, *proposals]
-                    # For verify-only, materialize the exact production input
-                    # before start; capture() drains all setup work on the NPU.
-                    block_ids = _input_ids(block, device)
-                    with capture("verify"):
-                        verify_output = adapter.verify_rollback(block_ids)
-            if stage == "draft":
-                # No verification/commit is needed for a Draft-only diagnostic.
-                # Discard its request-local KV outside collection before replay.
-                adapter.abort_rollback()
-                return {
-                    "anchor_token_id": anchor,
-                    "proposal_token_ids": proposals,
-                    "verify_input_token_ids": [],
-                    "target_top1_token_ids": [],
-                    "verify_rows": 0,
-                    "accepted_draft_tokens": None,
-                }
-            # Target Top1, accept and commit are deliberately outside collection.
-            # Keep ordinary production acceptance/disable semantics after the call.
-            target_tokens = _top1_rows(
-                verify_output, expected_rows=len(block), source="profile verify",
-            )
-            accepted = next(
-                (i for i, token in enumerate(proposals) if token != target_tokens[i]),
-                len(proposals),
-            )
-            if accepted == 0:
-                adapter.disable_speculation()
-            adapter.commit_rollback(accepted)
+            # Exactly one scope collects. Combined scopes add no internal barrier.
+            with capture("decode-round"):
+                prefix_ids = _input_ids([*prompt, anchor], device)
+                with capture("draft-verify"):
+                    with capture("draft"):
+                        raw_proposals = adapter.propose_rollback(prefix_ids, block_size - 1)
+                    with capture("verify-input"):
+                        proposals = _normalize_proposals(
+                            raw_proposals,
+                            proposal_limit=block_size - 1, eos_token_ids=eos,
+                        )
+                        if not proposals:
+                            raise RuntimeError("Draft returned no proposals; no Draft/verify capture")
+                        if stage != "draft":
+                            block = [anchor, *proposals]
+                            block_ids = _input_ids(block, device)
+                    if stage != "draft":
+                        with capture("verify"):
+                            verify_output = adapter.verify_rollback(block_ids)
+                if stage == "draft":
+                    adapter.abort_rollback()
+                    return {
+                        "anchor_token_id": anchor,
+                        "proposal_token_ids": proposals,
+                        "verify_input_token_ids": [],
+                        "target_top1_token_ids": [],
+                        "verify_rows": 0,
+                        "accepted_draft_tokens": None,
+                    }
+                with capture("target-top1"):
+                    target_tokens = _top1_rows(
+                        verify_output, expected_rows=len(block), source="profile verify",
+                    )
+                with capture("accept-commit"):
+                    accepted = next(
+                        (i for i, token in enumerate(proposals) if token != target_tokens[i]),
+                        len(proposals),
+                    )
+                    if accepted == 0:
+                        adapter.disable_speculation()
+                    adapter.commit_rollback(accepted)
         except Exception:
             adapter.abort_rollback()
             raise
@@ -232,11 +279,12 @@ def profile_one_stage(
         "collector": COLLECTOR,
         "aic_metrics": profiler.metrics,
         "capture_windows": profiler.windows,
-        "captured_calls": {
-            "prefill": int(stage == "prefill"),
-            "draft": int(stage in {"draft", "draft-verify"}),
-            "target_verify": int(stage in {"verify", "draft-verify"}),
-        },
+        "captured_calls": captured_calls(stage),
+        # With zero accepted tokens the HIAI commit can be entirely host work.
+        # Do not mistake a legitimate lack of NPU kernels for a failed handshake.
+        "operator_rows_required": not (
+            stage == "accept-commit" and measured.get("accepted_draft_tokens") == 0
+        ),
         "warmup_iterations": warmup,
         "warmup_output_match": stable,
         "profiled_elapsed_ms": profiler.elapsed_ms,
@@ -248,4 +296,33 @@ def profile_one_stage(
         "stage_scope": STAGE_SCOPES[stage],
         "synchronization": "before/after the selected stage; no added Draft/verify barrier in joint mode",
         "result": measured,
+    }
+
+
+def profile_all_stages(adapter, prompt_token_ids, *, block_size, eos_token_ids, warmup, profiler):
+    """Load models once; replay identical fresh request state for each window."""
+    reports = []
+    for stage in SINGLE_STAGES:
+        print(f"[stage-profile] preparing stage={stage} warmup={warmup}", flush=True)
+        child = profiler.for_stage(stage)
+        report = profile_one_stage(
+            adapter, prompt_token_ids, stage=stage, block_size=block_size,
+            eos_token_ids=eos_token_ids, warmup=warmup, profiler=child,
+        )
+        reports.append(report)
+        print(
+            f"[stage-profile] captured stage={stage} elapsed_ms={child.elapsed_ms:.3f}",
+            flush=True,
+        )
+    return {
+        "schema_version": 3, "route": "qwen3.5-dflash-all-stage-profile",
+        "status": "PASS_CAPTURE", "profile_stage": "all",
+        "profile_output": profiler.output, "collector": COLLECTOR,
+        "aic_metrics": profiler.metrics, "capture_windows": len(reports),
+        "stages": list(SINGLE_STAGES), "captures": reports,
+        "formal_latency_evidence": False, "strict_greedy_exact_match": None,
+        "correctness_gate": {"status": "NOT_RUN_STAGE_DIAGNOSTIC"},
+        "model_loads": 1, "warmup_iterations_per_stage": warmup,
+        "state_policy": "same prompt, fresh first-round state per warmup and capture",
+        "max_new_tokens_applies": False,
     }

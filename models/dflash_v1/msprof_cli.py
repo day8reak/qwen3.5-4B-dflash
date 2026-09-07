@@ -29,7 +29,19 @@ CONTROL_FD_ENV = "DFLASH_MSPROF_CONTROL_FD"
 TIMEOUT_ENV = "DFLASH_MSPROF_CONTROL_TIMEOUT"
 COLLECTOR = "msprof dynamic CLI"
 DEFAULT_TIMEOUT = 600.0
-PROFILE_STAGES = ("prefill", "draft", "verify", "draft-verify")
+SINGLE_STAGES = (
+    "prefill", "feature-project", "draft", "verify-input", "verify",
+    "target-top1", "accept-commit", "draft-verify", "decode-round",
+)
+PROFILE_STAGES = (*SINGLE_STAGES, "all")
+
+
+def captured_calls(stage):
+    return {
+        "prefill": int(stage == "prefill"),
+        "draft": int(stage in {"draft", "draft-verify", "decode-round"}),
+        "target_verify": int(stage in {"verify", "draft-verify", "decode-round"}),
+    }
 
 
 def positive_timeout(value) -> float:
@@ -49,6 +61,24 @@ class MsprofStageProfiler:
         self.elapsed_ms = None
         self._channel = None
         self._reader = None
+        self._children = []
+
+    def for_stage(self, stage):
+        """Share one application channel while keeping each window independent."""
+        if self.stage != "all" or self._channel is None:
+            raise RuntimeError("stage views require an active all-stage profiler")
+        index = len(self._children)
+        if index >= len(SINGLE_STAGES) or stage != SINGLE_STAGES[index]:
+            raise RuntimeError("all-stage captures must follow the declared stage order")
+        if self._children and self._children[-1].windows != 1:
+            raise RuntimeError("previous stage did not capture exactly one window")
+        child = MsprofStageProfiler(
+            str(Path(self.output) / stage), self.device_id, self.metrics,
+            self.synchronize, stage=stage,
+        )
+        child._channel, child._reader = self._channel, self._reader
+        self._children.append(child)
+        return child
 
     def __enter__(self):
         if os.environ.get("PROFILING_MODE") != "dynamic" or CONTROL_FD_ENV not in os.environ:
@@ -77,7 +107,7 @@ class MsprofStageProfiler:
 
     @contextmanager
     def capture(self):
-        if self._channel is None or self.windows:
+        if self._channel is None or self.windows or self.stage == "all":
             raise RuntimeError("stage profiler requires exactly one capture window")
         self.synchronize()
         self._exchange({
@@ -166,10 +196,20 @@ class DynamicCapture:
             "acknowledgements": {},
             "capture_completed": False, "events": [],
         }
+        self.capture_evidence = self.evidence
+        self.current_stage = args.stage
+        if args.stage == "all":
+            self.evidence.update(schema_version=2, stages=list(SINGLE_STAGES), captures=[])
 
     def event(self, name):
-        self.evidence["events"].append({"event": name, "monotonic_seconds": monotonic()})
-        print(f"[stage-profile] {name}", flush=True)
+        event = {"event": name, "monotonic_seconds": monotonic()}
+        if self.args.stage == "all":
+            event["stage"] = self.current_stage
+        self.evidence["events"].append(event)
+        if self.capture_evidence is not self.evidence:
+            self.capture_evidence["events"].append(dict(event))
+        label = f"stage={self.current_stage} " if self.args.stage == "all" else ""
+        print(f"[stage-profile] {label}{name}", flush=True)
 
     def pump(self, delay):
         for key, _ in self.selector.select(delay):
@@ -245,8 +285,8 @@ class DynamicCapture:
                 raise RuntimeError(f"msprof {name} failed; see its output above")
             acknowledgement = self.acknowledgement(name, self.prof_buffer, self.app.pid)
             if acknowledgement is not None:
-                self.evidence[name + "_acknowledged"] = True
-                self.evidence["acknowledgements"][name] = acknowledgement
+                self.capture_evidence[name + "_acknowledged"] = True
+                self.capture_evidence["acknowledgements"][name] = acknowledgement
                 self.event("msprof_" + name + "_acknowledged")
                 return
             remaining = deadline - monotonic()
@@ -293,20 +333,44 @@ class DynamicCapture:
         self.evidence["application_pid"] = self.app.pid
         self.selector.register(parent, selectors.EVENT_READ, "control")
         self.selector.register(self.app.stdout, selectors.EVENT_READ, "application")
+        stages = SINGLE_STAGES if self.args.stage == "all" else (self.args.stage,)
+        for stage in stages:
+            output = str(Path(self.args.output) / stage) if self.args.stage == "all" else self.args.output
+            self.current_stage = stage
+            if self.args.stage == "all":
+                self.capture_evidence = {
+                    "profile_stage": stage, "profile_output": str(Path(output).resolve()),
+                    "start_acknowledged": False, "stop_acknowledged": False,
+                    "quit_acknowledged": False, "acknowledgements": {},
+                    "capture_completed": False, "events": [],
+                }
+                self.evidence["captures"].append(self.capture_evidence)
+            self.run_capture(stage, output)
+        self.wait_exit(self.app, "application")
+        if self.messages:
+            raise RuntimeError("application sent extra stage control messages")
+        if self.args.stage == "all":
+            for key in ("start_acknowledged", "stop_acknowledged", "quit_acknowledged"):
+                self.evidence[key] = all(c[key] for c in self.evidence["captures"])
+        self.evidence["capture_completed"] = True
+        self.evidence["status"] = "PASS_CONTROL"
+
+    def run_capture(self, stage, output):
         ready = self.receive("ready")
-        if (ready.get("pid") != self.app.pid or ready.get("stage") != self.args.stage
+        if (ready.get("pid") != self.app.pid or ready.get("stage") != stage
                 or ready.get("metrics") != self.args.metrics
-                or Path(ready.get("output", "")).resolve() != Path(self.args.output).resolve()):
+                or Path(ready.get("output", "")).resolve() != Path(output).resolve()):
             raise RuntimeError("application ready message does not match the requested capture")
         self.event("application_ready")
-        self.evidence["device_id"] = ready.get("device_id")
+        self.capture_evidence["device_id"] = ready.get("device_id")
         argv = [
             self.args.msprof_bin, "--dynamic=on", f"--pid={self.app.pid}",
-            f"--output={self.args.output}", "--ascendcl=on", "--runtime-api=on",
+            f"--output={output}", "--ascendcl=on", "--runtime-api=on",
             "--task-time=on", "--aicpu=on", "--ai-core=on", "--aic-mode=task-based",
             f"--aic-metrics={self.args.metrics}",
         ]
-        self.evidence["msprof_arguments"] = argv
+        self.capture_evidence["msprof_arguments"] = argv
+        self.prof_buffer.clear()
         master, slave = pty.openpty()
         self.terminal = master
         settings = termios.tcgetattr(slave)
@@ -322,7 +386,7 @@ class DynamicCapture:
             )
         finally:
             os.close(slave)
-        self.evidence["msprof_pid"] = self.prof.pid
+        self.capture_evidence["msprof_pid"] = self.prof.pid
         self.selector.register(master, selectors.EVENT_READ, "msprof")
         self.command("start")
         self.send("started")
@@ -331,12 +395,22 @@ class DynamicCapture:
         self.command("stop")
         self.command("quit")
         self.wait_exit(self.prof, "msprof")
+        self.capture_evidence["msprof_exit_code"] = self.prof.returncode
+        # The next stage reattaches to the same application with its own output.
+        # Release the old PTY before receiving the next ready message.
+        try:
+            self.selector.unregister(self.terminal)
+        except KeyError:
+            pass
+        os.close(self.terminal)
+        self.terminal = None
+        self.prof = None
+        self.prof_buffer.clear()
         self.send("stopped")
-        self.wait_exit(self.app, "application")
-        if done.get("success") is not True or self.messages:
-            raise RuntimeError("application did not complete exactly one successful stage")
-        self.evidence["capture_completed"] = True
-        self.evidence["status"] = "PASS_CONTROL"
+        if done.get("success") is not True:
+            raise RuntimeError("application did not complete a successful stage")
+        if self.args.stage == "all":
+            self.capture_evidence["capture_completed"] = True
 
     def close(self):
         # On failure keep the application alive briefly so msprof can stop its
@@ -365,7 +439,16 @@ class DynamicCapture:
         if self.terminal is not None:
             os.close(self.terminal)
         self.evidence["application_exit_code"] = None if self.app is None else self.app.returncode
-        self.evidence["msprof_exit_code"] = None if self.prof is None else self.prof.returncode
+        if self.prof is not None:
+            self.capture_evidence["msprof_exit_code"] = self.prof.returncode
+        elif self.args.stage != "all":
+            self.evidence.setdefault("msprof_exit_code", None)
+        if self.args.stage == "all":
+            self.evidence["msprof_exit_code"] = (
+                0 if len(self.evidence["captures"]) == len(SINGLE_STAGES)
+                and all(c.get("msprof_exit_code") == 0 for c in self.evidence["captures"])
+                else None
+            )
 
 
 def main(argv=None):

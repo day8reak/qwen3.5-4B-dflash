@@ -47,11 +47,14 @@ npu = Npu()
         "PYTHONPATH": str(stubs), "TEST_EVENTS": str(events),
         "TEST_ACTIVE": str(active), "TEST_CONTROLLER": str(CONTROLLER),
         "TEST_ACK_FORMAT": request.param,
+        "TEST_FAILURE_STAGE": "",
         "TEST_FAILURE": "", "PYTHONDONTWRITEBYTECODE": "1",
     })
     common = r'''
 import json, os, pathlib, sys, time
 failure = os.environ["TEST_FAILURE"]
+def failure_for_stage(stage):
+    return failure if os.environ.get("TEST_FAILURE_STAGE", "") in ("", stage) else ""
 active = pathlib.Path(os.environ["TEST_ACTIVE"])
 def event(name, value=None):
     fd = os.open(os.environ["TEST_EVENTS"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -77,9 +80,11 @@ spec = importlib.util.spec_from_file_location("real_msprof_cli", os.environ["TES
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 work_done = False
+current_failure = failure
 def synchronize():
     event("sync", active.exists())
-    if work_done and failure == "sync": raise RuntimeError("injected device sync failure")
+    if work_done and current_failure == "sync": raise RuntimeError("injected device sync failure")
+reports = []
 with module.MsprofStageProfiler(
     str(root), 0, value("--profile-aic-metrics"), synchronize,
     stage="incorrect" if failure == "mismatched-ready" else stage,
@@ -88,24 +93,44 @@ with module.MsprofStageProfiler(
     if failure == "control-eof":
         profiler.close()
         time.sleep(30)
-    event("warmup-outside")
-    with profiler.capture():
-        assert active.exists(), "stage ran before collector start acknowledgement"
-        event("captured-work")
-        work_done = True
-        if failure == "application-capture": raise RuntimeError("injected application failure")
-        if failure == "application-hang": time.sleep(30)
-    assert not active.exists(), "postprocessing ran before collector stop"
-    event("postprocess-outside")
-    if failure == "second-window":
-        with profiler.capture(): event("unexpected-second-window")
-report = {
-    "status": "PASS_CAPTURE", "collector": module.COLLECTOR,
-    "profile_stage": stage, "capture_windows": 1,
-    "profile_output": str(root), "operator_fallback_enabled": False,
-    "captured_calls": {"prefill": int(stage == "prefill"),
-        "draft": int(stage in {"draft", "draft-verify"}),
-        "target_verify": int(stage in {"verify", "draft-verify"})},
+    stages = module.SINGLE_STAGES if stage == "all" else (stage,)
+    for selected in stages:
+        current_failure = failure_for_stage(selected)
+        if current_failure == "skip-stage": continue
+        window = profiler.for_stage(selected) if stage == "all" else profiler
+        if current_failure == "wrong-output": window.output += "-wrong"
+        event("warmup-outside", selected)
+        with window.capture():
+            assert active.exists(), "stage ran before collector start acknowledgement"
+            event("captured-work", selected)
+            work_done = True
+            if current_failure == "application-capture": raise RuntimeError("injected application failure")
+            if current_failure == "application-hang": time.sleep(30)
+        assert not active.exists(), "postprocessing ran before collector stop"
+        event("postprocess-outside", selected)
+        if current_failure == "second-window":
+            with window.capture(): event("unexpected-second-window")
+        item = {
+            "status": "PASS_CAPTURE", "collector": module.COLLECTOR,
+            "profile_stage": selected, "capture_windows": 1,
+            "profile_output": window.output, "operator_fallback_enabled": False,
+            "profiled_elapsed_ms": window.elapsed_ms,
+            "captured_calls": module.captured_calls(selected),
+        }
+        if current_failure == "empty-host-commit":
+            item["operator_rows_required"] = False
+            item["result"] = {"accepted_draft_tokens": 0}
+        if current_failure == "forged-empty-commit":
+            item["operator_rows_required"] = False
+            item["result"] = {"accepted_draft_tokens": 1}
+        if current_failure == "bad-subreport": item["capture_windows"] = 2
+        if current_failure == "missing-time": item.pop("profiled_elapsed_ms")
+        if current_failure == "invalid-time": item["profiled_elapsed_ms"] = float("nan")
+        reports.append(item)
+report = reports[0] if stage != "all" else {
+    "status": "PASS_CAPTURE", "collector": module.COLLECTOR, "profile_stage": "all",
+    "capture_windows": len(reports), "profile_output": str(root),
+    "operator_fallback_enabled": False, "stages": list(stages), "captures": reports,
 }
 if failure == "invalid-report": report["capture_windows"] = 2
 pathlib.Path(value("--report")).write_text(json.dumps(report))
@@ -119,9 +144,10 @@ if args == ["--version"]:
 event("msprof", args)
 if "--export=on" in args:
     assert len(args) == 3, args
+    root = pathlib.Path(next(a.split("=", 1)[1] for a in args if a.startswith("--output=")))
+    failure = failure_for_stage(root.name)
     if failure == "export": sys.exit(8)
-    if failure != "empty":
-        root = pathlib.Path(next(a.split("=", 1)[1] for a in args if a.startswith("--output=")))
+    if failure not in ("empty", "empty-host-commit", "forged-empty-commit"):
         (root / "op_summary_0.csv").write_text("Op Name,Task Duration(us)\nTEST_ONLY,1\n")
     sys.exit(0)
 if "--dynamic=on" not in args:
@@ -134,6 +160,7 @@ assert "--task-time=on" in args and "--runtime-api=on" in args
 pid = int(next(a.split("=")[1] for a in args if a.startswith("--pid=")))
 os.kill(pid, 0)
 root = pathlib.Path(next(a.split("=", 1)[1] for a in args if a.startswith("--output=")))
+failure = failure_for_stage(root.name)
 pid_format = os.environ["TEST_ACK_FORMAT"] == "pid"
 prefix = "dynamic profiling" + (f" for pid {pid}" if pid_format else "")
 prompt = "> " if pid_format else "(msprof) "
@@ -308,3 +335,67 @@ def test_invalid_stage_wrapper_request_fails_before_output(tmp_path, option):
     ], env=environment, capture_output=True, text=True)
     assert completed.returncode == 2
     assert not output.exists()
+
+
+@pytest.mark.parametrize("failure,selected", [
+    (None, ""), ("start", "verify"), ("stop", "target-top1"),
+    ("quit-exit", "verify-input"), ("start-wrong-pid", "accept-commit"),
+    ("application-capture", "verify"), ("skip-stage", "feature-project"),
+    ("wrong-output", "draft"), ("bad-subreport", "verify"),
+    ("export", "draft"), ("empty", "verify"),
+    ("empty-host-commit", "accept-commit"), ("forged-empty-commit", "accept-commit"),
+    ("empty-host-commit", "target-top1"),
+    ("missing-time", "verify"), ("invalid-time", "target-top1"),
+])
+def test_all_stage_wrapper_reattaches_one_application_and_checks_every_result(sandbox, failure, selected):
+    sandbox["env"].update(TEST_FAILURE=failure or "", TEST_FAILURE_STAGE=selected)
+    output = sandbox["tmp"] / "all-result"
+    completed = subprocess.run([
+        "bash", str(SCRIPT), "--label", "all", "--output-dir", str(output),
+        "--python", sys.executable, "--msprof-bin", sandbox["msprof"],
+        "--profile-stage", "all", "--profile-warmup", "0", "--profile-timeout", "1",
+        "--", sandbox["app"], "-m", "models.dflash_v1.run_npu",
+    ], env=sandbox["env"], capture_output=True, text=True, timeout=30)
+    events = read_events(sandbox)
+    assert len([e for e in events if e[0] == "application"]) == 1
+    control = json.loads((output / "manifest/all-control.json").read_text())
+    manifest = json.loads((output / "manifest/all.json").read_text())
+    stages = [
+        "prefill", "feature-project", "draft", "verify-input", "verify",
+        "target-top1", "accept-commit", "draft-verify", "decode-round",
+    ]
+    assert_processes_reaped(control)
+    for capture in control["captures"]:
+        assert_processes_reaped(capture)
+    assert not sandbox["active"].exists()
+    success = failure is None or (failure, selected) == ("empty-host-commit", "accept-commit")
+    if success:
+        import csv
+
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert manifest["status"] == "PASS" and control["status"] == "PASS_CONTROL"
+        assert control["stages"] == stages
+        assert [c["profile_stage"] for c in control["captures"]] == stages
+        attaches = [e[1] for e in events if e[0] == "msprof" and "--dynamic=on" in e[1]]
+        assert len(attaches) == len(stages)
+        assert all(f'--pid={control["application_pid"]}' in args for args in attaches)
+        assert [e[1] for e in events if e[0] == "captured-work"] == stages
+        assert [e[1] for e in events if e[0] == "command"] == ["start", "stop", "quit"] * len(stages)
+        exports = [e[1] for e in events if e[0] == "msprof" and "--export=on" in e[1]]
+        assert len(exports) == len(stages)
+        summary_path = output / "all-stage-summary.csv"
+        with summary_path.open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        assert [r["stage"] for r in rows] == stages
+        assert all(float(r["profiled_elapsed_ms"]) >= 0 for r in rows)
+        assert manifest["artifacts"]["stage_summary"] == str(summary_path)
+        if failure:
+            assert rows[6]["operator_rows"] == "0"
+    else:
+        assert completed.returncode != 0, completed.stdout + completed.stderr
+        assert manifest["status"] == "FAIL"
+        assert not (output / "all-stage-summary.csv").exists()
+        if failure not in {"bad-subreport", "export", "empty", "forged-empty-commit", "empty-host-commit", "missing-time", "invalid-time"}:
+            assert control["status"] == "FAIL" and not control["capture_completed"]
+            captured = [e[1] for e in events if e[0] == "captured-work"]
+            assert not any(s in captured for s in stages[stages.index(selected) + 1:])

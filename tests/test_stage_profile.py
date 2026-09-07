@@ -14,8 +14,9 @@ import torch
 
 from models.dflash_v1 import run_npu, run_rollback
 from models.dflash_v1.stage_profile import (
-    MsprofStageProfiler, profile_one_stage, validate_profile_request,
+    MsprofStageProfiler, profile_all_stages, profile_one_stage, validate_profile_request,
 )
+from models.dflash_v1.msprof_cli import SINGLE_STAGES, PROFILE_STAGES
 
 
 def logits(tokens):
@@ -64,7 +65,17 @@ class FakeTarget:
         a.requests += 1
         for start in range(0, ids.shape[1], 64):
             a.events.append(("prefill-chunk", a.collector.active, min(64, ids.shape[1] - start)))
-        return {"logits": logits([a.anchor])}
+        return {"logits": logits([a.anchor]), "features": torch.ones(1, ids.shape[1], 4)}
+
+
+class FakeDraft:
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def project_target_hidden(self, features):
+        a = self.adapter
+        a.events.append(("projection", a.collector.active))
+        return features[..., :2] + 1
 
 
 class FakeAdapter:
@@ -75,6 +86,7 @@ class FakeAdapter:
                  fail_draft=False, empty_draft=False):
         self.collector, self.events = collector, events
         self.target = FakeTarget(self)
+        self.draft = FakeDraft(self)
         self.anchor = anchor
         self.fail_verify = fail_verify
         self.reject = reject
@@ -82,6 +94,9 @@ class FakeAdapter:
         self.cursor = 0
         self.pending = None
         self.requests = 0
+
+    def _validated_output(self, output, *, rows, features):
+        return output["logits"], output["features"] if features else None
 
     def begin_rollback(self, ids):
         output = self.target.begin_rollback(ids)
@@ -305,7 +320,7 @@ def test_draft_failures_abort_without_an_empty_verify_capture(setup_profiler, st
         assert collector.messages[-1] == {"event": "done", "success": failure != "exception"}
 
 
-@pytest.mark.parametrize("stage", ["prefill", "draft", "verify", "draft-verify"])
+@pytest.mark.parametrize("stage", PROFILE_STAGES)
 def test_stage_arguments_forward_without_shrinking_block(tmp_path, stage):
     with patch.object(run_npu, "_adapter_main", return_value=0) as run:
         assert run_npu.main([
@@ -356,3 +371,94 @@ def test_stage_destinations_do_not_pollute_sources_or_raw_capture(tmp_path, loca
         with pytest.raises(ValueError, match="outside source|must not overlap"):
             validate_profile_request(args, source_root=source)
     assert not source.exists() and not raw.exists()
+
+
+@pytest.mark.parametrize("stage,expected", [
+    ("feature-project", ["projection"]),
+    ("verify-input", ["normalize", "input-ids"]),
+    ("target-top1", ["top1"]),
+    ("accept-commit", ["commit"]),
+    ("decode-round", ["input-ids", "draft", "normalize", "input-ids", "verify", "top1", "commit"]),
+])
+def test_auxiliary_stage_boundaries(setup_profiler, stage, expected):
+    from models.dflash_v1 import stage_profile as module
+
+    events, collector, profiler = setup_profiler(stage)
+    def observed(name, function):
+        def call(*args, **kwargs):
+            events.append((name, collector.active))
+            return function(*args, **kwargs)
+        return call
+    with profiler, patch.object(module, "_normalize_proposals",
+            side_effect=observed("normalize", module._normalize_proposals)), \
+            patch.object(module, "_input_ids", side_effect=observed("input-ids", module._input_ids)), \
+            patch.object(module, "_top1_rows", side_effect=observed("top1", module._top1_rows)):
+        report = profile_one_stage(
+            FakeAdapter(collector, events), [1, 2], stage=stage, block_size=16,
+            eos_token_ids=[], warmup=1, profiler=profiler,
+        )
+    captured = events[events.index(("start",)) + 1:events.index(("stop",))]
+    assert [e[0] for e in captured] == expected + ["sync"]
+    assert all(e[1] is True for e in captured)
+    assert report["warmup_output_match"] is True
+    if stage == "feature-project":
+        assert report["result"]["projection_shape"] == [1, 2, 2]
+        assert not any(e[0] in {"draft", "verify", "commit"} for e in events)
+
+
+def test_all_captures_each_stage_once_in_order_with_fresh_state(setup_profiler):
+    events, collector, profiler = setup_profiler("all")
+    adapter = FakeAdapter(collector, events)
+    with profiler:
+        report = profile_all_stages(
+            adapter, [1, 2], block_size=16, eos_token_ids=[], warmup=1, profiler=profiler,
+        )
+    assert report["model_loads"] == 1
+    assert report["capture_windows"] == len(SINGLE_STAGES)
+    assert adapter.requests == 2 * len(SINGLE_STAGES)
+    assert [m["stage"] for m in collector.messages if m["event"] == "ready"] == list(SINGLE_STAGES)
+    outputs = [m["output"] for m in collector.messages if m["event"] == "ready"]
+    assert len(set(outputs)) == len(SINGLE_STAGES)
+    assert [Path(p).name for p in outputs] == list(SINGLE_STAGES)
+    assert all(c["warmup_output_match"] for c in report["captures"])
+    assert events.count(("start",)) == events.count(("stop",)) == len(SINGLE_STAGES)
+
+
+def test_all_stops_before_later_stages_after_verify_failure(setup_profiler):
+    events, collector, profiler = setup_profiler("all")
+    with profiler, pytest.raises(RuntimeError, match="injected verify failure"):
+        profile_all_stages(
+            FakeAdapter(collector, events, fail_verify=True), [1],
+            block_size=16, eos_token_ids=[], warmup=0, profiler=profiler,
+        )
+    # verify-input postprocessing verifies outside collection and propagates failure.
+    assert [m["stage"] for m in collector.messages if m["event"] == "ready"] == [
+        "prefill", "feature-project", "draft", "verify-input",
+    ]
+    assert events[-1] == ("abort", False)
+
+
+def test_zero_acceptance_commit_can_have_no_device_operators(setup_profiler):
+    events, collector, profiler = setup_profiler("accept-commit")
+    with profiler:
+        report = profile_one_stage(
+            FakeAdapter(collector, events, reject=True), [1], stage="accept-commit",
+            block_size=16, eos_token_ids=[], warmup=0, profiler=profiler,
+        )
+    assert report["result"]["accepted_draft_tokens"] == 0
+    assert report["operator_rows_required"] is False
+    captured = events[events.index(("start",)) + 1:events.index(("stop",))]
+    assert captured == [("disable", True), ("commit", True, 0), ("sync", True)]
+
+
+def test_projection_values_must_match_warmup(setup_profiler):
+    events, collector, profiler = setup_profiler("feature-project")
+    adapter = FakeAdapter(collector, events)
+    with profiler, patch.object(adapter.draft, "project_target_hidden", side_effect=[
+            torch.zeros(1, 1, 2), torch.ones(1, 1, 2),
+    ]), pytest.raises(RuntimeError, match="outputs differ"):
+        profile_one_stage(
+            adapter, [1], stage="feature-project", block_size=16,
+            eos_token_ids=[], warmup=1, profiler=profiler,
+        )
+    assert events.count(("start",)) == events.count(("stop",)) == 1

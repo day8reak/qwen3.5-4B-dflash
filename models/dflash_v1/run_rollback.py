@@ -35,6 +35,7 @@ from .modeling_dflash import DFlashDraftModel
 from .stage_profile import (
     MsprofStageProfiler,
     add_profile_arguments,
+    profile_all_stages,
     profile_one_stage,
     validate_profile_request,
 )
@@ -354,13 +355,16 @@ def _run(args, *, request_started: float, cleanup: ExitStack) -> int:
 
     if profiler is not None:
         required_rows = len(prompt_ids) + (
-            effective_block_size if args.profile_stage in {"verify", "draft-verify"} else 0
+            effective_block_size
+            if args.profile_stage not in {"prefill", "feature-project", "draft"} else 0
         )
         capacity = getattr(target, "kv_cache_max_len", None)
         if capacity is not None and required_rows > int(capacity):
             raise ValueError("KV capacity must cover prompt plus the full profile block")
-        report = profile_one_stage(
-            adapter, prompt_ids, stage=args.profile_stage,
+        profile = profile_all_stages if args.profile_stage == "all" else profile_one_stage
+        stage_arguments = {} if args.profile_stage == "all" else {"stage": args.profile_stage}
+        report = profile(
+            adapter, prompt_ids, **stage_arguments,
             block_size=effective_block_size, eos_token_ids=args.eos_token_id,
             warmup=args.profile_warmup, profiler=profiler,
         )

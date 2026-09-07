@@ -328,7 +328,7 @@ profile 时长当作单次 measurement latency。
 
 ### 7.4 只采一次 prefill 或 Draft 生成 + Target verify
 
-Python NPU 路线可以传 `--profile-stage prefill|draft|verify|draft-verify`。参数放在 wrapper 的 `--` **之前**，
+Python NPU 路线可以传 `--profile-stage STAGE`。参数放在 wrapper 的 `--` **之前**，
 应用使用 `models.dflash_v1.run_npu`，不经过 `benchmark_npu` 的 correctness/warmup/measurement 循环。
 例如只采一次完整 prefill：
 
@@ -395,22 +395,73 @@ msprof 控制握手时间，包含 profiling 开销；具体算子时间读取�
 block 创建，且单独采集引入了各自的边界同步与 profiling 开销。联合窗口仍不在 Draft 与 verify
 之间额外插入同步。
 
+一条命令依次单独采集所有阶段，使用 `--profile-stage all`：
+
+```bash
+tools/run_msprof.sh \
+  --label all-stages \
+  --output-dir "$BENCH_DIR/all-stages" \
+  --python "$MODEL_PYTHON" \
+  --profile-stage all --profile-warmup 1 \
+  --aic-metrics PipeUtilization \
+  -- \
+  "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+    --target-dir /path/to/Qwen3.5-4B \
+    --draft-dir /path/to/Qwen3.5-4B-DFlash \
+    --kv-cache-max-len 2048 --block-size 16 --device npu:0 \
+    --prompt "请用一句话解释为什么天空是蓝色的。" \
+    --prompt-mode chat --enable-thinking
+```
+
+`all` 只启动一个应用进程、加载一份 Target/Draft，按下表所列阶段各采一次。
+每个阶段先从相同 prompt 重建首轮状态并执行指定次数的预热，准备和预热都不采集；
+这些重复准备会计入命令的总运行时间。控制器为每个阶段重新 attach 同一个应用 PID，
+分别执行 start/stop/quit，退出前一个 msprof 后再进入下一阶段，无需 pyACL。
+每次 start/stop/quit 都须有成功回执，各阶段的独立输出目录直接传给 msprof，
+不会依靠 PROF 目录生成时间猜测阶段归属。
+
+`all` 的输出路径：
+
+- `profile/msprof/<label>/<stage>/`：该阶段独立的原始数据和算子 CSV。
+- `<label>-stage-report.json`：共同运行身份，以及 `captures` 中逐阶段的范围、同步耗时和结果。
+- `<label>-stage-summary.csv`：每阶段 `profiled_elapsed_ms`、算子行数、是否为纯主机提交和数据路径。
+- `manifest/<label>-control.json`：共同应用 PID，以及每阶段的 msprof PID、命令、回执、退出状态。
+
+日志中的 `preparing stage=...` / `captured stage=...` 标明当前阶段。
+任一阶段的执行、握手、导出或结果检查失败，整体返回 FAIL；已有原始数据和控制日志保留。
+所有阶段都成功后才输出最终汇总 CSV。已有输出目录/报告不会被覆盖。
+在原命令中切换单个阶段或 `all` 时，其余模型、量化和 prompt 参数保持一致。
+
 W8A8 沿用应用参数 `--config /path/to/qwen3.5.ymal --quant_mode enable`。每次使用新的输出目录；
 需分别查看 Memory/MemoryUB 时，保持 prompt、B、量化配置一致，换 `--aic-metrics` 单独采集。
 
 | 选项 | 窗口内执行 | 窗口外执行 |
 | --- | --- | --- |
 | `prefill` | 一次 Target `begin_rollback`：新建 cache、所有真实 prompt 分块、feature 收集、最后真实行 LM head | 模型加载、预热、anchor Top1；本模式不执行 Draft feature projection 或 Draft/verify |
+| `feature-project` | 一次真实 prompt features 的 Target→Draft `fc + hidden_norm` 投影 | Target prefill、shape 检查、投影结果指纹回传；本模式不执行 Draft/verify |
 | `draft` | 一次首轮 Draft proposal：首次 Draft KV 构建、Draft 计算及 Top1 | 模型加载、预热、prefill、prompt feature projection、anchor Top1、proposal 整理和请求清理；不执行 Target verify |
+| `verify-input` | 一次 Draft token ID 回传、EOS 截断及 proposal 整理、verify block tensor 创建/上传 | Draft、Target verify 及后处理 |
 | `verify` | 一次首轮 Target verify，含首次状态 bank 准备 | 模型加载、预热、prefill、Draft、proposal 整理、verify 输入 tensor 创建，以及 verify 后的 Target Top1/accept/commit |
+| `target-top1` | 一次 verify logits 的有限值检查、argmax 和 token ID 回传 | Target LM head 已包含在 verify 中；prefill anchor Top1 在本窗口外 |
+| `accept-commit` | 接受数量判断、零接受时关闭推测、游标提交；继续推测时包含下一轮 feature projection | Target Top1、延迟到下次 verify 执行的状态 bank 选择/重整 |
 | `draft-verify` | 首轮 Draft proposal（含首次 Draft KV 构建和 Draft Top1）、proposal 整理与 block 构建、一次 Target verify（含首次状态 bank 准备） | 模型加载、预热、prefill、prompt feature projection、anchor Top1、Target verify 后的 Top1/accept/commit |
+| `decode-round` | 首轮事务：prefix tensor、Draft、verify 输入准备、Target verify、Target Top1、接受判断与提交；内部没有额外采集同步 | prefill、prompt feature projection、anchor Top1、外层生成循环的 token 输出/EOS 终止判断、回调和文本解码 |
+
+上述九项也都可以作为单独的 `--profile-stage` 值。`draft-verify` 和 `decode-round`
+是有重叠范围的联合窗口，因此不要把九项耗时相加当作请求耗时。`all` 中各窗口同样各自带有
+边界同步和 profiling 开销，不是同一轮时间线的无扰动拆分。
+`accept-commit` 若真实接受数量为 0，会按生产规则关闭推测、跳过下一轮 feature projection；
+HIAI 此时可能只有主机游标更新和 tensor view，没有 NPU 算子。仅此报告确认的分支允许
+零算子行，仍要求完整控制握手和成功导出，使用同步窗口耗时观察其主机开销。
+预处理/tokenizer、模型加载、prefill anchor Top1、文本输出及后续 decode 轮次不属于 `all` 的独立阶段。
 
 `--profile-warmup` 默认 1，预热不启动采集。每次预热和正式采集都从同一个 prompt 重建请求状态，
-不会沿用预热后推进的 KV/cursor。设为 0 可观察未预热的首次调用；三个 Draft/verify 相关模式
-仍须先完成 prefill，`verify` 还须先完成 Draft。
+不会沿用预热后推进的 KV/cursor。设为 0 可观察当前进程中未做该阶段显式预热的调用；
+`all` 中前面的阶段仍可能已经触发相同内核，不能把后面的窗口当作进程冷启动。
+Draft/verify 相关模式仍须先完成 prefill，`verify` 还须先完成 Draft。
 这里采的是 **prefill 后的首轮**，不代表后续已有 Draft KV 的稳定 decode 轮次。
 
-一个 prefill 可以包含多个 64-token 分块，不等于只执行一个模型 chunk。三个 Draft/verify 相关模式都按完整 B
+一个 prefill 可以包含多个 64-token 分块，不等于只执行一个模型 chunk。Draft/verify 相关模式都按完整 B
 请求 proposal：B=16 请求 15 个 draft token，通常 verify T=16；遇到 proposal EOS 会按生产规则
 缩短 T，实际值见报告 `result.verify_rows`；`draft` 不执行 verify，该值为 0，proposal 结果仍按 EOS
 规则截断。若 prefill anchor 已是 EOS，则报错退出而不生成空采集。
@@ -447,17 +498,21 @@ msprof --dynamic=on --pid=<应用PID> --output=<raw目录> \
 msprof；不接受 `--msproftx` 或额外 `--msprof-arg`。动态采集方式见
 [CANN msprof 交互式采集文档](https://www.hiascend.com/document/detail/zh/canncommercial/800/devaids/devtools/profiling/atlasprofiling_16_0016.html)，
 回执语义见 [CANN runtime 的 DynProfClient 实现](https://gitcode.com/cann/runtime/blob/68752f679cfb68365e472eec38855ec4fd4721f6/src/dfx/msprof/collector/dvvp/msprof/dynamic_profiling/src/dyn_prof_client.cpp)。
-关闭采集后 wrapper 执行 `msprof --export=on --output=... --summary-format=csv`，参数见
+同一应用允许退出交互模式后再次执行 msprof 连接，见
+[CANN 动态采集的 quit 说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/devaids/Profiling/atlasprofiling_16_0016.html)。
+关闭采集后 wrapper 对每个阶段目录执行 `msprof --export=on --output=... --summary-format=csv`，参数见
 [msprof 离线导出文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/devaids/Profiling/atlasprofiling_16_0021.html)。
 
 输出位于 `--output-dir` 下：
 
 - `profile/msprof/<label>/`：raw 数据及导出的 `op_summary*.csv`。
 - `<label>-stage-report.json`：阶段次数/范围和 token 结果。
+- `<label>-stage-summary.csv`：阶段同步耗时和算子行数。
 - `manifest/<label>-control.json`：应用 PID、实际 attach 命令、start/stop/quit 回执及进程退出状态。
 - `manifest/<label>.json`：运行身份和最终状态；`log/msprof-<label>.log` 保留完整交互输出。
 
-wrapper 仅在控制握手、应用、导出和非空算子 CSV 检查都成功后返回 PASS。阶段报告的
+wrapper 仅在控制握手、应用、导出和各阶段算子 CSV 检查都成功后返回 PASS
+（上文声明的零接受纯主机提交允许零算子行）。阶段报告的
 `PASS_CAPTURE` 只表示阶段流程完成，预热对照仅检查该阶段 token 结果稳定，不替代
 strict-greedy 正确性门禁。`profiled_elapsed_ms` 是带 profiling 开销的同步窗口时间，排除了
 attach/start/stop/quit 及等待控制回执的时间；具体算子时长看 CSV，正式时延仍按 3+10 测量。

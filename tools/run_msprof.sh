@@ -15,7 +15,9 @@ Options:
   --msprof-bin PATH         msprof executable (default: MSPROF_BIN or msprof).
   --aic-metrics NAME        AI Core metrics (default: PipeUtilization).
   --task-time LEVEL         msprof task-time value (default: on).
-  --profile-stage STAGE     Collect one prefill, draft, verify or draft-verify.
+  --profile-stage STAGE     Collect one stage, or all stages separately (one model load).
+                           prefill, feature-project, draft, verify-input, verify,
+                           target-top1, accept-commit, draft-verify, decode-round, all.
   --profile-warmup N        Unprofiled fresh-state warmups for a stage (default: 1).
   --profile-timeout SEC     Deadline per stage-control transition (default: 600).
   --msprof-arg ARG          Append one safe msprof option; repeat as needed.
@@ -81,11 +83,11 @@ while (($#)); do
       shift 2
       ;;
     --profile-stage)
-      (($# >= 2)) || fail "--profile-stage requires prefill, draft, verify or draft-verify"
+      (($# >= 2)) || fail "--profile-stage requires a stage name or all"
       profile_stage="$2"
       case "$profile_stage" in
-        prefill|draft|verify|draft-verify) ;;
-        *) fail "--profile-stage must be prefill, draft, verify or draft-verify" ;;
+        prefill|feature-project|draft|verify-input|verify|target-top1|accept-commit|draft-verify|decode-round|all) ;;
+        *) fail "invalid --profile-stage; see --help for stages and all" ;;
       esac
       shift 2
       ;;
@@ -225,6 +227,7 @@ log_dir="$output_root/log"
 manifest_dir="$output_root/manifest"
 manifest_path="$manifest_dir/$label.json"
 control_report="$manifest_dir/$label-control.json"
+summary_report="$output_root/$label-stage-summary.csv"
 runtime_log="$log_dir/msprof-$label.log"
 preflight_log="$log_dir/preflight-$label.log"
 device_log="$log_dir/device-$label.log"
@@ -232,8 +235,15 @@ device_log="$log_dir/device-$label.log"
 [[ ! -e "$profile_dir" ]] || fail "profile output already exists: $profile_dir"
 [[ ! -e "$manifest_path" ]] || fail "manifest already exists: $manifest_path"
 [[ ! -e "$control_report" && ! -L "$control_report" ]] || fail "control report already exists: $control_report"
+if [[ -n "$profile_stage" ]]; then
+  [[ ! -e "$summary_report" && ! -L "$summary_report" ]] || fail "summary already exists: $summary_report"
+fi
 mkdir -p "$output_root/profile/msprof" "$log_dir" "$manifest_dir"
 
+collect_stages=("$profile_stage")
+if [[ "$profile_stage" == "all" ]]; then
+  collect_stages=(prefill feature-project draft verify-input verify target-top1 accept-commit draft-verify decode-round)
+fi
 if [[ -n "$profile_stage" ]]; then
   unset DFLASH_MSPROF_PROCESS_CAPTURE || true
   application+=(
@@ -322,7 +332,6 @@ if [[ -n "$profile_stage" ]]; then
   # The actual child PID and attach command are recorded by the controller.
   msprof_args=("--dynamic=on" "${msprof_args[@]}")
 fi
-export_args=("--export=on" "--output=$profile_dir" "--summary-format=csv")
 
 write_manifest() {
   local run_status="$1"
@@ -335,7 +344,7 @@ write_manifest() {
     "$msproftx" "$requested_device" "$profile_stage" "$profile_warmup" "$stage_report" \
     "$profile_timeout" "$control_report" \
     "${#msprof_args[@]}" "${msprof_args[@]}" \
-    "${#application[@]}" "${application[@]}" <<'PY'
+    "${#application[@]}" "${application[@]}" "${collect_stages[@]}" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -357,6 +366,7 @@ cursor += msprof_count
 application_count = int(values[cursor])
 cursor += 1
 application = values[cursor:cursor + application_count]
+stages = values[cursor + application_count:]
 
 redacted_application = list(application)
 for index, argument in enumerate(redacted_application[:-1]):
@@ -396,7 +406,7 @@ for path in sorted(set(expanded)):
     source_files += 1
 
 payload = {
-    "schema_version": 5,
+    "schema_version": 6,
     "status": run_status,
     "exit_code": int(exit_code),
     "label": label,
@@ -424,16 +434,22 @@ payload = {
         "msproftx": msproftx,
         "collector": "msprof dynamic CLI" if profile_stage else "msprof process",
         "profile_stage": profile_stage or None,
+        "stages": stages if profile_stage else None,
         "profile_warmup": int(profile_warmup) if profile_stage else None,
         "profile_timeout_seconds": float(profile_timeout) if profile_stage else None,
         "actual_attach_arguments_in": control_report if profile_stage else None,
-        "export_arguments": ["--export=on", "--output=" + profile_dir, "--summary-format=csv"] if profile_stage else None,
+        "export_arguments": (
+            [["--export=on", "--output=" + str(Path(profile_dir) / stage), "--summary-format=csv"]
+             for stage in stages] if profile_stage == "all" else
+            ["--export=on", "--output=" + profile_dir, "--summary-format=csv"] if profile_stage else None
+        ),
     },
     "application": redacted_application,
     "artifacts": {
         "profile_dir": profile_dir, "runtime_log": runtime_log,
         "stage_report": stage_report if profile_stage else None,
         "control_report": control_report if profile_stage else None,
+        "stage_summary": str(Path(manifest_path).parent.parent / (label + "-stage-summary.csv")) if profile_stage else None,
     },
     "claim_boundary": (
         "msprof is diagnostic evidence, not the latency baseline; retain "
@@ -457,17 +473,27 @@ if [[ -n "$profile_stage" ]]; then
     -- "${application[@]}" 2>&1 | tee "$runtime_log"
   msprof_status=${PIPESTATUS[0]}
   if ((msprof_status == 0)); then
-    "$msprof_bin" "${export_args[@]}" 2>&1 | tee -a "$runtime_log"
-    msprof_status=${PIPESTATUS[0]}
+    for collected_stage in "${collect_stages[@]}"; do
+      export_dir="$profile_dir"
+      if [[ "$profile_stage" == "all" ]]; then
+        export_dir="$profile_dir/$collected_stage"
+      fi
+      "$msprof_bin" --export=on "--output=$export_dir" --summary-format=csv 2>&1 | tee -a "$runtime_log"
+      msprof_status=${PIPESTATUS[0]}
+      ((msprof_status == 0)) || break
+    done
   fi
   if ((msprof_status == 0)); then
-    "$python_bin" -B - "$profile_dir" "$stage_report" "$profile_stage" "$control_report" <<'PY' 2>&1 | tee -a "$runtime_log"
+    "$python_bin" -B - "$profile_dir" "$stage_report" "$profile_stage" "$control_report" \
+      "$summary_report" "${collect_stages[@]}" <<'PY' 2>&1 | tee -a "$runtime_log"
 import csv
 import json
+import math
 from pathlib import Path
 import sys
 
-root, report_path, stage, control_path = sys.argv[1:]
+root, report_path, stage, control_path, summary_path = sys.argv[1:6]
+stages = sys.argv[6:]
 report = json.loads(Path(report_path).read_text(encoding="utf-8"))
 control = json.loads(Path(control_path).read_text(encoding="utf-8"))
 if (control.get("status") != "PASS_CONTROL"
@@ -478,26 +504,66 @@ if (control.get("status") != "PASS_CONTROL"
             "start_acknowledged", "stop_acknowledged", "quit_acknowledged", "capture_completed"))
         or any(control.get(key) != 0 for key in ("application_exit_code", "msprof_exit_code"))):
     raise SystemExit("control report does not prove successful msprof start/stop/quit")
-expected = {
-    "prefill": int(stage == "prefill"),
-    "draft": int(stage in {"draft", "draft-verify"}),
-    "target_verify": int(stage in {"verify", "draft-verify"}),
-}
 if (report.get("status") != "PASS_CAPTURE"
         or report.get("collector") != "msprof dynamic CLI"
         or report.get("profile_stage") != stage
-        or report.get("capture_windows") != 1
-        or report.get("captured_calls") != expected
+        or report.get("capture_windows") != len(stages)
         or report.get("operator_fallback_enabled") is not False
         or Path(report.get("profile_output", "")).resolve() != Path(root).resolve()):
-    raise SystemExit("stage report does not prove one requested capture window")
-rows = 0
-for path in Path(root).rglob("op_summary*.csv"):
-    with path.open(encoding="utf-8-sig", newline="") as stream:
-        rows += sum(1 for row in csv.DictReader(stream) if any(row.values()))
-if not rows:
-    raise SystemExit("msprof export produced no operator rows; inspect the raw PROF_* data")
-print(f"PASS: one {stage} capture, {rows} exported operator rows")
+    raise SystemExit("stage report does not prove the requested capture windows")
+reports = report.get("captures", []) if stage == "all" else [report]
+controls = control.get("captures", []) if stage == "all" else [control]
+if stage == "all" and (report.get("stages") != stages or control.get("stages") != stages):
+    raise SystemExit("all-stage order does not match the requested stages")
+if len(reports) != len(stages) or len(controls) != len(stages):
+    raise SystemExit("missing or extra stage reports")
+summary = []
+for selected, capture, handshake in zip(stages, reports, controls):
+    destination = Path(root) / selected if stage == "all" else Path(root)
+    expected = {
+        "prefill": int(selected == "prefill"),
+        "draft": int(selected in {"draft", "draft-verify", "decode-round"}),
+        "target_verify": int(selected in {"verify", "draft-verify", "decode-round"}),
+    }
+    if (capture.get("status") != "PASS_CAPTURE"
+            or capture.get("collector") != "msprof dynamic CLI"
+            or capture.get("profile_stage") != selected
+            or capture.get("capture_windows") != 1
+            or capture.get("captured_calls") != expected
+            or Path(capture.get("profile_output", "")).resolve() != destination.resolve()):
+        raise SystemExit(f"{selected}: invalid stage capture report")
+    if (handshake.get("profile_stage") != selected
+            or Path(handshake.get("profile_output", "")).resolve() != destination.resolve()
+            or handshake.get("msprof_exit_code") != 0
+            or any(handshake.get(key) is not True for key in (
+                "start_acknowledged", "stop_acknowledged", "quit_acknowledged", "capture_completed"))):
+        raise SystemExit(f"{selected}: incomplete control handshake")
+    rows = 0
+    for path in destination.rglob("op_summary*.csv"):
+        with path.open(encoding="utf-8-sig", newline="") as stream:
+            rows += sum(1 for row in csv.DictReader(stream) if any(row.values()))
+    host_only_commit = (
+        selected == "accept-commit"
+        and capture.get("result", {}).get("accepted_draft_tokens") == 0
+        and capture.get("operator_rows_required") is False
+    )
+    if not rows and not host_only_commit:
+        raise SystemExit(f"{selected}: msprof export produced no operator rows; inspect the raw PROF_* data")
+    elapsed = capture.get("profiled_elapsed_ms")
+    if (isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
+            or not math.isfinite(elapsed) or elapsed < 0):
+        raise SystemExit(f"{selected}: missing or invalid synchronized stage time")
+    summary.append({
+        "stage": selected, "profiled_elapsed_ms": elapsed,
+        "operator_rows": rows, "host_only_commit": host_only_commit and rows == 0,
+        "profile_output": str(destination),
+    })
+    print(f"PASS: one {selected} capture, {rows} exported operator rows")
+with Path(summary_path).open("x", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=list(summary[0]))
+    writer.writeheader()
+    writer.writerows(summary)
+print(f"Stage timing summary: {summary_path}")
 PY
     msprof_status=${PIPESTATUS[0]}
   fi
