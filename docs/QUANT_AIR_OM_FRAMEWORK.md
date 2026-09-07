@@ -737,16 +737,19 @@ atc --mode=0 --framework=1 \
 $FUSED_BUNDLE/
 ├── deployment-manifest.json
 └── om/
-    ├── target-prefill.om
-    ├── target-prefill-head.om
-    ├── target-decode1.om
-    └── fused-speculative-step.om
+    ├── target-prefill{,_linux_aarch64,_linux_x86_64}.om
+    ├── target-prefill-head{,_linux_aarch64,_linux_x86_64}.om
+    ├── target-decode1{,_linux_aarch64,_linux_x86_64}.om
+    └── fused-speculative-step{,_linux_aarch64,_linux_x86_64}.om
 ```
 
 编译器在调用 ATC 前重新核验 AIR 与所有外置 payload 的 hash；ATC 成功后记录 OM hash、ATC
 版本、完整命令和日志。它还会重新校验并把 `custom_op_audit` 传入 deployment manifest；缺失
 审计或 GE 节点数少于 converter 命中数时不会调用 ATC。退出码为 0 但 OM 缺失或为空也判定
-失败。
+失败。不同 ATC/host 组合可能生成 `<role>.om`、`<role>_linux_aarch64.om` 或
+`<role>_linux_x86_64.om`；编译器要求其中恰好一个非空文件，并把实际名称写入
+`deployment-manifest.json`。后续流程必须读取 manifest 的 `.graphs[].om.path`，不能自行拼接
+固定文件名；同时出现多个候选也按歧义失败，防止误用旧产物。
 
 也可以一次执行 AIR + OM：
 
@@ -1260,6 +1263,8 @@ rg --files "$PROF_DIR" | \
 | `No supported Ops kernel and engine ... FusedInferAttentionScore`（Ascend310P3） | 旧 AIR 把 receiver 的 ADN 前端错误 lower 成 A2 GE type；真实 310P 包注册的是 `AdnFusedInferAttention` | 更新本分支和现有 `factory.json`，把完整 ADN vendor 加入 `ASCEND_CUSTOM_OPP_PATH`，重新导出到空目录；确认图中只有 `AdnFusedInferAttention` 再跑 ATC |
 | `AdnFusedInferAttention GE prototype is absent from the active ASCEND_CUSTOM_OPP_PATH` | PyTorch/LD 能加载 ADN op_api，但 ATC 的 OPP 搜索路径里没有对应 prototype/kernel vendor | 把 ADN 安装包的 `packages/vendors/<vendor>` 根加入 `ASCEND_CUSTOM_OPP_PATH`；不要只加入 `op_api/lib` |
 | `GatedDeltaRuleMTP` 在 eager 的 T16/T17 测试通过，但 AIR/ATC 报 `Template constraint` | eager ABI 可用不代表手写 TorchAir named converter 与 GE `REG_OP` 一致；旧 converter 把第二个输出错误命名为 `state_bank` | 更新本分支，从空目录重新导出四个 AIR；确认 manifest 中 `gdr_mtp_ge_prototype.abi=receiver-gdr-mtp-v1-named-io`，再重新 ATC。不要改 T16、state shape 或清理大范围缓存 |
+| ATC 返回 0 且目录已有 `<role>_linux_aarch64.om`，但 `compile-om` 报 `produced no non-empty OM` | v33 及更早只检查 `<role>.om`，没有识别 ATC 的 host 架构后缀 | 更新到 v34；在当前 run 自己拥有的空 OM 输出目录中重跑 `compile-om`。新 deployment manifest 会记录实际带后缀路径；不要 rename 后再伪造 manifest，也不要删除其他 run 的产物 |
+| 四个 OM 校验通过，前三个 load 完成，`fused-speculative-step` 在 `model-load-start` 后报 `OM tensor has an invalid dtype or byte size` | 动态模型的 `target_feature_tail=[1,-1,H]` 合法使 `aclmdlGetInputSizeByIndex` 返回 0；旧 runner 在查询 gear 前把 0 当成损坏 OM | 更新到 v34并只重新构建 C++ runner；无需重导 AIR 或重编 OM。新 runner 从所有 flattened dynamic gears 推导最大 dense bytes，仍会拒绝 undefined dtype、静态零字节 tensor、非法/溢出 gear，并在错误中打印 role/index/name/dtype/bytes/shape |
 | `pse_shift` 期望 `Optional[Tensor]` 但收到 `[64]` / `immutable_list` | 旧版 modeling 在 export 路径把 `allQLen` 长度列表误接到了 PSE 输入，尚未进入 Fake/converter | 更新本分支；确认两个 modeling 文件均传 `all_seq_lengths_q=allQLen` 且不构造伪 PSE Tensor |
 | `GE IR ... is not registered` | factory 中某个 `*_ge_op_type` 与目标 CANN/自定义包不一致 | 使用已正式注册且与算子实现一致的 GE type；不能用同名伪节点 |
 | custom-op converter/GE-node count 为 0 | 算子被绕开、converter 未调用或 GE 图丢失节点 | 导出按 FAIL 处理，保留 `dynamo.pbtxt` 和完整 TorchAir 日志 |

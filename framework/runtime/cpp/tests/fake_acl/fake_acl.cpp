@@ -819,9 +819,21 @@ aclDataType aclmdlGetOutputDataType(
 
 std::size_t aclmdlGetInputSizeByIndex(
     aclmdlDesc* description, std::size_t index) {
-  return description != nullptr && index < Inputs(description->role).size()
-      ? Bytes(Inputs(description->role)[index])
-      : 0;
+  if (description == nullptr || index >= Inputs(description->role).size()) {
+    return 0;
+  }
+  const auto& spec = Inputs(description->role)[index];
+  const char* force_zero_static =
+      std::getenv("QWEN35_DFLASH_FAKE_ZERO_STATIC_INPUT");
+  if (description->role == Role::kTargetPrefill && index == 0 &&
+      force_zero_static != nullptr && std::string(force_zero_static) == "1") {
+    return 0;
+  }
+  // Match AscendCL: unresolved dynamic input dimensions have no fixed size.
+  if (std::find(spec.shape.begin(), spec.shape.end(), -1) != spec.shape.end()) {
+    return 0;
+  }
+  return Bytes(spec);
 }
 
 std::size_t aclmdlGetOutputSizeByIndex(

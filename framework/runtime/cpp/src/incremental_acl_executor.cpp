@@ -114,10 +114,80 @@ struct TensorSpec {
   std::size_t bytes = 0;
 };
 
+bool HasDynamicDimension(const TensorSpec& spec) {
+  return std::find(spec.shape.begin(), spec.shape.end(), -1) !=
+      spec.shape.end();
+}
+
+std::string TensorDetails(
+    const std::string& role,
+    bool input,
+    std::size_t index,
+    const TensorSpec& spec) {
+  std::ostringstream message;
+  message << role << ": OM " << (input ? "input" : "output") << '['
+          << index << "] name='" << spec.name << "' dtype="
+          << static_cast<int>(spec.dtype) << " bytes=" << spec.bytes
+          << " shape=[";
+  for (std::size_t dimension = 0; dimension < spec.shape.size(); ++dimension) {
+    if (dimension != 0) {
+      message << ',';
+    }
+    message << spec.shape[dimension];
+  }
+  message << ']';
+  return message.str();
+}
+
+std::size_t TensorElementBytes(
+    aclDataType dtype,
+    const std::string& description) {
+  switch (dtype) {
+    case ACL_FLOAT:
+    case ACL_INT32:
+    case ACL_UINT32:
+      return 4;
+    case ACL_FLOAT16:
+    case ACL_INT16:
+    case ACL_UINT16:
+      return 2;
+    case ACL_INT64:
+    case ACL_UINT64:
+    case ACL_DOUBLE:
+      return 8;
+    case ACL_INT8:
+    case ACL_UINT8:
+    case ACL_BOOL:
+      return 1;
+    default:
+      throw std::runtime_error(
+          description + " has no supported dense element byte width");
+  }
+}
+
+std::size_t CheckedTensorBytes(
+    std::size_t current,
+    std::int64_t dimension,
+    const std::string& description) {
+  if (dimension <= 0) {
+    throw std::runtime_error(
+        description + " has a non-positive dynamic gear dimension");
+  }
+  const auto value = static_cast<std::uint64_t>(dimension);
+  if (value > std::numeric_limits<std::size_t>::max() ||
+      current > std::numeric_limits<std::size_t>::max() /
+          static_cast<std::size_t>(value)) {
+    throw std::overflow_error(description + " byte size overflows size_t");
+  }
+  return current * static_cast<std::size_t>(value);
+}
+
 TensorSpec ReadTensorSpec(
     aclmdlDesc* description,
     std::size_t index,
-    bool input) {
+    bool input,
+    bool allow_dynamic_input_size,
+    const std::string& role) {
   aclmdlIODims dimensions{};
   Check(
       input ? aclmdlGetInputDims(description, index, &dimensions)
@@ -141,8 +211,15 @@ TensorSpec ReadTensorSpec(
   result.bytes = input
       ? aclmdlGetInputSizeByIndex(description, index)
       : aclmdlGetOutputSizeByIndex(description, index);
-  if (result.dtype == ACL_DT_UNDEFINED || result.bytes == 0) {
-    throw std::runtime_error("OM tensor has an invalid dtype or byte size");
+  if (result.dtype == ACL_DT_UNDEFINED) {
+    throw std::runtime_error(
+        TensorDetails(role, input, index, result) + " has an undefined dtype");
+  }
+  if (result.bytes == 0 &&
+      (!input || !allow_dynamic_input_size || !HasDynamicDimension(result))) {
+    throw std::runtime_error(
+        TensorDetails(role, input, index, result) +
+        " has an invalid zero byte size");
   }
   return result;
 }
@@ -241,10 +318,12 @@ struct ModelSession {
     inputs.reserve(input_count);
     outputs.reserve(output_count);
     for (std::size_t index = 0; index < input_count; ++index) {
-      inputs.push_back(ReadTensorSpec(description, index, true));
+      inputs.push_back(ReadTensorSpec(
+          description, index, true, require_dynamic_gears, role));
     }
     for (std::size_t index = 0; index < output_count; ++index) {
-      outputs.push_back(ReadTensorSpec(description, index, false));
+      outputs.push_back(ReadTensorSpec(
+          description, index, false, false, role));
     }
 
     if (require_dynamic_gears) {
@@ -282,8 +361,85 @@ struct ModelSession {
         public_input_indices.push_back(index);
       }
     }
+    if (require_dynamic_gears) {
+      ResolveDynamicInputSizes();
+    }
     if (progress) {
       progress(role.c_str(), "load-done", work_bytes, weight_bytes);
+    }
+  }
+
+  void ResolveDynamicInputSizes() {
+    std::size_t flattened_dimension_count = 0;
+    for (const std::size_t input_index : public_input_indices) {
+      const std::size_t rank = inputs.at(input_index).shape.size();
+      if (rank > std::numeric_limits<std::size_t>::max() -
+                     flattened_dimension_count) {
+        throw std::overflow_error(
+            role + ": dynamic input rank total overflows size_t");
+      }
+      flattened_dimension_count += rank;
+    }
+    if (flattened_dimension_count == 0 || flattened_dimension_count > 128) {
+      throw std::runtime_error(
+          role + ": flattened dynamic input rank is outside 1..128");
+    }
+
+    std::vector<std::size_t> maximum_bytes(public_input_indices.size(), 0);
+    for (std::size_t gear_index = 0; gear_index < dynamic_gears.size();
+         ++gear_index) {
+      const auto& gear = dynamic_gears[gear_index];
+      if (gear.dimCount != flattened_dimension_count) {
+        throw std::runtime_error(
+            role + ": dynamic gear " + std::to_string(gear_index) +
+            " flattened dimension count differs from the public input ABI");
+      }
+      std::size_t cursor = 0;
+      for (std::size_t public_index = 0;
+           public_index < public_input_indices.size(); ++public_index) {
+        const std::size_t input_index = public_input_indices[public_index];
+        const auto& spec = inputs.at(input_index);
+        const bool dynamic = HasDynamicDimension(spec);
+        std::size_t dense_bytes = dynamic
+            ? TensorElementBytes(
+                  spec.dtype,
+                  TensorDetails(role, true, input_index, spec))
+            : 0;
+        for (const std::int64_t model_dimension : spec.shape) {
+          const std::int64_t gear_dimension = gear.dims[cursor++];
+          const std::string details =
+              TensorDetails(role, true, input_index, spec) +
+              " dynamic gear " + std::to_string(gear_index);
+          if (gear_dimension <= 0) {
+            throw std::runtime_error(
+                details + " has a non-positive dimension");
+          }
+          if (model_dimension != -1 && model_dimension != gear_dimension) {
+            throw std::runtime_error(
+                details + " changes a static dimension");
+          }
+          if (dynamic) {
+            dense_bytes = CheckedTensorBytes(
+                dense_bytes, gear_dimension, details);
+          }
+        }
+        maximum_bytes[public_index] =
+            std::max(maximum_bytes[public_index], dense_bytes);
+      }
+    }
+
+    for (std::size_t public_index = 0;
+         public_index < public_input_indices.size(); ++public_index) {
+      const std::size_t input_index = public_input_indices[public_index];
+      auto& spec = inputs.at(input_index);
+      if (HasDynamicDimension(spec)) {
+        if (maximum_bytes[public_index] == 0) {
+          throw std::runtime_error(
+              TensorDetails(role, true, input_index, spec) +
+              " could not be bounded from dynamic gears");
+        }
+        spec.bytes = std::max(spec.bytes, maximum_bytes[public_index]);
+      }
     }
   }
 

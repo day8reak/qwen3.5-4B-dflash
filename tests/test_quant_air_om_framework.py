@@ -21,6 +21,8 @@ if str(FRAMEWORK_PYTHON) not in sys.path:
     sys.path.insert(0, str(FRAMEWORK_PYTHON))
 
 from qwen35_dflash.ascend310p.compiler import (
+    AtcCompileError,
+    _resolve_atc_om_path,
     _validate_extra_args,
     _validated_custom_op_audit,
     _validated_external_weight_mapping,
@@ -2471,9 +2473,14 @@ def test_padded_draft_context_matches_compact_quant_draft() -> None:
     assert len(list(exported.graph.nodes)) > 100
 
 
+@pytest.mark.parametrize(
+    "om_suffix",
+    [".om", "_linux_aarch64.om", "_linux_x86_64.om"],
+)
 def test_compile_uses_air_framework_and_hash_locks_payload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    om_suffix: str,
 ) -> None:
     run_dir = tmp_path / "run"
     bundle = run_dir / "bundle"
@@ -2556,7 +2563,7 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
     def runner(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         commands.append(list(command))
         output = next(item.split("=", 1)[1] for item in command if item.startswith("--output="))
-        Path(output + ".om").write_bytes(b"quant-om")
+        Path(output + om_suffix).write_bytes(b"quant-om")
         return subprocess.CompletedProcess(command, 0, stdout="ok")
 
     monkeypatch.setenv("AI_RUN_DIR", str(run_dir))
@@ -2570,8 +2577,26 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
     assert result["status"] == "PASS"
     assert len(result["graphs"][0]["custom_op_audit"]) == 2
     assert result["graphs"][0]["custom_op_audit"][0]["status"] == "PASS"
+    assert result["graphs"][0]["om"]["path"] == (
+        f"om/quant_dflash_recompute{om_suffix}"
+    )
     assert commands[0][1:3] == ["--mode=0", "--framework=1"]
     assert commands[0][-1] == "--soc_version=Ascend310P3"
+
+
+def test_atc_output_resolution_rejects_ambiguous_platform_names(
+    tmp_path: Path,
+) -> None:
+    output_prefix = tmp_path / "fused-speculative-step"
+    Path(f"{output_prefix}.om").write_bytes(b"canonical")
+    Path(f"{output_prefix}_linux_aarch64.om").write_bytes(b"qualified")
+
+    with pytest.raises(AtcCompileError, match="ambiguous OM artifacts"):
+        _resolve_atc_om_path(
+            output_prefix,
+            graph_name="fused-speculative-step",
+            log_path=tmp_path / "atc.log",
+        )
 
 
 def test_quant_input_manifest_hashes_and_rechecks_external_artifacts(

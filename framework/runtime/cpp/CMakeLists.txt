@@ -225,6 +225,19 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       ${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om
   )
   add_test(
+    NAME qwen35_dflash_rejects_zero_static_input
+    COMMAND "${CMAKE_COMMAND}"
+      -DTEST_RUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_tests>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
+      -DDRAFT=${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      -DVERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om
+      -DDYNAMIC_VERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om
+      -DFUSED=${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_reject_zero_static.cmake
+  )
+  add_test(
     NAME qwen35_dflash_fake_acl_runner
     COMMAND "${CMAKE_COMMAND}"
       -DRUNNER=$<TARGET_FILE:qwen35_dflash_acl_runner_fake>

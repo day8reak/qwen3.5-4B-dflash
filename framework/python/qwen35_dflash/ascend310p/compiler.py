@@ -35,6 +35,36 @@ class AtcCompileError(RuntimeError):
     """ATC failed or did not produce the promised OM artifact."""
 
 
+def _resolve_atc_om_path(
+    output_prefix: Path,
+    *,
+    graph_name: str,
+    log_path: Path,
+) -> Path:
+    candidates = (
+        Path(f"{output_prefix}.om"),
+        Path(f"{output_prefix}_linux_aarch64.om"),
+        Path(f"{output_prefix}_linux_x86_64.om"),
+    )
+    produced = [
+        candidate
+        for candidate in candidates
+        if candidate.is_file() and candidate.stat().st_size > 0
+    ]
+    if len(produced) == 1:
+        return produced[0]
+    if not produced:
+        checked = ", ".join(str(candidate) for candidate in candidates)
+        raise AtcCompileError(
+            f"ATC returned success but produced no non-empty OM for {graph_name!r}; "
+            f"checked={checked}; log={log_path}"
+        )
+    raise AtcCompileError(
+        f"ATC returned ambiguous OM artifacts for {graph_name!r}: "
+        f"{', '.join(str(candidate) for candidate in produced)}; log={log_path}"
+    )
+
+
 def validate_soc_version(soc_version: str) -> str:
     """Require an ATC SoC variant instead of the generic 310P family name."""
 
@@ -314,15 +344,13 @@ def compile_air_bundle(
         result = execute(command, air_path.parent)
         log_path = log_root / f"{name}.log"
         log_path.write_text(result.stdout or "", encoding="utf-8")
-        om_path = output_prefix.with_suffix(".om")
         if result.returncode != 0:
             raise AtcCompileError(
                 f"ATC failed for {name!r} with exit {result.returncode}; log={log_path}"
             )
-        if not om_path.is_file() or om_path.stat().st_size == 0:
-            raise AtcCompileError(
-                f"ATC returned success but produced no non-empty OM for {name!r}; log={log_path}"
-            )
+        om_path = _resolve_atc_om_path(
+            output_prefix, graph_name=name, log_path=log_path
+        )
         compiled_graph = {
             "name": name,
             "role": graph["role"],

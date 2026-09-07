@@ -149,6 +149,18 @@ logit、allocator 和并存服务重新声明。`DEVICE_BUDGET_BYTES` 必须来�
 
 ```bash
 CPP_BUILD="$AI_RUN_DIR/build/cpp-performance"
+OM_BUNDLE=/ABSOLUTE/PATH/TO/OM-BUNDLE
+OM_MANIFEST="$OM_BUNDLE/deployment-manifest.json"
+PREFILL_OM="$OM_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-prefill") | .om.path' "$OM_MANIFEST")"
+PREFILL_HEAD_OM="$OM_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-prefill-head") | .om.path' "$OM_MANIFEST")"
+DECODE_OM="$OM_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-decode1") | .om.path' "$OM_MANIFEST")"
+DRAFT_OM="$OM_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "draft-propose") | .om.path' "$OM_MANIFEST")"
+VERIFY_OM="$OM_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-verify-commit") | .om.path' "$OM_MANIFEST")"
 STATE_BYTES=999817216
 IO_RUNTIME_MARGIN_BYTES=1073741824
 DEVICE_BUDGET_BYTES=<本次进程可使用的设备字节预算>
@@ -160,11 +172,11 @@ cmake -S framework/runtime/cpp -B "$CPP_BUILD" \
 cmake --build "$CPP_BUILD" -j
 
 "$CPP_BUILD/qwen35_dflash_om_inspect" \
-  --model target-prefill="$AI_RUN_DIR/om/target-prefill.om" \
-  --model target-prefill-head="$AI_RUN_DIR/om/target-prefill-head.om" \
-  --model target-decode1="$AI_RUN_DIR/om/target-decode1.om" \
-  --model draft-propose="$AI_RUN_DIR/om/draft-propose.om" \
-  --model target-verify-commit="$AI_RUN_DIR/om/target-verify-commit.om" \
+  --model target-prefill="$PREFILL_OM" \
+  --model target-prefill-head="$PREFILL_HEAD_OM" \
+  --model target-decode1="$DECODE_OM" \
+  --model draft-propose="$DRAFT_OM" \
+  --model target-verify-commit="$VERIFY_OM" \
   --state-bytes "$STATE_BYTES" \
   --io-runtime-margin-bytes "$IO_RUNTIME_MARGIN_BYTES" \
   --device-budget-bytes "$DEVICE_BUDGET_BYTES" \
@@ -176,7 +188,9 @@ cmake --build "$CPP_BUILD" -j
 `draft-propose`/`target-verify-commit` 两行并增加：
 
 ```bash
---model fused-speculative-step="$FUSED_BUNDLE/om/fused-speculative-step.om"
+--model fused-speculative-step="$FUSED_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "fused-speculative-step") | .om.path' \
+  "$FUSED_BUNDLE/deployment-manifest.json")"
 ```
 
 其输出应使用 `four-graph-fused-speculative-step-memory.json`。重点查看：
@@ -469,6 +483,15 @@ jq -r '.graphs[] | [.name,.role,.om.path,.om.sha256] | @tsv' \
 `--framework=1` 的 AIR→OM ATC 命令额外拼 `--dynamic_dims`。生成 OM 后，C++ 启动会要求
 `N=1..16` 和从 64 到 `max_sequence_length` 的每个 64 倍数都能由
 `aclmdlGetInputDynamicDims` 查询到，缺一档就直接失败。
+
+AscendCL 的
+[`aclmdlGetInputSizeByIndex`](https://www.hiascend.com/document/detail/en/canncommercial/850/API/appdevgapi/aclcppdevg_03_1451.html)
+约束明确说明：shape 含 `-1` 的动态输入会返回 0。runner 不把这个 0 当作损坏 OM，而是按
+[`aclmdlGetInputDynamicDims`](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_1468.html)
+给出的“所有公开输入 rank 之和”的 flattened gear 顺序校验静态维度，并以全部 gear 中的最大
+dense bytes 建立有界分配；静态输入、输出或未声明动态 gear 的零字节仍直接失败。OM 文件名也
+必须从 deployment manifest 的 `.om.path` 读取，因为 ATC 可能追加 `_linux_aarch64` 或
+`_linux_x86_64`。
 
 先用 manifest 确认拆图 ABI 和 head 自定义量化节点都被保留：
 
@@ -1751,11 +1774,21 @@ DFlash `model_total` median/p90 都超过事先确定的测量噪声门槛，才
 控制面是推荐路径。需要排除 Python 控制面时，可直接执行同一个 runner：
 
 ```bash
-export PREFILL_OM="$INCREMENTAL_BUNDLE/om/target-prefill.om"
-export PREFILL_HEAD_OM="$INCREMENTAL_BUNDLE/om/target-prefill-head.om"
-export DECODE_OM="$INCREMENTAL_BUNDLE/om/target-decode1.om"
-export DRAFT_OM="$INCREMENTAL_BUNDLE/om/draft-propose.om"
-export VERIFY_OM="$INCREMENTAL_BUNDLE/om/target-verify-commit.om"
+export PREFILL_OM="$INCREMENTAL_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-prefill") | .om.path' \
+  "$INCREMENTAL_BUNDLE/deployment-manifest.json")"
+export PREFILL_HEAD_OM="$INCREMENTAL_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-prefill-head") | .om.path' \
+  "$INCREMENTAL_BUNDLE/deployment-manifest.json")"
+export DECODE_OM="$INCREMENTAL_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-decode1") | .om.path' \
+  "$INCREMENTAL_BUNDLE/deployment-manifest.json")"
+export DRAFT_OM="$INCREMENTAL_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "draft-propose") | .om.path' \
+  "$INCREMENTAL_BUNDLE/deployment-manifest.json")"
+export VERIFY_OM="$INCREMENTAL_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-verify-commit") | .om.path' \
+  "$INCREMENTAL_BUNDLE/deployment-manifest.json")"
 export INCREMENTAL_RUNNER="$AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner"
 
 "$INCREMENTAL_RUNNER" \
@@ -1804,10 +1837,18 @@ carrier 基线。`REAL,TOKEN,IDS` 和 `REAL,EOS,IDS` 必须替换成 tokenizer �
 统一 Target-step 使用相同二进制，只改成四个 OM，**完全删除**两项 `--target-decode1` 参数：
 
 ```bash
-export UNIFIED_PREFILL_OM="$UNIFIED_BUNDLE/om/target-prefill.om"
-export UNIFIED_PREFILL_HEAD_OM="$UNIFIED_BUNDLE/om/target-prefill-head.om"
-export UNIFIED_DRAFT_OM="$UNIFIED_BUNDLE/om/draft-propose.om"
-export UNIFIED_TARGET_STEP_OM="$UNIFIED_BUNDLE/om/target-verify-commit.om"
+export UNIFIED_PREFILL_OM="$UNIFIED_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-prefill") | .om.path' \
+  "$UNIFIED_BUNDLE/deployment-manifest.json")"
+export UNIFIED_PREFILL_HEAD_OM="$UNIFIED_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-prefill-head") | .om.path' \
+  "$UNIFIED_BUNDLE/deployment-manifest.json")"
+export UNIFIED_DRAFT_OM="$UNIFIED_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "draft-propose") | .om.path' \
+  "$UNIFIED_BUNDLE/deployment-manifest.json")"
+export UNIFIED_TARGET_STEP_OM="$UNIFIED_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-verify-commit") | .om.path' \
+  "$UNIFIED_BUNDLE/deployment-manifest.json")"
 
 "$INCREMENTAL_RUNNER" \
   --target-prefill "$UNIFIED_PREFILL_OM" \
@@ -1848,10 +1889,18 @@ fused speculative-step 同样使用这个 runner，但保留独立 `target-decod
 替换两项独立 Draft/verify。下面是可直接复制的未 profiling 3+10 命令：
 
 ```bash
-export FUSED_PREFILL_OM="$FUSED_BUNDLE/om/target-prefill.om"
-export FUSED_PREFILL_HEAD_OM="$FUSED_BUNDLE/om/target-prefill-head.om"
-export FUSED_DECODE_OM="$FUSED_BUNDLE/om/target-decode1.om"
-export FUSED_STEP_OM="$FUSED_BUNDLE/om/fused-speculative-step.om"
+export FUSED_PREFILL_OM="$FUSED_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-prefill") | .om.path' \
+  "$FUSED_BUNDLE/deployment-manifest.json")"
+export FUSED_PREFILL_HEAD_OM="$FUSED_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-prefill-head") | .om.path' \
+  "$FUSED_BUNDLE/deployment-manifest.json")"
+export FUSED_DECODE_OM="$FUSED_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "target-decode1") | .om.path' \
+  "$FUSED_BUNDLE/deployment-manifest.json")"
+export FUSED_STEP_OM="$FUSED_BUNDLE/$(jq -er \
+  '.graphs[] | select(.name == "fused-speculative-step") | .om.path' \
+  "$FUSED_BUNDLE/deployment-manifest.json")"
 
 "$INCREMENTAL_RUNNER" \
   --target-prefill "$FUSED_PREFILL_OM" \
