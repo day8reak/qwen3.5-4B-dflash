@@ -18,7 +18,7 @@ foreach(expected IN ITEMS
     "fused-speculative-step: dynamic execution contract mismatch"
     "aclmdlGetInputIndexByName returned 100000"
     "aclmdlSetDatasetTensorDesc"
-    "input_count=16"
+    "input_count=48"
     "name='target_feature_tail' dimCount=3 dtype=1 bytes=0 shape=[1,-1,8]"
     "name='lifted_float_scalar' dimCount=0 dtype=11 bytes=8 shape=[]"
     "output_count=16")

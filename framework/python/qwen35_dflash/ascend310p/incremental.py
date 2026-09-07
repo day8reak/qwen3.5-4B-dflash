@@ -118,7 +118,7 @@ class ExactAcceptCommitStateGraph(nn.Module):
             dtype=torch.int32,
         )
         drafted_mask = within_requested & cumulative_eos.eq(eos_bits)
-        drafted_count = drafted_mask.to(torch.int32).sum(dim=1)
+        drafted_count = drafted_mask.to(torch.int32).sum(dim=1, dtype=torch.int32)
 
         matches = proposal_ids.eq(target_top1[:, :width])
         mismatch_bits = (drafted_mask & ~matches).to(torch.int32)
@@ -128,7 +128,7 @@ class ExactAcceptCommitStateGraph(nn.Module):
             dtype=torch.int32,
         )
         accepted_mask = drafted_mask & cumulative_mismatches.eq(0)
-        accepted_count = accepted_mask.to(torch.int32).sum(dim=1)
+        accepted_count = accepted_mask.to(torch.int32).sum(dim=1, dtype=torch.int32)
         rejected_count = drafted_count.to(torch.int32) - accepted_count
 
         accepted_eos = (

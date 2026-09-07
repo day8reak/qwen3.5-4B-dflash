@@ -328,6 +328,7 @@ struct ModelSession {
   std::size_t dynamic_input_index = std::numeric_limits<std::size_t>::max();
   std::vector<std::size_t> public_input_indices;
   std::vector<aclmdlIODims> dynamic_gears;
+  bool dynamic_shape = false;
 
   void Query(
       const std::filesystem::path& model_path,
@@ -387,21 +388,31 @@ struct ModelSession {
       const aclError status = aclmdlGetInputIndexByName(
           description, kDynamicTensorName, &index);
       if (status != ACL_SUCCESS) {
-        throw std::runtime_error(
+        std::size_t gear_count = 0;
+        const aclError gear_status = aclmdlGetInputDynamicGearCount(
+            description, std::numeric_limits<std::size_t>::max(), &gear_count);
+        const std::size_t expected_inputs = role == "fused-speculative-step"
+            ? 15 : (role == "draft-propose" ? 8 : 9);
+        if (gear_status != ACL_SUCCESS || gear_count != 0 ||
+            input_count != expected_inputs) {
+          throw std::runtime_error(
             role + ": dynamic execution contract mismatch: this runner requires "
-            "an ATC discrete-gear OM with ascend_mbatch_shape_data, but "
+            "a canonical public tensor ABI for dynamic Shape, or a discrete-gear "
+            "OM with ascend_mbatch_shape_data; "
             "aclmdlGetInputIndexByName returned " + std::to_string(status) +
-            ". TorchAir dynamic=True AIR can use dynamic Shape inputs and "
-            "does not imply this control tensor exists. AIR framework=1 "
-            "cannot be repaired by adding --dynamic_dims or setting "
-            "dynamic=False. Inspect the actual tensor/scalar ABI before "
-            "implementing aclmdlSetDatasetTensorDesc bindings." +
+            ". Re-export AIR with public input normalization and specialized "
+            "Python floats. Unknown scalar bindings must not be passed to "
+            "aclmdlSetDatasetTensorDesc. Do not add --dynamic_dims to AIR "
+            "or set dynamic=False." +
             DescribeModelIo(description));
+        }
+        dynamic_shape = true;
+      } else {
+        if (index >= input_count) {
+          throw std::runtime_error(role + ": dynamic input index is invalid");
+        }
+        dynamic_input_index = index;
       }
-      if (index >= input_count) {
-        throw std::runtime_error(role + ": dynamic input index is invalid");
-      }
-      dynamic_input_index = index;
     }
     inputs.reserve(input_count);
     outputs.reserve(output_count);
@@ -418,7 +429,7 @@ struct ModelSession {
           description, index, false, false, role));
     }
 
-    if (require_dynamic_gears) {
+    if (require_dynamic_gears && !dynamic_shape) {
       std::size_t gear_count = 0;
       Check(
           aclmdlGetInputDynamicGearCount(
@@ -444,15 +455,15 @@ struct ModelSession {
         public_input_indices.push_back(index);
       }
     }
-    if (require_dynamic_gears) {
-      ResolveDynamicInputSizes();
+    if (require_dynamic_gears && !dynamic_shape) {
+      ResolveDynamicInputSizes(dynamic_gears);
     }
     if (progress) {
       progress(role.c_str(), "load-done", work_bytes, weight_bytes);
     }
   }
 
-  void ResolveDynamicInputSizes() {
+  void ResolveDynamicInputSizes(const std::vector<aclmdlIODims>& shape_plans) {
     std::size_t flattened_dimension_count = 0;
     for (const std::size_t input_index : public_input_indices) {
       const std::size_t rank = inputs.at(input_index).shape.size();
@@ -469,9 +480,9 @@ struct ModelSession {
     }
 
     std::vector<std::size_t> maximum_bytes(public_input_indices.size(), 0);
-    for (std::size_t gear_index = 0; gear_index < dynamic_gears.size();
+    for (std::size_t gear_index = 0; gear_index < shape_plans.size();
          ++gear_index) {
-      const auto& gear = dynamic_gears[gear_index];
+      const auto& gear = shape_plans[gear_index];
       if (gear.dimCount != flattened_dimension_count) {
         throw std::runtime_error(
             role + ": dynamic gear " + std::to_string(gear_index) +
@@ -533,6 +544,10 @@ struct ModelSession {
     return inputs[public_input_indices[index]];
   }
 
+  std::size_t DynamicControlBytes() const {
+    return dynamic_shape ? 0 : inputs.at(dynamic_input_index).bytes;
+  }
+
   void Release() noexcept {
     if (description != nullptr) {
       static_cast<void>(aclmdlDestroyDesc(description));
@@ -570,6 +585,10 @@ struct DeviceAllocation {
       throw std::out_of_range("device buffer view exceeds its allocation");
     }
     return BufferView{data, size};
+  }
+
+  BufferView OptionalView() const {
+    return bytes == 0 ? BufferView{} : View();
   }
 
   void Release() noexcept {
@@ -669,6 +688,7 @@ struct DatasetPlan {
   aclmdlDataset* output = nullptr;
   std::vector<aclDataBuffer*> input_buffers;
   std::vector<aclDataBuffer*> output_buffers;
+  std::vector<aclTensorDesc*> input_descriptors;
 
   static void Add(
       aclmdlDataset* dataset,
@@ -740,6 +760,53 @@ struct DatasetPlan {
     if (input != nullptr) {
       static_cast<void>(aclmdlDestroyDataset(input));
       input = nullptr;
+    }
+    for (auto* descriptor : input_descriptors) {
+      aclDestroyTensorDesc(descriptor);
+    }
+    input_descriptors.clear();
+  }
+
+  void SetInputShape(const ModelSession& session, const aclmdlIODims& shape) {
+    if (!session.dynamic_shape) {
+      Check(aclmdlSetInputDynamicDims(
+                session.id, input, session.dynamic_input_index, &shape),
+            session.role + ": aclmdlSetInputDynamicDims");
+      return;
+    }
+    std::size_t cursor = 0;
+    for (std::size_t index = 0; index < session.inputs.size(); ++index) {
+      const auto& spec = session.inputs[index];
+      std::vector<std::int64_t> actual;
+      for (const auto dimension : spec.shape) {
+        if (cursor >= shape.dimCount || cursor >= 128 ||
+            shape.dims[cursor] <= 0 ||
+            (dimension != -1 && dimension != shape.dims[cursor])) {
+          throw std::runtime_error(session.role + ": invalid dynamic Shape plan");
+        }
+        actual.push_back(shape.dims[cursor++]);
+      }
+      if (!HasDynamicDimension(spec)) {
+        continue;
+      }
+      std::size_t bytes = TensorElementBytes(spec.dtype, session.role);
+      for (const auto dimension : actual) {
+        bytes = CheckedTensorBytes(bytes, dimension, session.role);
+      }
+      if (bytes > spec.bytes) {
+        throw std::runtime_error(session.role + ": dynamic Shape exceeds input allocation");
+      }
+      aclTensorDesc* descriptor = aclCreateTensorDesc(
+          spec.dtype, static_cast<int>(actual.size()), actual.data(), ACL_FORMAT_ND);
+      if (descriptor == nullptr) {
+        throw std::runtime_error(session.role + ": aclCreateTensorDesc returned null");
+      }
+      input_descriptors.push_back(descriptor);
+      Check(aclmdlSetDatasetTensorDesc(input, descriptor, index),
+            session.role + ": aclmdlSetDatasetTensorDesc");
+    }
+    if (cursor != shape.dimCount) {
+      throw std::runtime_error(session.role + ": dynamic Shape has trailing dimensions");
     }
   }
 };
@@ -1837,6 +1904,9 @@ class AclIncrementalExecutor::Impl {
         transaction.PublicInput(fused_speculative_step_ ? 4 : 1),
         draft_contract.PublicInput(4),
         "Draft proposal count");
+    if (unified_target_step_) {
+      ResolveTargetStepGears();
+    }
     if (!fused_speculative_step_) {
       if (unified_target_step_) {
         if (verify_.PublicInput(0).dtype != draft_.outputs[0].dtype ||
@@ -1850,9 +1920,6 @@ class AclIncrementalExecutor::Impl {
       }
     }
     ResolveDraftGears();
-    if (unified_target_step_) {
-      ResolveTargetStepGears();
-    }
   }
 
   std::vector<std::int64_t> FlattenDraftShape(std::size_t feature_rows) const {
@@ -1879,10 +1946,19 @@ class AclIncrementalExecutor::Impl {
   }
 
   void ResolveDraftGears() {
-    const ModelSession& session =
+    ModelSession& session =
         fused_speculative_step_ ? fused_ : draft_;
     const auto find = [this, &session](std::size_t rows) -> aclmdlIODims {
       const auto expected = FlattenDraftShape(rows);
+      if (session.dynamic_shape) {
+        aclmdlIODims shape{};
+        if (expected.size() > 128) {
+          throw std::runtime_error("Draft dynamic Shape rank total exceeds 128");
+        }
+        shape.dimCount = expected.size();
+        std::copy(expected.begin(), expected.end(), shape.dims);
+        return shape;
+      }
       for (const auto& gear : session.dynamic_gears) {
         if (gear.dimCount != expected.size()) {
           continue;
@@ -1905,7 +1981,8 @@ class AclIncrementalExecutor::Impl {
     }
     const std::size_t prefill_gears =
         (sequence_length_ - 1) / prefill_width_ + 1;
-    if (session.dynamic_gears.size() != prefill_gears + verify_width_) {
+    if (!session.dynamic_shape &&
+        session.dynamic_gears.size() != prefill_gears + verify_width_) {
       throw std::runtime_error(
           "Draft-bearing OM dynamic gear count differs from N=1..16 plus "
           "every 64-row prompt batch");
@@ -1914,7 +1991,15 @@ class AclIncrementalExecutor::Impl {
     for (std::size_t index = 0; index < prefill_gears; ++index) {
       draft_gear_prefill_.push_back(find((index + 1) * prefill_width_));
     }
-    stats_.draft_dynamic_gear_count = session.dynamic_gears.size();
+    if (session.dynamic_shape) {
+      session.ResolveDynamicInputSizes(draft_gear_prefill_);
+    }
+    stats_.draft_dynamic_shape = session.dynamic_shape;
+    stats_.draft_om_dynamic_gear_count = session.dynamic_gears.size();
+    // Legacy *_gear_count report fields count bounded runtime shape plans.
+    // The new *_om_dynamic_gear_count fields report only queried OM gears.
+    stats_.draft_dynamic_gear_count =
+        draft_gear_verify_.size() + draft_gear_prefill_.size();
     stats_.draft_verify_dynamic_gear_count = draft_gear_verify_.size();
     stats_.draft_prefill_dynamic_gear_count = draft_gear_prefill_.size();
   }
@@ -1943,13 +2028,23 @@ class AclIncrementalExecutor::Impl {
   }
 
   void ResolveTargetStepGears() {
-    if (verify_.dynamic_gears.size() != verify_width_) {
+    if (!verify_.dynamic_shape && verify_.dynamic_gears.size() != verify_width_) {
       throw std::runtime_error(
           "unified Target step must expose exactly T=1..16 gears");
     }
     target_step_gears_.reserve(verify_width_);
     for (std::size_t rows = 1; rows <= verify_width_; ++rows) {
       const auto expected = FlattenTargetStepShape(rows);
+      if (verify_.dynamic_shape) {
+        aclmdlIODims shape{};
+        if (expected.size() > 128) {
+          throw std::runtime_error("Target dynamic Shape rank total exceeds 128");
+        }
+        shape.dimCount = expected.size();
+        std::copy(expected.begin(), expected.end(), shape.dims);
+        target_step_gears_.push_back(shape);
+        continue;
+      }
       const auto match = std::find_if(
           verify_.dynamic_gears.begin(),
           verify_.dynamic_gears.end(),
@@ -1972,6 +2067,11 @@ class AclIncrementalExecutor::Impl {
       target_step_gears_.push_back(*match);
     }
     stats_.target_step_dynamic_gear_count = target_step_gears_.size();
+    stats_.target_step_dynamic_shape = verify_.dynamic_shape;
+    stats_.target_step_om_dynamic_gear_count = verify_.dynamic_gears.size();
+    if (verify_.dynamic_shape) {
+      verify_.ResolveDynamicInputSizes(target_step_gears_);
+    }
   }
 
   void AllocateBuffers() {
@@ -2154,15 +2254,16 @@ class AclIncrementalExecutor::Impl {
       verify_ids_.Allocate(verify_.PublicInput(0).bytes);
     }
     prefill_dynamic_controls_.resize(stats_.prefill_staging_slots);
-    for (auto& control : prefill_dynamic_controls_) {
-      control.Allocate(
-          draft_contract.inputs.at(draft_contract.dynamic_input_index).bytes);
+    if (draft_contract.DynamicControlBytes() != 0) {
+      for (auto& control : prefill_dynamic_controls_) {
+        control.Allocate(draft_contract.DynamicControlBytes());
+      }
+      verify_dynamic_control_.Allocate(draft_contract.DynamicControlBytes());
     }
-    verify_dynamic_control_.Allocate(
-        draft_contract.inputs.at(draft_contract.dynamic_input_index).bytes);
     if (unified_target_step_) {
-      target_step_dynamic_control_.Allocate(
-          verify_.inputs.at(verify_.dynamic_input_index).bytes);
+      if (verify_.DynamicControlBytes() != 0) {
+        target_step_dynamic_control_.Allocate(verify_.DynamicControlBytes());
+      }
       target_step_plans_.resize(verify_width_);
       staged_target_step_plans_.resize(verify_width_);
     }
@@ -2565,14 +2666,8 @@ class AclIncrementalExecutor::Impl {
            output_state.at(1),
            output_state.at(2)},
           dynamic_control);
-      Check(
-          aclmdlSetInputDynamicDims(
-              draft_.id,
-              plan.input,
-              draft_.dynamic_input_index,
-              &gear),
-          std::string("draft-propose: aclmdlSetInputDynamicDims(") +
-              gear_description + ")");
+      static_cast<void>(gear_description);
+      plan.SetInputShape(draft_, gear);
     };
 
     for (std::size_t current = 0; current < 2; ++current) {
@@ -2628,15 +2723,8 @@ class AclIncrementalExecutor::Impl {
                   {input_ids, proposal_count, EosIdsView(), EosCountView()},
                   current),
               verify_outputs(output_staging_index),
-              target_step_dynamic_control_.View());
-          Check(
-              aclmdlSetInputDynamicDims(
-                  verify_.id,
-                  plan.input,
-                  verify_.dynamic_input_index,
-                  &target_step_gears_.at(rows - 1)),
-              "target-verify-commit: aclmdlSetInputDynamicDims(T=" +
-                  std::to_string(rows) + ")");
+              target_step_dynamic_control_.OptionalView());
+          plan.SetInputShape(verify_, target_step_gears_.at(rows - 1));
         };
         build_target_step(
             decode_upload_plans_[current],
@@ -2772,7 +2860,7 @@ class AclIncrementalExecutor::Impl {
                 committed_input_count_.View(),
                 draft_states_[current].tensors,
                 draft_states_[next].tensors,
-                verify_dynamic_control_.View(),
+                verify_dynamic_control_.OptionalView(),
                 draft_gear_verify_.at(rows - 1),
                 "verify committed-prefix prebind");
             if (draft_feature_policy_ ==
@@ -2789,7 +2877,7 @@ class AclIncrementalExecutor::Impl {
                     committed_input_count_.View(),
                     draft_states_[current].tensors,
                     draft_states_[next].tensors,
-                    verify_dynamic_control_.View(),
+                    verify_dynamic_control_.OptionalView(),
                     draft_gear_verify_.at(rows - 1),
                     "verify direct-staging carrier prebind");
               }
@@ -2805,7 +2893,7 @@ class AclIncrementalExecutor::Impl {
                 PrefillTotalCountView(),
                 draft_states_[current].tensors,
                 draft_states_[next].tensors,
-                prefill_dynamic_controls_[slot].View(),
+                prefill_dynamic_controls_[slot].OptionalView(),
                 draft_gear_prefill_[slot],
                 "prefill batch prebind");
           }
@@ -2844,7 +2932,7 @@ class AclIncrementalExecutor::Impl {
                 PrefillTotalCountView(),
                 draft_zero_state_.tensors,
                 draft_states_[0].tensors,
-                prefill_dynamic_controls_[slot].View(),
+                prefill_dynamic_controls_[slot].OptionalView(),
                 draft_gear_prefill_[slot],
                 "immutable zero prefill batch prebind");
           }
@@ -2868,6 +2956,9 @@ class AclIncrementalExecutor::Impl {
       const BufferView& dynamic_control,
       const aclmdlIODims& gear,
       std::size_t feature_rows) {
+    if (gear.dimCount < 2 || gear.dims[1] != static_cast<std::int64_t>(feature_rows)) {
+      throw std::runtime_error("fused feature rows differ from the shape plan");
+    }
     if (!fused_speculative_step_ || target_state_index >= 2 ||
         draft_input_state.size() != 3 || draft_output_state.size() != 3) {
       throw std::logic_error("invalid fused speculative plan state");
@@ -2921,14 +3012,7 @@ class AclIncrementalExecutor::Impl {
          draft_output_state[1],
          draft_output_state[2]},
         dynamic_control);
-    Check(
-        aclmdlSetInputDynamicDims(
-            fused_.id,
-            plan.input,
-            fused_.dynamic_input_index,
-            &gear),
-        "fused-speculative-step: aclmdlSetInputDynamicDims(N=" +
-            std::to_string(feature_rows) + ")");
+    plan.SetInputShape(fused_, gear);
   }
 
   void BuildFusedPlans() {
@@ -2947,8 +3031,8 @@ class AclIncrementalExecutor::Impl {
             ? PrefillTotalCountView()
             : committed_input_count_.View();
         const BufferView dynamic_control = prefill_source
-            ? prefill_dynamic_controls_.at(gear_index).View()
-            : verify_dynamic_control_.View();
+            ? prefill_dynamic_controls_.at(gear_index).OptionalView()
+            : verify_dynamic_control_.OptionalView();
         for (std::size_t target = 0; target < 2; ++target) {
           for (std::size_t draft = 0; draft < 2; ++draft) {
             const std::size_t next_draft = 1 - draft;
@@ -3001,7 +3085,7 @@ class AclIncrementalExecutor::Impl {
                 PrefillTotalCountView(),
                 draft_zero_state_.tensors,
                 draft_states_[0].tensors,
-                prefill_dynamic_controls_.at(gear_index).View(),
+                prefill_dynamic_controls_.at(gear_index).OptionalView(),
                 draft_gear_prefill_.at(gear_index),
                 feature_rows);
           }

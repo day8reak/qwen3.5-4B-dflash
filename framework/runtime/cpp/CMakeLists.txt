@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(qwen35_dflash_acl_runner VERSION 1.21.1 LANGUAGES CXX)
+project(qwen35_dflash_acl_runner VERSION 1.22.0 LANGUAGES CXX)
 
 option(QWEN35_DFLASH_BUILD_ACL_RUNNER "Build the AscendCL executable" ON)
 option(QWEN35_DFLASH_BUILD_TESTS "Build host-only scheduler tests" ON)
@@ -236,6 +236,18 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DDYNAMIC_VERIFY=${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om
       -DFUSED=${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_reject_zero_static.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_dynamic_shape_acl_tests
+    COMMAND "${CMAKE_COMMAND}" -E env QWEN35_DFLASH_FAKE_DYNAMIC_SHAPE=1
+      $<TARGET_FILE:qwen35_dflash_incremental_acl_tests>
+      ${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      ${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      ${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
+      ${CMAKE_CURRENT_BINARY_DIR}/draft-propose.om
+      ${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit.om
+      ${CMAKE_CURRENT_BINARY_DIR}/target-verify-commit-dynamic.om
+      ${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om
   )
   add_test(
     NAME qwen35_dflash_missing_dynamic_control_diagnostic
@@ -491,6 +503,22 @@ if(QWEN35_DFLASH_BUILD_TESTS)
       -DFUSED=${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om
       -DFUSED_SHA=${_fused_speculative_om_sha256}
       -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-fused-speculative-step-report.json
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_fused_speculative_runner.cmake
+  )
+  add_test(
+    NAME qwen35_dflash_fake_fused_dynamic_shape_runner
+    COMMAND "${CMAKE_COMMAND}" -E env QWEN35_DFLASH_FAKE_DYNAMIC_SHAPE=1
+      "${CMAKE_COMMAND}"
+      -DRUNNER=$<TARGET_FILE:qwen35_dflash_incremental_acl_runner_fake>
+      -DPREFILL=${CMAKE_CURRENT_BINARY_DIR}/target-prefill.om
+      -DPREFILL_SHA=${_prefill_om_sha256}
+      -DPREFILL_HEAD=${CMAKE_CURRENT_BINARY_DIR}/target-prefill-head.om
+      -DPREFILL_HEAD_SHA=${_prefill_head_om_sha256}
+      -DDECODE=${CMAKE_CURRENT_BINARY_DIR}/target-decode1.om
+      -DDECODE_SHA=${_decode_om_sha256}
+      -DFUSED=${CMAKE_CURRENT_BINARY_DIR}/fused-speculative-step.om
+      -DFUSED_SHA=${_fused_speculative_om_sha256}
+      -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fake-fused-dynamic-shape-report.json
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_fake_fused_speculative_runner.cmake
   )
   add_test(

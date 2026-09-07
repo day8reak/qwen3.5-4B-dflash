@@ -26,6 +26,12 @@ typedef enum aclDataType {
   ACL_BOOL = 12,
 } aclDataType;
 
+typedef enum aclFormat { ACL_FORMAT_ND = 2 } aclFormat;
+typedef struct aclTensorDesc aclTensorDesc;
+aclTensorDesc* aclCreateTensorDesc(
+    aclDataType dtype, int num_dims, const std::int64_t* dims, aclFormat format);
+void aclDestroyTensorDesc(const aclTensorDesc* desc);
+
 typedef enum aclrtMemMallocPolicy {
   ACL_MEM_MALLOC_HUGE_FIRST = 0,
   ACL_MEM_MALLOC_HUGE_ONLY = 1,
@@ -137,6 +143,8 @@ aclError aclmdlGetInputDynamicDims(
     std::size_t gear_count);
 aclmdlDataset* aclmdlCreateDataset();
 aclError aclmdlDestroyDataset(aclmdlDataset* dataset);
+aclError aclmdlSetDatasetTensorDesc(
+    aclmdlDataset* dataset, aclTensorDesc* tensor_desc, std::size_t index);
 aclDataBuffer* aclCreateDataBuffer(void* data, std::size_t size);
 aclError aclDestroyDataBuffer(aclDataBuffer* buffer);
 aclError aclmdlAddDatasetBuffer(

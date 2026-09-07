@@ -8,6 +8,7 @@ import re
 import subprocess
 from typing import Any, Callable, Mapping, Sequence
 
+from .draft_cache_export import validated_draft_cache_index_audit
 from .utils import (
     atomic_write_json,
     contained_path,
@@ -33,6 +34,37 @@ _FORBIDDEN_ATC_PREFIXES = (
 
 class AtcCompileError(RuntimeError):
     """ATC failed or did not produce the promised OM artifact."""
+
+
+def _validated_runtime_input_abi(
+    graph: Mapping[str, Any], *, required: bool, allow_test_double: bool = False,
+) -> dict[str, Any] | None:
+    record = graph.get("runtime_input_abi")
+    if record is None and not required:
+        return None
+    if not isinstance(record, Mapping):
+        raise ValueError("AIR requires a passing runtime_input_abi audit; re-export AIR")
+    if (allow_test_double and
+            record.get("status") == "NOT_APPLICABLE_EXPLICIT_TEST_DOUBLE"):
+        return dict(record)
+    if record.get("status") != "PASS":
+        raise ValueError("AIR runtime_input_abi audit is not passing")
+    names = graph.get("input_names", [])
+    bindings = record.get("bindings", [])
+    if (record.get("policy") != "public-tensor-storage-identity-v1" or
+            record.get("python_float_policy") != "dynamo-specialize-float" or
+            record.get("calls") != 1 or record.get("logical_input_names") != names or
+            not names or not isinstance(bindings, list) or len(bindings) != len(names)):
+        raise ValueError("AIR runtime_input_abi policy/count differs from public inputs")
+    seen = set()
+    for index, (name, binding) in enumerate(zip(names, bindings)):
+        if (not isinstance(binding, Mapping) or binding.get("index") != index or
+                binding.get("logical_name") != name or
+                not isinstance(binding.get("data_node_name"), str) or
+                not binding["data_node_name"] or binding["data_node_name"] in seen):
+            raise ValueError("AIR runtime_input_abi has invalid or reordered bindings")
+        seen.add(binding["data_node_name"])
+    return dict(record)
 
 
 def _resolve_atc_om_path(
@@ -288,13 +320,17 @@ def compile_air_bundle(
     raw_graphs = air_manifest.get("graphs")
     if not isinstance(raw_graphs, list) or not raw_graphs:
         raise ValueError("AIR manifest contains no graph entries")
-    validated_graphs: list[tuple[Mapping[str, Any], dict[str, Any] | None]] = []
+    validated_graphs = []
     for graph in raw_graphs:
         if not isinstance(graph, Mapping):
             raise TypeError("AIR graph manifest entry must be an object")
-        validated_graphs.append(
-            (graph, _validated_external_weight_mapping(graph))
+        weight_mapping = _validated_external_weight_mapping(graph)
+        input_abi = _validated_runtime_input_abi(
+            graph, required=int(air_manifest.get("schema_version", 1)) >= 4,
+            allow_test_double=runner is not None,
         )
+        draft_index_audit = validated_draft_cache_index_audit(graph)
+        validated_graphs.append((graph, weight_mapping, input_abi, draft_index_audit))
     exact_soc_version = validate_soc_version(soc_version)
     atc_path = resolve_atc_executable(atc_bin)
 
@@ -309,7 +345,7 @@ def compile_air_bundle(
     log_root.mkdir(parents=True, exist_ok=True)
 
     compiled: list[dict[str, Any]] = []
-    for graph, external_weight_mapping in validated_graphs:
+    for graph, external_weight_mapping, input_abi, draft_index_audit in validated_graphs:
         name = str(graph["name"])
         custom_op_audit = _validated_custom_op_audit(graph)
         air_record = graph["air"]
@@ -368,6 +404,10 @@ def compile_air_bundle(
             compiled_graph["torchair_external_weight_mapping"] = (
                 external_weight_mapping
             )
+        if input_abi is not None:
+            compiled_graph["runtime_input_abi"] = input_abi
+        if draft_index_audit is not None:
+            compiled_graph["draft_cache_index_audit"] = draft_index_audit
         compiled.append(compiled_graph)
 
     deployment = {

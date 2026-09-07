@@ -838,6 +838,10 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
+         << ",\"draft_dynamic_shape\":" << (execution.draft_dynamic_shape ? "true" : "false")
+         << ",\"draft_om_dynamic_gear_count\":" << execution.draft_om_dynamic_gear_count
+         << ",\"target_step_dynamic_shape\":" << (execution.target_step_dynamic_shape ? "true" : "false")
+         << ",\"target_step_om_dynamic_gear_count\":" << execution.target_step_om_dynamic_gear_count
          << ",\"draft_verify_dynamic_gear_count\":"
          << execution.draft_verify_dynamic_gear_count
          << ",\"draft_prefill_dynamic_gear_count\":"
@@ -1170,6 +1174,10 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
+         << ",\"draft_dynamic_shape\":" << (execution.draft_dynamic_shape ? "true" : "false")
+         << ",\"draft_om_dynamic_gear_count\":" << execution.draft_om_dynamic_gear_count
+         << ",\"target_step_dynamic_shape\":" << (execution.target_step_dynamic_shape ? "true" : "false")
+         << ",\"target_step_om_dynamic_gear_count\":" << execution.target_step_om_dynamic_gear_count
          << ",\"draft_verify_dynamic_gear_count\":"
          << execution.draft_verify_dynamic_gear_count
          << ",\"draft_prefill_dynamic_gear_count\":"

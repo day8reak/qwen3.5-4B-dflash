@@ -335,9 +335,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 35
+    assert framework_lock["schema_version"] == 37
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v35"
+        "qwen3.5-4b-quant-air-om-ascendcl-v37"
     )
     assert deployment["schema_version"] == 2
     assert performance["schema_version"] == 6
@@ -364,6 +364,11 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     ]
     assert transaction_decomposition["scan_count"] == 2
     assert "external OM ABI unchanged" in transaction_decomposition["semantics"]
+    draft_index = framework_lock["graph"]["draft_cache_index"]
+    assert draft_index["policy"] == "static-repeat-tile-v1"
+    assert "independent of logical counts" in draft_index["physical_rows"]
+    assert "no index_copy substitution" in draft_index["semantics"]
+    assert "before ATC" in framework_lock["compiler"]["draft_cache_index_gate"]
     assert "Data.index == runtime input index" in framework_lock["compiler"][
         "dynamic_external_weight_mapping_gate"
     ]
@@ -390,6 +395,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert "ascend_mbatch_shape_data" in runtime["dynamic_input_size_policy"]
     assert "opaque" in runtime["dynamic_input_size_policy"]
     assert "ranks outside 1..128" in runtime["dynamic_input_size_policy"]
+    assert "aclmdlSetDatasetTensorDesc" in runtime["dynamic_input_size_policy"]
+    assert "specialize_float=True" in framework_lock["compiler"]["runtime_input_abi_gate"]
+    assert "INT32" in runtime["transaction_count_dtype"]
     assert "input device mirrors" in runtime["memory"]
     assert "last K+1 rows" in runtime["memory"]
     assert "actual/full-equivalent H2D and D2H bytes" in (
