@@ -637,6 +637,30 @@ def test_draft_graph_batched_prompt_features_match_sequential_chunk_state() -> N
         torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("count", [1, 16, 63, 64])
+@pytest.mark.parametrize("proposal_count", [1, 15])
+def test_draft_cache_writes_physical_tail_not_logical_counts(count, proposal_count):
+    draft = _FakeDraft().eval()
+    embedding = nn.Embedding(128, 2).to(torch.float16)
+    graph = DraftProposeStateGraph(draft, embedding, embedding, kv_cache_max_len=128)
+    features = torch.arange(256, dtype=torch.float16).reshape(1, 64, 4)
+    key = torch.full((2, 1, 1, 128, 2), -1.0, dtype=torch.float16)
+    value = key.clone()
+    actual = graph(
+        features, torch.tensor([count], dtype=torch.int32),
+        torch.tensor([[40] + [0] * 15], dtype=torch.long),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([proposal_count], dtype=torch.int32),
+        key, value, torch.tensor([3], dtype=torch.long),
+    )
+    assert actual[0].shape == (1, 16)  # K does not change the physical verify width.
+    assert actual[3].item() == 3 + count  # Only the logical cursor uses the count.
+    for layer in range(2):
+        assert torch.equal(actual[1][layer, :, 0, 3:67, :], features[..., :2])
+        assert torch.equal(actual[2][layer, :, 0, 3:67, :], features[..., :2] + 1)
+        assert torch.equal(actual[1][layer, :, :, 67:, :], key[layer, :, :, 67:, :])
+
+
 def test_five_physical_specs_freeze_binding_order_and_reuse_state_examples() -> None:
     target = _FakeTarget().eval()
     draft = _FakeDraft().eval()
@@ -661,6 +685,10 @@ def test_five_physical_specs_freeze_binding_order_and_reuse_state_examples() -> 
     ]
     assert [item.role for item in specs] == [item.name for item in specs]
     assert specs[3].dynamic is True
+    assert specs[3].metadata["draft_cache_index_policy"] == "static-repeat-tile-v1"
+    assert specs[3].metadata["draft_cache_index_layers"] == len(draft.layers)
+    assert all("draft_cache_index_policy" not in item.metadata
+               for item in specs if item.role != "draft-propose")
     assert specs[3].input_dim_gears == {
         0: {1: tuple(range(1, 17)) + (64,)}
     }
@@ -759,6 +787,8 @@ def test_four_physical_specs_fuse_draft_and_verify_without_external_carrier() ->
         "fused-speculative-step",
     ]
     fused = specs[-1]
+    assert fused.metadata["draft_cache_index_policy"] == "static-repeat-tile-v1"
+    assert fused.metadata["draft_cache_index_layers"] == 2
     assert isinstance(fused.model, FusedSpeculativeStepStateGraph)
     assert fused.dynamic is True
     assert fused.input_dim_gears == {

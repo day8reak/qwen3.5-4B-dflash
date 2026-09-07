@@ -1339,9 +1339,74 @@ index 1、2、3、4、8 均应为 INT32、4 bytes。若 receiver 生成真正的
 [CANN 的 `--dynamic_dims` 约束](https://www.hiascend.com/document/detail/en/canncommercial/800/devaids/atc/atlasatcparam_16_0020.html)
 仍禁止它与 AIR 的 `--framework=1` 同用；不要添加该参数，也不要改 `dynamic=False`。
 
+### 12.2 Draft KV 索引的动态 BroadcastTo tiling 失败（v37）
+
+2026-09-07 06:00:22、PID 129854 的 receiver 日志已定位到
+`BroadcastTo_1 -> ScatterElements/ScatterElements_1` 的 Draft KV 写入索引。
+`InferShape_BroadcastTo_1` 的输入为 INT64 `[1,1,64,1]` 与 shape tensor `[4]`，
+输出 original/storage shape **均为 `[1,8,64,128]`**；随后才在 `broadcast_v3.cc`
+的 `CalcTiling` 报 `The output shape must be greater than 0`，再经
+`Autotiling func failed -> RuntimeV2ModelExecute -> aclmdlExecuteAsync result[500002]`
+返回。不能据此断言 `s58=0`、accepted count 为零或显存不足；`arch35` 文件名本身也不是
+错装算子包的证据。CANN 内部具体成因仍需 receiver 同环境的小图/算子日志确认。
+
+v37 在 split/fused 共用的 `_FixedDraftCache.update` 中，将
+`positions[:, None, :, None].expand_as(context_key)` 改为
+`repeat(1, H, 1, D)`。锁定 Draft 的 H=8、D=128，重复次数是常量；N 仍由
+`target_feature_tail.shape[1]` 决定，不放进动态目标 shape tensor。
+公开 TorchAir 的 [repeat converter](https://raw.githubusercontent.com/Ascend/torchair/master/python/torchair/_ge_concrete_graph/ge_converter/aten/repeat.py)
+将其降为 Tile；实际 receiver 的序列化结果必须由下面的审计确认，不能仅凭源码假定。
+
+- 六层 Draft 的 K/V 共 12 个 ScatterElements 保留原样，只改 indices 的生成方式。
+  clamping、物理 padding 写入、INT64 index、缓存布局、权重、公开 I/O ABI 和 greedy/EOS
+  语义不变；不替换为 `index_copy`，避免改变容量边界处重复索引的处理。
+- `committed_input_count` 只决定逻辑 cursor/mask。物理 N 不是 proposal/accepted count，
+  不固定为 64；`--max-draft-tokens 1` 也不会把这条 fused 路径的物理 T16 改为 T2。
+- 新 Draft-bearing graph 声明 `draft_cache_index_policy=static-repeat-tile-v1`。
+  导出逐边检查每个 ScatterElements 的 indices 必须来自 Tile，且 repeats 来自 Const，
+  节点数必须为每层两个。支持 `node/op` 两种 pbtxt 表示，不依赖 `BroadcastTo_1` 等自动名称，
+  也不禁止 mask/state 等其他位置的 BroadcastTo。
+- `air-manifest.json` 的 `draft_cache_index_audit.status` 必须为 `PASS`。
+  缺少 pbtxt、仍走 BroadcastTo、动态 Pack repeats、层数/节点数不符时停止导出并保留诊断。
+  `compile-om` 在启动 ATC 前校验审计，并将其保留到 deployment manifest。
+  历史 AIR 仍可用于显式回退，但不具有这个修复标记。
+
+#### 重跑顺序
+
+无需重新量化、下载权重或重新安装 OPP。更新分支后新起 Python 进程，**从第 6 节
+`export-air` 开始重新生成 AIR，再按第 7 节生成 OM**；只重编 C++ 或重新编译旧 AIR
+都不会改变故障节点。保留旧 bundle，使用新的空目录，四个 OM 不得混用不同 manifest。
+
+```bash
+export FUSED_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-fused-tile-v37"
+"$MODEL_PYTHON" -m qwen35_dflash.ascend310p export-air \
+  --factory \
+    qwen35_dflash.ascend310p.quant_factory:create_quant_fused_speculative_step_graphs \
+  --factory-config "$AI_RUN_DIR/factory-fused.json" \
+  --bundle-dir "$FUSED_BUNDLE"
+
+# 不要求 receiver 安装 rg/jq；此命令只检查新 manifest，不修改它。
+"$MODEL_PYTHON" -c 'import json,sys; m=json.load(open(sys.argv[1])); g=next(g for g in m["graphs"] if g["role"]=="fused-speculative-step"); a=g["draft_cache_index_audit"]; assert a["status"]=="PASS" and a["layers"]==6; assert all(f["scatter_count"]==12 for f in a["files"]); print(json.dumps(a,indent=2))' \
+  "$FUSED_BUNDLE/air-manifest.json"
+```
+
+然后运行 `compile-om --soc-version Ascend310P3`（其余参数沿用第 7 节），执行 12.1 的
+新 OM I/O 检查，再以新 deployment manifest 运行第 10–11 节。C++ 未改变，保留
+runner `1.22.0`；如果还在更旧版本，则先按第 8 节构建。OM 架构后缀识别、15 个公开输入、
+INT32 count 和有界 dynamic Shape 的既有检查全部保留。
+
+本次回归包含真实 `_FixedDraftCache` 的 CPU 精确对照、N=1..16 和 64..2048 的全部
+48 个声明宽度、六层 12 路索引结构、缓存末端重复索引、逻辑计数独立性，以及导出/编译
+失败门禁。它们**不是 CANN/310P 实机通过证据**。Tile 也可能受 receiver 后端或 ATC
+优化影响；AIR 审计通过不保证最终 OM 不会重新使用同类内核。若仍失败，保留新 OM hash、
+输入宽度/计数及首个 OP/GE 错误上下文，核对失败节点是否已换成 Tile，不要只贴清理阶段
+或最后的 500002。完成普通 greedy 对照、零 token/EOS mismatch 和 state-branch 检查后
+才能声明设备正确性通过；本修复不声明性能提升。
+
 | 失败 | 含义 | 处理 |
 | --- | --- | --- |
 | input manifest hash mismatch | 权重、量化文件或 wrapper 已变化 | 先确认变化是否预期；重新冻结，不要跳过校验 |
+| BroadcastTo 输出已推断为正数 `[1,8,N,128]`，但 tiling 报 `output shape must be greater than 0` 并最终返回 500002 | 本次 Draft KV INT64 索引的 host auto-tiling 故障，不等于 N 或 accepted count 为零 | 按 12.2 从新 AIR bundle 重导，确认 12 路索引的 Tile/Const 审计，再编译和验证新 OM；不要把 N 固定为 64 或只重编 runner |
 | 找不到 `export_model_wrapper_qwen3_5.py` | receiver 路径错误 | 修正 `receiver_models_dir` |
 | QLinear coverage mismatch | 量化权重与 Target topology 不同 | 核对 YAML、checkpoint revision 和 quant artifact |
 | `torch_npu`/TorchAir import 失败 | 环境不匹配 | 使用与 CANN/驱动匹配的声明环境 |

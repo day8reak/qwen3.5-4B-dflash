@@ -2111,6 +2111,83 @@ def test_air_export_audits_retained_adn_rms_norm(
     )
 
 
+@pytest.mark.parametrize("index_type", ["Tile", "BroadcastTo"])
+def test_draft_index_audit_is_required_at_export_and_before_atc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, index_type: str,
+) -> None:
+    _ensure_adn_rms_norm_test_schema()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("AI_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("ASCEND_CUSTOM_OPP_PATH", raising=False)
+
+    class FakeDraftTorchAir(_FakeTorchAir):
+        def dynamo_export(self, *args, **kwargs):
+            super().dynamo_export(*args, **kwargs)
+            path = Path(kwargs["export_path"]) / "dynamo.pbtxt"
+            path.write_text(path.read_text(encoding="utf-8") + (
+                'op { name: "multiples" type: "Const" }\n'
+                f'op {{ name: "index" type: "{index_type}" '
+                'input: "positions:0" input: "multiples:0" }\n'
+                'op { name: "key" type: "ScatterElements" '
+                'input: "k:0" input: "index:0" input: "update_k:0" }\n'
+                'op { name: "value" type: "ScatterElements" '
+                'input: "v:0" input: "index:0" input: "update_v:0" }\n'
+            ), encoding="utf-8")
+
+    def factory(config):
+        return (AirGraphSpec(
+            name="draft-propose", role="draft-propose", model=nn.Identity(),
+            example_args=(torch.ones(1),),
+            metadata={"draft_cache_index_policy": "static-repeat-tile-v1",
+                      "draft_cache_index_layers": 1},
+            custom_ops=(CustomOpExportSpec(
+                torch_op=ADN_RMS_NORM_TORCH_OP,
+                ge_op_type=ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
+            ),),
+        ),)
+
+    bundle = run_dir / "bundle"
+    if index_type == "BroadcastTo":
+        with pytest.raises(ValueError, match="expected Tile"):
+            export_air_bundle(factory, {}, bundle, torchair_module=FakeDraftTorchAir())
+        assert not (bundle / "air-manifest.json").exists()
+        assert list(bundle.rglob("dynamo.pbtxt"))  # Preserve failed export evidence.
+        return
+    result = export_air_bundle(factory, {}, bundle, torchair_module=FakeDraftTorchAir())
+    audit = result["graphs"][0]["draft_cache_index_audit"]
+    assert audit["status"] == "PASS"
+    assert audit["files"][0]["scatter_count"] == 2
+    manifest = bundle / "air-manifest.json"
+    invalid = copy.deepcopy(result)
+    del invalid["graphs"][0]["draft_cache_index_audit"]
+    manifest.write_text(json.dumps(invalid), encoding="utf-8")
+    # No ATC resolution, OM directory creation or subprocess before this gate.
+    def unexpected_runner(command, cwd):
+        pytest.fail("ATC must not execute with a missing Draft index audit")
+
+    with pytest.raises(ValueError, match="re-export AIR"):
+        compile_air_bundle(manifest, soc_version="Ascend310P3",
+                           atc_bin=tmp_path / "absent-atc", runner=unexpected_runner)
+    assert not (bundle / "om").exists()
+    manifest.write_text(json.dumps(result), encoding="utf-8")
+    atc = tmp_path / "atc"
+    atc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    atc.chmod(0o755)
+
+    def runner(command, cwd):
+        prefix = next(item.split("=", 1)[1] for item in command if item.startswith("--output="))
+        Path(prefix + "_linux_aarch64.om").write_bytes(b"fake-tile-om")
+        return subprocess.CompletedProcess(command, 0, stdout="ok")
+
+    deployment = compile_air_bundle(
+        manifest, soc_version="Ascend310P3", atc_bin=atc,
+        runner=runner, atc_identity="explicit-test-double",
+    )
+    assert deployment["graphs"][0]["draft_cache_index_audit"] == audit
+    assert deployment["graphs"][0]["om"]["path"].endswith("_linux_aarch64.om")
+
+
 def test_custom_op_audit_rejects_missing_ge_node(tmp_path: Path) -> None:
     _ensure_adn_rms_norm_test_schema()
     torchair = _FakeTorchAir()

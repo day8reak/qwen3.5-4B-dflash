@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import torch
 
 from .contracts import AirGraphSpec
+from .draft_cache_export import audit_draft_cache_index_export
 from .custom_op_export import (
     NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
     NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
@@ -233,6 +234,9 @@ def export_air_bundle(
             relative_to=root,
             minimum_occurrences=_softplus_minimum_occurrences(spec),
         )
+        draft_cache_index_audit = audit_draft_cache_index_export(
+            spec.metadata, graph_dir, relative_to=root,
+        )
 
         air_files = sorted(graph_dir.glob("*.air"))
         if len(air_files) != 1:
@@ -265,6 +269,10 @@ def export_air_bundle(
                     for name, item in spec.example_kwargs.items()
                 },
                 "metadata": dict(spec.metadata),
+                **(
+                    {"draft_cache_index_audit": draft_cache_index_audit}
+                    if draft_cache_index_audit is not None else {}
+                ),
                 "torchair_external_weight_mapping": (
                     external_weight_mapping.as_manifest_record()
                 ),

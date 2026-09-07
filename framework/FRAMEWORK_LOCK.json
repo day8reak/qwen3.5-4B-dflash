@@ -1,6 +1,6 @@
 {
-  "schema_version": 36,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v36",
+  "schema_version": 37,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v37",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -198,9 +198,20 @@
         "reason": "receiver TorchAir leaves aten.amin.default, aten.min.dim and aten.cumprod.default converters unimplemented while aten.cumsum.default lowers to GE Cumsum"
       }
     ],
+    "draft_cache_index": {
+      "policy": "static-repeat-tile-v1",
+      "source": "_FixedDraftCache.update, shared by draft-propose and fused-speculative-step",
+      "replacement": "positions[B,1,N,1].repeat(1,H,1,D) -> Tile with Const [1,8,1,128] for the locked Draft",
+      "physical_rows": "N remains the dynamic target_feature_tail width, independent of logical counts",
+      "scatter_nodes": "two ScatterElements per Draft layer; six layers in the locked checkpoint",
+      "semantics": "identical INT64 indices, clamp, padded cache writes and K/V scatter operations; no index_copy substitution, token/EOS/state or external OM ABI change",
+      "reason": "receiver BroadcastTo_1 inferred positive [1,8,64,128] then failed host auto-tiling before ACL 500002",
+      "claim_boundary": "exact source/CPU and serialized AIR lowering checks; receiver ATC and Ascend310P correctness remain required"
+    },
     "state_policy": "recompute committed prefix"
   },
   "compiler": {
+    "draft_cache_index_gate": "new Draft-bearing graphs declare static-repeat-tile-v1; audit every ScatterElements indices edge in dynamo.pbtxt for Tile with Const repeats, require two scatter nodes per layer, reject missing/failed evidence before ATC and retain it in deployment; unrelated BroadcastTo operations are allowed and legacy bundles do not claim this fix",
     "runtime_input_abi_gate": "AIR schema 4 requires public-tensor-storage-identity-v1 normalization: Dynamo specialize_float=True preserves model Python float constants without freezing tensor dimensions; resolve Data.index against concrete serialization inputs before weights are externalized, canonicalize Data/RefData order to public tensor arguments, and reject every unknown scalar, duplicate, alias, or missing public input before serialization; compile-om validates and retains the passing audit",
     "exporter": "TorchAir dynamo_export",
     "dynamic_external_weight_mapping_gate": "for every dynamic graph, identify the canonical TorchAir package by import identity rather than assuming types.ModuleType, replace captured parameter placeholders only by GraphDef Data.index == runtime input index, and never index GraphDef.op by the runtime ordinal; only an explicitly marked injected unit-test double may skip receiver internals; fail export if the receiver private ABI drifts, the indexed Data is absent/RefData, the conversion is not invoked, or converted/used counts differ; restore TorchAir immediately after each export, record per-graph manifest evidence, and make compile-om reject every dynamic non-PASS/missing/count-mismatched audit before starting ATC",

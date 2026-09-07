@@ -15,6 +15,7 @@ from torch import Tensor, nn
 
 from .incremental import ExactAcceptCommitStateGraph, _valid_eos_matches
 from .contracts import AirGraphSpec, CustomOpExportSpec
+from .draft_cache_export import DRAFT_CACHE_INDEX_POLICY
 
 
 VERIFY_ROWS = 16
@@ -544,7 +545,17 @@ class _FixedDraftCache:
             device=key_states.device,
         ).reshape(1, -1)
         positions = torch.clamp(positions, max=self.max_length - 1)
-        index = positions[:, None, :, None].expand_as(context_key)
+        # N comes from the physical feature-tail width, not a logical count.
+        # A receiver CANN 9.0 BroadcastTo inferred [1,8,64,128] correctly but
+        # failed during auto-tiling of this INT64 index. Keep N on the input
+        # tensor and materialize only the static head/channel repeats (Tile),
+        # instead of constructing a dynamic [B,H,N,D] BroadcastTo shape.
+        # Both scatter calls read the same values; clamping/padded writes stay
+        # unchanged. Do not replace this with index_copy: clamped positions
+        # may contain duplicates at the cache boundary.
+        index = positions[:, None, :, None].repeat(
+            1, context_key.shape[1], 1, context_key.shape[-1]
+        )
         next_key = old_key.scatter(2, index, context_key)
         next_value = old_value.scatter(2, index, context_value)
         self.next_keys.append(next_key)
@@ -918,6 +929,14 @@ def incremental_state_graph_specs(
         return {
             **shared_metadata,
             "role": role,
+            **(
+                {
+                    "draft_cache_index_policy": DRAFT_CACHE_INDEX_POLICY,
+                    "draft_cache_index_layers": draft_layers,
+                }
+                if role in {"draft-propose", "fused-speculative-step"}
+                else {}
+            ),
             "device_buffer_aliases": aliases,
             "custom_op_export_contracts": [
                 {

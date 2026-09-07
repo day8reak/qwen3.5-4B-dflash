@@ -8,6 +8,7 @@ import re
 import subprocess
 from typing import Any, Callable, Mapping, Sequence
 
+from .draft_cache_export import validated_draft_cache_index_audit
 from .utils import (
     atomic_write_json,
     contained_path,
@@ -328,7 +329,8 @@ def compile_air_bundle(
             graph, required=int(air_manifest.get("schema_version", 1)) >= 4,
             allow_test_double=runner is not None,
         )
-        validated_graphs.append((graph, weight_mapping, input_abi))
+        draft_index_audit = validated_draft_cache_index_audit(graph)
+        validated_graphs.append((graph, weight_mapping, input_abi, draft_index_audit))
     exact_soc_version = validate_soc_version(soc_version)
     atc_path = resolve_atc_executable(atc_bin)
 
@@ -343,7 +345,7 @@ def compile_air_bundle(
     log_root.mkdir(parents=True, exist_ok=True)
 
     compiled: list[dict[str, Any]] = []
-    for graph, external_weight_mapping, input_abi in validated_graphs:
+    for graph, external_weight_mapping, input_abi, draft_index_audit in validated_graphs:
         name = str(graph["name"])
         custom_op_audit = _validated_custom_op_audit(graph)
         air_record = graph["air"]
@@ -404,6 +406,8 @@ def compile_air_bundle(
             )
         if input_abi is not None:
             compiled_graph["runtime_input_abi"] = input_abi
+        if draft_index_audit is not None:
+            compiled_graph["draft_cache_index_audit"] = draft_index_audit
         compiled.append(compiled_graph)
 
     deployment = {
