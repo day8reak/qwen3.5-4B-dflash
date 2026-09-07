@@ -394,11 +394,19 @@ msprof --dynamic=on --pid=<应用PID> --output=<raw目录> \
 # 自动发送：start → 指定阶段执行完毕并同步 NPU → stop → quit
 ```
 
-只有收到 `dynamic profiling start success......` 回执才放行指定阶段；执行完毕、同步 NPU 后，
+只有收到明确的 start 成功回执才放行指定阶段。兼容 `dynamic profiling start success......`
+和目标机返回的 `dynamic profiling for pid <应用PID> start success`，带 PID 时必须与当前应用
+一致；stop、quit 使用相同规则。实际匹配的回执保存在控制报告的 `acknowledgements` 字段。
+执行完毕、同步 NPU 后，
 等待 stop、quit 的成功回执及 msprof 正常退出，才继续应用的后处理。Draft 与 verify 之间不额外
 插入同步。流程使用回执握手控制边界，不使用固定 delay/duration，也不暂停整个应用进程。
 `--profile-timeout 600` 是默认的每步控制超时，覆盖等候模型加载/预热、阶段执行及 CLI 命令完成；
 较慢机器可增大该值。超时、未识别的成功回执或进程异常退出均报 FAIL，并清理本次创建的进程。
+如果停在 `msprof_start_sent`，工具已打印带 PID 的 `start success`，但没有
+`msprof_start_acknowledged` / `application_started`，这是旧版 wrapper 未识别回执的现象。
+按 Ctrl+C 结束该次运行，更新到包含此兼容修复的代码后，用原命令和新的输出目录重跑；
+增大超时不能解决回执格式不匹配。正常执行结束还应看到 `msprof_stop_acknowledged` 和
+`msprof_quit_acknowledged`，最终以 wrapper 的完整报告与导出检查为准。
 目标环境需要支持 `--dynamic=on --pid` 的 msprof 和配套 CANN runtime；仅看到提示符或
 “Start profiling” 日志不算采集已启动。如果安装版本的交互协议不同，请保留日志核对。
 

@@ -23,8 +23,8 @@ def executable(path, body):
     return str(path)
 
 
-@pytest.fixture
-def sandbox(tmp_path):
+@pytest.fixture(params=("legacy", "pid"))
+def sandbox(tmp_path, request):
     stubs = tmp_path / "stubs"
     stubs.mkdir()
     (stubs / "torch.py").write_text("""
@@ -46,6 +46,7 @@ npu = Npu()
         "PATH": str(stubs) + os.pathsep + environment["PATH"],
         "PYTHONPATH": str(stubs), "TEST_EVENTS": str(events),
         "TEST_ACTIVE": str(active), "TEST_CONTROLLER": str(CONTROLLER),
+        "TEST_ACK_FORMAT": request.param,
         "TEST_FAILURE": "", "PYTHONDONTWRITEBYTECODE": "1",
     })
     common = r'''
@@ -132,13 +133,19 @@ assert "--task-time=on" in args and "--runtime-api=on" in args
 pid = int(next(a.split("=")[1] for a in args if a.startswith("--pid=")))
 os.kill(pid, 0)
 root = pathlib.Path(next(a.split("=", 1)[1] for a in args if a.startswith("--output=")))
-print("(msprof) ", end="", flush=True)
+pid_format = os.environ["TEST_ACK_FORMAT"] == "pid"
+prefix = "dynamic profiling" + (f" for pid {pid}" if pid_format else "")
+prompt = "> " if pid_format else "(msprof) "
+print(prompt, end="", flush=True)
 for line in sys.stdin:
     command = line.strip()
     event("command", command)
     if failure == "prof-exit": sys.exit(9)
     if failure == command:
-        print("dynamic profiling " + command + " failed......", flush=True)
+        print(prefix + " " + command + " failed", flush=True)
+        continue
+    if failure == command + "-wrong-pid":
+        print(f"dynamic profiling for pid {pid + 1} {command} success", flush=True)
         continue
     if failure == command + "-no-ack":
         # Prompts and startup logs are not server acknowledgements.
@@ -152,11 +159,11 @@ for line in sys.stdin:
     else:
         raise AssertionError(command)
     # Delayed split writes exercise buffering. Sleeps are confined to the stub.
-    print("dynamic profiling " + command[:2], end="", flush=True)
+    print(prefix + " " + command[:2], end="", flush=True)
     time.sleep(0.01)
-    print(command[2:] + " success......", flush=True)
+    print(command[2:] + (" success" if pid_format else " success......"), flush=True)
     if command == "quit": sys.exit(10 if failure == "quit-exit" else 0)
-    print("(msprof) ", end="", flush=True)
+    print(prompt, end="", flush=True)
 ''')
     return dict(tmp=tmp_path, env=environment, events=events, active=active, app=app, msprof=msprof)
 
@@ -181,6 +188,7 @@ def assert_processes_reaped(control):
         "start", "start-no-ack", "stop", "stop-no-ack", "quit", "quit-exit",
         "prof-exit", "application-capture", "application-hang", "control-eof",
         "mismatched-ready", "second-window", "sync",
+        "start-wrong-pid", "stop-wrong-pid", "quit-wrong-pid",
     )
 ] + [(None, None), (None, "application")])
 def test_collector_dispatch_and_export(sandbox, stage, failure):
@@ -220,6 +228,12 @@ def test_collector_dispatch_and_export(sandbox, stage, failure):
             assert names.count("captured-work") == 1 and exported
             assert control["status"] == "PASS_CONTROL"
             assert all(control[name + "_acknowledged"] for name in ("start", "stop", "quit"))
+            assert set(control["acknowledgements"]) == {"start", "stop", "quit"}
+            if sandbox["env"]["TEST_ACK_FORMAT"] == "pid":
+                assert all(
+                    f'for pid {control["application_pid"]}' in value
+                    for value in control["acknowledgements"].values()
+                )
             sequence = [e["event"] for e in control["events"]]
             for before, after in (
                 ("application_ready", "msprof_start_sent"),
@@ -235,9 +249,9 @@ def test_collector_dispatch_and_export(sandbox, stage, failure):
         else:
             assert control["status"] == "FAIL" and not exported
             assert control["capture_completed"] is False
-        if failure in ("application", "control-eof", "mismatched-ready", "start", "start-no-ack", "prof-exit"):
+        if failure in ("application", "control-eof", "mismatched-ready", "start", "start-no-ack", "start-wrong-pid", "prof-exit"):
             assert "captured-work" not in names
-        if failure in ("stop", "stop-no-ack", "quit", "quit-exit"):
+        if failure in ("stop", "stop-no-ack", "stop-wrong-pid", "quit", "quit-exit", "quit-wrong-pid"):
             assert "postprocess-outside" not in names
         assert "unexpected-second-window" not in names
     if failure is None:

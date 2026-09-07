@@ -1,7 +1,7 @@
 {
   "schema_version": 6,
   "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback with the original GDR effective-length ABI and optional Target-only W8A8 dynamic quantization configured by the original inference YAML",
-  "package_revision": "r17",
+  "package_revision": "r18",
   "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-chunk-prefill-gdr-effective-length-air-copy-free-cache-update-private-v4444-quant-fp32-eager-scale-attention-length-abi-load-safe-rope-init-unfold-free-conv-bank",
   "package_layout": {
     "version": 6,
@@ -115,7 +115,7 @@
     "stage_profiler_file": "models/dflash_v1/stage_profile.py",
     "stage_profiler_sha256": "e17a5915903e4624501d712cfcd4828eafdc472881c706306c7539e9d3b992f0",
     "msprof_controller_file": "models/dflash_v1/msprof_cli.py",
-    "msprof_controller_sha256": "294cb6823d83e67398624fe2e53fb2eb58cbee3b474d7b41887db0a1806290e9"
+    "msprof_controller_sha256": "d62bd70092d75f255237a8b8fdf5d9c40b087284d5bb218d4cfe4025f1f111b5"
   },
   "rollback_runtime": {
     "runner_file": "models/dflash_v1/run_rollback.py",
@@ -140,7 +140,7 @@
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "fa21e6a58b17ed2651709fd20d880ebf43af02429e6727f1e388efb5852ece9d",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "32a9d35ffe3161e6a08d9444807c77928fa3d466f20007bd2b2c7424056bb144",
+    "documentation_sha256": "f1b9c20bda69961379885373f7b62819ce748cd704857e8b0be1aafa5f3198e8",
     "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks on the original GDR route with call-local effective length; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback; opt-in native msprof dynamic CLI single-stage prefill or first Draft/verify capture with uncollected fresh-state warmups, one synchronized window released only after CLI start acknowledgement, stop/quit acknowledgements before postprocessing, and offline msprof export; stage capture does not run the strict-greedy gate or establish formal latency"
   }
 }

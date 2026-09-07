@@ -118,11 +118,34 @@ class DynamicCapture:
     # https://gitcode.com/cann/runtime/blob/68752f679cfb68365e472eec38855ec4fd4721f6/src/dfx/msprof/collector/dvvp/msprof/dynamic_profiling/src/dyn_prof_client.cpp
     ACK = {name: re.compile(rb"dynamic profiling " + name.encode() + rb" success\.{2,}", re.I)
            for name in ("start", "stop", "quit")}
+    # Receiver msprof also emits: "> dynamic profiling for pid 408845 start success".
+    # Require the complete command reply and the attached PID, including when
+    # the reply is split across PTY reads. A bare prompt/startup log is not an ACK.
+    PID_ACK = {
+        name: re.compile(
+            rb"\bdynamic[ \t]+profiling[ \t]+for[ \t]+pid[ \t]+(?P<pid>[0-9]+)[ \t]+"
+            + name.encode() + rb"[ \t]+success(?:\.{2,})?[ \t]*(?=[\r\n>])", re.I,
+        ) for name in ("start", "stop", "quit")
+    }
     FAILURE = re.compile(
-        rb"\[ERROR\]|dynamic profiling (?:already started|has not started|device has not been set up)|"
-        rb"dynamic profiling (?:start|stop|quit) failed|cannot connect to server|invalid option",
+        rb"\[ERROR\]|dynamic profiling(?: for pid [0-9]+)? "
+        rb"(?:already started|has not started|device has not been set up|(?:start|stop|quit) failed)"
+        rb"|cannot connect to server|invalid option",
         re.I,
     )
+
+    @classmethod
+    def acknowledgement(cls, name, output, application_pid):
+        match = cls.PID_ACK[name].search(output)
+        if match is not None:
+            if int(match["pid"]) != application_pid:
+                raise RuntimeError(
+                    f"msprof {name} acknowledged unexpected PID {match['pid'].decode()}; "
+                    f"expected application PID {application_pid}"
+                )
+        else:
+            match = cls.ACK[name].search(output)
+        return None if match is None else match[0].decode("utf-8", errors="replace").strip()
 
     def __init__(self, args):
         self.args = args
@@ -139,6 +162,7 @@ class DynamicCapture:
             "profile_stage": args.stage, "profile_output": str(Path(args.output).resolve()),
             "timeout_seconds": args.timeout, "start_acknowledged": False,
             "stop_acknowledged": False, "quit_acknowledged": False,
+            "acknowledgements": {},
             "capture_completed": False, "events": [],
         }
 
@@ -218,16 +242,22 @@ class DynamicCapture:
         while True:
             if self.FAILURE.search(self.prof_buffer):
                 raise RuntimeError(f"msprof {name} failed; see its output above")
-            if self.ACK[name].search(self.prof_buffer):
+            acknowledgement = self.acknowledgement(name, self.prof_buffer, self.app.pid)
+            if acknowledgement is not None:
                 self.evidence[name + "_acknowledged"] = True
+                self.evidence["acknowledgements"][name] = acknowledgement
                 self.event("msprof_" + name + "_acknowledged")
                 return
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"msprof did not acknowledge {name}; no stage is released without success")
+                tail = bytes(self.prof_buffer[-500:]).decode("utf-8", errors="replace")
+                raise TimeoutError(
+                    f"msprof did not acknowledge {name} for application PID {self.app.pid}; "
+                    f"no stage is released without success. Last collector output: {tail!r}"
+                )
             # Drain an exit's final acknowledgement before checking return codes.
             self.pump(min(remaining, 0.2))
-            if not self.ACK[name].search(self.prof_buffer):
+            if self.acknowledgement(name, self.prof_buffer, self.app.pid) is None:
                 self.check_processes()
 
     def wait_exit(self, process, description):
