@@ -130,6 +130,42 @@ def test_dynamo_specializes_model_float_without_freezing_dynamic_tensor_rows():
         torch._dynamo.reset()
 
 
+@pytest.mark.parametrize("serialized", [[1, 64, 4], [1, -1, 4], [1, 16, 4]])
+@pytest.mark.parametrize("change_during_conversion", [False, True])
+def test_static_export_audits_real_data_descriptors_and_restores_patch(
+    monkeypatch, serialized, change_during_conversion,
+):
+    torchair = ModuleType("torchair")
+    public = torch.zeros(1, 64, 4)
+    node = _Op("feature", "Data", index=0)
+    node.output_desc = [SimpleNamespace(shape=SimpleNamespace(
+        dim=[1, 64, 4] if change_during_conversion else serialized,
+    ))]
+    graph = _Graph([node])
+
+    def original(*args):
+        if change_during_conversion:
+            node.output_desc[0].shape.dim = serialized
+        return False, 0
+
+    module = SimpleNamespace(_convert_data_to_const=original)
+    monkeypatch.setitem(sys.modules, "torchair", torchair)
+    monkeypatch.setitem(sys.modules, "torchair._utils.export_utils", module)
+    if serialized == [1, 64, 4]:
+        with canonical_runtime_input_abi(
+            torchair, public_inputs=[public], public_names=["features"], require_static_shapes=True,
+        ) as audit:
+            module._convert_data_to_const([public], graph, "unused", {})
+        assert audit["bindings"][0]["serialized_shape"] == serialized
+    else:
+        with pytest.raises(RuntimeError, match="static AIR input"):
+            with canonical_runtime_input_abi(
+                torchair, public_inputs=[public], public_names=["features"], require_static_shapes=True,
+            ):
+                module._convert_data_to_const([public], graph, "unused", {})
+    assert module._convert_data_to_const is original
+
+
 @pytest.mark.parametrize("damage", [None, "missing", "scalar", "order", "duplicate", "calls"])
 def test_compiler_checks_canonical_input_audit(damage):
     graph = {"input_names": ["x", "state"], "runtime_input_abi": {

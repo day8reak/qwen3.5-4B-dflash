@@ -65,6 +65,7 @@ struct Arguments {
   std::int64_t pad_token_id = 0;
   std::size_t max_new_tokens = 32;
   std::size_t max_draft_tokens = 15;
+  std::size_t fused_static_feature_rows = 0;
   std::size_t dflash_sync_window = 1;
   bool coalesce_prefill_with_first_verify = false;
   ZeroAcceptFallbackPolicy zero_accept_fallback_policy =
@@ -97,6 +98,7 @@ void Usage(std::ostream& stream) {
       << "  --target-verify-commit-sha256 HEX        expected verify SHA-256\n"
       << "  --fused-speculative-step PATH            exact Draft+verify supergraph; replaces separate pair\n"
       << "  --fused-speculative-step-sha256 HEX      expected fused OM SHA-256\n"
+      << "  --fused-static-feature-rows N            opt in to a fixed fused carrier (multiple of 64)\n"
       << "  --output PATH                            paired JSON report\n"
       << "  --prompt-token-ids CSV                   non-empty prompt\n"
       << "  --eos-token-ids CSV                      optional EOS token IDs\n"
@@ -314,6 +316,20 @@ Arguments ParseArguments(int argc, char** argv) {
       TakeOptional(&values, "max-new-tokens", "32"), "max-new-tokens");
   result.max_draft_tokens = ParseSize(
       TakeOptional(&values, "max-draft-tokens", "15"), "max-draft-tokens");
+  const std::int64_t static_feature_rows = ParseInt64(
+      TakeOptional(&values, "fused-static-feature-rows", "0"),
+      "fused-static-feature-rows");
+  if (static_feature_rows < 0) {
+    throw std::invalid_argument("static fused carrier rows must be non-negative");
+  }
+  result.fused_static_feature_rows = static_cast<std::size_t>(static_feature_rows);
+  if (result.fused_static_feature_rows != 0 &&
+      (!fused || result.fused_static_feature_rows % 64 != 0 ||
+       result.prompt_token_ids.size() > result.fused_static_feature_rows)) {
+    throw std::invalid_argument(
+        "static fused carrier requires fused topology, N a multiple of 64, "
+        "and prompt_tokens <= N; re-export a larger carrier, do not truncate");
+  }
   result.dflash_sync_window = ParseSize(
       TakeOptional(&values, "dflash-sync-window", "1"),
       "dflash-sync-window");
@@ -730,9 +746,9 @@ void WriteReport(
               execution.draft_verify_feature_rows_elided !=
           execution.draft_verify_full_width_equivalent_rows ||
       execution.draft_verify_dynamic_gear_count !=
-          executor.proposal_width() + 1 ||
+          (execution.fused_static_feature_rows ? 0 : executor.proposal_width() + 1) ||
       execution.draft_prefill_dynamic_gear_count !=
-          execution.prefill_staging_slots ||
+          (execution.fused_static_feature_rows ? 0 : execution.prefill_staging_slots) ||
       execution.draft_dynamic_gear_count !=
           execution.draft_verify_dynamic_gear_count +
               execution.draft_prefill_dynamic_gear_count) {
@@ -838,6 +854,7 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
+         << ",\"fused_static_feature_rows\":" << execution.fused_static_feature_rows
          << ",\"draft_dynamic_shape\":" << (execution.draft_dynamic_shape ? "true" : "false")
          << ",\"draft_om_dynamic_gear_count\":" << execution.draft_om_dynamic_gear_count
          << ",\"target_step_dynamic_shape\":" << (execution.target_step_dynamic_shape ? "true" : "false")
@@ -910,7 +927,10 @@ void WriteReport(
             "table/count; all device subsegments start at 64-byte "
             "boundaries\","
          << "\"prefill_draft_policy\":\""
-         << (fused_speculative_step
+         << (execution.fused_static_feature_rows
+                 ? "Target feature slabs stay device-resident; a fixed-shape fused "
+                   "transaction consumes the zero-padded prompt feature carrier"
+                 : fused_speculative_step
                  ? "Target feature slabs stay device-resident; no prompt "
                    "chunk launches Draft separately; the first prebound "
                    "dynamic-gear fused transaction consumes the complete "
@@ -944,7 +964,10 @@ void WriteReport(
          << qwen35::dflash::IncrementalDraftFeaturePolicyName(
                 executor.draft_feature_policy())
          << "\",\"draft_feature_policy_description\":\""
-         << (executor.draft_feature_policy() ==
+         << (execution.fused_static_feature_rows
+                 ? "static fused always binds fixed N; the feature policy selects "
+                   "the valid source carrier extent before zero padding, not the OM shape"
+                 : executor.draft_feature_policy() ==
                      IncrementalDraftFeaturePolicy::kCommittedPrefix
                  ? "after a synchronized verify, Draft binds exactly accepted+1 "
                    "leading Target feature rows; each later unsynchronized "
@@ -1174,6 +1197,7 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
+         << ",\"fused_static_feature_rows\":" << execution.fused_static_feature_rows
          << ",\"draft_dynamic_shape\":" << (execution.draft_dynamic_shape ? "true" : "false")
          << ",\"draft_om_dynamic_gear_count\":" << execution.draft_om_dynamic_gear_count
          << ",\"target_step_dynamic_shape\":" << (execution.target_step_dynamic_shape ? "true" : "false")
@@ -1188,6 +1212,10 @@ void WriteReport(
          << execution.target_step_zero_count_device_bytes
          << ",\"target_step_zero_count_bindings\":"
          << execution.target_step_zero_count_bindings
+         << ",\"fused_static_physical_feature_rows\":" << execution.fused_static_physical_feature_rows
+         << ",\"fused_static_source_feature_rows\":" << execution.fused_static_source_feature_rows
+         << ",\"fused_static_padding_rows\":" << execution.fused_static_padding_rows
+         << ",\"fused_static_padding_operations\":" << execution.fused_static_padding_operations
          << "},\"profile_model_execution_trace\":[";
   for (std::size_t index = 0; index < model_execution_trace.size(); ++index) {
     if (index != 0) output << ',';
@@ -1311,6 +1339,13 @@ int main(int argc, char** argv) {
         arguments.measurement_protocol == MeasurementProtocol::kProfile,
         arguments.draft_feature_policy);
     const auto load_end = std::chrono::steady_clock::now();
+    const std::size_t static_rows = executor.execution_stats().fused_static_feature_rows;
+    if (static_rows != arguments.fused_static_feature_rows) {
+      throw std::runtime_error(
+          "loaded fused OM shape differs from --fused-static-feature-rows; "
+          "static export/manifest/runner must agree");
+    }
+    executor.ValidateRequest(arguments.prompt_token_ids.size(), arguments.max_new_tokens);
     const double load_ms = std::chrono::duration<double, std::milli>(
         load_end - load_start).count();
     {

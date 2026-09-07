@@ -813,6 +813,7 @@ def incremental_state_graph_specs(
     verify_custom_ops: tuple[CustomOpExportSpec, ...],
     unified_target_step: bool = False,
     fused_speculative_step: bool = False,
+    fused_static_feature_rows: int = 0,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[AirGraphSpec, ...]:
     """Create one approved exact incremental physical-topology candidate."""
@@ -830,6 +831,20 @@ def incremental_state_graph_specs(
     if unified_target_step and fused_speculative_step:
         raise ValueError(
             "unified_target_step and fused_speculative_step are mutually exclusive"
+        )
+    if isinstance(fused_static_feature_rows, bool) or not isinstance(
+        fused_static_feature_rows, int
+    ):
+        raise TypeError("fused_static_feature_rows must be an integer")
+    if fused_static_feature_rows and (
+        not fused_speculative_step
+        or fused_static_feature_rows < PREFILL_ROWS
+        or fused_static_feature_rows % PREFILL_ROWS
+        or fused_static_feature_rows > kv_cache_max_len
+    ):
+        raise ValueError(
+            "fused_static_feature_rows requires fused topology and a positive "
+            "multiple of 64 no larger than KV capacity"
         )
     target_device = torch.device(device)
     config = getattr(target, "config", None)
@@ -1188,13 +1203,26 @@ def incremental_state_graph_specs(
             "verify_input_ids_externalized": False,
             "target_verify_rows": VERIFY_ROWS,
         }
+        if fused_static_feature_rows:
+            fused_metadata["fused_static_shape"] = {
+                "feature_rows": fused_static_feature_rows,
+                "feature_width": feature_width,
+                "verify_rows": VERIFY_ROWS,
+                "kv_capacity": kv_cache_max_len,
+                "padding_policy": "zero-tail-on-stream-v1",
+                "capacity_policy": "reserve-full-static-write-v1",
+            }
+            fused_metadata["draft_feature_tail"] = (
+                f"FP16[1,{fused_static_feature_rows},{feature_width}]; "
+                "fixed carrier, live committed_input_count"
+            )
         fused_spec = AirGraphSpec(
             name="fused-speculative-step",
             role="fused-speculative-step",
             model=fused,
             example_args=(
                 torch.zeros(
-                    (1, VERIFY_ROWS, feature_width),
+                    (1, fused_static_feature_rows or VERIFY_ROWS, feature_width),
                     dtype=dtype,
                     device=target_device,
                 ),
@@ -1251,8 +1279,10 @@ def incremental_state_graph_specs(
                 "draft_value_cache",
                 "logical_draft_cursor",
             ),
-            dynamic=True,
-            input_dim_gears={0: {1: draft_feature_gears}},
+            dynamic=not bool(fused_static_feature_rows),
+            input_dim_gears=(
+                {} if fused_static_feature_rows else {0: {1: draft_feature_gears}}
+            ),
             metadata=fused_metadata,
             custom_ops=verify_custom_ops,
         )

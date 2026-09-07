@@ -458,6 +458,7 @@ void ValidateStatefulInputs(
     const StatefulGraphExecutor& executor,
     const std::vector<std::int64_t>& prompt,
     const GenerationOptions& options) {
+  executor.ValidateRequest(prompt.size(), options.max_new_tokens);
   if (executor.sequence_length() <= 1) {
     throw std::invalid_argument("stateful OM capacity must exceed one token");
   }

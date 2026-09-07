@@ -218,6 +218,7 @@ def export_air_bundle(
                 public_inputs=spec.example_args,
                 public_names=spec.input_names,
                 explicit_test_double=explicit_test_double,
+                require_static_shapes=bool(spec.metadata.get("fused_static_shape")),
             ) as runtime_input_abi,
         ):
             torchair.dynamo_export(*spec.example_args, **call_kwargs)

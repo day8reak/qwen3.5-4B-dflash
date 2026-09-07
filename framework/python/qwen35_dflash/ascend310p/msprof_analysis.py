@@ -552,19 +552,42 @@ def _validate_runner_report(
             "fused-speculative-step" if fused else "draft-propose"
         )
         draft_rows = rows_by_role[draft_trace_role]
+        static_rows = counters.get("fused_static_feature_rows", 0)
+        if (isinstance(static_rows, bool) or not isinstance(static_rows, int)
+                or static_rows < 0 or static_rows % 64 or (static_rows and not fused)):
+            raise MsprofAnalysisError("runner static fused feature shape is invalid")
+        if static_rows:
+            physical = counters.get("fused_static_physical_feature_rows")
+            source = counters.get("fused_static_source_feature_rows")
+            padding = counters.get("fused_static_padding_rows")
+            memsets = counters.get("fused_static_padding_operations")
+            if (
+                any(isinstance(v, bool) or not isinstance(v, int) or v < 0
+                    for v in (physical, source, padding, memsets))
+                or any(row != static_rows for row in draft_rows)
+                or physical != sum(draft_rows) or source + padding != physical
+                or source < total_draft_count or memsets > total_draft_count or memsets > padding
+                or (padding > 0 and memsets == 0)
+                or dynamic_gears != 0 or prefill_gears != 0 or verify_gears != 0
+                or counters.get("draft_dynamic_shape") is not False
+                or counters.get("draft_om_dynamic_gear_count") != 0
+            ):
+                raise MsprofAnalysisError("static fused physical trace/padding counters differ")
         prefill_trace_rows = [row for row in draft_rows if row > verify_width]
         verify_trace_rows = [row for row in draft_rows if row <= verify_width]
         if (
             verify_draft_count < 0
-            or len(prefill_trace_rows) != prefill_draft_count
-            or len(verify_trace_rows) != verify_draft_count
-            or any(row % prefill_width for row in prefill_trace_rows)
-            or sum(prefill_trace_rows) != prefill_feature_rows
-            or sum(verify_trace_rows) != verify_feature_rows
+            or (not static_rows and (
+                len(prefill_trace_rows) != prefill_draft_count
+                or len(verify_trace_rows) != verify_draft_count
+                or any(row % prefill_width for row in prefill_trace_rows)
+                or sum(prefill_trace_rows) != prefill_feature_rows
+                or sum(verify_trace_rows) != verify_feature_rows
+            ))
             or verify_full_rows != verify_draft_count * verify_width
             or verify_feature_rows + verify_elided_rows != verify_full_rows
             or fixed_count + prefix_count + pending_count != verify_draft_count
-            or verify_gears != verify_width
+            or verify_gears != (0 if static_rows else verify_width)
             or dynamic_gears != verify_gears + prefill_gears
         ):
             raise MsprofAnalysisError(
@@ -572,7 +595,7 @@ def _validate_runner_report(
             )
         if draft_policy == "fixed-16":
             if (
-                any(row != verify_width for row in verify_trace_rows)
+                (not static_rows and any(row != verify_width for row in verify_trace_rows))
                 or fixed_count != verify_draft_count
                 or prefix_count != 0
                 or pending_count != 0
@@ -995,6 +1018,7 @@ def analyze_incremental_msprof(
         "aclrtMemsetAsync": (
             int(counters["state_memset_operations"])
             + int(counters["state_initialization_memset_operations"])
+            + int(counters.get("fused_static_padding_operations", 0))
         ),
         "aclrtSynchronizeStream": (
             int(counters["stream_synchronizations"])
@@ -1128,6 +1152,9 @@ def analyze_incremental_msprof(
                     "draft_verify_pending_upper_bound_executions"
                 ],
                 "trace_gate": (
+                    "static fused physical rows equal fixed N for every invocation; "
+                    "source rows plus padding equal total physical rows"
+                    if counters.get("fused_static_feature_rows", 0) else
                     "sum "
                     + (
                         "fused-speculative-step"

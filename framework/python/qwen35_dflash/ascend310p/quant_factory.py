@@ -739,6 +739,21 @@ def create_quant_incremental_state_graphs(
         raise ValueError(
             "max_sequence_length exceeds the GDR INT16 effective-length ABI"
         )
+    fused_static_feature_rows = config.get("fused_static_feature_rows", 0)
+    if isinstance(fused_static_feature_rows, bool) or not isinstance(
+        fused_static_feature_rows, int
+    ):
+        raise TypeError("fused_static_feature_rows must be an integer")
+    if fused_static_feature_rows and (
+        not fused_speculative_step
+        or fused_static_feature_rows < 64
+        or fused_static_feature_rows % 64
+        or fused_static_feature_rows > max_sequence_length
+    ):
+        raise ValueError(
+            "fused_static_feature_rows requires fused topology and a positive "
+            "multiple of 64 no larger than max_sequence_length"
+        )
     dtype_name = str(config.get("dtype", "float16"))
     if dtype_name not in _DTYPES:
         raise ValueError("incremental quant AIR supports float16 only")
@@ -849,6 +864,7 @@ def create_quant_incremental_state_graphs(
         verify_custom_ops=_target_custom_op_exports(config, mtp=True),
         unified_target_step=unified_target_step,
         fused_speculative_step=fused_speculative_step,
+        fused_static_feature_rows=fused_static_feature_rows,
         metadata=metadata,
     )
 

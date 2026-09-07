@@ -1,6 +1,6 @@
 {
-  "schema_version": 37,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v37",
+  "schema_version": 38,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v38",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -202,7 +202,7 @@
       "policy": "static-repeat-tile-v1",
       "source": "_FixedDraftCache.update, shared by draft-propose and fused-speculative-step",
       "replacement": "positions[B,1,N,1].repeat(1,H,1,D) -> Tile with Const [1,8,1,128] for the locked Draft",
-      "physical_rows": "N remains the dynamic target_feature_tail width, independent of logical counts",
+      "physical_rows": "N is the target_feature_tail carrier width, independent of logical counts; dynamic on the original route or fixed by fused_static_feature_rows on the opt-in static route; logical counts stay live",
       "scatter_nodes": "two ScatterElements per Draft layer; six layers in the locked checkpoint",
       "semantics": "identical INT64 indices, clamp, padded cache writes and K/V scatter operations; no index_copy substitution, token/EOS/state or external OM ABI change",
       "reason": "receiver BroadcastTo_1 inferred positive [1,8,64,128] then failed host auto-tiling before ACL 500002",
@@ -227,6 +227,17 @@
     "atc_output_path_policy": "after each successful ATC invocation, require exactly one non-empty artifact among <graph>.om, <graph>_linux_aarch64.om and <graph>_linux_x86_64.om; reject missing or ambiguous artifacts and hash-lock the actual path in the deployment manifest"
   },
   "runtime": {
+    "static_fused_baseline": {
+      "selector": "fused factory config fused_static_feature_rows=N; 0 preserves dynamic rollback",
+      "feature_rows": "positive multiple of 64 within KV capacity; initial baseline N=64",
+      "topology": "same four OMs; all dynamic=false with empty gears; Target verify T=16",
+      "export_gate": "canonical 15 public Data tensors must have positive serialized shapes equal to their examples; compiler retains the audited fused_static_shape contract",
+      "execution": "fixed loaded OM dimensions; no dynamic-control allocation, no aclmdlSetInputDynamicDims and no aclmdlSetDatasetTensorDesc; opt-in --fused-static-feature-rows must match the actual loaded OM",
+      "padding": "zero-tail-on-stream-v1; preserve valid prefill features and preceding verify source rows, clear remaining input rows before every fused execution on its own stream",
+      "capacity_gate": "prompt_tokens <= N and prompt_tokens + max_new_tokens + N <= KV capacity; reserve full static writes to avoid clamped padding overwriting live cache",
+      "counters": "legacy feature counters describe source rows, not static physical savings; report fixed physical rows, source rows, padding rows and padding memset calls separately; dynamic shape/gear counters are zero",
+      "claim_boundary": "static correctness candidate only; real CANN export/ATC, strict-greedy parity and repeated Ascend310P3 execution remain required before returning to dynamic or making performance claims"
+    },
     "language": "C++17",
     "api": "AscendCL",
     "model_load": "integrated runner uses aclmdlLoadFromFile; incremental runner uses aclmdlLoadFromFileWithMem with separate per-artifact weights and one serial shared workspace",

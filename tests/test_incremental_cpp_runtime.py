@@ -698,6 +698,7 @@ def _validate(
     ),
     unified_target_step: bool = False,
     fused_speculative_step: bool = False,
+    fused_static_feature_rows: int = 0,
 ) -> None:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
     hashes = _hashes()
@@ -724,6 +725,7 @@ def _validate(
         dflash_sync_window=dflash_sync_window,
         prefill_completion_policy=prefill_completion_policy,
         zero_accept_fallback_policy=zero_accept_fallback_policy,
+        fused_static_feature_rows=fused_static_feature_rows,
     )
 
 
@@ -838,6 +840,45 @@ def test_build_cpp_runner_keeps_policy_specific_logs_with_build(
 
 def test_unified_incremental_runner_report_closes_resident_zero_count() -> None:
     _validate(_unified_report(), unified_target_step=True)
+
+
+@pytest.mark.parametrize("damage", [None, "rows", "padding", "gears", "dynamic", "memsets"])
+def test_static_fused_report_locks_shape_and_accounts_for_real_padding(damage):
+    report = _fused_report()
+    report["protocol"]["draft_feature_policy_description"] = (
+        "static fused always binds fixed N; the feature policy selects "
+        "the valid source carrier extent before zero padding, not the OM shape"
+    )
+    report["protocol"]["prefill_draft_policy"] = (
+        "Target feature slabs stay device-resident; a fixed-shape fused "
+        "transaction consumes the zero-padded prompt feature carrier"
+    )
+    for scope in (report["model_memory_query"], report["execution_io_counters"]):
+        scope.update(
+            fused_static_feature_rows=64, draft_dynamic_shape=False,
+            draft_om_dynamic_gear_count=0, draft_dynamic_gear_count=0,
+            draft_verify_dynamic_gear_count=0, draft_prefill_dynamic_gear_count=0,
+        )
+    counts = report["execution_io_counters"]
+    calls = counts["fused_speculative_step_executions"]
+    prefill = counts["prefill_draft_propose_executions"]
+    source = prefill + (calls - prefill) * 16
+    counts.update(
+        fused_static_physical_feature_rows=calls * 64,
+        fused_static_source_feature_rows=source,
+        fused_static_padding_rows=calls * 64 - source,
+        fused_static_padding_operations=calls,
+    )
+    if damage == "rows": report["model_memory_query"]["fused_static_feature_rows"] = 128
+    if damage == "padding": counts["fused_static_padding_rows"] += 1
+    if damage == "gears": report["model_memory_query"]["draft_om_dynamic_gear_count"] = 1
+    if damage == "dynamic": report["model_memory_query"]["draft_dynamic_shape"] = True
+    if damage == "memsets": counts["fused_static_padding_operations"] = 0
+    if damage:
+        with pytest.raises(RuntimeError, match="static fused"):
+            _validate(report, fused_speculative_step=True, fused_static_feature_rows=64)
+    else:
+        _validate(report, fused_speculative_step=True, fused_static_feature_rows=64)
 
 
 def test_fused_incremental_runner_report_closes_one_physical_launch() -> None:

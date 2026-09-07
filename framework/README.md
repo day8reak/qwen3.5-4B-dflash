@@ -31,6 +31,8 @@ ordinary greedy 与 strict-greedy DFlash 逐 token 生成
 
 详细构建、运行与验证命令见
 [docs/QUANT_AIR_OM_FRAMEWORK.md](../docs/QUANT_AIR_OM_FRAMEWORK.md)。
+当前排查优先走 [固定 64 行静态 fused 基线](../docs/STATIC_FUSED_OM_BASELINE.md)，
+真机跑通并完成严格 greedy 对齐后再恢复动态；v38 使用同一四图拓扑和 runner 1.23.0。
 增量状态 ABI、2/3/4 OM 选择门禁和内存检查命令见
 [docs/INCREMENTAL_OM_PERFORMANCE.md](../docs/INCREMENTAL_OM_PERFORMANCE.md)。
 

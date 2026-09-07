@@ -12,6 +12,7 @@ import sys
 import time
 from typing import Any, Callable, Mapping, Sequence
 
+from .static_shape import validated_fused_static_shape, validate_static_request
 from .utils import (
     atomic_write_json,
     contained_path,
@@ -647,6 +648,13 @@ def _resolve_incremental_oms(
         else "draft-propose"
     )
     draft_graph = resolved[draft_role][1]
+    static_shape = validated_fused_static_shape(draft_graph)
+    if static_shape is not None:
+        if any(
+            item[1].get("dynamic") is not False or item[1].get("input_dim_gears", {})
+            for item in resolved.values()
+        ):
+            raise ValueError("static fused baseline requires four static OMs without gears")
     draft_gears = draft_graph.get("input_dim_gears")
     draft_rows = (
         draft_gears.get("0", {}).get("1", [])
@@ -654,7 +662,7 @@ def _resolve_incremental_oms(
         and isinstance(draft_gears.get("0"), Mapping)
         else []
     )
-    if (
+    if static_shape is None and (
         draft_graph.get("dynamic") is not True
         or not isinstance(draft_rows, list)
         or any(isinstance(item, bool) or not isinstance(item, int) for item in draft_rows)
@@ -858,6 +866,7 @@ def validate_incremental_cpp_runner_report(
     dflash_sync_window: int = 1,
     prefill_completion_policy: str = SEPARATE_PREFILL_COMPLETION_POLICY,
     zero_accept_fallback_policy: str = DISABLED_ZERO_ACCEPT_FALLBACK_POLICY,
+    fused_static_feature_rows: int = 0,
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
 
@@ -966,6 +975,9 @@ def validate_incremental_cpp_runner_report(
     if protocol.get("draft_feature_policy") != draft_feature_policy:
         raise RuntimeError("incremental runner Draft feature policy differs")
     expected_draft_feature_description = (
+        "static fused always binds fixed N; the feature policy selects "
+        "the valid source carrier extent before zero padding, not the OM shape"
+        if fused_static_feature_rows else
         "after a synchronized verify, Draft binds exactly accepted+1 leading "
         "Target feature rows; each later unsynchronized transaction binds its "
         "predecessor's causal K+1 upper bound; masked suffix cache writes are "
@@ -1052,6 +1064,9 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental prefill control policy differs")
     expected_prefill_draft_policy = (
+        "Target feature slabs stay device-resident; a fixed-shape fused "
+        "transaction consumes the zero-padded prompt feature carrier"
+        if fused_static_feature_rows else
         "Target feature slabs stay device-resident; no prompt chunk launches "
         "Draft separately; the first prebound dynamic-gear fused transaction "
         "consumes the complete prompt feature batch"
@@ -1139,6 +1154,20 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental sequence/prefill capacity differs")
     memory = report.get("model_memory_query", {})
+    static_rows = memory.get("fused_static_feature_rows", 0)
+    if (
+        isinstance(static_rows, bool) or not isinstance(static_rows, int)
+        or static_rows != fused_static_feature_rows
+        or static_rows < 0 or static_rows % 64
+        or static_rows > sequence_capacity
+        or (static_rows and not fused_speculative_step)
+    ):
+        raise RuntimeError("static fused OM shape differs from the manifest")
+    if static_rows:
+        validate_static_request(
+            {"feature_rows": static_rows, "kv_capacity": sequence_capacity},
+            len(prompt_token_ids), max_new_tokens,
+        )
     if memory.get("source") != "aclmdlQuerySize":
         raise RuntimeError("incremental runner omitted model memory queries")
     if memory.get("load_policy") != (
@@ -1177,9 +1206,6 @@ def validate_incremental_cpp_runner_report(
         "proposal_count_staging_pinned_host_bytes",
         "prefill_feature_slab_bytes",
         "prefill_feature_arena_bytes",
-        "draft_dynamic_gear_count",
-        "draft_verify_dynamic_gear_count",
-        "draft_prefill_dynamic_gear_count",
     ):
         value = memory.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -1268,11 +1294,14 @@ def validate_incremental_cpp_runner_report(
         or int(memory["prefill_feature_arena_bytes"]) % 64
         or memory["prefill_feature_arena_bytes"]
         < minimum_feature_arena_bytes
-        or memory["draft_verify_dynamic_gear_count"] != verify_width
-        or memory["draft_prefill_dynamic_gear_count"]
-        != expected_staging_slots
-        or memory["draft_dynamic_gear_count"]
-        != verify_width + expected_staging_slots
+        or type(memory.get("draft_verify_dynamic_gear_count")) is not int
+        or type(memory.get("draft_prefill_dynamic_gear_count")) is not int
+        or type(memory.get("draft_dynamic_gear_count")) is not int
+        or memory.get("draft_verify_dynamic_gear_count") != (0 if static_rows else verify_width)
+        or memory.get("draft_prefill_dynamic_gear_count")
+        != (0 if static_rows else expected_staging_slots)
+        or memory.get("draft_dynamic_gear_count")
+        != (0 if static_rows else verify_width + expected_staging_slots)
     ):
         raise RuntimeError("incremental prefill feature arena or gears differ")
     expected_allocated = (
@@ -1287,6 +1316,13 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental explicit device allocation does not close")
     execution = report.get("execution_io_counters", {})
+    if execution.get("fused_static_feature_rows", 0) != static_rows:
+        raise RuntimeError("static fused execution shape evidence differs")
+    if static_rows and (
+        memory.get("draft_dynamic_shape") is not False
+        or memory.get("draft_om_dynamic_gear_count") != 0
+    ):
+        raise RuntimeError("static fused OM must not use dynamic shapes or gears")
     for prefix in ("draft", "target_step"):
         shape_key = f"{prefix}_dynamic_shape"
         actual_key = f"{prefix}_om_dynamic_gear_count"
@@ -1318,6 +1354,20 @@ def validate_incremental_cpp_runner_report(
         int(value) for value in role_counts
     )
     fused_execution = execution.get("fused_speculative_step_executions")
+    if static_rows:
+        physical = execution.get("fused_static_physical_feature_rows")
+        source = execution.get("fused_static_source_feature_rows")
+        padding = execution.get("fused_static_padding_rows")
+        memsets = execution.get("fused_static_padding_operations")
+        if (
+            any(isinstance(v, bool) or not isinstance(v, int) or v < 0
+                for v in (physical, source, padding, memsets, fused_execution))
+            or physical != static_rows * fused_execution
+            or physical != source + padding or source < fused_execution
+            or memsets > fused_execution or memsets > padding
+            or (padding > 0 and memsets == 0)
+        ):
+            raise RuntimeError("static fused physical feature/padding counters do not close")
     fused_launches_elided = execution.get(
         "draft_to_verify_model_launches_elided"
     )
@@ -1974,10 +2024,17 @@ def run_cpp_pair(
     graph: dict[str, Any] | None = None
     om_record: dict[str, Any] | None = None
     om_path: Path | None = None
+    fused_static_shape = None
     if incremental:
         resolved_incremental, deployment = _resolve_incremental_oms(
             deployment_manifest
         )
+        if "fused-speculative-step" in resolved_incremental:
+            fused_static_shape = validated_fused_static_shape(
+                resolved_incremental["fused-speculative-step"][1]
+            )
+        if fused_static_shape is not None:
+            validate_static_request(fused_static_shape, len(tokens), max_new_tokens)
         artifacts = {
             role: str(record["sha256"])
             for role, (_, _, record) in resolved_incremental.items()
@@ -2000,6 +2057,10 @@ def run_cpp_pair(
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     command = [str(executable)]
+    if fused_static_shape is not None:
+        command.extend([
+            "--fused-static-feature-rows", str(fused_static_shape["feature_rows"]),
+        ])
     if incremental:
         for role, (role_path, _, record) in resolved_incremental.items():
             command.extend(
@@ -2112,6 +2173,9 @@ def run_cpp_pair(
             zero_accept_fallback_policy=identity[
                 "zero_accept_fallback_policy"
             ],
+            fused_static_feature_rows=(
+                0 if fused_static_shape is None else fused_static_shape["feature_rows"]
+            ),
         )
     else:
         assert om_record is not None

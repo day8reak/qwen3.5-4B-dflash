@@ -82,6 +82,7 @@ def _normalize_public_nodes(graph: Any, bindings: list[tuple[int, Any]]) -> None
 def canonical_runtime_input_abi(
     torchair: Any, *, public_inputs: Sequence[torch.Tensor],
     public_names: Sequence[str], explicit_test_double: bool = False,
+    require_static_shapes: bool = False,
 ) -> Iterator[dict[str, Any]]:
     audit: dict[str, Any] = {
         "policy": "public-tensor-storage-identity-v1",
@@ -122,6 +123,22 @@ def canonical_runtime_input_abi(
             ]
             result = original(inputs, export_graph, file_path, weight_name)
             _normalize_public_nodes(export_graph, bindings)
+            if require_static_shapes:
+                final_nodes = _indexed_graph_inputs(export_graph)
+                for record in records:
+                    index = record["index"]
+                    node = final_nodes[index]
+                    if len(node.output_desc) != 1:
+                        raise RuntimeError("static AIR Data must have one tensor output")
+                    shape = list(node.output_desc[0].shape.dim)
+                    if shape != list(public_inputs[index].shape) or any(
+                        dimension <= 0 for dimension in shape
+                    ):
+                        raise RuntimeError(
+                            f"static AIR input {public_names[index]} has unexpected "
+                            f"serialized shape {shape}; refusing a dynamic artifact"
+                        )
+                    record["serialized_shape"] = shape
             audit["calls"] += 1
             audit["bindings"] = records
             return result

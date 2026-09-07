@@ -1,5 +1,10 @@
 # 基于 `quant` 分支的 AIR → OM → C++ token 推理框架
 
+针对当前 fused 动态运行故障，先按
+[静态 fused OM 基线](STATIC_FUSED_OM_BASELINE.md) 使用固定 N=64；
+静态真机通过后再恢复本文的原动态候选。静态开关是
+`fused_static_feature_rows`，不是 `example_sequence_length`。
+
 ## 1. 目标和边界
 
 本框架直接建立在远端 `quant` 分支提交

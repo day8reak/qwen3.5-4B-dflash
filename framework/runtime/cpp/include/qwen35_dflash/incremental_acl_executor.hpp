@@ -162,6 +162,13 @@ struct IncrementalAclExecutionStats {
   std::size_t draft_prefill_dynamic_gear_count = 0;
   std::size_t target_step_dynamic_gear_count = 0;
   bool draft_dynamic_shape = false;
+  // Nonzero only for the opt-in fixed-carrier fused OM. The legacy feature
+  // counters describe source rows; these counters expose actual padded work.
+  std::size_t fused_static_feature_rows = 0;
+  std::size_t fused_static_physical_feature_rows = 0;
+  std::size_t fused_static_source_feature_rows = 0;
+  std::size_t fused_static_padding_rows = 0;
+  std::size_t fused_static_padding_operations = 0;
   bool target_step_dynamic_shape = false;
   std::size_t draft_om_dynamic_gear_count = 0;
   std::size_t target_step_om_dynamic_gear_count = 0;
@@ -221,6 +228,7 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
   AclIncrementalExecutor& operator=(AclIncrementalExecutor&&) noexcept;
 
   std::size_t sequence_length() const noexcept override;
+  void ValidateRequest(std::size_t prompt_rows, std::size_t max_new_tokens) const override;
   std::size_t prefill_width() const noexcept override;
   std::size_t proposal_width() const noexcept override;
   std::size_t eos_table_width() const noexcept override;

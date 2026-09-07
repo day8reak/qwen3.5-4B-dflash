@@ -60,6 +60,12 @@ bool DynamicShapeMode(Role role) {
        role == Role::kFusedSpeculativeStep);
 }
 
+bool StaticFusedMode(Role role) {
+  const char* enabled = std::getenv("QWEN35_DFLASH_FAKE_STATIC_FUSED");
+  return role == Role::kFusedSpeculativeStep && enabled != nullptr &&
+      std::string(enabled) == "1";
+}
+
 constexpr std::size_t kSequenceLength = 32;
 constexpr std::size_t kIncrementalSequenceLength = 128;
 constexpr std::size_t kIntegratedDraftWidth = 15;
@@ -239,6 +245,11 @@ const std::vector<Spec>& Inputs(Role role) {
   static const std::vector<Spec> shape_draft(draft.begin(), draft.end() - 1);
   static const std::vector<Spec> shape_target_step(target_step.begin(), target_step.end() - 1);
   static const std::vector<Spec> shape_fused(fused.begin(), fused.end() - 1);
+  static const std::vector<Spec> static_fused = [&]() {
+    auto result = shape_fused;
+    result[0].shape[1] = 64;
+    return result;
+  }();
   // Reduced-width version of the receiver's 48-input AIR ABI. The 33 FP64
   // placeholders and reordered public tensors must fail before inference.
   static const std::vector<Spec> lifted_fused = [&]() {
@@ -266,6 +277,9 @@ const std::vector<Spec>& Inputs(Role role) {
     case Role::kTargetStep:
       return DynamicShapeMode(role) ? shape_target_step : target_step;
     case Role::kFusedSpeculativeStep:
+      if (StaticFusedMode(role)) {
+        return static_fused;
+      }
       if (MissingDynamicControl(role)) {
         return lifted_fused;
       }
@@ -596,6 +610,25 @@ aclError ExecuteFused(
       verify_ids.data(), verify_ids.size() * sizeof(std::int64_t)};
   aclmdlDataset draft_input;
   draft_input.dynamic_dims = input->dynamic_dims;
+  if (StaticFusedMode(Role::kFusedSpeculativeStep)) {
+    // The runner must never set dynamic dims or TensorDesc on the real static
+    // dataset. Only adapt this local fake-Draft fixture for its shared oracle.
+    if (input->dynamic_dims.dimCount != 0 || input->uses_tensor_descriptor ||
+        input->buffers[0]->size != 64 * 8 * sizeof(std::uint16_t)) {
+      return 1;
+    }
+    const auto cursor = Scalar<std::int64_t>(input->buffers[14]);
+    const std::size_t source_rows = cursor == 0
+        ? static_cast<std::size_t>(Scalar<std::int32_t>(input->buffers[1])) : 16;
+    const auto* features = static_cast<const std::uint16_t*>(input->buffers[0]->data);
+    for (std::size_t index = source_rows * 8; index < 64 * 8; ++index) {
+      if (features[index] != 0) return 1;
+    }
+    draft_input.dynamic_dims.dimCount = 3;
+    draft_input.dynamic_dims.dims[0] = 1;
+    draft_input.dynamic_dims.dims[1] = 64;
+    draft_input.dynamic_dims.dims[2] = 8;
+  }
   for (const std::size_t index : {0U, 1U, 2U, 3U, 4U, 12U, 13U, 14U}) {
     draft_input.buffers.push_back(input->buffers[index]);
   }
@@ -623,7 +656,14 @@ aclError ExecuteFused(
   aclmdlDataset verify_output;
   verify_output.buffers.assign(
       output->buffers.begin(), output->buffers.begin() + 13);
-  return ExecuteVerify(&verify_input, &verify_output);
+  const aclError status = ExecuteVerify(&verify_input, &verify_output);
+  if (status == ACL_SUCCESS && StaticFusedMode(Role::kFusedSpeculativeStep)) {
+    // Poison input-only rows after each call. The next invocation/request must
+    // clear them even though Target output 7 writes just the first 16 rows.
+    auto* features = static_cast<std::uint16_t*>(input->buffers[0]->data);
+    std::fill(features + 16 * 8, features + 64 * 8, 0x7e00);
+  }
+  return status;
 }
 
 }  // namespace
@@ -933,6 +973,11 @@ aclError aclmdlGetInputDynamicGearCount(
        description->role != Role::kTargetStep)) {
     return 1;
   }
+  // Static OMs need not implement this dynamic-only query. The static runner
+  // must never depend on its success, even if a dynamic Shape OM returns 0 gears.
+  if (StaticFusedMode(description->role)) {
+    return 100000;
+  }
   if (DynamicShapeMode(description->role) || MissingDynamicControl(description->role)) {
     *gear_count = 0;
     return ACL_SUCCESS;
@@ -1057,7 +1102,7 @@ aclError aclmdlSetInputDynamicDims(
   if (iterator == g_models.end() || dataset == nullptr || dimensions == nullptr) {
     return 1;
   }
-  if (DynamicShapeMode(iterator->second)) {
+  if (DynamicShapeMode(iterator->second) || StaticFusedMode(iterator->second)) {
     return 1;
   }
   const std::size_t expected_index =

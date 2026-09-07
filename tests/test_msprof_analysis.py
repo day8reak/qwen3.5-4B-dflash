@@ -290,6 +290,7 @@ def _write_api_csv(
     execute_count: int = 8,
     memcpy_count: int = 8,
     synchronize_count: int = 4,
+    memset_count: int = 2,
 ) -> None:
     rows = [
         {
@@ -311,7 +312,7 @@ def _write_api_csv(
             "Level": "AscendCL",
             "API Name": "aclrtMemsetAsync",
             "Time(us)": 10.0,
-            "Count": 2,
+            "Count": memset_count,
         },
         {
             "Device_id": "host",
@@ -414,6 +415,46 @@ def test_msprof_analysis_attributes_every_role_and_dynamic_gear(
             "target_decode1_executions + speculative_transactions"
         ),
     }
+
+
+@pytest.mark.parametrize("damage", [None, "trace", "gears", "padding", "memset"])
+def test_msprof_static_fused_counts_padding_and_does_not_infer_small_gears(tmp_path, damage):
+    report = _fused_runner_report()
+    counts = report["execution_io_counters"]
+    counts.update(
+        fused_static_feature_rows=128,
+        fused_static_physical_feature_rows=256,
+        fused_static_source_feature_rows=74,
+        fused_static_padding_rows=182,
+        fused_static_padding_operations=2,
+        draft_dynamic_gear_count=0, draft_verify_dynamic_gear_count=0,
+        draft_prefill_dynamic_gear_count=0, draft_om_dynamic_gear_count=0,
+        draft_dynamic_shape=False,
+    )
+    for event in report["profile_model_execution_trace"]:
+        if event["model_id"] == 4:
+            event["physical_rows"] = 128
+    if damage == "trace": report["profile_model_execution_trace"][5]["physical_rows"] = 4
+    if damage == "gears": counts["draft_dynamic_gear_count"] = 18
+    if damage == "padding": counts["fused_static_padding_rows"] += 1
+    report_path = tmp_path / "report.json"
+    _write_json(report_path, report)
+    profile = tmp_path / "PROF_static" / "mindstudio_profiler_output"
+    profile.mkdir(parents=True)
+    _write_csv(profile / "op_summary_static.csv", _op_rows_for_invocations(
+        [(1, 1), (1, 2), (2, 1), (3, 1), (4, 1), (4, 2), (3, 2)]
+    ))
+    _write_api_csv(profile / "api_statistic_static.csv", execute_count=7, memcpy_count=9,
+                   synchronize_count=5, memset_count=2 if damage == "memset" else 4)
+    if damage:
+        with pytest.raises(MsprofAnalysisError, match="static fused|aclrtMemsetAsync"):
+            analyze_incremental_msprof(profile_dir=profile.parent, runner_report=report_path)
+    else:
+        payload = analyze_incremental_msprof(profile_dir=profile.parent, runner_report=report_path)
+        assert payload["by_role_and_physical_rows"]["fused-speculative-step:T=128"][
+            "invocation_task_duration"]["count"] == 2
+        assert payload["api_count_gates"]["aclrtMemsetAsync"]["expected"] == 4
+        assert payload["expected_draft_feature_signature"]["trace_gate"].startswith("static fused")
 
 
 def test_msprof_analysis_attributes_fused_physical_launches(

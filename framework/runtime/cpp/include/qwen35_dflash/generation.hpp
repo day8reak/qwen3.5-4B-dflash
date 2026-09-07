@@ -87,6 +87,9 @@ class StatefulGraphExecutor {
  public:
   virtual ~StatefulGraphExecutor() = default;
 
+  // Optional shape-specific admission, before Reset or any model invocation.
+  virtual void ValidateRequest(std::size_t, std::size_t) const {}
+
   virtual std::size_t sequence_length() const noexcept = 0;
   virtual std::size_t prefill_width() const noexcept = 0;
   virtual std::size_t proposal_width() const noexcept = 0;

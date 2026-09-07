@@ -329,6 +329,7 @@ struct ModelSession {
   std::vector<std::size_t> public_input_indices;
   std::vector<aclmdlIODims> dynamic_gears;
   bool dynamic_shape = false;
+  bool static_fused = false;
 
   void Query(
       const std::filesystem::path& model_path,
@@ -383,7 +384,22 @@ struct ModelSession {
     Check(aclmdlGetDesc(description, id), role + ": aclmdlGetDesc");
     const std::size_t input_count = aclmdlGetNumInputs(description);
     const std::size_t output_count = aclmdlGetNumOutputs(description);
-    if (require_dynamic_gears) {
+    // A canonical static fused OM has exactly 15 ordinary, fixed-shape inputs.
+    // Detect that contract from physical tensor metadata first: dynamic-only
+    // queries need not be supported by a static OM (nor return a zero gear count).
+    if (require_dynamic_gears && role == "fused-speculative-step" &&
+        input_count == 15) {
+      inputs.reserve(input_count);
+      for (std::size_t index = 0; index < input_count; ++index) {
+        inputs.push_back(ReadTensorSpec(description, index, true, true, role));
+      }
+      static_fused =
+          std::none_of(inputs.begin(), inputs.end(), HasDynamicDimension);
+      if (!static_fused) {
+        inputs.clear();
+      }
+    }
+    if (require_dynamic_gears && !static_fused) {
       std::size_t index = 0;
       const aclError status = aclmdlGetInputIndexByName(
           description, kDynamicTensorName, &index);
@@ -403,7 +419,7 @@ struct ModelSession {
             ". Re-export AIR with public input normalization and specialized "
             "Python floats. Unknown scalar bindings must not be passed to "
             "aclmdlSetDatasetTensorDesc. Do not add --dynamic_dims to AIR "
-            "or set dynamic=False." +
+            "or relabel a dynamic artifact as static." +
             DescribeModelIo(description));
         }
         dynamic_shape = true;
@@ -416,7 +432,7 @@ struct ModelSession {
     }
     inputs.reserve(input_count);
     outputs.reserve(output_count);
-    for (std::size_t index = 0; index < input_count; ++index) {
+    for (std::size_t index = inputs.size(); index < input_count; ++index) {
       if (index == dynamic_input_index) {
         inputs.push_back(ReadDynamicControlSpec(description, index, role));
       } else {
@@ -428,8 +444,7 @@ struct ModelSession {
       outputs.push_back(ReadTensorSpec(
           description, index, false, false, role));
     }
-
-    if (require_dynamic_gears && !dynamic_shape) {
+    if (require_dynamic_gears && !dynamic_shape && !static_fused) {
       std::size_t gear_count = 0;
       Check(
           aclmdlGetInputDynamicGearCount(
@@ -455,7 +470,7 @@ struct ModelSession {
         public_input_indices.push_back(index);
       }
     }
-    if (require_dynamic_gears && !dynamic_shape) {
+    if (require_dynamic_gears && !dynamic_shape && !static_fused) {
       ResolveDynamicInputSizes(dynamic_gears);
     }
     if (progress) {
@@ -545,7 +560,7 @@ struct ModelSession {
   }
 
   std::size_t DynamicControlBytes() const {
-    return dynamic_shape ? 0 : inputs.at(dynamic_input_index).bytes;
+    return (dynamic_shape || static_fused) ? 0 : inputs.at(dynamic_input_index).bytes;
   }
 
   void Release() noexcept {
@@ -768,6 +783,11 @@ struct DatasetPlan {
   }
 
   void SetInputShape(const ModelSession& session, const aclmdlIODims& shape) {
+    if (session.static_fused) {
+      // Static OM: do not invent an ascend_mbatch_shape_data binding or attach
+      // dynamic TensorDesc overrides. Its loaded tensor descriptors own shape.
+      return;
+    }
     if (!session.dynamic_shape) {
       Check(aclmdlSetInputDynamicDims(
                 session.id, input, session.dynamic_input_index, &shape),
@@ -1112,6 +1132,7 @@ class AclIncrementalExecutor::Impl {
     prefill_total_token_count_ = 0;
     fused_prefill_feature_rows_ = 0;
     draft_reset_pending_ = true;
+    fused_prefill_valid_rows_ = 0;
 
     configured_eos_token_ids_ = eos_token_ids;
     eos_control_upload_pending_ =
@@ -1169,6 +1190,10 @@ class AclIncrementalExecutor::Impl {
     if (token_ids.size() > sequence_length_ - prefill_total_token_count_) {
       throw std::length_error("prefill token count exceeds sequence capacity");
     }
+    if (prepare_draft && stats_.fused_static_feature_rows != 0 &&
+        prefill_total_token_count_ + token_ids.size() > stats_.fused_static_feature_rows) {
+      throw std::length_error("prompt exceeds static fused feature carrier");
+    }
     const std::size_t staging_index = prefill_staging_index_++;
     prefill_total_token_count_ += token_ids.size();
     const bool use_immutable_zero = ApplyPendingReset();
@@ -1208,6 +1233,7 @@ class AclIncrementalExecutor::Impl {
         // The exact fused OM consumes these resident Target features and runs
         // Draft+verify together in the first speculative transaction.
         fused_prefill_feature_rows_ = feature_rows;
+        fused_prefill_valid_rows_ = prefill_total_token_count_;
         proposal_ready_ = false;
       } else {
         ExecuteDraft(
@@ -1616,6 +1642,7 @@ class AclIncrementalExecutor::Impl {
     proposal_ready_ = false;
     fused_prefill_feature_rows_ = 0;
     feature_source_ = FeatureSource::kVerify;
+    fused_prefill_valid_rows_ = 0;
     return PendingSpeculative{
         1,
         target_state_index_,
@@ -1883,11 +1910,20 @@ class AclIncrementalExecutor::Impl {
     const auto& draft_feature = fused_speculative_step_
         ? fused_.PublicInput(0)
         : draft_.PublicInput(0);
+    const bool static_fused = fused_speculative_step_ && fused_.static_fused;
     if (draft_feature.dtype != ACL_FLOAT16 || draft_feature.shape.size() != 3 ||
-        draft_feature.shape[0] != 1 || draft_feature.shape[1] != -1 ||
+        draft_feature.shape[0] != 1 ||
+        (static_fused
+             ? (draft_feature.shape[1] < 64 || draft_feature.shape[1] % 64 != 0 ||
+                static_cast<std::size_t>(draft_feature.shape[1]) > sequence_length_)
+             : draft_feature.shape[1] != -1) ||
         draft_feature.shape[2] != static_cast<std::int64_t>(feature_width_)) {
       throw std::runtime_error(
-          "Draft feature input must be FP16[1,-1,feature_width]");
+          "Draft feature input must be FP16[1,-1,F] or static fused FP16[1,N,F] "
+          "with N a positive multiple of 64 within KV capacity");
+    }
+    if (static_fused) {
+      stats_.fused_static_feature_rows = static_cast<std::size_t>(draft_feature.shape[1]);
     }
     const ModelSession& draft_contract =
         fused_speculative_step_ ? fused_ : draft_;
@@ -1950,7 +1986,7 @@ class AclIncrementalExecutor::Impl {
         fused_speculative_step_ ? fused_ : draft_;
     const auto find = [this, &session](std::size_t rows) -> aclmdlIODims {
       const auto expected = FlattenDraftShape(rows);
-      if (session.dynamic_shape) {
+      if (session.dynamic_shape || session.static_fused) {
         aclmdlIODims shape{};
         if (expected.size() > 128) {
           throw std::runtime_error("Draft dynamic Shape rank total exceeds 128");
@@ -1981,7 +2017,7 @@ class AclIncrementalExecutor::Impl {
     }
     const std::size_t prefill_gears =
         (sequence_length_ - 1) / prefill_width_ + 1;
-    if (!session.dynamic_shape &&
+    if (!session.dynamic_shape && !session.static_fused &&
         session.dynamic_gears.size() != prefill_gears + verify_width_) {
       throw std::runtime_error(
           "Draft-bearing OM dynamic gear count differs from N=1..16 plus "
@@ -1998,10 +2034,10 @@ class AclIncrementalExecutor::Impl {
     stats_.draft_om_dynamic_gear_count = session.dynamic_gears.size();
     // Legacy *_gear_count report fields count bounded runtime shape plans.
     // The new *_om_dynamic_gear_count fields report only queried OM gears.
-    stats_.draft_dynamic_gear_count =
+    stats_.draft_dynamic_gear_count = session.static_fused ? 0 :
         draft_gear_verify_.size() + draft_gear_prefill_.size();
-    stats_.draft_verify_dynamic_gear_count = draft_gear_verify_.size();
-    stats_.draft_prefill_dynamic_gear_count = draft_gear_prefill_.size();
+    stats_.draft_verify_dynamic_gear_count = session.static_fused ? 0 : draft_gear_verify_.size();
+    stats_.draft_prefill_dynamic_gear_count = session.static_fused ? 0 : draft_gear_prefill_.size();
   }
 
   std::vector<std::int64_t> FlattenTargetStepShape(
@@ -2235,7 +2271,8 @@ class AclIncrementalExecutor::Impl {
     }
     const std::size_t packed_feature_bytes =
         stats_.prefill_staging_slots * prefill_feature_payload;
-    if (draft_contract.PublicInput(0).bytes < packed_feature_bytes) {
+    if (!draft_contract.static_fused &&
+        draft_contract.PublicInput(0).bytes < packed_feature_bytes) {
       throw std::runtime_error(
           "Draft feature input buffer is smaller than the maximum prompt batch");
     }
@@ -2956,7 +2993,9 @@ class AclIncrementalExecutor::Impl {
       const BufferView& dynamic_control,
       const aclmdlIODims& gear,
       std::size_t feature_rows) {
-    if (gear.dimCount < 2 || gear.dims[1] != static_cast<std::int64_t>(feature_rows)) {
+    const std::size_t physical_rows = fused_.static_fused
+        ? stats_.fused_static_feature_rows : feature_rows;
+    if (gear.dimCount < 2 || gear.dims[1] != static_cast<std::int64_t>(physical_rows)) {
       throw std::runtime_error("fused feature rows differ from the shape plan");
     }
     if (!fused_speculative_step_ || target_state_index >= 2 ||
@@ -3027,6 +3066,9 @@ class AclIncrementalExecutor::Impl {
         const std::size_t feature_rows = prefill_source
             ? (gear_index + 1) * prefill_width_
             : gear_index + 1;
+        if (fused_.static_fused && feature_rows > stats_.fused_static_feature_rows) {
+          continue;
+        }
         const BufferView committed_count = prefill_source
             ? PrefillTotalCountView()
             : committed_input_count_.View();
@@ -3071,6 +3113,9 @@ class AclIncrementalExecutor::Impl {
            gear_index < initial_fused_prefill_plans_.size();
            ++gear_index) {
         const std::size_t feature_rows = (gear_index + 1) * prefill_width_;
+        if (fused_.static_fused && feature_rows > stats_.fused_static_feature_rows) {
+          continue;
+        }
         for (std::size_t target = 0; target < 2; ++target) {
           for (std::size_t output_route = 0; output_route < 2; ++output_route) {
             const std::size_t output_staging_index = output_route == 0
@@ -3315,7 +3360,33 @@ class AclIncrementalExecutor::Impl {
     if (plan == nullptr || plan->input == nullptr || plan->output == nullptr) {
       throw std::logic_error("fused speculative plan was not prebuilt");
     }
-    Execute(fused_, *plan, feature_rows);
+    const std::size_t static_rows = stats_.fused_static_feature_rows;
+    if (static_rows != 0) {
+      // Only the leading source rows belong to the preceding Target call.
+      // Output 7 overwrites 16 rows of this shared arena, not the whole static
+      // input. Clear its tail on the SAME stream before every use (also in an
+      // unsynchronized speculative window); never read a device count on host.
+      const std::size_t source_rows = prefill_source
+          ? fused_prefill_valid_rows_ : feature_rows;
+      if (source_rows == 0 || source_rows > static_rows || feature_rows > static_rows) {
+        throw std::length_error("fused source exceeds static feature carrier");
+      }
+      const std::size_t row_bytes = feature_width_ * sizeof(std::uint16_t);
+      const std::size_t padding_rows = static_rows - source_rows;
+      if (padding_rows != 0) {
+        const std::size_t padding_bytes = padding_rows * row_bytes;
+        Check(aclrtMemsetAsync(
+                  static_cast<std::byte*>(prefill_features_.data) + source_rows * row_bytes,
+                  padding_bytes, 0, padding_bytes, stream_),
+              "aclrtMemsetAsync(static fused feature padding)");
+        stream_work_pending_ = true;
+        ++stats_.fused_static_padding_operations;
+      }
+      stats_.fused_static_source_feature_rows += source_rows;
+      stats_.fused_static_padding_rows += padding_rows;
+      stats_.fused_static_physical_feature_rows += static_rows;
+    }
+    Execute(fused_, *plan, static_rows ? static_rows : feature_rows);
     ++stats_.fused_speculative_step_executions;
     ++stats_.draft_to_verify_model_launches_elided;
     ++stats_.draft_propose_executions;
@@ -3946,6 +4017,7 @@ class AclIncrementalExecutor::Impl {
   std::size_t prefill_staging_index_ = 0;
   std::size_t prefill_total_token_count_ = 0;
   std::size_t fused_prefill_feature_rows_ = 0;
+  std::size_t fused_prefill_valid_rows_ = 0;
   bool deferred_prefill_pending_ = false;
   bool stream_work_pending_ = false;
   bool proposal_ready_ = false;
@@ -3997,6 +4069,21 @@ AclIncrementalExecutor& AclIncrementalExecutor::operator=(
 
 std::size_t AclIncrementalExecutor::sequence_length() const noexcept {
   return impl_->sequence_length();
+}
+
+void AclIncrementalExecutor::ValidateRequest(
+    std::size_t prompt_rows, std::size_t max_new_tokens) const {
+  const std::size_t rows = execution_stats().fused_static_feature_rows;
+  if (rows == 0) return;
+  if (prompt_rows > rows) {
+    throw std::length_error("prompt exceeds static fused feature carrier");
+  }
+  if (rows > sequence_length() || prompt_rows > sequence_length() - rows ||
+      max_new_tokens > sequence_length() - rows - prompt_rows) {
+    throw std::length_error(
+        "static fused generation budget must leave N free KV slots: "
+        "prompt_tokens + max_new_tokens + N <= KV capacity");
+  }
 }
 
 std::size_t AclIncrementalExecutor::prefill_width() const noexcept {
