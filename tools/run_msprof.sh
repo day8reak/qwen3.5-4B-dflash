@@ -15,7 +15,7 @@ Options:
   --msprof-bin PATH         msprof executable (default: MSPROF_BIN or msprof).
   --aic-metrics NAME        AI Core metrics (default: PipeUtilization).
   --task-time LEVEL         msprof task-time value (default: on).
-  --profile-stage STAGE     Collect one prefill or draft-verify in run_npu/run_rollback.
+  --profile-stage STAGE     Collect one prefill, draft, verify or draft-verify.
   --profile-warmup N        Unprofiled fresh-state warmups for a stage (default: 1).
   --profile-timeout SEC     Deadline per stage-control transition (default: 600).
   --msprof-arg ARG          Append one safe msprof option; repeat as needed.
@@ -81,11 +81,11 @@ while (($#)); do
       shift 2
       ;;
     --profile-stage)
-      (($# >= 2)) || fail "--profile-stage requires prefill or draft-verify"
+      (($# >= 2)) || fail "--profile-stage requires prefill, draft, verify or draft-verify"
       profile_stage="$2"
       case "$profile_stage" in
-        prefill|draft-verify) ;;
-        *) fail "--profile-stage must be prefill or draft-verify" ;;
+        prefill|draft|verify|draft-verify) ;;
+        *) fail "--profile-stage must be prefill, draft, verify or draft-verify" ;;
       esac
       shift 2
       ;;
@@ -480,8 +480,8 @@ if (control.get("status") != "PASS_CONTROL"
     raise SystemExit("control report does not prove successful msprof start/stop/quit")
 expected = {
     "prefill": int(stage == "prefill"),
-    "draft": int(stage == "draft-verify"),
-    "target_verify": int(stage == "draft-verify"),
+    "draft": int(stage in {"draft", "draft-verify"}),
+    "target_verify": int(stage in {"verify", "draft-verify"}),
 }
 if (report.get("status") != "PASS_CAPTURE"
         or report.get("collector") != "msprof dynamic CLI"

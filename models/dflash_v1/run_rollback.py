@@ -354,7 +354,7 @@ def _run(args, *, request_started: float, cleanup: ExitStack) -> int:
 
     if profiler is not None:
         required_rows = len(prompt_ids) + (
-            effective_block_size if args.profile_stage == "draft-verify" else 0
+            effective_block_size if args.profile_stage in {"verify", "draft-verify"} else 0
         )
         capacity = getattr(target, "kv_cache_max_len", None)
         if capacity is not None and required_rows > int(capacity):

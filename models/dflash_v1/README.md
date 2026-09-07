@@ -9,7 +9,7 @@
 | `run_rollback.py` | CPU/CUDA/NPU 共用入口、validate/dflash 模式和报告 |
 | `run_npu.py` | HIAI 固定参数入口；默认 FP16，可选 Target W8A8 |
 | `msprof_cli.py` | msprof 原生动态采集 CLI 的 start/stop/quit 回执握手，无 pyACL 依赖 |
-| `stage_profile.py` | NPU 单次 prefill / 首轮 Draft+verify 的阶段边界与预热状态重建 |
+| `stage_profile.py` | NPU 单次 prefill、Draft、verify 或联合 Draft+verify 的阶段边界、同步计时与预热状态重建 |
 | `benchmark_npu.py` | 正确性门禁后的 independent-process NPU benchmark |
 | `dflash_rollback_decode.py` | ordinary incremental、Draft/verify、longest-prefix accept、EOS |
 | `dflash_rollback_adapter.py` | framework transaction、feature 生命周期和 Draft KV adapter |

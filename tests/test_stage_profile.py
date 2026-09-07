@@ -71,12 +71,14 @@ class FakeAdapter:
     device = torch.device("cpu")
     max_block_size = 16
 
-    def __init__(self, collector, events, *, anchor=10, fail_verify=False, reject=False):
+    def __init__(self, collector, events, *, anchor=10, fail_verify=False, reject=False,
+                 fail_draft=False, empty_draft=False):
         self.collector, self.events = collector, events
         self.target = FakeTarget(self)
         self.anchor = anchor
         self.fail_verify = fail_verify
         self.reject = reject
+        self.fail_draft, self.empty_draft = fail_draft, empty_draft
         self.cursor = 0
         self.pending = None
         self.requests = 0
@@ -90,6 +92,10 @@ class FakeAdapter:
         assert self.cursor == prefix_ids.shape[1] - 1
         assert self.pending is None
         self.events.append(("draft", self.collector.active, proposal_limit, self.cursor))
+        if self.fail_draft:
+            raise RuntimeError("injected draft failure")
+        if self.empty_draft:
+            return torch.empty((1, 0), dtype=torch.long)
         return torch.tensor([list(range(11, 11 + proposal_limit))])
 
     def verify_rollback(self, ids):
@@ -144,7 +150,7 @@ def setup_profiler(tmp_path, monkeypatch):
         assert not collector.errors
 
 
-@pytest.mark.parametrize("stage", ["prefill", "draft-verify"])
+@pytest.mark.parametrize("stage", ["prefill", "draft", "verify", "draft-verify"])
 def test_only_one_stage_is_collected_after_fresh_warmup(setup_profiler, stage):
     events, collector, profiler = setup_profiler(stage)
     adapter = FakeAdapter(collector, events)
@@ -166,26 +172,43 @@ def test_only_one_stage_is_collected_after_fresh_warmup(setup_profiler, stage):
     assert result["warmup_output_match"] is True
     assert result["strict_greedy_exact_match"] is None
     assert result["formal_latency_evidence"] is False
+    assert result["profiled_elapsed_ms"] >= 0
+    assert result["captured_calls"] == {
+        "prefill": int(stage == "prefill"),
+        "draft": int(stage in {"draft", "draft-verify"}),
+        "target_verify": int(stage in {"verify", "draft-verify"}),
+    }
     if stage == "prefill":
         assert [event[0] for event in captured] == ["prefill-chunk"] * 3 + ["sync"]
         assert [event[2] for event in captured[:-1]] == [64, 64, 1]
         assert not any(e[0] in {"draft", "verify", "projection", "commit"} for e in events)
+    elif stage == "draft":
+        assert captured == [("draft", True, 15, 129), ("sync", True)]
+        assert not any(e[0] in {"verify", "commit"} for e in events)
+        assert events[-1] == ("abort", False)
+        assert adapter.pending is None and adapter.cursor == 129
+        assert result["result"]["verify_rows"] == 0
+        assert result["result"]["proposal_token_ids"] == list(range(11, 26))
     else:
-        assert [event[0] for event in captured] == ["draft", "verify", "sync"]
-        assert captured[0] == ("draft", True, 15, 129)
-        assert captured[1][2] == [list(range(10, 26))]
+        expected_ops = ["verify", "sync"] if stage == "verify" else ["draft", "verify", "sync"]
+        assert [event[0] for event in captured] == expected_ops
+        assert captured[-2][2] == [list(range(10, 26))]
         assert result["result"]["verify_rows"] == 16
         assert all(not e[1] for e in events if e[0] in {"prefill-chunk", "projection", "commit"})
+        assert all(e[1] == (stage == "draft-verify") for e in captured if e[0] == "draft")
+        if stage == "verify":
+            assert all(not e[1] for e in events if e[0] == "draft")
         assert adapter.cursor == 129 + 16
 
 
-def test_verify_error_stops_capture_and_aborts_after_stop(setup_profiler):
-    events, collector, profiler = setup_profiler()
+@pytest.mark.parametrize("stage", ["verify", "draft-verify"])
+def test_verify_error_stops_capture_and_aborts_after_stop(setup_profiler, stage):
+    events, collector, profiler = setup_profiler(stage)
     adapter = FakeAdapter(collector, events, fail_verify=True)
     with pytest.raises(RuntimeError, match="injected verify failure"):
         with profiler:
             profile_one_stage(
-                adapter, [1], stage="draft-verify", block_size=16,
+                adapter, [1], stage=stage, block_size=16,
                 eos_token_ids=[99], warmup=0, profiler=profiler,
             )
     assert events[-3:] == [("sync", True), ("stop",), ("abort", False)]
@@ -193,56 +216,107 @@ def test_verify_error_stops_capture_and_aborts_after_stop(setup_profiler):
     assert not any(e[0] == "commit" for e in events)
 
 
-def test_proposal_eos_reports_actual_verify_rows(setup_profiler):
-    events, collector, profiler = setup_profiler()
+@pytest.mark.parametrize("stage", ["draft", "verify", "draft-verify"])
+def test_proposal_eos_reports_actual_verify_rows(setup_profiler, stage):
+    events, collector, profiler = setup_profiler(stage)
     with profiler:
         result = profile_one_stage(
-            FakeAdapter(collector, events), [1], stage="draft-verify", block_size=16,
+            FakeAdapter(collector, events), [1], stage=stage, block_size=16,
             eos_token_ids=[12], warmup=0, profiler=profiler,
         )
     assert result["result"]["proposal_token_ids"] == [11, 12]
-    assert result["result"]["verify_input_token_ids"] == [10, 11, 12]
-    assert result["result"]["verify_rows"] == 3
+    assert result["result"]["verify_input_token_ids"] == ([] if stage == "draft" else [10, 11, 12])
+    assert result["result"]["verify_rows"] == (0 if stage == "draft" else 3)
     assert result["warmup_output_match"] is None
     assert events.count(("start",)) == events.count(("stop",)) == 1
 
 
-def test_immediate_eos_does_not_emit_an_empty_capture(setup_profiler):
-    events, collector, profiler = setup_profiler()
+@pytest.mark.parametrize("stage", ["draft", "verify", "draft-verify"])
+def test_immediate_eos_does_not_emit_an_empty_capture(setup_profiler, stage):
+    events, collector, profiler = setup_profiler(stage)
     with pytest.raises(RuntimeError, match="anchor is EOS"):
         with profiler:
             profile_one_stage(
                 FakeAdapter(collector, events, anchor=99), [1],
-                stage="draft-verify", block_size=16,
+                stage=stage, block_size=16,
                 eos_token_ids=[99], warmup=0, profiler=profiler,
             )
     assert ("start",) not in events
     assert not collector.messages
 
 
-def test_zero_acceptance_commit_remains_outside_capture(setup_profiler):
-    events, collector, profiler = setup_profiler()
+@pytest.mark.parametrize("stage", ["verify", "draft-verify"])
+def test_zero_acceptance_commit_remains_outside_capture(setup_profiler, stage):
+    events, collector, profiler = setup_profiler(stage)
     with profiler:
         result = profile_one_stage(
             FakeAdapter(collector, events, reject=True), [1],
-            stage="draft-verify", block_size=16,
+            stage=stage, block_size=16,
             eos_token_ids=[99], warmup=1, profiler=profiler,
         )
     assert result["result"]["accepted_draft_tokens"] == 0
     assert events[events.index(("stop",)) + 1:][:2] == [("disable", False), ("commit", False, 0)]
 
 
-def test_stage_arguments_forward_without_shrinking_block(tmp_path):
+@pytest.mark.parametrize("stage", ["draft", "verify", "draft-verify"])
+def test_separate_windows_exclude_proposal_normalization_and_input_upload(setup_profiler, stage):
+    from models.dflash_v1 import stage_profile as module
+
+    events, collector, profiler = setup_profiler(stage)
+    normalize, input_ids = module._normalize_proposals, module._input_ids
+
+    def normalize_observed(*args, **kwargs):
+        events.append(("normalize", collector.active))
+        return normalize(*args, **kwargs)
+
+    def input_ids_observed(tokens, device):
+        events.append(("input-ids", collector.active, len(tokens)))
+        return input_ids(tokens, device)
+
+    with profiler, patch.object(module, "_normalize_proposals", side_effect=normalize_observed), \
+            patch.object(module, "_input_ids", side_effect=input_ids_observed):
+        profile_one_stage(
+            FakeAdapter(collector, events), [1], stage=stage, block_size=16,
+            eos_token_ids=[], warmup=0, profiler=profiler,
+        )
+    assert [e for e in events if e[0] == "normalize"] == [("normalize", stage == "draft-verify")]
+    block_inputs = [e for e in events if e[0] == "input-ids" and e[2] == 16]
+    assert block_inputs == ([] if stage == "draft" else [("input-ids", stage == "draft-verify", 16)])
+
+
+@pytest.mark.parametrize("stage", ["draft", "verify"])
+@pytest.mark.parametrize("failure", ["exception", "empty"])
+def test_draft_failures_abort_without_an_empty_verify_capture(setup_profiler, stage, failure):
+    events, collector, profiler = setup_profiler(stage)
+    adapter = FakeAdapter(
+        collector, events, fail_draft=failure == "exception", empty_draft=failure == "empty",
+    )
+    with profiler, pytest.raises(RuntimeError, match="draft failure|no proposals"):
+        profile_one_stage(
+            adapter, [1], stage=stage, block_size=16,
+            eos_token_ids=[], warmup=0, profiler=profiler,
+        )
+    assert profiler.windows == int(stage == "draft")
+    assert not collector.active and adapter.pending is None
+    assert events[-1] == ("abort", False)
+    assert not any(e[0] in {"verify", "commit"} for e in events)
+    if stage == "draft":
+        assert events.count(("stop",)) == 1
+        assert collector.messages[-1] == {"event": "done", "success": failure != "exception"}
+
+
+@pytest.mark.parametrize("stage", ["prefill", "draft", "verify", "draft-verify"])
+def test_stage_arguments_forward_without_shrinking_block(tmp_path, stage):
     with patch.object(run_npu, "_adapter_main", return_value=0) as run:
         assert run_npu.main([
             "--target-dir", "/model/target", "--draft-dir", "/model/draft",
             "--kv-cache-max-len", "256", "--prompt-ids", "1,2",
             "--max-new-tokens", "1", "--block-size", "16",
-            "--profile-stage", "draft-verify", "--profile-output", str(tmp_path / "raw"),
+            "--profile-stage", stage, "--profile-output", str(tmp_path / "raw"),
             "--profile-warmup", "0", "--profile-aic-metrics", "Memory",
         ]) == 0
     args = run_rollback._parser().parse_args(run.call_args.args[0])
-    assert (args.profile_stage, args.profile_warmup, args.profile_aic_metrics) == ("draft-verify", 0, "Memory")
+    assert (args.profile_stage, args.profile_warmup, args.profile_aic_metrics) == (stage, 0, "Memory")
     assert args.block_size == 16 and args.max_new_tokens == 1
 
 

@@ -95,6 +95,8 @@
       "wrapper_option": "--profile-stage",
       "stages": [
         "prefill",
+        "draft",
+        "verify",
         "draft-verify"
       ],
       "collector": "msprof dynamic CLI",
@@ -112,7 +114,10 @@
       "formal_latency_evidence": false,
       "control_protocol": "PROFILING_MODE=dynamic before app launch; attach --dynamic=on --pid; acknowledged start/stop/quit via PTY and local socket barriers",
       "control_timeout_seconds": 600,
-      "pass_requires_acknowledged_control": true
+      "pass_requires_acknowledged_control": true,
+      "draft_only_executes_target_verify": false,
+      "verify_only_setup_collected": false,
+      "elapsed_time_field": "profiled_elapsed_ms"
     }
   },
   "route_boundary": {

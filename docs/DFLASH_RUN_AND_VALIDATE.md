@@ -328,7 +328,7 @@ profile 时长当作单次 measurement latency。
 
 ### 7.4 只采一次 prefill 或 Draft 生成 + Target verify
 
-Python NPU 路线可以传 `--profile-stage prefill|draft-verify`。参数放在 wrapper 的 `--` **之前**，
+Python NPU 路线可以传 `--profile-stage prefill|draft|verify|draft-verify`。参数放在 wrapper 的 `--` **之前**，
 应用使用 `models.dflash_v1.run_npu`，不经过 `benchmark_npu` 的 correctness/warmup/measurement 循环。
 例如只采一次完整 prefill：
 
@@ -366,21 +366,54 @@ tools/run_msprof.sh \
     --prompt-mode chat --enable-thinking
 ```
 
+单独测一次 Draft 和一次 Target verify，可以分别运行下面两种模式（每种模式一个进程、一个采集窗口）：
+
+```bash
+for stage in draft verify; do
+  tools/run_msprof.sh \
+    --label "single-$stage" \
+    --output-dir "$BENCH_DIR/single-$stage" \
+    --python "$MODEL_PYTHON" \
+    --profile-stage "$stage" --profile-warmup 1 \
+    --aic-metrics PipeUtilization \
+    -- \
+    "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+      --target-dir /path/to/Qwen3.5-4B \
+      --draft-dir /path/to/Qwen3.5-4B-DFlash \
+      --kv-cache-max-len 2048 --block-size 16 --device npu:0 \
+      --prompt "请用一句话解释为什么天空是蓝色的。" \
+      --prompt-mode chat --enable-thinking
+done
+```
+
+读取各自 `single-draft-stage-report.json` / `single-verify-stage-report.json` 中的
+`profiled_elapsed_ms`，即对应阶段的同步耗时（毫秒）。该值排除模型加载、前置阶段和
+msprof 控制握手时间，包含 profiling 开销；具体算子时间读取各自输出目录的 `op_summary*.csv`。
+`verify` 会先在窗口外执行真实 prefill 和 Draft，使用其状态与 token 构建完整 verify 输入。
+`draft` 完成后清理请求，不执行 verify。两次运行应保持 prompt、B、预热次数和量化配置一致。
+单独测出的两段耗时不能视为联合窗口的精确拆分：`draft-verify` 还包含 proposal 整理和
+block 创建，且单独采集引入了各自的边界同步与 profiling 开销。联合窗口仍不在 Draft 与 verify
+之间额外插入同步。
+
 W8A8 沿用应用参数 `--config /path/to/qwen3.5.ymal --quant_mode enable`。每次使用新的输出目录；
 需分别查看 Memory/MemoryUB 时，保持 prompt、B、量化配置一致，换 `--aic-metrics` 单独采集。
 
 | 选项 | 窗口内执行 | 窗口外执行 |
 | --- | --- | --- |
 | `prefill` | 一次 Target `begin_rollback`：新建 cache、所有真实 prompt 分块、feature 收集、最后真实行 LM head | 模型加载、预热、anchor Top1；本模式不执行 Draft feature projection 或 Draft/verify |
+| `draft` | 一次首轮 Draft proposal：首次 Draft KV 构建、Draft 计算及 Top1 | 模型加载、预热、prefill、prompt feature projection、anchor Top1、proposal 整理和请求清理；不执行 Target verify |
+| `verify` | 一次首轮 Target verify，含首次状态 bank 准备 | 模型加载、预热、prefill、Draft、proposal 整理、verify 输入 tensor 创建，以及 verify 后的 Target Top1/accept/commit |
 | `draft-verify` | 首轮 Draft proposal（含首次 Draft KV 构建和 Draft Top1）、proposal 整理与 block 构建、一次 Target verify（含首次状态 bank 准备） | 模型加载、预热、prefill、prompt feature projection、anchor Top1、Target verify 后的 Top1/accept/commit |
 
 `--profile-warmup` 默认 1，预热不启动采集。每次预热和正式采集都从同一个 prompt 重建请求状态，
-不会沿用预热后推进的 KV/cursor。设为 0 可观察未预热的首次调用；`draft-verify` 仍须先完成 prefill。
+不会沿用预热后推进的 KV/cursor。设为 0 可观察未预热的首次调用；三个 Draft/verify 相关模式
+仍须先完成 prefill，`verify` 还须先完成 Draft。
 这里采的是 **prefill 后的首轮**，不代表后续已有 Draft KV 的稳定 decode 轮次。
 
-一个 prefill 可以包含多个 64-token 分块，不等于只执行一个模型 chunk。`draft-verify` 按完整 B
+一个 prefill 可以包含多个 64-token 分块，不等于只执行一个模型 chunk。三个 Draft/verify 相关模式都按完整 B
 请求 proposal：B=16 请求 15 个 draft token，通常 verify T=16；遇到 proposal EOS 会按生产规则
-缩短 T，实际值见报告 `result.verify_rows`。若 prefill anchor 已是 EOS，则报错退出而不生成空采集。
+缩短 T，实际值见报告 `result.verify_rows`；`draft` 不执行 verify，该值为 0，proposal 结果仍按 EOS
+规则截断。若 prefill anchor 已是 EOS，则报错退出而不生成空采集。
 此诊断分支忽略 `max-new-tokens` 的生成预算，也不运行 `execution-mode=validate` 的 ordinary 对照。
 
 内部使用 **msprof 原生动态采集 CLI**，无需 Python `acl` 模块，也不调用 profiling API。

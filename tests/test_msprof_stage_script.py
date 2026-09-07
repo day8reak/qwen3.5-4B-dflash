@@ -104,7 +104,8 @@ report = {
     "profile_stage": stage, "capture_windows": 1,
     "profile_output": str(root), "operator_fallback_enabled": False,
     "captured_calls": {"prefill": int(stage == "prefill"),
-        "draft": int(stage == "draft-verify"), "target_verify": int(stage == "draft-verify")},
+        "draft": int(stage in {"draft", "draft-verify"}),
+        "target_verify": int(stage in {"verify", "draft-verify"})},
 }
 if failure == "invalid-report": report["capture_windows"] = 2
 pathlib.Path(value("--report")).write_text(json.dumps(report))
@@ -181,7 +182,7 @@ def assert_processes_reaped(control):
 
 @pytest.mark.parametrize("stage,failure", [
     (stage, failure)
-    for stage in ("prefill", "draft-verify")
+    for stage in ("prefill", "draft", "verify", "draft-verify")
     for failure in (None, "application", "export", "empty", "invalid-report")
 ] + [
     ("draft-verify", failure) for failure in (

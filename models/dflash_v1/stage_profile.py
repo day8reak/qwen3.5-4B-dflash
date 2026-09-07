@@ -1,4 +1,4 @@
-"""One real prefill or first Draft/verify round, collected through the msprof dynamic CLI.
+"""One prefill, Draft, verify or joint round through the msprof dynamic CLI.
 
 The wrapper attaches msprof after warmup and exports after acknowledged stop/quit.
 Warmups rebuild the same first-round state and never start the collector.
@@ -19,7 +19,7 @@ from .dflash_rollback_decode import (
     _normalize_proposals,
     _top1_rows,
 )
-from .msprof_cli import COLLECTOR, CONTROL_FD_ENV, MsprofStageProfiler
+from .msprof_cli import COLLECTOR, CONTROL_FD_ENV, PROFILE_STAGES, MsprofStageProfiler
 from .target_quant import (
     TARGET_EMBEDDING_SCALE_PATH_ENV,
     TARGET_EMBEDDING_WEIGHT_PATH_ENV,
@@ -28,14 +28,36 @@ from .target_quant import (
 )
 
 
-PROFILE_STAGES = ("prefill", "draft-verify")
 AIC_METRICS = ("PipeUtilization", "Memory", "MemoryUB")
+STAGE_SCOPES = {
+    "prefill": (
+        "one complete Target.begin_rollback: fresh-cache reset, all real "
+        "prompt chunks, feature capture and final-row LM head; excludes "
+        "Draft feature projection and anchor Top1"
+    ),
+    "draft": (
+        "one first-round Draft proposal including initial Draft KV construction "
+        "and Draft Top1; excludes prefill, prompt feature projection, anchor Top1, "
+        "proposal normalization and request cleanup; no Target verify is executed"
+    ),
+    "verify": (
+        "one first-round Target verify including state-bank preparation; uses the "
+        "real prefill state and Draft tokens prepared before start; excludes "
+        "prefill, Draft, proposal normalization/block construction, Target Top1, "
+        "accept and commit"
+    ),
+    "draft-verify": (
+        "first Draft proposal, proposal normalization/block construction "
+        "and Target verify including first-round state-bank preparation; "
+        "excludes prefill, prompt feature projection, Target Top1, accept and commit"
+    ),
+}
 
 
 def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--profile-stage", choices=PROFILE_STAGES,
-        help="NPU diagnostic: collect exactly one prefill or first Draft+verify round",
+        help="NPU diagnostic: collect one prefill, Draft, verify or joint Draft+verify round",
     )
     parser.add_argument("--profile-output", help="new directory for raw msprof data")
     parser.add_argument(
@@ -117,9 +139,11 @@ def profile_one_stage(
     eos = _normalize_eos(eos_token_ids)
 
     def once(measured: bool):
-        capture = profiler.capture if measured else nullcontext
+        def capture(selected_stage: str):
+            return profiler.capture() if measured and stage == selected_stage else nullcontext()
+
         if stage == "prefill":
-            with capture():
+            with capture("prefill"):
                 # The adapter's begin also projects Draft features. Keep that
                 # outside this pure Target-prefill diagnostic.
                 output = adapter.target.begin_rollback(prompt_ids)
@@ -132,15 +156,36 @@ def profile_one_stage(
             raise RuntimeError("prefill anchor is EOS; no Draft/verify round to profile")
         prefix_ids = _input_ids([*prompt, anchor], device)
         try:
-            with capture():
+            # Exactly one of these scopes collects. The joint mode retains one
+            # uninterrupted window, without a new barrier between Draft/verify.
+            with capture("draft-verify"):
+                with capture("draft"):
+                    raw_proposals = adapter.propose_rollback(prefix_ids, block_size - 1)
                 proposals = _normalize_proposals(
-                    adapter.propose_rollback(prefix_ids, block_size - 1),
+                    raw_proposals,
                     proposal_limit=block_size - 1, eos_token_ids=eos,
                 )
                 if not proposals:
                     raise RuntimeError("Draft returned no proposals; no Draft/verify capture")
-                block = [anchor, *proposals]
-                verify_output = adapter.verify_rollback(_input_ids(block, device))
+                if stage != "draft":
+                    block = [anchor, *proposals]
+                    # For verify-only, materialize the exact production input
+                    # before start; capture() drains all setup work on the NPU.
+                    block_ids = _input_ids(block, device)
+                    with capture("verify"):
+                        verify_output = adapter.verify_rollback(block_ids)
+            if stage == "draft":
+                # No verification/commit is needed for a Draft-only diagnostic.
+                # Discard its request-local KV outside collection before replay.
+                adapter.abort_rollback()
+                return {
+                    "anchor_token_id": anchor,
+                    "proposal_token_ids": proposals,
+                    "verify_input_token_ids": [],
+                    "target_top1_token_ids": [],
+                    "verify_rows": 0,
+                    "accepted_draft_tokens": None,
+                }
             # Target Top1, accept and commit are deliberately outside collection.
             # Keep ordinary production acceptance/disable semantics after the call.
             target_tokens = _top1_rows(
@@ -189,8 +234,8 @@ def profile_one_stage(
         "capture_windows": profiler.windows,
         "captured_calls": {
             "prefill": int(stage == "prefill"),
-            "draft": int(stage == "draft-verify"),
-            "target_verify": int(stage == "draft-verify"),
+            "draft": int(stage in {"draft", "draft-verify"}),
+            "target_verify": int(stage in {"verify", "draft-verify"}),
         },
         "warmup_iterations": warmup,
         "warmup_output_match": stable,
@@ -200,15 +245,7 @@ def profile_one_stage(
         "block_size": block_size,
         "proposal_capacity": block_size - 1,
         "max_new_tokens_applies": False,
-        "stage_scope": (
-            "one complete Target.begin_rollback: fresh-cache reset, all real "
-            "prompt chunks, feature capture and final-row LM head; excludes "
-            "Draft feature projection and anchor Top1"
-            if stage == "prefill" else
-            "first Draft proposal, proposal normalization/block construction "
-            "and Target verify including first-round state-bank preparation; "
-            "excludes prefill, prompt feature projection, Target Top1, accept and commit"
-        ),
-        "synchronization": "before start and before stop; no added Draft/verify barrier",
+        "stage_scope": STAGE_SCOPES[stage],
+        "synchronization": "before/after the selected stage; no added Draft/verify barrier in joint mode",
         "result": measured,
     }

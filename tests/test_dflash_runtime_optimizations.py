@@ -136,29 +136,40 @@ class DFlashRuntimeOptimizationTest(unittest.TestCase):
         )
         first_round = ordinary_schedule.rounds[1]
         # CPU reduced-shape orchestration only; no device collection evidence.
-        profiler = SimpleNamespace(
-            windows=0, output="HOST_TEST_NO_CAPTURE", metrics="PipeUtilization",
-            elapsed_ms=None, synchronize=lambda: None,
-        )
+        for stage in ("draft-verify", "draft", "verify"):
+            with self.subTest(stage=stage):
+                verify_calls_before = adapter.rollback_stats.rollback_verify_calls
+                profiler = SimpleNamespace(
+                    windows=0, output="HOST_TEST_NO_CAPTURE", metrics="PipeUtilization",
+                    elapsed_ms=None, synchronize=lambda: None,
+                )
 
-        @contextmanager
-        def capture():
-            profiler.windows += 1
-            yield
+                @contextmanager
+                def capture():
+                    profiler.windows += 1
+                    yield
 
-        profiler.capture = capture
-        report = profile_one_stage(
-            adapter, [1, 2, 3], stage="draft-verify", block_size=4,
-            eos_token_ids=[], warmup=2, profiler=profiler,
-        )
-        result = report["result"]
-        self.assertTrue(report["warmup_output_match"])
-        self.assertEqual(result["anchor_token_id"], ordinary_schedule.generated_token_ids[0])
-        self.assertEqual(tuple(result["proposal_token_ids"]), first_round.proposed_token_ids)
-        self.assertEqual(tuple(result["target_top1_token_ids"]), first_round.target_token_ids)
-        self.assertEqual(result["accepted_draft_tokens"], len(first_round.accepted_draft_token_ids))
-        self.assertEqual(result["verify_rows"], 4)
-        self.assertIsNone(adapter.target.pending)
+                profiler.capture = capture
+                report = profile_one_stage(
+                    adapter, [1, 2, 3], stage=stage, block_size=4,
+                    eos_token_ids=[], warmup=2, profiler=profiler,
+                )
+                result = report["result"]
+                self.assertTrue(report["warmup_output_match"])
+                self.assertEqual(result["anchor_token_id"], ordinary_schedule.generated_token_ids[0])
+                self.assertEqual(tuple(result["proposal_token_ids"]), first_round.proposed_token_ids)
+                self.assertIsNone(adapter.target.pending)
+                if stage == "draft":
+                    self.assertEqual(result["verify_rows"], 0)
+                    self.assertIsNone(result["accepted_draft_tokens"])
+                    self.assertEqual(adapter.rollback_stats.rollback_verify_calls, verify_calls_before)
+                    self.assertEqual(adapter._draft_kv_cache.committed_length, 0)
+                    self.assertIsNone(adapter._rollback_pending_projected_features)
+                else:
+                    self.assertEqual(tuple(result["target_top1_token_ids"]), first_round.target_token_ids)
+                    self.assertEqual(result["accepted_draft_tokens"], len(first_round.accepted_draft_token_ids))
+                    self.assertEqual(result["verify_rows"], 4)
+                    self.assertEqual(adapter.rollback_stats.rollback_verify_calls - verify_calls_before, 3)
 
     def test_projected_feature_path_matches_uncached_path(self) -> None:
         torch.manual_seed(20260827)

@@ -29,6 +29,7 @@ CONTROL_FD_ENV = "DFLASH_MSPROF_CONTROL_FD"
 TIMEOUT_ENV = "DFLASH_MSPROF_CONTROL_TIMEOUT"
 COLLECTOR = "msprof dynamic CLI"
 DEFAULT_TIMEOUT = 600.0
+PROFILE_STAGES = ("prefill", "draft", "verify", "draft-verify")
 
 
 def positive_timeout(value) -> float:
@@ -371,7 +372,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--msprof-bin", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--stage", required=True, choices=("prefill", "draft-verify"))
+    parser.add_argument("--stage", required=True, choices=PROFILE_STAGES)
     parser.add_argument("--metrics", default="PipeUtilization", choices=("PipeUtilization", "Memory", "MemoryUB"))
     parser.add_argument("--timeout", type=positive_timeout, default=DEFAULT_TIMEOUT)
     parser.add_argument("--control-report", required=True)
