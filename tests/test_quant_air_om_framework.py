@@ -2069,7 +2069,7 @@ def test_air_export_audits_retained_adn_rms_norm(
     graph = result["graphs"][0]
     audit = graph["custom_op_audit"][0]
     standard_override = graph["standard_op_overrides"][0]
-    assert result["schema_version"] == 3
+    assert result["schema_version"] == 4
     assert graph["input_dim_gears"] == {"0": {"0": [1, 2]}}
     assert graph["torchair_external_weight_mapping"]["status"] == (
         "NOT_APPLICABLE_EXPLICIT_TEST_DOUBLE"

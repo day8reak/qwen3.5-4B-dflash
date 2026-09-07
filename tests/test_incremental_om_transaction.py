@@ -115,6 +115,9 @@ def test_exact_accept_commit_and_state_selection(
         next_cursor,
         finished,
     ) = outputs
+    for count in (commit_count, drafted_count, accepted_count,
+                  rejected_count, committed_input_count):
+        assert count.dtype == torch.int32
     expected, drafted, accepted, rejected, expected_finished = _reference(
         proposals,
         target,

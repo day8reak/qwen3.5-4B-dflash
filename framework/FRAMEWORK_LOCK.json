@@ -1,6 +1,6 @@
 {
-  "schema_version": 35,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v35",
+  "schema_version": 36,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v36",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -201,6 +201,7 @@
     "state_policy": "recompute committed prefix"
   },
   "compiler": {
+    "runtime_input_abi_gate": "AIR schema 4 requires public-tensor-storage-identity-v1 normalization: Dynamo specialize_float=True preserves model Python float constants without freezing tensor dimensions; resolve Data.index against concrete serialization inputs before weights are externalized, canonicalize Data/RefData order to public tensor arguments, and reject every unknown scalar, duplicate, alias, or missing public input before serialization; compile-om validates and retains the passing audit",
     "exporter": "TorchAir dynamo_export",
     "dynamic_external_weight_mapping_gate": "for every dynamic graph, identify the canonical TorchAir package by import identity rather than assuming types.ModuleType, replace captured parameter placeholders only by GraphDef Data.index == runtime input index, and never index GraphDef.op by the runtime ordinal; only an explicitly marked injected unit-test double may skip receiver internals; fail export if the receiver private ABI drifts, the indexed Data is absent/RefData, the conversion is not invoked, or converted/used counts differ; restore TorchAir immediately after each export, record per-graph manifest evidence, and make compile-om reject every dynamic non-PASS/missing/count-mismatched audit before starting ATC",
     "custom_op_gate": "validate and propagate AIR custom_op_audit before ATC",
@@ -219,7 +220,9 @@
     "api": "AscendCL",
     "model_load": "integrated runner uses aclmdlLoadFromFile; incremental runner uses aclmdlLoadFromFileWithMem with separate per-artifact weights and one serial shared workspace",
     "model_memory_query": "aclmdlQuerySize is recorded for the active integrated OM; qwen35_dflash_om_inspect sums weights and uses the maximum serial workspace across a proposed multi-OM set",
-    "dynamic_input_size_policy": "locate the synthetic ascend_mbatch_shape_data index by its fixed CANN name before reading public tensor descriptors and treat only that nonzero-sized internal control buffer as opaque because aclmdlGetInputDims may report dimCount=0 and aclmdlGetInputDataType may be undefined; aclmdlGetInputSizeByIndex returning zero is valid only for a public input whose model shape contains -1 in a required dynamic-gear OM; validate every positive flattened gear against all static dimensions, derive the maximum dense byte bound with overflow checks before allocation, and keep zero-sized control buffers, undefined public dtypes, zero-sized static inputs or outputs, and public/output ranks outside 1..128 fatal with role/index/name/shape diagnostics",
+    "dynamic_input_size_policy": "retain legacy ascend_mbatch_shape_data discrete gears and opaque control handling; for canonical public-input OMs with no control and zero queried gears, use aclmdlSetDatasetTensorDesc for bounded dynamic Shape input plans without a synthetic control allocation; aclmdlGetInputSizeByIndex returning zero is legal only for inputs containing -1; validate each flattened gear or runtime shape plan against static dimensions and derive maximum dense bytes with overflow checks before allocation; undefined public dtypes, zero-sized static inputs or outputs, and public/output ranks outside 1..128 remain fatal; outputs must have the fixed tensor ABI",
+    "dynamic_shape_evidence": "legacy *_dynamic_gear_count fields count bounded runtime shape plans; *_dynamic_shape distinguishes the API, and *_om_dynamic_gear_count reports only queried OM gears (zero for dynamic Shape), never fabricated compiler profiles",
+    "transaction_count_dtype": "drafted_count and accepted_count reductions explicitly use INT32; commit_count, rejected_count and committed_input_count stay INT32; token IDs and logical cursors stay INT64; no token/acceptance semantics change",
     "execute": "aclmdlExecuteAsync",
     "memory": "persistent pinned host/device buffers; integrated input device mirrors upload only changed contiguous ranges after the first call and target D2H is limited to the last K+1 rows required by every current scheduler read; the multi-OM runner (five-artifact baseline, four-artifact unified Target step, or four-artifact fused speculative step) uses one 64-byte-aligned prefill control carrier but uploads only the prefix through the last field consumed by each chunk, keeps the EOS tail process-resident, gives the unified topology one aligned process-resident INT32 zero-count view, accumulates contiguous Target feature slabs in one device arena, and downloads only compact scheduler-visible results",
     "device_memory_allocation": "normal-only remains the compiled rollback default; build-cpp can produce a separate huge-first exact candidate. Both runners report the compiled policy, which covers every explicit aclrtMalloc including integrated I/O, multi-OM weights, the shared serial workspace, state and carriers; changing the default requires same-source/same-OM forward-and-reverse physical Ascend310P 3+10 zero-mismatch, memory-headroom and median/p90 evidence",

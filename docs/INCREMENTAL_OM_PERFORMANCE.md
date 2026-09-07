@@ -415,9 +415,10 @@ host API 开销，不能消除 OM 内部的完整前缀重算。只有上述多�
   起始地址必须 64-byte 对齐，先做一次 8-byte D2D 到现有对齐 scalar。标准 scheduler 不再上传
   decode ID，只有调用者显式改写 ID 才走 pinned-host H2D；token 语义和五个 OM 的 ABI 均不改变；
 - Draft 的 verify-source `N=1..16` 与 prompt-source
-  `N=64,128,...,kv_cache_max_len` 离散 gear 通过 TorchAir
-  `set_dim_gears` 写入 AIR；C++ 启动时逐档核验并预建 dataset，request 热循环不调用
-  `aclmdlSetInputDynamicDims`。默认 `fixed-16` 仍绑定 N=16；候选 `committed-prefix` 在同步后绑定
+  `N=64,128,...,kv_cache_max_len` 是有界运行 shape 合同；TorchAir `set_dim_gears`
+  只是前端声明，不保证 OM 携带分档控制输入。C++ 启动时对实际分档 OM 逐档核验，对动态
+  Shape OM 则按同一合同设置 `aclmdlSetDatasetTensorDesc` 并预建 dataset；request 热循环
+  不调用两种 shape 设置接口。默认 `fixed-16` 仍绑定 N=16；候选 `committed-prefix` 在同步后绑定
   `accepted+1` 行；同一 window 内尚未读回上一事务时，后续事务绑定其前驱严格因果上界
   `K+1`；
 - ordinary 路径执行 `target-prefill` body、末尾一次 `target-prefill-head` 和后续
@@ -481,19 +482,22 @@ jq -r '.graphs[] | [.name,.role,.om.path,.om.sha256] | @tsv' \
 静默分解成普通 Tensor 子图。exporter 在调用 `torchair.dynamo_export` 前对第 0 个输入执行
 `torchair.inference.set_dim_gears`，但该调用仅说明前端声明，不能证明 AIR/OM 含分档控制输入。
 不要给 `--framework=1` 的 AIR→OM ATC 命令额外拼 `--dynamic_dims`，CANN 明确不支持此组合。
-当前 C++ 仅实现分档接口，启动会要求
-`N=1..16` 和从 64 到 `max_sequence_length` 的每个 64 倍数都能由
-`aclmdlGetInputDynamicDims` 查询到，缺一档就直接失败。2026-09-07 receiver AIR/OM
-未满足这一执行合同；参见[动态 Shape 接口故障说明](QUANT_AIR_OM_FRAMEWORK.md#121-动态-shape-air-与分档-om-的接口不匹配尚未闭环)。
-本节构建命令不能当成设备集成已经通过的证据。
+v36 / C++ `1.22.0` 支持两条互斥路径：实际分档 OM 必须能查询到完整的 `N=1..16`
+及每个 64-row prompt gear；没有控制输入且 gear 查询成功、count 为 0 的动态 Shape OM，
+则必须先通过规范公开输入 ABI，再按同一组有界 shape 计划设置
+`aclmdlSetDatasetTensorDesc`。两条路径都不接受未知 scalar 或动态输出。
+2026-09-07 的旧 receiver OM 有 48 个输入和错误的输出计数 dtype，需从 `export-air`
+开始重导到新 bundle；参见[公开输入与动态 Shape 修复](QUANT_AIR_OM_FRAMEWORK.md#121-动态-shape-的公开输入绑定与计数类型修复)。
+本节构建命令和主机回归不能当成新产物已经通过设备集成的证据。
 
 AscendCL 的
 [`aclmdlGetInputSizeByIndex`](https://www.hiascend.com/document/detail/en/canncommercial/850/API/appdevgapi/aclcppdevg_03_1451.html)
-约束明确说明：shape 含 `-1` 的动态输入会返回 0。对于已经确认使用分档接口的 OM，runner
-不把这个 0 当作损坏 OM，而是按
+约束明确说明：shape 含 `-1` 的动态输入会返回 0。runner 不把这个 0 当作损坏 OM。
+分档 OM 按
 [`aclmdlGetInputDynamicDims`](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_1468.html)
 给出的“所有公开输入 rank 之和”的 flattened gear 顺序校验静态维度，并以全部 gear 中的最大
-dense bytes 建立有界分配；静态输入、输出或未声明动态 gear 的零字节仍直接失败。OM 文件名也
+dense bytes 建立有界分配；动态 Shape OM 则按固定 cache 容量与相同公开 shape 合同解析
+最大 dense bytes。静态输入和所有输出的零字节仍直接失败。OM 文件名也
 必须从 deployment manifest 的 `.om.path` 读取，因为 ATC 可能追加 `_linux_aarch64` 或
 `_linux_x86_64`。
 
@@ -539,7 +543,8 @@ PYTHONPATH="$PWD/framework/python:$PWD" "$MODEL_PYTHON" -m pytest -q \
 #### 5.2.1 生成四物理 OM 的统一 Target-step 候选
 
 使用同一个 factory 配置、checkpoint、量化文件和 receiver，只替换 factory 名；不要给 ATC
-手写 `--dynamic_dims`。16 档是当前 runner 的要求，不是已验证由 TorchAir AIR 携带的属性；
+手写 `--dynamic_dims`。T=1..16 是当前 runner 的 shape 计划要求，不是已验证由 TorchAir AIR
+携带的原生分档属性；
 仍须完成上文实际 OM 动态接口和物理输入绑定检查：
 
 ```bash
@@ -575,8 +580,10 @@ PYTHONPATH="$PWD/framework/python:$PWD" "$MODEL_PYTHON" -m pytest -q \
   tests/test_incremental_cpp_runtime.py
 ```
 
-C++ runner 看到 manifest 中没有 `target-decode1` 且 verify gear 合同完整时会自动选择四模型路径；
-缺 T=1、任一中间 gear、动态标记或固定 13 输出都会在 load/控制面校验阶段失败。运行后再检查：
+C++ runner 看到 manifest 中没有 `target-decode1` 且 verify shape 合同完整时会自动选择四模型路径；
+缺 T=1、任一中间 shape 计划、动态标记或固定 13 输出都会在 load/控制面校验阶段失败。
+原生分档模式还会逐项查询 OM gear；动态 Shape 模式会预建 16 个输入描述计划。
+运行后再检查：
 
 ```bash
 jq -e '
@@ -584,6 +591,12 @@ jq -e '
     "split-prefill-head-four-resident-unified-target-step-v1") and
   (.models | length == 4) and
   (.execution_io_counters.target_step_dynamic_gear_count == 16) and
+  (.execution_io_counters as $io |
+    if $io.target_step_dynamic_shape then
+      $io.target_step_om_dynamic_gear_count == 0
+    else
+      $io.target_step_om_dynamic_gear_count == 16
+    end) and
   (.protocol.target_step_zero_count_policy ==
     "T=1 datasets bind a process-resident aligned INT32 zero; positive K stays in the mutable proposal carrier") and
   (.model_memory_query.target_step_zero_count_device_bytes == 4) and
@@ -605,9 +618,9 @@ jq -e '
 #### 5.2.2 生成四物理 OM 的 fused speculative-step 候选
 
 仍使用同一份 checkpoint、量化文件、receiver、自定义算子注册和 factory 配置，只替换 factory
-入口。`fused-speculative-step` 的第 0 个输入是 Draft 消费的 Target feature，因此 AIR 必须携带
-N=1..16 以及 N=64,128,...,`max_sequence_length` 的完整离散 gear；内部 Target verify 始终是
-固定 T=16。
+入口。`fused-speculative-step` 的第 0 个输入是 Draft 消费的 Target feature，因此 manifest 必须
+声明 N=1..16 以及 N=64,128,...,`max_sequence_length` 的完整运行 shape 集；最终 OM 可以是
+原生分档或动态 Shape 接口，不能仅靠声明判断。内部 Target verify 始终是固定 T=16。
 
 ```bash
 export FUSED_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-fused-speculative-step"
@@ -622,7 +635,7 @@ export FUSED_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-fused-speculative-step"
 ```
 
 生成后必须恰好是下面四个 role；不能同时混入独立 `draft-propose` 或
-`target-verify-commit`。所有 Target verify 自定义节点仍必须保留，且动态 gear 不能缺失：
+`target-verify-commit`。所有 Target verify 自定义节点仍必须保留，且声明的运行 shape 不能缺失：
 
 ```bash
 jq -e --argjson max_sequence_length 2048 '
@@ -1475,7 +1488,9 @@ for DRAFT_POLICY in fixed prefix; do
 done
 ```
 
-先检查 token、EOS、动态 gear 和所有行数/route 计数闭合：
+先检查 token、EOS、有界 shape 计划及实际 OM gear 证据和所有行数/route 计数闭合：
+`*_dynamic_gear_count` 是历史字段名，表示 runner 计划数；`*_om_dynamic_gear_count`
+才表示 AscendCL 实际查询到的分档数，动态 Shape 模式必须为 0。
 
 ```bash
 jq -e -s '
@@ -1494,6 +1509,11 @@ jq -e -s '
     ($io.draft_dynamic_gear_count ==
      ($io.draft_verify_dynamic_gear_count +
       $io.draft_prefill_dynamic_gear_count)) and
+    (if $io.draft_dynamic_shape then
+       $io.draft_om_dynamic_gear_count == 0
+     else
+       $io.draft_om_dynamic_gear_count == $io.draft_dynamic_gear_count
+     end) and
     (($io.draft_verify_fixed_width_executions +
       $io.draft_verify_committed_prefix_executions +
       $io.draft_verify_pending_upper_bound_executions) ==
@@ -1887,8 +1907,8 @@ export UNIFIED_TARGET_STEP_OM="$UNIFIED_BUNDLE/$(jq -er \
   --progress true
 ```
 
-如果误把静态五图的 verify OM 放到这里，runner 会因缺少动态控制输入或 T=1..16 gear 而拒绝
-启动；不会静默退回固定 T=16。
+如果误把静态五图的 verify OM 放到这里，runner 会因缺少动态维度或完整 T=1..16 运行 shape
+合同而拒绝启动；不会静默退回固定 T=16。
 
 fused speculative-step 同样使用这个 runner，但保留独立 `target-decode1`，并用一个 fused OM
 替换两项独立 Draft/verify。下面是可直接复制的未 profiling 3+10 命令：

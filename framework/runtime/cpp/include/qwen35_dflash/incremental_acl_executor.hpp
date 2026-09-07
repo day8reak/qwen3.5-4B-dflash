@@ -161,6 +161,10 @@ struct IncrementalAclExecutionStats {
   std::size_t draft_verify_dynamic_gear_count = 0;
   std::size_t draft_prefill_dynamic_gear_count = 0;
   std::size_t target_step_dynamic_gear_count = 0;
+  bool draft_dynamic_shape = false;
+  bool target_step_dynamic_shape = false;
+  std::size_t draft_om_dynamic_gear_count = 0;
+  std::size_t target_step_om_dynamic_gear_count = 0;
   std::size_t target_step_input_rows = 0;
   std::size_t target_step_padded_rows_elided = 0;
   std::size_t target_step_zero_count_device_bytes = 0;

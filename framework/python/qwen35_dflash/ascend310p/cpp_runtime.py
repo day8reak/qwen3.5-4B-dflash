@@ -1287,6 +1287,21 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental explicit device allocation does not close")
     execution = report.get("execution_io_counters", {})
+    for prefix in ("draft", "target_step"):
+        shape_key = f"{prefix}_dynamic_shape"
+        actual_key = f"{prefix}_om_dynamic_gear_count"
+        planned_key = f"{prefix}_dynamic_gear_count"
+        if any(key in scope for scope in (memory, execution)
+               for key in (shape_key, actual_key)):
+            mode = memory.get(shape_key)
+            actual = memory.get(actual_key)
+            if (not isinstance(mode, bool) or isinstance(actual, bool) or
+                    not isinstance(actual, int) or actual < 0 or
+                    actual != (0 if mode else memory.get(planned_key, 0)) or
+                    execution.get(shape_key) != mode or
+                    execution.get(actual_key) != actual or
+                    (prefix == "target_step" and mode and not unified_target_step)):
+                raise RuntimeError(f"incremental {prefix} dynamic Shape/OM gear evidence differs")
     role_counts = [
         execution.get("target_prefill_executions"),
         execution.get("target_prefill_head_executions"),

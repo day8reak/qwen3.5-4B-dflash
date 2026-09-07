@@ -844,6 +844,23 @@ def test_fused_incremental_runner_report_closes_one_physical_launch() -> None:
     _validate(_fused_report(), fused_speculative_step=True)
 
 
+@pytest.mark.parametrize("wrong_gears", [False, True])
+def test_fused_dynamic_shape_reports_real_om_gears_separately(wrong_gears) -> None:
+    report = _fused_report()
+    for scope in (report["model_memory_query"], report["execution_io_counters"]):
+        scope.update({
+            "draft_dynamic_shape": True,
+            "draft_om_dynamic_gear_count": 18 if wrong_gears else 0,
+            "target_step_dynamic_shape": False,
+            "target_step_om_dynamic_gear_count": 0,
+        })
+    if wrong_gears:
+        with pytest.raises(RuntimeError, match="dynamic Shape/OM gear"):
+            _validate(report, fused_speculative_step=True)
+    else:
+        _validate(report, fused_speculative_step=True)
+
+
 def test_fused_incremental_runner_rejects_launch_elision_drift() -> None:
     report = _fused_report()
     report["execution_io_counters"][

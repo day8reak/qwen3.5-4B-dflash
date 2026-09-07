@@ -18,6 +18,13 @@ struct aclDataBuffer {
 struct aclmdlDataset {
   std::vector<aclDataBuffer*> buffers;
   aclmdlIODims dynamic_dims{};
+  bool uses_tensor_descriptor = false;
+};
+
+struct aclTensorDesc {
+  aclDataType dtype;
+  aclFormat format;
+  std::vector<std::int64_t> dims;
 };
 
 namespace {
@@ -44,6 +51,13 @@ bool MissingDynamicControl(Role role) {
       std::getenv("QWEN35_DFLASH_FAKE_MISSING_DYNAMIC_CONTROL");
   return role == Role::kFusedSpeculativeStep && enabled != nullptr &&
          std::string(enabled) == "1";
+}
+
+bool DynamicShapeMode(Role role) {
+  const char* enabled = std::getenv("QWEN35_DFLASH_FAKE_DYNAMIC_SHAPE");
+  return enabled != nullptr && std::string(enabled) == "1" &&
+      (role == Role::kDraftPropose || role == Role::kTargetStep ||
+       role == Role::kFusedSpeculativeStep);
 }
 
 constexpr std::size_t kSequenceLength = 32;
@@ -222,6 +236,22 @@ const std::vector<Spec>& Inputs(Role role) {
       kDraftCursor,
       {ACL_UINT64, {64}, "ascend_mbatch_shape_data"},
   };
+  static const std::vector<Spec> shape_draft(draft.begin(), draft.end() - 1);
+  static const std::vector<Spec> shape_target_step(target_step.begin(), target_step.end() - 1);
+  static const std::vector<Spec> shape_fused(fused.begin(), fused.end() - 1);
+  // Reduced-width version of the receiver's 48-input AIR ABI. The 33 FP64
+  // placeholders and reordered public tensors must fail before inference.
+  static const std::vector<Spec> lifted_fused = [&]() {
+    const Spec scalar{ACL_DOUBLE, {}, "lifted_float_scalar"};
+    std::vector<Spec> result{
+        fused[0], fused[1], fused[2], scalar, scalar, fused[14],
+        fused[3], fused[4], fused[12], fused[13]};
+    result.insert(result.end(), 31, scalar);
+    for (const std::size_t index : {11U, 7U, 8U, 9U, 10U, 5U, 6U}) {
+      result.push_back(fused[index]);
+    }
+    return result;
+  }();
   switch (role) {
     case Role::kTargetPrefill:
       return prefill;
@@ -230,13 +260,16 @@ const std::vector<Spec>& Inputs(Role role) {
     case Role::kTargetDecode:
       return decode;
     case Role::kDraftPropose:
-      return draft;
+      return DynamicShapeMode(role) ? shape_draft : draft;
     case Role::kTargetVerify:
       return verify;
     case Role::kTargetStep:
-      return target_step;
+      return DynamicShapeMode(role) ? shape_target_step : target_step;
     case Role::kFusedSpeculativeStep:
-      return fused;
+      if (MissingDynamicControl(role)) {
+        return lifted_fused;
+      }
+      return DynamicShapeMode(role) ? shape_fused : fused;
     case Role::kIntegrated:
       return integrated;
   }
@@ -554,7 +587,8 @@ aclError ExecuteVerify(const aclmdlDataset* input, aclmdlDataset* output) {
 aclError ExecuteFused(
     const aclmdlDataset* input,
     aclmdlDataset* output) {
-  if (input->buffers.size() != 16 || output->buffers.size() != 16) {
+  if (input->buffers.size() != Inputs(Role::kFusedSpeculativeStep).size() ||
+      output->buffers.size() != 16) {
     return 1;
   }
   alignas(64) std::array<std::int64_t, kVerifyRows> verify_ids{};
@@ -810,9 +844,6 @@ aclError aclmdlGetInputDims(
     // Exercise opaque control metadata; this fixture is not evidence that
     // any particular real OM exposes the same descriptor.
     dimensions->dimCount = 0;
-    if (MissingDynamicControl(description->role)) {
-      std::strcpy(dimensions->name, "lifted_float_scalar");
-    }
   }
   return status;
 }
@@ -829,10 +860,6 @@ aclError aclmdlGetOutputDims(
 
 aclDataType aclmdlGetInputDataType(
     const aclmdlDesc* description, std::size_t index) {
-  if (description != nullptr && MissingDynamicControl(description->role) &&
-      index + 1 == Inputs(description->role).size()) {
-    return ACL_DOUBLE;
-  }
   return description != nullptr && index < Inputs(description->role).size()
       ? Inputs(description->role)[index].dtype
       : ACL_DT_UNDEFINED;
@@ -851,10 +878,6 @@ std::size_t aclmdlGetInputSizeByIndex(
     return 0;
   }
   const auto& spec = Inputs(description->role)[index];
-  if (MissingDynamicControl(description->role) &&
-      std::string(spec.name) == "ascend_mbatch_shape_data") {
-    return sizeof(double);
-  }
   const char* force_zero_static =
       std::getenv("QWEN35_DFLASH_FAKE_ZERO_STATIC_INPUT");
   if (description->role == Role::kTargetPrefill && index == 0 &&
@@ -886,6 +909,10 @@ aclError aclmdlGetInputIndexByName(
       std::string(name) == "ascend_mbatch_shape_data") {
     return 100000;
   }
+  if (DynamicShapeMode(description->role) &&
+      std::string(name) == "ascend_mbatch_shape_data") {
+    return 100000;
+  }
   const auto& inputs = Inputs(description->role);
   for (std::size_t candidate = 0; candidate < inputs.size(); ++candidate) {
     if (inputs[candidate].name == std::string(name)) {
@@ -905,6 +932,10 @@ aclError aclmdlGetInputDynamicGearCount(
        description->role != Role::kFusedSpeculativeStep &&
        description->role != Role::kTargetStep)) {
     return 1;
+  }
+  if (DynamicShapeMode(description->role) || MissingDynamicControl(description->role)) {
+    *gear_count = 0;
+    return ACL_SUCCESS;
   }
   *gear_count =
       (description->role == Role::kDraftPropose ||
@@ -959,6 +990,38 @@ aclmdlDataset* aclmdlCreateDataset() {
   return new (std::nothrow) aclmdlDataset();
 }
 
+aclTensorDesc* aclCreateTensorDesc(
+    aclDataType dtype, int num_dims, const std::int64_t* dims, aclFormat format) {
+  if (num_dims <= 0 || num_dims > 128 || dims == nullptr || format != ACL_FORMAT_ND) {
+    return nullptr;
+  }
+  return new (std::nothrow) aclTensorDesc{dtype, format, {dims, dims + num_dims}};
+}
+
+void aclDestroyTensorDesc(const aclTensorDesc* desc) { delete desc; }
+
+aclError aclmdlSetDatasetTensorDesc(
+    aclmdlDataset* dataset, aclTensorDesc* tensor_desc, std::size_t index) {
+  if (dataset == nullptr || tensor_desc == nullptr || index != 0 ||
+      dataset->buffers.empty() || tensor_desc->dims.size() < 2) {
+    return 1;
+  }
+  std::size_t bytes = TypeBytes(tensor_desc->dtype);
+  for (const auto dim : tensor_desc->dims) {
+    if (dim <= 0) {
+      return 1;
+    }
+    bytes *= static_cast<std::size_t>(dim);
+  }
+  if (bytes > dataset->buffers[index]->size) {
+    return 1;
+  }
+  dataset->dynamic_dims.dimCount = tensor_desc->dims.size();
+  std::copy(tensor_desc->dims.begin(), tensor_desc->dims.end(), dataset->dynamic_dims.dims);
+  dataset->uses_tensor_descriptor = true;
+  return ACL_SUCCESS;
+}
+
 aclError aclmdlDestroyDataset(aclmdlDataset* dataset) {
   delete dataset;
   return ACL_SUCCESS;
@@ -994,6 +1057,9 @@ aclError aclmdlSetInputDynamicDims(
   if (iterator == g_models.end() || dataset == nullptr || dimensions == nullptr) {
     return 1;
   }
+  if (DynamicShapeMode(iterator->second)) {
+    return 1;
+  }
   const std::size_t expected_index =
       iterator->second == Role::kDraftPropose
       ? 8
@@ -1014,6 +1080,9 @@ aclError aclmdlExecuteAsync(
     aclrtStream) {
   const auto iterator = g_models.find(model_id);
   if (iterator == g_models.end() || input == nullptr || output == nullptr) {
+    return 1;
+  }
+  if (DynamicShapeMode(iterator->second) && !input->uses_tensor_descriptor) {
     return 1;
   }
   const auto aligned = [](const aclDataBuffer* buffer) {

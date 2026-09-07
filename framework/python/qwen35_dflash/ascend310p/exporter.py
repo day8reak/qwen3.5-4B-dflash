@@ -27,6 +27,7 @@ from .standard_op_export import (
     prepare_aten_softplus_export,
 )
 from .torchair_compat import index_safe_external_weight_conversion
+from .runtime_input_export import canonical_runtime_input_abi
 from .utils import atomic_write_json, file_record, require_run_output, resolve_callable
 
 
@@ -211,6 +212,12 @@ def export_air_bundle(
                 required=bool(spec.dynamic),
                 explicit_test_double=explicit_test_double,
             ) as external_weight_mapping,
+            canonical_runtime_input_abi(
+                torchair,
+                public_inputs=spec.example_args,
+                public_names=spec.input_names,
+                explicit_test_double=explicit_test_double,
+            ) as runtime_input_abi,
         ):
             torchair.dynamo_export(*spec.example_args, **call_kwargs)
 
@@ -261,6 +268,7 @@ def export_air_bundle(
                 "torchair_external_weight_mapping": (
                     external_weight_mapping.as_manifest_record()
                 ),
+                "runtime_input_abi": runtime_input_abi,
                 "standard_op_overrides": [softplus_audit],
                 "custom_op_audit": custom_op_audit,
                 "air": air_record,
@@ -274,7 +282,7 @@ def export_air_bundle(
         else f"{factory_callable.__module__}:{factory_callable.__qualname__}"
     )
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "artifact_kind": "qwen35-dflash-torchair-bundle",
         "status": "PASS",
         "factory": factory_name,
