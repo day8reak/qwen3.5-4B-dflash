@@ -383,23 +383,46 @@ W8A8 沿用应用参数 `--config /path/to/qwen3.5.ymal --quant_mode enable`。�
 缩短 T，实际值见报告 `result.verify_rows`。若 prefill anchor 已是 EOS，则报错退出而不生成空采集。
 此诊断分支忽略 `max-new-tokens` 的生成预算，也不运行 `execution-mode=validate` 的 ordinary 对照。
 
-内部使用 `acl.prof.start/stop` 控制唯一采集窗口，窗口前和 stop 前各同步一次 NPU，Draft 与 verify
-之间不额外插入同步。需要目标 CANN 配套的 `acl` Python 模块；程序在模型加载前初始化 profiling，
-关闭后由 wrapper 执行 `msprof --export=on --output=... --summary-format=csv`。不要再在 wrapper 外套
-进程级 msprof；本模式不使用 MSTX，也不接受 `--msproftx` 或额外 `--msprof-arg`。
-采集项为 ACL API、task time、AI Core metrics；未照搬进程级 wrapper 的全部采集开关。
-API 生命周期及导出参数见 [CANN pyACL profiling 文档](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/devaids/Profiling/atlasprofiling_16_0049.html)
-和 [msprof 离线导出文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/devaids/Profiling/atlasprofiling_16_0021.html)。
+内部使用 **msprof 原生动态采集 CLI**，无需 Python `acl` 模块，也不调用 profiling API。
+wrapper 在启动应用前自动设置 `PROFILING_MODE=dynamic`；模型加载和预热完成后，应用同步 NPU，
+通过本地 socket 等待。控制程序执行以下命令并接管其交互输入：
 
-输出位于 `--output-dir` 下：`profile/msprof/<label>/` 保存 raw 数据及导出的 `op_summary*.csv`、
-`<label>-stage-report.json` 保存采集次数/范围和 token 结果，`manifest/<label>.json` 保存运行身份和状态。
-profiling 初始化期间可能保留模型元数据；推理算子的采集由 start/stop 窗口限定。
-wrapper 仅在应用、导出和非空算子 CSV 检查都成功后返回 PASS。阶段报告的 `PASS_CAPTURE`
-只表示采集流程完成，预热对照仅检查该阶段 token 结果稳定，不替代 strict-greedy 正确性门禁。
-`profiled_elapsed_ms` 是带 profiling 开销的同步窗口时间；具体算子时长看 CSV，正式时延仍按 3+10 测量。
+```bash
+msprof --dynamic=on --pid=<应用PID> --output=<raw目录> \
+  --ascendcl=on --runtime-api=on --task-time=on --aicpu=on \
+  --ai-core=on --aic-mode=task-based --aic-metrics=PipeUtilization
+# 自动发送：start → 指定阶段执行完毕并同步 NPU → stop → quit
+```
 
-也可直接给 `run_npu` 传 `--profile-stage`、新的 `--profile-output` 和 `--profile-warmup`，退出后手动
-执行上述 msprof 导出命令。当前参数适用于 Python NPU rollback 路线，OM/C++ runner 的 profiling
+只有收到 `dynamic profiling start success......` 回执才放行指定阶段；执行完毕、同步 NPU 后，
+等待 stop、quit 的成功回执及 msprof 正常退出，才继续应用的后处理。Draft 与 verify 之间不额外
+插入同步。流程使用回执握手控制边界，不使用固定 delay/duration，也不暂停整个应用进程。
+`--profile-timeout 600` 是默认的每步控制超时，覆盖等候模型加载/预热、阶段执行及 CLI 命令完成；
+较慢机器可增大该值。超时、未识别的成功回执或进程异常退出均报 FAIL，并清理本次创建的进程。
+目标环境需要支持 `--dynamic=on --pid` 的 msprof 和配套 CANN runtime；仅看到提示符或
+“Start profiling” 日志不算采集已启动。如果安装版本的交互协议不同，请保留日志核对。
+
+本模式通过 wrapper 启动；直接给 `run_npu` 传阶段参数会提示使用 wrapper。不要再外套进程级
+msprof；不接受 `--msproftx` 或额外 `--msprof-arg`。动态采集方式见
+[CANN msprof 交互式采集文档](https://www.hiascend.com/document/detail/zh/canncommercial/800/devaids/devtools/profiling/atlasprofiling_16_0016.html)，
+回执语义见 [CANN runtime 的 DynProfClient 实现](https://gitcode.com/cann/runtime/blob/68752f679cfb68365e472eec38855ec4fd4721f6/src/dfx/msprof/collector/dvvp/msprof/dynamic_profiling/src/dyn_prof_client.cpp)。
+关闭采集后 wrapper 执行 `msprof --export=on --output=... --summary-format=csv`，参数见
+[msprof 离线导出文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/devaids/Profiling/atlasprofiling_16_0021.html)。
+
+输出位于 `--output-dir` 下：
+
+- `profile/msprof/<label>/`：raw 数据及导出的 `op_summary*.csv`。
+- `<label>-stage-report.json`：阶段次数/范围和 token 结果。
+- `manifest/<label>-control.json`：应用 PID、实际 attach 命令、start/stop/quit 回执及进程退出状态。
+- `manifest/<label>.json`：运行身份和最终状态；`log/msprof-<label>.log` 保留完整交互输出。
+
+wrapper 仅在控制握手、应用、导出和非空算子 CSV 检查都成功后返回 PASS。阶段报告的
+`PASS_CAPTURE` 只表示阶段流程完成，预热对照仅检查该阶段 token 结果稳定，不替代
+strict-greedy 正确性门禁。`profiled_elapsed_ms` 是带 profiling 开销的同步窗口时间，排除了
+attach/start/stop/quit 及等待控制回执的时间；具体算子时长看 CSV，正式时延仍按 3+10 测量。
+该 CLI 集成已通过主机上的交互协议与异常路径测试；真实算子采集效果须在目标 NPU/CANN 上验证。
+
+当前参数适用于 Python NPU rollback 路线，OM/C++ runner 的 profiling
 继续使用 [11.4 节流程](QUANT_AIR_OM_FRAMEWORK.md#114-用-msprof-单独分析当前-om)。
 
 ## 8. 报告门禁

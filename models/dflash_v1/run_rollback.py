@@ -33,7 +33,7 @@ from .dflash_rollback_decode import dflash_rollback_greedy
 from .dflash_weights import require_official_dflash_checkpoint
 from .modeling_dflash import DFlashDraftModel
 from .stage_profile import (
-    AclStageProfiler,
+    MsprofStageProfiler,
     add_profile_arguments,
     profile_one_stage,
     validate_profile_request,
@@ -107,6 +107,7 @@ def _rollback_runtime_identity(package_dir: Path) -> dict[str, object]:
         "runner": package_dir / "run_rollback.py",
         "npu_runner": package_dir / "run_npu.py",
         "stage_profiler": package_dir / "stage_profile.py",
+        "msprof_controller": package_dir / "msprof_cli.py",
         "target_quant_contract": package_dir / "target_quant.py",
         "bridge": parent / "internal_dflash_bridge.py",
         "wrapper": parent / _ROLLBACK_WRAPPER_SOURCE,
@@ -275,12 +276,13 @@ def _run(args, *, request_started: float, cleanup: ExitStack) -> int:
 
     profiler = None
     if args.profile_stage is not None:
-        # Establish torch_npu's runtime before pyACL profiling initialization;
-        # initialize profiling before loading the models to retain their metadata.
+        # PROFILING_MODE=dynamic was set by the wrapper before process startup.
+        # Connect the control channel; msprof attaches only at the stage barrier.
         _synchronize_device(args.device)
-        profiler = cleanup.enter_context(AclStageProfiler(
+        profiler = cleanup.enter_context(MsprofStageProfiler(
             args.profile_output, int(torch.npu.current_device()),
             args.profile_aic_metrics, lambda: _synchronize_device(args.device),
+            stage=args.profile_stage,
         ))
 
     target_root = Path(args.target_dir).expanduser().resolve()
@@ -362,7 +364,7 @@ def _run(args, *, request_started: float, cleanup: ExitStack) -> int:
             block_size=effective_block_size, eos_token_ids=args.eos_token_id,
             warmup=args.profile_warmup, profiler=profiler,
         )
-        # Flush successfully before publishing PASS_CAPTURE or invoking msprof export.
+        # The capture barrier has already acknowledged msprof stop/quit.
         profiler.close()
         source_identity_after = _rollback_runtime_identity(package_dir)
         if source_identity_after != source_identity_before:

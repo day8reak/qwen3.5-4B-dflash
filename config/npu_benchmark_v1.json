@@ -97,7 +97,7 @@
         "prefill",
         "draft-verify"
       ],
-      "collector": "acl.prof.start/stop followed by msprof offline export",
+      "collector": "msprof dynamic CLI",
       "capture_windows": 1,
       "warmup_iterations": 1,
       "warmup_collected": false,
@@ -109,7 +109,10 @@
       "correctness_gate": "NOT_RUN_STAGE_DIAGNOSTIC",
       "pass_requires_nonempty_operator_csv": true,
       "cpu_fallback_allowed": false,
-      "formal_latency_evidence": false
+      "formal_latency_evidence": false,
+      "control_protocol": "PROFILING_MODE=dynamic before app launch; attach --dynamic=on --pid; acknowledged start/stop/quit via PTY and local socket barriers",
+      "control_timeout_seconds": 600,
+      "pass_requires_acknowledged_control": true
     }
   },
   "route_boundary": {

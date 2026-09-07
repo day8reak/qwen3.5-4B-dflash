@@ -109,7 +109,7 @@ embedding_scale_path: /data/qwen35-w8a8/embedding_scale.bin
 
 只想用 msprof 查看一次 prefill 或首轮 Draft 生成 + Target verify 时，可给 `tools/run_msprof.sh`
 增加 `--profile-stage prefill` 或 `--profile-stage draft-verify`（放在 `--` 之前，应用使用 `run_npu`）。
-默认先在采集窗口外预热一次；完整命令和采集范围见[运行与验证 7.4 节](docs/DFLASH_RUN_AND_VALIDATE.md#74-只采一次-prefill-或-draft-生成--target-verify)。
+通过 msprof 原生动态采集 CLI 控制窗口，无需 pyACL；默认先在窗口外预热一次。完整命令和采集范围见[运行与验证 7.4 节](docs/DFLASH_RUN_AND_VALIDATE.md#74-只采一次-prefill-或-draft-生成--target-verify)。
 
 ## 文档
 

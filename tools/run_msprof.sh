@@ -17,6 +17,7 @@ Options:
   --task-time LEVEL         msprof task-time value (default: on).
   --profile-stage STAGE     Collect one prefill or draft-verify in run_npu/run_rollback.
   --profile-warmup N        Unprofiled fresh-state warmups for a stage (default: 1).
+  --profile-timeout SEC     Deadline per stage-control transition (default: 600).
   --msprof-arg ARG          Append one safe msprof option; repeat as needed.
   --msproftx                Opt in to msproftx and benchmark MSTX ranges.
   --no-msproftx             Keep MSTX disabled (default; compatibility option).
@@ -41,6 +42,8 @@ task_time="on"
 profile_stage=""
 profile_warmup=1
 profile_warmup_set="false"
+profile_timeout=600
+profile_timeout_set="false"
 stage_report=""
 msproftx="off"
 extra_msprof_args=()
@@ -91,6 +94,14 @@ while (($#)); do
       [[ "$2" =~ ^[0-9]+$ ]] || fail "--profile-warmup must be non-negative"
       profile_warmup="$2"
       profile_warmup_set="true"
+      shift 2
+      ;;
+    --profile-timeout)
+      (($# >= 2)) || fail "--profile-timeout requires seconds"
+      [[ "$2" =~ ^[0-9]+([.][0-9]+)?$ && "$2" =~ [1-9] ]] || \
+        fail "--profile-timeout must be positive seconds"
+      profile_timeout="$2"
+      profile_timeout_set="true"
       shift 2
       ;;
     --msprof-arg)
@@ -151,15 +162,15 @@ done
 if [[ -n "$profile_stage" ]]; then
   [[ "$stage_runner" == "true" ]] || \
     fail "--profile-stage requires python -m models.dflash_v1.run_npu (or run_rollback)"
-  [[ "$msproftx" == "off" ]] || fail "stage API capture does not use --msproftx"
-  [[ "$task_time" == "on" ]] || fail "stage API capture requires --task-time on"
-  ((${#extra_msprof_args[@]} == 0)) || fail "stage API capture does not accept --msprof-arg"
+  [[ "$msproftx" == "off" ]] || fail "dynamic stage capture does not use --msproftx"
+  [[ "$task_time" == "on" ]] || fail "dynamic stage capture requires --task-time on"
+  ((${#extra_msprof_args[@]} == 0)) || fail "dynamic stage capture does not accept --msprof-arg"
   case "$aic_metrics" in
     PipeUtilization|Memory|MemoryUB) ;;
     *) fail "stage metrics must be PipeUtilization, Memory or MemoryUB" ;;
   esac
-elif [[ "$profile_warmup_set" == "true" ]]; then
-  fail "--profile-warmup requires --profile-stage"
+elif [[ "$profile_warmup_set" == "true" || "$profile_timeout_set" == "true" ]]; then
+  fail "--profile-warmup/--profile-timeout requires --profile-stage"
 fi
 expect_device_value="false"
 requested_device="npu:0"
@@ -213,12 +224,14 @@ profile_dir="$output_root/profile/msprof/$label"
 log_dir="$output_root/log"
 manifest_dir="$output_root/manifest"
 manifest_path="$manifest_dir/$label.json"
+control_report="$manifest_dir/$label-control.json"
 runtime_log="$log_dir/msprof-$label.log"
 preflight_log="$log_dir/preflight-$label.log"
 device_log="$log_dir/device-$label.log"
 
 [[ ! -e "$profile_dir" ]] || fail "profile output already exists: $profile_dir"
 [[ ! -e "$manifest_path" ]] || fail "manifest already exists: $manifest_path"
+[[ ! -e "$control_report" && ! -L "$control_report" ]] || fail "control report already exists: $control_report"
 mkdir -p "$output_root/profile/msprof" "$log_dir" "$manifest_dir"
 
 if [[ -n "$profile_stage" ]]; then
@@ -306,9 +319,10 @@ if [[ "$msproftx" == "on" ]]; then
 fi
 msprof_args+=("${extra_msprof_args[@]}")
 if [[ -n "$profile_stage" ]]; then
-  # The application owns collection. msprof is used only after stop/finalize.
-  msprof_args=("--export=on" "--output=$profile_dir" "--summary-format=csv")
+  # The actual child PID and attach command are recorded by the controller.
+  msprof_args=("--dynamic=on" "${msprof_args[@]}")
 fi
+export_args=("--export=on" "--output=$profile_dir" "--summary-format=csv")
 
 write_manifest() {
   local run_status="$1"
@@ -319,6 +333,7 @@ write_manifest() {
     "$label" "$profile_dir" "$runtime_log" "$preflight_log" "$device_log" \
     "$msprof_bin" "$msprof_version" "$source_root" "$aic_metrics" "$task_time" \
     "$msproftx" "$requested_device" "$profile_stage" "$profile_warmup" "$stage_report" \
+    "$profile_timeout" "$control_report" \
     "${#msprof_args[@]}" "${msprof_args[@]}" \
     "${#application[@]}" "${application[@]}" <<'PY'
 import hashlib
@@ -332,8 +347,9 @@ values = sys.argv[1:]
     profile_dir, runtime_log, preflight_log, device_log, msprof_bin,
     msprof_version, source_root, aic_metrics, task_time, msproftx,
     requested_device, profile_stage, profile_warmup, stage_report,
-) = values[:20]
-cursor = 20
+    profile_timeout, control_report,
+) = values[:22]
+cursor = 22
 msprof_count = int(values[cursor])
 cursor += 1
 msprof_args = values[cursor:cursor + msprof_count]
@@ -380,7 +396,7 @@ for path in sorted(set(expanded)):
     source_files += 1
 
 payload = {
-    "schema_version": 4,
+    "schema_version": 5,
     "status": run_status,
     "exit_code": int(exit_code),
     "label": label,
@@ -406,14 +422,18 @@ payload = {
         "aic_metrics": aic_metrics,
         "task_time": task_time,
         "msproftx": msproftx,
-        "collector": "pyACL stage API" if profile_stage else "msprof process",
+        "collector": "msprof dynamic CLI" if profile_stage else "msprof process",
         "profile_stage": profile_stage or None,
         "profile_warmup": int(profile_warmup) if profile_stage else None,
+        "profile_timeout_seconds": float(profile_timeout) if profile_stage else None,
+        "actual_attach_arguments_in": control_report if profile_stage else None,
+        "export_arguments": ["--export=on", "--output=" + profile_dir, "--summary-format=csv"] if profile_stage else None,
     },
     "application": redacted_application,
     "artifacts": {
         "profile_dir": profile_dir, "runtime_log": runtime_log,
         "stage_report": stage_report if profile_stage else None,
+        "control_report": control_report if profile_stage else None,
     },
     "claim_boundary": (
         "msprof is diagnostic evidence, not the latency baseline; retain "
@@ -430,27 +450,41 @@ PY
 write_manifest "RUNNING" 0 ""
 set +e
 if [[ -n "$profile_stage" ]]; then
-  "${application[@]}" 2>&1 | tee "$runtime_log"
+  "$python_bin" -B "$source_root/models/dflash_v1/msprof_cli.py" \
+    --msprof-bin "$msprof_bin" --output "$profile_dir" \
+    --stage "$profile_stage" --metrics "$aic_metrics" \
+    --timeout "$profile_timeout" --control-report "$control_report" \
+    -- "${application[@]}" 2>&1 | tee "$runtime_log"
   msprof_status=${PIPESTATUS[0]}
   if ((msprof_status == 0)); then
-    "$msprof_bin" "${msprof_args[@]}" 2>&1 | tee -a "$runtime_log"
+    "$msprof_bin" "${export_args[@]}" 2>&1 | tee -a "$runtime_log"
     msprof_status=${PIPESTATUS[0]}
   fi
   if ((msprof_status == 0)); then
-    "$python_bin" -B - "$profile_dir" "$stage_report" "$profile_stage" <<'PY' 2>&1 | tee -a "$runtime_log"
+    "$python_bin" -B - "$profile_dir" "$stage_report" "$profile_stage" "$control_report" <<'PY' 2>&1 | tee -a "$runtime_log"
 import csv
 import json
 from pathlib import Path
 import sys
 
-root, report_path, stage = sys.argv[1:]
+root, report_path, stage, control_path = sys.argv[1:]
 report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+control = json.loads(Path(control_path).read_text(encoding="utf-8"))
+if (control.get("status") != "PASS_CONTROL"
+        or control.get("collector") != "msprof dynamic CLI"
+        or control.get("profile_stage") != stage
+        or Path(control.get("profile_output", "")).resolve() != Path(root).resolve()
+        or any(control.get(key) is not True for key in (
+            "start_acknowledged", "stop_acknowledged", "quit_acknowledged", "capture_completed"))
+        or any(control.get(key) != 0 for key in ("application_exit_code", "msprof_exit_code"))):
+    raise SystemExit("control report does not prove successful msprof start/stop/quit")
 expected = {
     "prefill": int(stage == "prefill"),
     "draft": int(stage == "draft-verify"),
     "target_verify": int(stage == "draft-verify"),
 }
 if (report.get("status") != "PASS_CAPTURE"
+        or report.get("collector") != "msprof dynamic CLI"
         or report.get("profile_stage") != stage
         or report.get("capture_windows") != 1
         or report.get("captured_calls") != expected

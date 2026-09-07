@@ -1,7 +1,7 @@
 {
   "schema_version": 6,
   "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback with the original GDR effective-length ABI and optional Target-only W8A8 dynamic quantization configured by the original inference YAML",
-  "package_revision": "r16",
+  "package_revision": "r17",
   "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-chunk-prefill-gdr-effective-length-air-copy-free-cache-update-private-v4444-quant-fp32-eager-scale-attention-length-abi-load-safe-rope-init-unfold-free-conv-bank",
   "package_layout": {
     "version": 6,
@@ -113,11 +113,13 @@
     "w8a8_cpu_validator_sha256": "d86d60a8dc1c308a6a9047992313c3c1240e06cc249a55397ca211d2dc4bfdc6",
     "target_quant_policy": "the CLI mirrors inference.py with --config and --quant_mode enable; the packaged original utils conversion is fail-closed and every pre-conversion nn.Linear path must become the original HIAI QLinear with exact K-by-N shape/device buffers; Draft-facing embedding and LM head remain FP16; every prompt chunk, decode row, and verify block indexes the YAML-declared INT8 embedding and FP32 scale artifacts",
     "stage_profiler_file": "models/dflash_v1/stage_profile.py",
-    "stage_profiler_sha256": "17b53fba71cdb627bc45367c0cacb0e10ecf7b300aab35b7901550afc5d750b6"
+    "stage_profiler_sha256": "e17a5915903e4624501d712cfcd4828eafdc472881c706306c7539e9d3b992f0",
+    "msprof_controller_file": "models/dflash_v1/msprof_cli.py",
+    "msprof_controller_sha256": "294cb6823d83e67398624fe2e53fb2eb58cbee3b474d7b41887db0a1806290e9"
   },
   "rollback_runtime": {
     "runner_file": "models/dflash_v1/run_rollback.py",
-    "runner_sha256": "9bd0ee53bdd7a6ffc811d6b6e23b31e1843d47c83c63168866cd22125c11e66c",
+    "runner_sha256": "6bc8e6ae8803b7d853c3391a9f6f755c4f62b9580e3ed05db4cdd97f3143ef1e",
     "adapter_file": "models/dflash_v1/dflash_rollback_adapter.py",
     "adapter_sha256": "c00e5e060d15575c27c5fdf7bf48d61e88d0fdbfdf4d9af085de42f8131b0af0",
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
@@ -134,11 +136,11 @@
     "runner_file": "models/dflash_v1/benchmark_npu.py",
     "runner_sha256": "a244545da5e748d596f3319c40c33441e635cb50c3e19f9272a78575731ce3c6",
     "msprof_wrapper_file": "tools/run_msprof.sh",
-    "msprof_wrapper_sha256": "70c97dc0a64abb70930bb9a8998026c81d0ecd518a16661487db1ca584f5d29c",
+    "msprof_wrapper_sha256": "10566f1e06e3d3cbb73bac3e1caddb7294951197a5c32311b51415e63e80628f",
     "contract_file": "config/npu_benchmark_v1.json",
-    "contract_sha256": "4eb9980fa7a44c1527ef539076fbd7496bab3a04485312409e0e4fb5fd200fdb",
+    "contract_sha256": "fa21e6a58b17ed2651709fd20d880ebf43af02429e6727f1e388efb5852ece9d",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "6f3af47b02a707d5697b1de57bfcfa1f8403fdd2e103d7d575b587006798ff68",
-    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks on the original GDR route with call-local effective length; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback; opt-in pyACL single-stage prefill or first Draft/verify capture with uncollected fresh-state warmups, one synchronized window and offline msprof export; stage capture does not run the strict-greedy gate or establish formal latency"
+    "documentation_sha256": "32a9d35ffe3161e6a08d9444807c77928fa3d466f20007bd2b2c7424056bb144",
+    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks on the original GDR route with call-local effective length; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback; opt-in native msprof dynamic CLI single-stage prefill or first Draft/verify capture with uncollected fresh-state warmups, one synchronized window released only after CLI start acknowledgement, stop/quit acknowledgements before postprocessing, and offline msprof export; stage capture does not run the strict-greedy gate or establish formal latency"
   }
 }

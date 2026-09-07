@@ -43,6 +43,7 @@ class BenchmarkSourceLockTests(unittest.TestCase):
         pairs = (
             ("runner_file", "runner_sha256"),
             ("stage_profiler_file", "stage_profiler_sha256"),
+            ("msprof_controller_file", "msprof_controller_sha256"),
             ("loader_file", "loader_sha256"),
             ("loader_contract_file", "loader_contract_sha256"),
             ("hiai_source_check_file", "hiai_source_check_sha256"),

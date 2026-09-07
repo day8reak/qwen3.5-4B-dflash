@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import socket
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,7 +14,7 @@ import torch
 
 from models.dflash_v1 import run_npu, run_rollback
 from models.dflash_v1.stage_profile import (
-    AclStageProfiler, profile_one_stage, validate_profile_request,
+    MsprofStageProfiler, profile_one_stage, validate_profile_request,
 )
 
 
@@ -22,43 +25,32 @@ def logits(tokens):
     return result
 
 
-class FakeAclProf:
-    def __init__(self, events, *, fail=None):
-        self.events = events
-        self.fail = fail
+class SocketController:
+    """Host-only peer for the actual application-side stage barrier."""
+
+    def __init__(self, events, channel):
+        self.events, self.channel = events, channel
         self.active = False
+        self.messages = []
+        self.errors = []
 
-    def init(self, path):
-        self.events.append(("init", path))
-        return 0
-
-    def create_config(self, devices, metric, reserved, flags):
-        self.events.append(("config", devices, metric, reserved, flags))
-        return None if self.fail == "config" else 1234
-
-    def start(self, config):
-        assert config == 1234
-        self.events.append(("start",))
-        if self.fail == "start":
-            return 17
-        assert not self.active
-        self.active = True
-        return 0
-
-    def stop(self, config):
-        assert config == 1234 and self.active
-        self.events.append(("stop",))
-        self.active = False
-        return 18 if self.fail == "stop" else 0
-
-    def destroy_config(self, config):
-        assert config == 1234 and not self.active
-        self.events.append(("destroy",))
-        return 19 if self.fail == "destroy_config" else 0
-
-    def finalize(self):
-        self.events.append(("finalize",))
-        return 20 if self.fail == "finalize" else 0
+    def run(self):
+        try:
+            with self.channel, self.channel.makefile("rb") as reader:
+                for line in reader:
+                    message = json.loads(line)
+                    self.messages.append(message)
+                    if message["event"] == "ready":
+                        assert not self.active
+                        self.events.append(("start",))
+                        self.active, response = True, "started"
+                    else:
+                        assert message["event"] == "done" and self.active
+                        self.events.append(("stop",))
+                        self.active, response = False, "stopped"
+                    self.channel.sendall(json.dumps({"event": response}).encode() + b"\n")
+        except BaseException as error:
+            self.errors.append(error)
 
 
 class FakeTarget:
@@ -71,7 +63,7 @@ class FakeTarget:
         a.pending = None
         a.requests += 1
         for start in range(0, ids.shape[1], 64):
-            a.events.append(("prefill-chunk", a.acl.active, min(64, ids.shape[1] - start)))
+            a.events.append(("prefill-chunk", a.collector.active, min(64, ids.shape[1] - start)))
         return {"logits": logits([a.anchor])}
 
 
@@ -79,8 +71,8 @@ class FakeAdapter:
     device = torch.device("cpu")
     max_block_size = 16
 
-    def __init__(self, acl, events, *, anchor=10, fail_verify=False, reject=False):
-        self.acl, self.events = acl, events
+    def __init__(self, collector, events, *, anchor=10, fail_verify=False, reject=False):
+        self.collector, self.events = collector, events
         self.target = FakeTarget(self)
         self.anchor = anchor
         self.fail_verify = fail_verify
@@ -91,17 +83,17 @@ class FakeAdapter:
 
     def begin_rollback(self, ids):
         output = self.target.begin_rollback(ids)
-        self.events.append(("projection", self.acl.active))
+        self.events.append(("projection", self.collector.active))
         return output
 
     def propose_rollback(self, prefix_ids, proposal_limit):
         assert self.cursor == prefix_ids.shape[1] - 1
         assert self.pending is None
-        self.events.append(("draft", self.acl.active, proposal_limit, self.cursor))
+        self.events.append(("draft", self.collector.active, proposal_limit, self.cursor))
         return torch.tensor([list(range(11, 11 + proposal_limit))])
 
     def verify_rollback(self, ids):
-        self.events.append(("verify", self.acl.active, ids.tolist(), self.cursor))
+        self.events.append(("verify", self.collector.active, ids.tolist(), self.cursor))
         assert self.pending is None
         self.pending = ids.tolist()[0]
         if self.fail_verify:
@@ -112,48 +104,64 @@ class FakeAdapter:
         return logits(tokens)
 
     def disable_speculation(self):
-        self.events.append(("disable", self.acl.active))
+        self.events.append(("disable", self.collector.active))
 
     def commit_rollback(self, accepted):
         assert self.pending is not None
-        self.events.append(("commit", self.acl.active, accepted))
+        self.events.append(("commit", self.collector.active, accepted))
         self.cursor += accepted + 1
         self.pending = None
 
     def abort_rollback(self):
-        self.events.append(("abort", self.acl.active))
+        self.events.append(("abort", self.collector.active))
         self.pending = None
 
 
-def setup_profiler(tmp_path, *, fail=None):
-    events = []
-    acl = FakeAclProf(events, fail=fail)
-    profiler = AclStageProfiler(
-        str(tmp_path / "raw"), 2, "MemoryUB",
-        lambda: events.append(("sync", acl.active)),
-    )
-    return events, acl, profiler
+@pytest.fixture
+def setup_profiler(tmp_path, monkeypatch):
+    controllers = []
+
+    def create(stage="draft-verify"):
+        events = []
+        server, client = socket.socketpair()
+        collector = SocketController(events, server)
+        monkeypatch.setenv("PROFILING_MODE", "dynamic")
+        monkeypatch.setenv("DFLASH_MSPROF_CONTROL_FD", str(client.detach()))
+        monkeypatch.setenv("DFLASH_MSPROF_CONTROL_TIMEOUT", "3")
+        profiler = MsprofStageProfiler(
+            str(tmp_path / "raw"), 2, "MemoryUB",
+            lambda: events.append(("sync", collector.active)), stage=stage,
+        )
+        thread = threading.Thread(target=collector.run, daemon=True)
+        thread.start()
+        controllers.append((collector, thread))
+        return events, collector, profiler
+
+    yield create
+    for collector, thread in controllers:
+        thread.join(timeout=3)
+        assert not thread.is_alive(), "stage client did not close its control channel"
+        assert not collector.errors
 
 
 @pytest.mark.parametrize("stage", ["prefill", "draft-verify"])
-def test_only_one_stage_is_collected_after_fresh_warmup(tmp_path, stage):
-    events, acl, profiler = setup_profiler(tmp_path)
-    adapter = FakeAdapter(acl, events)
-    with patch("models.dflash_v1.stage_profile.importlib.import_module",
-               return_value=SimpleNamespace(prof=acl)):
-        with profiler:
-            result = profile_one_stage(
-                adapter, [1] * 129, stage=stage, block_size=16,
-                eos_token_ids=[99], warmup=2, profiler=profiler,
-            )
+def test_only_one_stage_is_collected_after_fresh_warmup(setup_profiler, stage):
+    events, collector, profiler = setup_profiler(stage)
+    adapter = FakeAdapter(collector, events)
+    with profiler:
+        result = profile_one_stage(
+            adapter, [1] * 129, stage=stage, block_size=16,
+            eos_token_ids=[99], warmup=2, profiler=profiler,
+        )
     start = events.index(("start",))
     stop = events.index(("stop",))
     captured = events[start + 1:stop]
     assert events[start - 1] == ("sync", False)
     assert captured[-1] == ("sync", True)
     assert events.count(("start",)) == events.count(("stop",)) == 1
-    assert events[-2:] == [("destroy",), ("finalize",)]
-    assert ("config", [2], 5, 0, 7) in events
+    assert collector.messages[0]["device_id"] == 2
+    assert collector.messages[0]["metrics"] == "MemoryUB"
+    assert collector.messages[-1] == {"event": "done", "success": True}
     assert adapter.requests == 3
     assert result["warmup_output_match"] is True
     assert result["strict_greedy_exact_match"] is None
@@ -171,45 +179,27 @@ def test_only_one_stage_is_collected_after_fresh_warmup(tmp_path, stage):
         assert adapter.cursor == 129 + 16
 
 
-def test_verify_error_stops_and_finalizes_capture(tmp_path):
-    events, acl, profiler = setup_profiler(tmp_path)
-    adapter = FakeAdapter(acl, events, fail_verify=True)
-    with patch("models.dflash_v1.stage_profile.importlib.import_module",
-               return_value=SimpleNamespace(prof=acl)):
-        with pytest.raises(RuntimeError, match="injected verify failure"):
-            with profiler:
-                profile_one_stage(
-                    adapter, [1], stage="draft-verify", block_size=16,
-                    eos_token_ids=[99], warmup=0, profiler=profiler,
-                )
-    assert events[-5:] == [
-        ("sync", True), ("stop",), ("abort", False), ("destroy",), ("finalize",),
-    ]
+def test_verify_error_stops_capture_and_aborts_after_stop(setup_profiler):
+    events, collector, profiler = setup_profiler()
+    adapter = FakeAdapter(collector, events, fail_verify=True)
+    with pytest.raises(RuntimeError, match="injected verify failure"):
+        with profiler:
+            profile_one_stage(
+                adapter, [1], stage="draft-verify", block_size=16,
+                eos_token_ids=[99], warmup=0, profiler=profiler,
+            )
+    assert events[-3:] == [("sync", True), ("stop",), ("abort", False)]
+    assert collector.messages[-1] == {"event": "done", "success": False}
     assert not any(e[0] == "commit" for e in events)
 
 
-@pytest.mark.parametrize("fail", ["config", "start", "stop", "destroy_config", "finalize"])
-def test_profiling_api_errors_are_not_reported_as_success(tmp_path, fail):
-    events, acl, profiler = setup_profiler(tmp_path, fail=fail)
-    with patch("models.dflash_v1.stage_profile.importlib.import_module",
-               return_value=SimpleNamespace(prof=acl)):
-        with pytest.raises(RuntimeError, match="config|start|stop|finalize"):
-            with profiler:
-                with profiler.capture():
-                    events.append(("work",))
-    assert events[-1] == ("finalize",)
-    assert not acl.active
-
-
-def test_proposal_eos_reports_actual_verify_rows(tmp_path):
-    events, acl, profiler = setup_profiler(tmp_path)
-    with patch("models.dflash_v1.stage_profile.importlib.import_module",
-               return_value=SimpleNamespace(prof=acl)):
-        with profiler:
-            result = profile_one_stage(
-                FakeAdapter(acl, events), [1], stage="draft-verify", block_size=16,
-                eos_token_ids=[12], warmup=0, profiler=profiler,
-            )
+def test_proposal_eos_reports_actual_verify_rows(setup_profiler):
+    events, collector, profiler = setup_profiler()
+    with profiler:
+        result = profile_one_stage(
+            FakeAdapter(collector, events), [1], stage="draft-verify", block_size=16,
+            eos_token_ids=[12], warmup=0, profiler=profiler,
+        )
     assert result["result"]["proposal_token_ids"] == [11, 12]
     assert result["result"]["verify_input_token_ids"] == [10, 11, 12]
     assert result["result"]["verify_rows"] == 3
@@ -217,31 +207,27 @@ def test_proposal_eos_reports_actual_verify_rows(tmp_path):
     assert events.count(("start",)) == events.count(("stop",)) == 1
 
 
-def test_immediate_eos_does_not_emit_an_empty_capture(tmp_path):
-    events, acl, profiler = setup_profiler(tmp_path)
-    with patch("models.dflash_v1.stage_profile.importlib.import_module",
-               return_value=SimpleNamespace(prof=acl)):
-        with pytest.raises(RuntimeError, match="anchor is EOS"):
-            with profiler:
-                profile_one_stage(
-                    FakeAdapter(acl, events, anchor=99), [1],
-                    stage="draft-verify", block_size=16,
-                    eos_token_ids=[99], warmup=0, profiler=profiler,
-                )
-    assert ("start",) not in events
-    assert events[-2:] == [("destroy",), ("finalize",)]
-
-
-def test_zero_acceptance_commit_remains_outside_capture(tmp_path):
-    events, acl, profiler = setup_profiler(tmp_path)
-    with patch("models.dflash_v1.stage_profile.importlib.import_module",
-               return_value=SimpleNamespace(prof=acl)):
+def test_immediate_eos_does_not_emit_an_empty_capture(setup_profiler):
+    events, collector, profiler = setup_profiler()
+    with pytest.raises(RuntimeError, match="anchor is EOS"):
         with profiler:
-            result = profile_one_stage(
-                FakeAdapter(acl, events, reject=True), [1],
+            profile_one_stage(
+                FakeAdapter(collector, events, anchor=99), [1],
                 stage="draft-verify", block_size=16,
-                eos_token_ids=[99], warmup=1, profiler=profiler,
+                eos_token_ids=[99], warmup=0, profiler=profiler,
             )
+    assert ("start",) not in events
+    assert not collector.messages
+
+
+def test_zero_acceptance_commit_remains_outside_capture(setup_profiler):
+    events, collector, profiler = setup_profiler()
+    with profiler:
+        result = profile_one_stage(
+            FakeAdapter(collector, events, reject=True), [1],
+            stage="draft-verify", block_size=16,
+            eos_token_ids=[99], warmup=1, profiler=profiler,
+        )
     assert result["result"]["accepted_draft_tokens"] == 0
     assert events[events.index(("stop",)) + 1:][:2] == [("disable", False), ("commit", False, 0)]
 
@@ -261,6 +247,7 @@ def test_stage_arguments_forward_without_shrinking_block(tmp_path):
 
 
 @pytest.mark.parametrize("device, env, error", [
+    ("npu:0", {}, "must be launched"),
     ("cpu", {}, "real NPU"),
     ("npu:0", {"ASCEND310P_SIMULATION_ONLY": "1"}, "simulation-only"),
     ("npu:0", {"DFLASH_MSPROF_PROCESS_CAPTURE": "1"}, "before --"),
