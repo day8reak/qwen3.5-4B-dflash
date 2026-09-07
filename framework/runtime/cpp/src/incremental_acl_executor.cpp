@@ -194,14 +194,24 @@ TensorSpec ReadTensorSpec(
             : aclmdlGetOutputDims(description, index, &dimensions),
       input ? "aclmdlGetInputDims" : "aclmdlGetOutputDims");
   if (dimensions.dimCount == 0 || dimensions.dimCount > 128) {
-    throw std::runtime_error("OM tensor has an invalid dimension count");
+    std::ostringstream message;
+    message << role << ": OM " << (input ? "input" : "output") << '['
+            << index << "] name='" << dimensions.name
+            << "' has an invalid dimension count " << dimensions.dimCount
+            << " (expected 1..128)";
+    throw std::runtime_error(message.str());
   }
   TensorSpec result;
   result.name = dimensions.name;
   result.shape.reserve(dimensions.dimCount);
   for (std::size_t dimension = 0; dimension < dimensions.dimCount; ++dimension) {
     if (dimensions.dims[dimension] == 0 || dimensions.dims[dimension] < -1) {
-      throw std::runtime_error("OM tensor has an invalid dimension");
+      std::ostringstream message;
+      message << role << ": OM " << (input ? "input" : "output") << '['
+              << index << "] name='" << result.name << "' dimension["
+              << dimension << "] has invalid value "
+              << dimensions.dims[dimension];
+      throw std::runtime_error(message.str());
     }
     result.shape.push_back(dimensions.dims[dimension]);
   }
@@ -220,6 +230,22 @@ TensorSpec ReadTensorSpec(
     throw std::runtime_error(
         TensorDetails(role, input, index, result) +
         " has an invalid zero byte size");
+  }
+  return result;
+}
+
+TensorSpec ReadDynamicControlSpec(
+    aclmdlDesc* description,
+    std::size_t index,
+    const std::string& role) {
+  TensorSpec result;
+  result.name = kDynamicTensorName;
+  result.dtype = aclmdlGetInputDataType(description, index);
+  result.bytes = aclmdlGetInputSizeByIndex(description, index);
+  if (result.bytes == 0) {
+    throw std::runtime_error(
+        TensorDetails(role, true, index, result) +
+        " has an invalid zero byte size for the dynamic control buffer");
   }
   return result;
 }
@@ -315,11 +341,26 @@ struct ModelSession {
     Check(aclmdlGetDesc(description, id), role + ": aclmdlGetDesc");
     const std::size_t input_count = aclmdlGetNumInputs(description);
     const std::size_t output_count = aclmdlGetNumOutputs(description);
+    if (require_dynamic_gears) {
+      std::size_t index = 0;
+      Check(
+          aclmdlGetInputIndexByName(
+              description, kDynamicTensorName, &index),
+          role + ": aclmdlGetInputIndexByName(dynamic dims)");
+      if (index >= input_count) {
+        throw std::runtime_error(role + ": dynamic input index is invalid");
+      }
+      dynamic_input_index = index;
+    }
     inputs.reserve(input_count);
     outputs.reserve(output_count);
     for (std::size_t index = 0; index < input_count; ++index) {
-      inputs.push_back(ReadTensorSpec(
-          description, index, true, require_dynamic_gears, role));
+      if (index == dynamic_input_index) {
+        inputs.push_back(ReadDynamicControlSpec(description, index, role));
+      } else {
+        inputs.push_back(ReadTensorSpec(
+            description, index, true, require_dynamic_gears, role));
+      }
     }
     for (std::size_t index = 0; index < output_count; ++index) {
       outputs.push_back(ReadTensorSpec(
@@ -327,15 +368,6 @@ struct ModelSession {
     }
 
     if (require_dynamic_gears) {
-      std::size_t index = 0;
-      Check(
-          aclmdlGetInputIndexByName(
-              description, kDynamicTensorName, &index),
-          role + ": aclmdlGetInputIndexByName(dynamic dims)");
-      if (index >= inputs.size()) {
-        throw std::runtime_error(role + ": dynamic input index is invalid");
-      }
-      dynamic_input_index = index;
       std::size_t gear_count = 0;
       Check(
           aclmdlGetInputDynamicGearCount(

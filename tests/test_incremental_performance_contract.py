@@ -335,9 +335,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 34
+    assert framework_lock["schema_version"] == 35
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v34"
+        "qwen3.5-4b-quant-air-om-ascendcl-v35"
     )
     assert deployment["schema_version"] == 2
     assert performance["schema_version"] == 6
@@ -387,6 +387,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
         "dynamic_input_size_policy"
     ]
     assert "flattened gear" in runtime["dynamic_input_size_policy"]
+    assert "ascend_mbatch_shape_data" in runtime["dynamic_input_size_policy"]
+    assert "opaque" in runtime["dynamic_input_size_policy"]
+    assert "ranks outside 1..128" in runtime["dynamic_input_size_policy"]
     assert "input device mirrors" in runtime["memory"]
     assert "last K+1 rows" in runtime["memory"]
     assert "actual/full-equivalent H2D and D2H bytes" in (

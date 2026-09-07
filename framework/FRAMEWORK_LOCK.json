@@ -1,6 +1,6 @@
 {
-  "schema_version": 34,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v34",
+  "schema_version": 35,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v35",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -219,7 +219,7 @@
     "api": "AscendCL",
     "model_load": "integrated runner uses aclmdlLoadFromFile; incremental runner uses aclmdlLoadFromFileWithMem with separate per-artifact weights and one serial shared workspace",
     "model_memory_query": "aclmdlQuerySize is recorded for the active integrated OM; qwen35_dflash_om_inspect sums weights and uses the maximum serial workspace across a proposed multi-OM set",
-    "dynamic_input_size_policy": "aclmdlGetInputSizeByIndex returning zero is valid only for a public input whose model shape contains -1 in a required dynamic-gear OM; validate every positive flattened gear against all static dimensions, derive the maximum dense byte bound with overflow checks before allocation, and keep undefined dtypes plus zero-sized static inputs or outputs fatal with role/index/name/shape diagnostics",
+    "dynamic_input_size_policy": "locate the synthetic ascend_mbatch_shape_data index by its fixed CANN name before reading public tensor descriptors and treat only that nonzero-sized internal control buffer as opaque because aclmdlGetInputDims may report dimCount=0 and aclmdlGetInputDataType may be undefined; aclmdlGetInputSizeByIndex returning zero is valid only for a public input whose model shape contains -1 in a required dynamic-gear OM; validate every positive flattened gear against all static dimensions, derive the maximum dense byte bound with overflow checks before allocation, and keep zero-sized control buffers, undefined public dtypes, zero-sized static inputs or outputs, and public/output ranks outside 1..128 fatal with role/index/name/shape diagnostics",
     "execute": "aclmdlExecuteAsync",
     "memory": "persistent pinned host/device buffers; integrated input device mirrors upload only changed contiguous ranges after the first call and target D2H is limited to the last K+1 rows required by every current scheduler read; the multi-OM runner (five-artifact baseline, four-artifact unified Target step, or four-artifact fused speculative step) uses one 64-byte-aligned prefill control carrier but uploads only the prefix through the last field consumed by each chunk, keeps the EOS tail process-resident, gives the unified topology one aligned process-resident INT32 zero-count view, accumulates contiguous Target feature slabs in one device arena, and downloads only compact scheduler-visible results",
     "device_memory_allocation": "normal-only remains the compiled rollback default; build-cpp can produce a separate huge-first exact candidate. Both runners report the compiled policy, which covers every explicit aclrtMalloc including integrated I/O, multi-OM weights, the shared serial workspace, state and carriers; changing the default requires same-source/same-OM forward-and-reverse physical Ascend310P 3+10 zero-mismatch, memory-headroom and median/p90 evidence",

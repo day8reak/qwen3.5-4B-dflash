@@ -790,7 +790,22 @@ aclError aclmdlGetInputDims(
   if (description == nullptr || index >= Inputs(description->role).size()) {
     return 1;
   }
-  return SetDims(dimensions, Inputs(description->role)[index]);
+  const Spec& spec = Inputs(description->role)[index];
+  const aclError status = SetDims(dimensions, spec);
+  const char* force_zero_rank_public =
+      std::getenv("QWEN35_DFLASH_FAKE_ZERO_RANK_PUBLIC_INPUT");
+  if (status == ACL_SUCCESS && description->role == Role::kTargetPrefill &&
+      index == 0 && force_zero_rank_public != nullptr &&
+      std::string(force_zero_rank_public) == "1") {
+    dimensions->dimCount = 0;
+  } else if (status == ACL_SUCCESS &&
+             std::string(spec.name) == "ascend_mbatch_shape_data") {
+    // CANN exposes this synthetic dynamic-gear control input as an opaque
+    // buffer: its byte size is valid, while aclmdlGetInputDims may report no
+    // ordinary model dimensions.
+    dimensions->dimCount = 0;
+  }
+  return status;
 }
 
 aclError aclmdlGetOutputDims(
