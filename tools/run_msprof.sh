@@ -15,6 +15,8 @@ Options:
   --msprof-bin PATH         msprof executable (default: MSPROF_BIN or msprof).
   --aic-metrics NAME        AI Core metrics (default: PipeUtilization).
   --task-time LEVEL         msprof task-time value (default: on).
+  --profile-stage STAGE     Collect one prefill or draft-verify in run_npu/run_rollback.
+  --profile-warmup N        Unprofiled fresh-state warmups for a stage (default: 1).
   --msprof-arg ARG          Append one safe msprof option; repeat as needed.
   --msproftx                Opt in to msproftx and benchmark MSTX ranges.
   --no-msproftx             Keep MSTX disabled (default; compatibility option).
@@ -36,6 +38,10 @@ python_bin="${PYTHON_BIN:-python3}"
 msprof_bin="${MSPROF_BIN:-msprof}"
 aic_metrics="PipeUtilization"
 task_time="on"
+profile_stage=""
+profile_warmup=1
+profile_warmup_set="false"
+stage_report=""
 msproftx="off"
 extra_msprof_args=()
 
@@ -69,6 +75,22 @@ while (($#)); do
     --task-time)
       (($# >= 2)) || fail "--task-time requires a value"
       task_time="$2"
+      shift 2
+      ;;
+    --profile-stage)
+      (($# >= 2)) || fail "--profile-stage requires prefill or draft-verify"
+      profile_stage="$2"
+      case "$profile_stage" in
+        prefill|draft-verify) ;;
+        *) fail "--profile-stage must be prefill or draft-verify" ;;
+      esac
+      shift 2
+      ;;
+    --profile-warmup)
+      (($# >= 2)) || fail "--profile-warmup requires a count"
+      [[ "$2" =~ ^[0-9]+$ ]] || fail "--profile-warmup must be non-negative"
+      profile_warmup="$2"
+      profile_warmup_set="true"
       shift 2
       ;;
     --msprof-arg)
@@ -111,6 +133,34 @@ done
   fail "simulation-only target profiles cannot produce msprof evidence"
 
 application=("$@")
+stage_runner="false"
+for ((index=0; index<${#application[@]}; index++)); do
+  case "${application[index]}" in
+    --profile-stage|--profile-stage=*|--profile-output|--profile-output=*|--profile-warmup|--profile-warmup=*|--profile-aic-metrics|--profile-aic-metrics=*)
+      fail "put --profile-stage/--profile-warmup on run_msprof.sh before --"
+      ;;
+    -m)
+      case "${application[index+1]:-}" in
+        models.dflash_v1.run_npu|models.dflash_v1.run_rollback) stage_runner="true" ;;
+      esac
+      ;;
+    --report) stage_report="${application[index+1]:-}" ;;
+    --report=*) stage_report="${application[index]#--report=}" ;;
+  esac
+done
+if [[ -n "$profile_stage" ]]; then
+  [[ "$stage_runner" == "true" ]] || \
+    fail "--profile-stage requires python -m models.dflash_v1.run_npu (or run_rollback)"
+  [[ "$msproftx" == "off" ]] || fail "stage API capture does not use --msproftx"
+  [[ "$task_time" == "on" ]] || fail "stage API capture requires --task-time on"
+  ((${#extra_msprof_args[@]} == 0)) || fail "stage API capture does not accept --msprof-arg"
+  case "$aic_metrics" in
+    PipeUtilization|Memory|MemoryUB) ;;
+    *) fail "stage metrics must be PipeUtilization, Memory or MemoryUB" ;;
+  esac
+elif [[ "$profile_warmup_set" == "true" ]]; then
+  fail "--profile-warmup requires --profile-stage"
+fi
 expect_device_value="false"
 requested_device="npu:0"
 for argument in "${application[@]}"; do
@@ -170,6 +220,20 @@ device_log="$log_dir/device-$label.log"
 [[ ! -e "$profile_dir" ]] || fail "profile output already exists: $profile_dir"
 [[ ! -e "$manifest_path" ]] || fail "manifest already exists: $manifest_path"
 mkdir -p "$output_root/profile/msprof" "$log_dir" "$manifest_dir"
+
+if [[ -n "$profile_stage" ]]; then
+  unset DFLASH_MSPROF_PROCESS_CAPTURE || true
+  application+=(
+    --profile-stage "$profile_stage" --profile-output "$profile_dir"
+    --profile-warmup "$profile_warmup" --profile-aic-metrics "$aic_metrics"
+  )
+  if [[ -z "$stage_report" ]]; then
+    stage_report="$output_root/$label-stage-report.json"
+    application+=(--report "$stage_report")
+  fi
+else
+  export DFLASH_MSPROF_PROCESS_CAPTURE=1
+fi
 
 if [[ "$msproftx" == "on" ]]; then
   export DFLASH_BENCHMARK_MSTX=1
@@ -241,6 +305,10 @@ if [[ "$msproftx" == "on" ]]; then
   msprof_args+=("--msproftx=on")
 fi
 msprof_args+=("${extra_msprof_args[@]}")
+if [[ -n "$profile_stage" ]]; then
+  # The application owns collection. msprof is used only after stop/finalize.
+  msprof_args=("--export=on" "--output=$profile_dir" "--summary-format=csv")
+fi
 
 write_manifest() {
   local run_status="$1"
@@ -250,7 +318,7 @@ write_manifest() {
     "$manifest_path" "$run_status" "$exit_code" "$started_at" "$finished_at" \
     "$label" "$profile_dir" "$runtime_log" "$preflight_log" "$device_log" \
     "$msprof_bin" "$msprof_version" "$source_root" "$aic_metrics" "$task_time" \
-    "$msproftx" "$requested_device" \
+    "$msproftx" "$requested_device" "$profile_stage" "$profile_warmup" "$stage_report" \
     "${#msprof_args[@]}" "${msprof_args[@]}" \
     "${#application[@]}" "${application[@]}" <<'PY'
 import hashlib
@@ -263,9 +331,9 @@ values = sys.argv[1:]
     manifest_path, run_status, exit_code, started_at, finished_at, label,
     profile_dir, runtime_log, preflight_log, device_log, msprof_bin,
     msprof_version, source_root, aic_metrics, task_time, msproftx,
-    requested_device,
-) = values[:17]
-cursor = 17
+    requested_device, profile_stage, profile_warmup, stage_report,
+) = values[:20]
+cursor = 20
 msprof_count = int(values[cursor])
 cursor += 1
 msprof_args = values[cursor:cursor + msprof_count]
@@ -312,7 +380,7 @@ for path in sorted(set(expanded)):
     source_files += 1
 
 payload = {
-    "schema_version": 3,
+    "schema_version": 4,
     "status": run_status,
     "exit_code": int(exit_code),
     "label": label,
@@ -338,9 +406,15 @@ payload = {
         "aic_metrics": aic_metrics,
         "task_time": task_time,
         "msproftx": msproftx,
+        "collector": "pyACL stage API" if profile_stage else "msprof process",
+        "profile_stage": profile_stage or None,
+        "profile_warmup": int(profile_warmup) if profile_stage else None,
     },
     "application": redacted_application,
-    "artifacts": {"profile_dir": profile_dir, "runtime_log": runtime_log},
+    "artifacts": {
+        "profile_dir": profile_dir, "runtime_log": runtime_log,
+        "stage_report": stage_report if profile_stage else None,
+    },
     "claim_boundary": (
         "msprof is diagnostic evidence, not the latency baseline; retain "
         "separate unprofiled 3-warmup/10-measurement ordinary and DFlash runs"
@@ -355,8 +429,48 @@ PY
 
 write_manifest "RUNNING" 0 ""
 set +e
-"$msprof_bin" "${msprof_args[@]}" "${application[@]}" 2>&1 | tee "$runtime_log"
-msprof_status=${PIPESTATUS[0]}
+if [[ -n "$profile_stage" ]]; then
+  "${application[@]}" 2>&1 | tee "$runtime_log"
+  msprof_status=${PIPESTATUS[0]}
+  if ((msprof_status == 0)); then
+    "$msprof_bin" "${msprof_args[@]}" 2>&1 | tee -a "$runtime_log"
+    msprof_status=${PIPESTATUS[0]}
+  fi
+  if ((msprof_status == 0)); then
+    "$python_bin" -B - "$profile_dir" "$stage_report" "$profile_stage" <<'PY' 2>&1 | tee -a "$runtime_log"
+import csv
+import json
+from pathlib import Path
+import sys
+
+root, report_path, stage = sys.argv[1:]
+report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+expected = {
+    "prefill": int(stage == "prefill"),
+    "draft": int(stage == "draft-verify"),
+    "target_verify": int(stage == "draft-verify"),
+}
+if (report.get("status") != "PASS_CAPTURE"
+        or report.get("profile_stage") != stage
+        or report.get("capture_windows") != 1
+        or report.get("captured_calls") != expected
+        or report.get("operator_fallback_enabled") is not False
+        or Path(report.get("profile_output", "")).resolve() != Path(root).resolve()):
+    raise SystemExit("stage report does not prove one requested capture window")
+rows = 0
+for path in Path(root).rglob("op_summary*.csv"):
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        rows += sum(1 for row in csv.DictReader(stream) if any(row.values()))
+if not rows:
+    raise SystemExit("msprof export produced no operator rows; inspect the raw PROF_* data")
+print(f"PASS: one {stage} capture, {rows} exported operator rows")
+PY
+    msprof_status=${PIPESTATUS[0]}
+  fi
+else
+  "$msprof_bin" "${msprof_args[@]}" "${application[@]}" 2>&1 | tee "$runtime_log"
+  msprof_status=${PIPESTATUS[0]}
+fi
 set -e
 finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if ((msprof_status == 0)); then

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import os
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -120,6 +122,44 @@ class TinyTransactionalTarget(nn.Module):
 
 
 class DFlashRuntimeOptimizationTest(unittest.TestCase):
+    def test_profile_round_matches_production_with_real_draft_kv(self) -> None:
+        from models.dflash_v1.dflash_rollback_decode import dflash_rollback_greedy
+        from models.dflash_v1.stage_profile import profile_one_stage
+
+        torch.manual_seed(20260907)
+        adapter = Qwen35DFlashRollbackAdapter(
+            TinyTransactionalTarget().eval(), initialized_tiny_model(),
+            require_official_config=False,
+        )
+        ordinary_schedule = dflash_rollback_greedy(
+            adapter, [1, 2, 3], block_size=4, max_new_tokens=4, eos_token_ids=[],
+        )
+        first_round = ordinary_schedule.rounds[1]
+        # CPU reduced-shape orchestration only; no device collection evidence.
+        profiler = SimpleNamespace(
+            windows=0, output="HOST_TEST_NO_CAPTURE", metrics="PipeUtilization",
+            elapsed_ms=None, synchronize=lambda: None,
+        )
+
+        @contextmanager
+        def capture():
+            profiler.windows += 1
+            yield
+
+        profiler.capture = capture
+        report = profile_one_stage(
+            adapter, [1, 2, 3], stage="draft-verify", block_size=4,
+            eos_token_ids=[], warmup=2, profiler=profiler,
+        )
+        result = report["result"]
+        self.assertTrue(report["warmup_output_match"])
+        self.assertEqual(result["anchor_token_id"], ordinary_schedule.generated_token_ids[0])
+        self.assertEqual(tuple(result["proposal_token_ids"]), first_round.proposed_token_ids)
+        self.assertEqual(tuple(result["target_top1_token_ids"]), first_round.target_token_ids)
+        self.assertEqual(result["accepted_draft_tokens"], len(first_round.accepted_draft_token_ids))
+        self.assertEqual(result["verify_rows"], 4)
+        self.assertIsNone(adapter.target.pending)
+
     def test_projected_feature_path_matches_uncached_path(self) -> None:
         torch.manual_seed(20260827)
         model = initialized_tiny_model()

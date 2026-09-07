@@ -326,6 +326,82 @@ tools/run_msprof.sh \
 重采。默认进程级 profile 还包含模型加载、correctness gate 和 warmup，不能把算子累计值或整个
 profile 时长当作单次 measurement latency。
 
+### 7.4 只采一次 prefill 或 Draft 生成 + Target verify
+
+Python NPU 路线可以传 `--profile-stage prefill|draft-verify`。参数放在 wrapper 的 `--` **之前**，
+应用使用 `models.dflash_v1.run_npu`，不经过 `benchmark_npu` 的 correctness/warmup/measurement 循环。
+例如只采一次完整 prefill：
+
+```bash
+tools/run_msprof.sh \
+  --label single-prefill \
+  --output-dir "$BENCH_DIR/single-prefill" \
+  --python "$MODEL_PYTHON" \
+  --profile-stage prefill --profile-warmup 1 \
+  --aic-metrics PipeUtilization \
+  -- \
+  "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+    --target-dir /path/to/Qwen3.5-4B \
+    --draft-dir /path/to/Qwen3.5-4B-DFlash \
+    --kv-cache-max-len 2048 --block-size 16 --device npu:0 \
+    --prompt "请用一句话解释为什么天空是蓝色的。" \
+    --prompt-mode chat --enable-thinking
+```
+
+只采一次 Draft 生成和紧接着的 Target verify：
+
+```bash
+tools/run_msprof.sh \
+  --label single-draft-verify \
+  --output-dir "$BENCH_DIR/single-draft-verify" \
+  --python "$MODEL_PYTHON" \
+  --profile-stage draft-verify --profile-warmup 1 \
+  --aic-metrics PipeUtilization \
+  -- \
+  "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+    --target-dir /path/to/Qwen3.5-4B \
+    --draft-dir /path/to/Qwen3.5-4B-DFlash \
+    --kv-cache-max-len 2048 --block-size 16 --device npu:0 \
+    --prompt "请用一句话解释为什么天空是蓝色的。" \
+    --prompt-mode chat --enable-thinking
+```
+
+W8A8 沿用应用参数 `--config /path/to/qwen3.5.ymal --quant_mode enable`。每次使用新的输出目录；
+需分别查看 Memory/MemoryUB 时，保持 prompt、B、量化配置一致，换 `--aic-metrics` 单独采集。
+
+| 选项 | 窗口内执行 | 窗口外执行 |
+| --- | --- | --- |
+| `prefill` | 一次 Target `begin_rollback`：新建 cache、所有真实 prompt 分块、feature 收集、最后真实行 LM head | 模型加载、预热、anchor Top1；本模式不执行 Draft feature projection 或 Draft/verify |
+| `draft-verify` | 首轮 Draft proposal（含首次 Draft KV 构建和 Draft Top1）、proposal 整理与 block 构建、一次 Target verify（含首次状态 bank 准备） | 模型加载、预热、prefill、prompt feature projection、anchor Top1、Target verify 后的 Top1/accept/commit |
+
+`--profile-warmup` 默认 1，预热不启动采集。每次预热和正式采集都从同一个 prompt 重建请求状态，
+不会沿用预热后推进的 KV/cursor。设为 0 可观察未预热的首次调用；`draft-verify` 仍须先完成 prefill。
+这里采的是 **prefill 后的首轮**，不代表后续已有 Draft KV 的稳定 decode 轮次。
+
+一个 prefill 可以包含多个 64-token 分块，不等于只执行一个模型 chunk。`draft-verify` 按完整 B
+请求 proposal：B=16 请求 15 个 draft token，通常 verify T=16；遇到 proposal EOS 会按生产规则
+缩短 T，实际值见报告 `result.verify_rows`。若 prefill anchor 已是 EOS，则报错退出而不生成空采集。
+此诊断分支忽略 `max-new-tokens` 的生成预算，也不运行 `execution-mode=validate` 的 ordinary 对照。
+
+内部使用 `acl.prof.start/stop` 控制唯一采集窗口，窗口前和 stop 前各同步一次 NPU，Draft 与 verify
+之间不额外插入同步。需要目标 CANN 配套的 `acl` Python 模块；程序在模型加载前初始化 profiling，
+关闭后由 wrapper 执行 `msprof --export=on --output=... --summary-format=csv`。不要再在 wrapper 外套
+进程级 msprof；本模式不使用 MSTX，也不接受 `--msproftx` 或额外 `--msprof-arg`。
+采集项为 ACL API、task time、AI Core metrics；未照搬进程级 wrapper 的全部采集开关。
+API 生命周期及导出参数见 [CANN pyACL profiling 文档](https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/devaids/Profiling/atlasprofiling_16_0049.html)
+和 [msprof 离线导出文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/devaids/Profiling/atlasprofiling_16_0021.html)。
+
+输出位于 `--output-dir` 下：`profile/msprof/<label>/` 保存 raw 数据及导出的 `op_summary*.csv`、
+`<label>-stage-report.json` 保存采集次数/范围和 token 结果，`manifest/<label>.json` 保存运行身份和状态。
+profiling 初始化期间可能保留模型元数据；推理算子的采集由 start/stop 窗口限定。
+wrapper 仅在应用、导出和非空算子 CSV 检查都成功后返回 PASS。阶段报告的 `PASS_CAPTURE`
+只表示采集流程完成，预热对照仅检查该阶段 token 结果稳定，不替代 strict-greedy 正确性门禁。
+`profiled_elapsed_ms` 是带 profiling 开销的同步窗口时间；具体算子时长看 CSV，正式时延仍按 3+10 测量。
+
+也可直接给 `run_npu` 传 `--profile-stage`、新的 `--profile-output` 和 `--profile-warmup`，退出后手动
+执行上述 msprof 导出命令。当前参数适用于 Python NPU rollback 路线，OM/C++ runner 的 profiling
+继续使用 [11.4 节流程](QUANT_AIR_OM_FRAMEWORK.md#114-用-msprof-单独分析当前-om)。
+
 ## 8. 报告门禁
 
 `validate`：
@@ -402,6 +478,8 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
   tests/test_dflash_runtime_optimizations.py \
   tests/test_benchmark_npu.py \
   tests/test_msprof_script.py \
+  tests/test_msprof_stage_script.py \
+  tests/test_stage_profile.py \
   tests/test_source_lock_benchmark.py \
   tests/test_rollback_target_quant.py
 ```

@@ -10,6 +10,7 @@ the HIAI route delegates state-bank and logical-KV commit to the receiver bridge
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict
 import json
 import os
@@ -31,6 +32,12 @@ from .dflash_rollback_adapter import (
 from .dflash_rollback_decode import dflash_rollback_greedy
 from .dflash_weights import require_official_dflash_checkpoint
 from .modeling_dflash import DFlashDraftModel
+from .stage_profile import (
+    AclStageProfiler,
+    add_profile_arguments,
+    profile_one_stage,
+    validate_profile_request,
+)
 
 
 DEFAULT_NPU_TARGET_FACTORY = (
@@ -56,6 +63,7 @@ def _parser():
             "dflash runs only the production DFlash session"
         ),
     )
+    add_profile_arguments(parser)
     rollback_help = {
         "target_loader": (
             "CPU/CUDA only: optional MODULE:FUNCTION returning a framework "
@@ -98,6 +106,7 @@ def _rollback_runtime_identity(package_dir: Path) -> dict[str, object]:
         "draft_npu_ops": package_dir / "dflash_ascend310p_ops.py",
         "runner": package_dir / "run_rollback.py",
         "npu_runner": package_dir / "run_npu.py",
+        "stage_profiler": package_dir / "stage_profile.py",
         "target_quant_contract": package_dir / "target_quant.py",
         "bridge": parent / "internal_dflash_bridge.py",
         "wrapper": parent / _ROLLBACK_WRAPPER_SOURCE,
@@ -208,10 +217,18 @@ def _synchronize_device(device: str | torch.device) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     request_started = perf_counter()
     args = _parser().parse_args(argv)
+    with ExitStack() as cleanup:
+        return _run(args, request_started=request_started, cleanup=cleanup)
+
+
+def _run(args, *, request_started: float, cleanup: ExitStack) -> int:
     device_type = str(args.device).split(":", 1)[0].lower()
+    package_dir = Path(__file__).resolve().parent
+    validate_profile_request(args, source_root=package_dir.parents[1])
     if args.max_new_tokens < 0:
         raise ValueError("--max-new-tokens must be non-negative")
-    if device_type in {"cuda", "npu"} and args.max_new_tokens < 2:
+    if (args.profile_stage is None and device_type in {"cuda", "npu"}
+            and args.max_new_tokens < 2):
         raise ValueError(
             "accelerator rollback execution needs at least two new tokens"
         )
@@ -235,7 +252,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if device_type == "npu" and tuple(args.eos_token_id) != (248044,):
         raise ValueError("the locked NPU rollback route requires EOS token 248044")
 
-    package_dir = Path(__file__).resolve().parent
     expected_hiai_source = package_dir.parent / _ROLLBACK_MODEL_SOURCE
     if args.hiai_source is not None:
         supplied_hiai_source = Path(args.hiai_source).expanduser()
@@ -256,6 +272,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     dtype = _legacy._dtype(args.dtype)
     _legacy._prepare_device_backend(args.device)
     _legacy._validate_experiment_dtype(args.device, dtype)
+
+    profiler = None
+    if args.profile_stage is not None:
+        # Establish torch_npu's runtime before pyACL profiling initialization;
+        # initialize profiling before loading the models to retain their metadata.
+        _synchronize_device(args.device)
+        profiler = cleanup.enter_context(AclStageProfiler(
+            args.profile_output, int(torch.npu.current_device()),
+            args.profile_aic_metrics, lambda: _synchronize_device(args.device),
+        ))
 
     target_root = Path(args.target_dir).expanduser().resolve()
     target_checkpoint = _legacy._audit_target_config(target_root)
@@ -323,6 +349,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.block_size is None
         else args.block_size
     )
+
+    if profiler is not None:
+        required_rows = len(prompt_ids) + (
+            effective_block_size if args.profile_stage == "draft-verify" else 0
+        )
+        capacity = getattr(target, "kv_cache_max_len", None)
+        if capacity is not None and required_rows > int(capacity):
+            raise ValueError("KV capacity must cover prompt plus the full profile block")
+        report = profile_one_stage(
+            adapter, prompt_ids, stage=args.profile_stage,
+            block_size=effective_block_size, eos_token_ids=args.eos_token_id,
+            warmup=args.profile_warmup, profiler=profiler,
+        )
+        # Flush successfully before publishing PASS_CAPTURE or invoking msprof export.
+        profiler.close()
+        source_identity_after = _rollback_runtime_identity(package_dir)
+        if source_identity_after != source_identity_before:
+            raise RuntimeError("runtime source identity changed during stage profiling")
+        report.update({
+            "execution_mode": "profile",
+            "device": str(adapter.device),
+            "dtype": str(adapter.dtype),
+            "runtime_identity": _legacy._runtime_identity(adapter.device),
+            "rollback_runtime_identity": source_identity_after,
+            "target_route": target_route,
+            "ops_backend": backend,
+            "operator_fallback_enabled": False,
+            "target_checkpoint": target_checkpoint,
+            "draft_checkpoint": draft_checkpoint,
+            "target_rollback_audit": dict(target.dflash_rollback_audit),
+            "target_quantization": dict(target.dflash_target_quantization_audit),
+            "draft_kv_cache_audit": dict(adapter.dflash_draft_cache_audit),
+            "request": _legacy._request_payload(
+                args, effective_block_size=effective_block_size,
+                prompt_token_ids=prompt_ids,
+            ),
+        })
+        serialized = json.dumps(report, indent=2, sort_keys=True)
+        _atomic_report(args.report, serialized)
+        print(serialized)
+        return 0
 
     progress_fields = {
         "execution_mode": args.execution_mode,

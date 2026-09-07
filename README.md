@@ -107,6 +107,10 @@ embedding_scale_path: /data/qwen35-w8a8/embedding_scale.bin
 正确性门禁通过后，可以把 `--execution-mode validate` 改为 `dflash`，只运行 DFlash 生产路径。
 该模式没有当次 ordinary 对照，因此报告不会伪造 exact-match PASS。
 
+只想用 msprof 查看一次 prefill 或首轮 Draft 生成 + Target verify 时，可给 `tools/run_msprof.sh`
+增加 `--profile-stage prefill` 或 `--profile-stage draft-verify`（放在 `--` 之前，应用使用 `run_npu`）。
+默认先在采集窗口外预热一次；完整命令和采集范围见[运行与验证 7.4 节](docs/DFLASH_RUN_AND_VALIDATE.md#74-只采一次-prefill-或-draft-生成--target-verify)。
+
 ## 文档
 
 | 文档 | 内容 |

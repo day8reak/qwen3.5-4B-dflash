@@ -34,7 +34,10 @@
     "Target quant mode, original YAML identity, and all three quant artifact identities"
   ],
   "target_quantization": {
-    "modes": ["disabled", "w8a8_dynamic"],
+    "modes": [
+      "disabled",
+      "w8a8_dynamic"
+    ],
     "scope": "Target Linear and layer-0 embedding input only; DFlash Draft remains FP16",
     "required_w8a8_options": [
       "--config",
@@ -86,7 +89,28 @@
       "PipeUtilization",
       "Memory",
       "MemoryUB"
-    ]
+    ],
+    "single_stage": {
+      "entrypoint": "python -B -m models.dflash_v1.run_npu",
+      "wrapper_option": "--profile-stage",
+      "stages": [
+        "prefill",
+        "draft-verify"
+      ],
+      "collector": "acl.prof.start/stop followed by msprof offline export",
+      "capture_windows": 1,
+      "warmup_iterations": 1,
+      "warmup_collected": false,
+      "fresh_prompt_state_for_each_iteration": true,
+      "draft_verify_round": "first round after prefill, including first Draft KV and Target bank preparation",
+      "full_block_size_requested": true,
+      "proposal_eos_can_shorten_verify_rows": true,
+      "max_new_tokens_applies": false,
+      "correctness_gate": "NOT_RUN_STAGE_DIAGNOSTIC",
+      "pass_requires_nonempty_operator_csv": true,
+      "cpu_fallback_allowed": false,
+      "formal_latency_evidence": false
+    }
   },
   "route_boundary": {
     "ordinary": "rollback receiver internal control using persistent target-state incremental greedy; not the original main deployment",
