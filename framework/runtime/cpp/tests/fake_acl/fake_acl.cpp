@@ -617,8 +617,6 @@ aclError ExecuteVerify(const aclmdlDataset* input, aclmdlDataset* output) {
                 sizeof(std::int64_t)) {
       return 1;
     }
-  } else if (proposal_count == 0) {
-    return 1;
   }
   const auto* verify = static_cast<const std::int64_t*>(input->buffers[0]->data);
   std::vector<std::int64_t> proposals;

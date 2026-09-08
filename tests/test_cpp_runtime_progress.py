@@ -14,7 +14,7 @@ FRAMEWORK_PYTHON = ROOT / "framework" / "python"
 if str(FRAMEWORK_PYTHON) not in sys.path:
     sys.path.insert(0, str(FRAMEWORK_PYTHON))
 
-from qwen35_dflash.ascend310p.cli import build_parser
+from qwen35_dflash.ascend310p.cli import _cpp_eos_token_ids, build_parser
 from qwen35_dflash.ascend310p import cpp_runtime
 from qwen35_dflash.ascend310p.cpp_runtime import (
     INCREMENTAL_STATE_POLICY,
@@ -54,6 +54,15 @@ def test_infer_cpp_progress_is_on_by_default_and_can_be_disabled() -> None:
     assert parser.parse_args(_infer_cpp_args("--no-progress")).progress is False
 
 
+def test_cpp_eos_defaults_to_current_torch_npu_and_allows_explicit_override() -> None:
+    parser = build_parser()
+    assert _cpp_eos_token_ids(parser.parse_args(_infer_cpp_args())) == (248044,)
+    explicit = parser.parse_args(_infer_cpp_args(
+        "--eos-token-id", "248046", "--eos-token-id", "248044",
+    ))
+    assert _cpp_eos_token_ids(explicit) == (248046, 248044)
+
+
 def test_run_e2e_cpp_defaults_to_static_split_four_om_factory() -> None:
     args = build_parser().parse_args(
         [
@@ -79,6 +88,7 @@ def test_run_e2e_cpp_defaults_to_static_split_four_om_factory() -> None:
 
     assert args.factory == DEFAULT_CPP_GRAPH_FACTORY
     assert args.factory.endswith("create_quant_incremental_state_graphs")
+    assert _cpp_eos_token_ids(args) == (248044,)
 
 
 @pytest.mark.parametrize("command", ["export-air", "build-om"])

@@ -4,11 +4,12 @@
 greedy 对齐，再另建动态候选；本次不缩减模型、量化精度、KV 容量或请求长度。
 这是用户选择的源码默认值，不代表已经取得 Ascend310P 真机正确性或性能结论。
 
-**v42 修复 Draft mask 语义，四图默认拓扑仍保持 v41。** 旧显式状态 Draft 把最后一层
-full attention 错误覆盖成 causal；新实现保留逐层策略，并在 K<15 时屏蔽物理 block padding。
-已经跑通 v41 的用户也需从 `export-air → compile-om` 重建新 bundle；只更新 C++ 无效。
-详见 [Draft/eager 对齐与重跑说明](DRAFT_OM_ATTENTION_PARITY.md)。这次没有重新量化或修改
-C++ ABI，匹配四图 ABI 的 runner 1.25.0 可继续使用；接受率改善仍需真机测量。
+**当前为 v43 / runner 1.26.0 / report schema 13，四图拓扑保持 v41。**
+保留 [v42 Draft mask 修复](DRAFT_OM_ATTENTION_PARITY.md)，进一步修正部分 Prefill 的
+conv state 提交，并对齐当前分支 torch_npu 的 K、零接受回退和 EOS 默认值。
+必须重建 runner，并从 `export-air → compile-om` 重建 bundle；只更新 C++ 无效。
+不重新量化、不改变四图张量 ABI。详见 [OM/torch_npu 对齐与验收](OM_TORCH_NPU_PARITY.md)；
+源码/主机测试通过不代表真机接受率已闭合。
 
 ## 文档入口与版本范围
 
@@ -33,9 +34,9 @@ ASan/UBSan 生命周期专项 4/4，以及 31 个 C++ 报告正例 / 186 个损�
 | 物理 OM | 输入 / 输出数 | 固定物理行数 | 生命周期 |
 | --- | ---: | --- | --- |
 | `target-prefill` | 9 / 11 | prompt chunk 64 | body + Top1/EOS head 合为一个 OM，连续 prompt 块之间常驻，阶段结束后卸载 |
-| `target-decode1` | 8 / 8 | 1 | ordinary 热循环常驻；DFlash 尾部或显式 target-only 回退使用 |
+| `target-decode1` | 8 / 8 | 1 | ordinary 热循环常驻；默认静态 split 的 DFlash 不调用 |
 | `draft-propose` | 8 / 4 | Target feature N=64，proposal block 16 | 与 Verify 一起常驻，不在每轮交替时重载 |
-| `target-verify-commit` | 9 / 13 | 16 | 最多 15 proposals，按实际接受数提交，与 Draft 一起常驻 |
+| `target-verify-commit` | 9 / 13 | 16 | 最多 15 proposals；DFlash target-only 使用 K=0，与 Draft 一起常驻 |
 
 不再生成单独的 `target-prefill-head` 或 `fused-speculative-step`。
 Prefill 复用原 body 与精确 head：原 7 个输入追加 EOS 表及 count，原 8 个输出追加
@@ -47,7 +48,7 @@ N 大于 64 时，prompt 仍分块处理，每块都会计算 head，但只观�
 
 ```text
 ordinary：{Prefill} → {Decode1，循环}
-DFlash：  {Prefill} → {Draft + Verify，循环} → {Decode1，仅尾部/回退需要时}
+DFlash：  {Prefill} → {Draft + Verify，循环；零接受后仅执行 Verify K=0}
 ```
 
 启动时逐个加载、复制并校验 metadata、卸载，避免启动即分配所有权重。
@@ -69,8 +70,9 @@ OM 自动共享权重。它避免四图权重同时常驻，但不能保证在�
 显式 `all-resident` 可用于对照，预算恢复为四份权重之和。
 短到不进入 Draft 的请求允许仅 Prefill 组常驻，并不要求人为装载两张热图。
 
-Decode1 不能在这次修改中删除：ordinary 依赖它；DFlash 剩余生成预算为 1，或启用
-`request-target-only` 后触发零接受回退，也使用它。正常的 Draft→Verify 事务不调用 Decode1。
+Decode1 仍保留供 ordinary 使用。默认静态 split 的 DFlash 剩余预算为 1 时，Draft 尚未
+关闭则执行 K=1；首次零接受后使用 Verify16 K=0，保持 GDR-MTP 的 FP32 recurrent state，
+不切到 ordinary Decode1。旧 fused 无独立 Verify，仍是历史回退路径，不声称 eager 逐轮对齐。
 
 ## 静态尺寸与逻辑长度
 
@@ -94,9 +96,9 @@ Verify 输出只有 16 行，不能假定其余 feature 区域已被覆写。
 ## 从哪里重新运行
 
 **重建 C++ runner，并从 export-air → compile-om 重新生成四图。**
-这次改变了 Prefill ABI 和 Draft 物理 shape：旧的 body/head/fused OM 不能靠改名、重排
+v41 改变了 Prefill ABI 和 Draft 物理 shape：旧的 body/head/fused OM 不能靠改名、重排
 manifest 或只重建 runner 转成新默认。v40 文档中“不用重新导出”仅适用于旧静态 fused
-拓扑的生命周期修复，不适用于此次 v41 默认构图。
+拓扑的生命周期修复，不适用于 v41 默认构图或 v42/v43 的图内语义修复。
 沿用已锁定的 checkpoint、量化输入和 CANN 环境，不需要重新量化；新产物放活动 run 的新目录，
 保留旧 bundle 作为回退。
 
@@ -106,7 +108,9 @@ manifest 或只重建 runner 转成新默认。v40 文档中“不用重新导�
    `fused_speculative_step`、`unified_target_step`、`fused_static_feature_rows`，不要混用选择器。
 2. 填写 [runner 模板](../config/quant_air_om_static_split_runner.example.json)，保存为
    `$AI_RUN_DIR/runner-static-split.json`。必须填真实设备、CANN、driver、firmware 身份。
-   首轮保持 `phase-resident`、`async-memset`、`fixed-16`、window 1、`separate`、fallback disabled。
+   对齐 torch_npu 时使用 `phase-resident`、`async-memset`、`fixed-16`、window 1、
+   `separate`、`zero_accept_fallback_policy: request-target-only`。旧 JSON 的显式
+   `disabled` 不会自动迁移；这里的 target-only 不是 CPU fallback。
 3. 在已经激活的模型/CANN 环境执行；每步成功后再进行下一步：
 
 命令须使用本分支的 `framework/python`，不要误用 workspace 旧参考实现或旧安装包。
@@ -142,6 +146,7 @@ export STATIC_SPLIT_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-static-split64"
   --model-dir "$TARGET_MODEL_DIR" \
   --prompt "请用一句话解释为什么天空是蓝色的。" --chat \
   --max-new-tokens 32 --max-draft-tokens 15 --device-id 0 \
+  --eos-token-id 248044 \
   --output "$AI_RUN_DIR/reports/cpp-infer-static-split.json"
 ```
 
@@ -173,6 +178,9 @@ AIR 输入审计会验证所有四图的固定正整数 shape；Draft 必须有 
 报告的 `abi.physical_topology` 为 `merged-prefill-four-static-split-v1`；检查：
 
 - 独立 `target_prefill_head_executions=0`，`fused_speculative_step_executions=0`；
+- `schema_version=13`，protocol 的 budget 为 `torch-npu-remaining-v1`，target-only 为
+  `static-verify16-k0`；`target_only_verify_executions` 是逻辑单步计数的子集，
+  不能把它当作一次 Decode1 加一次 Verify，详见 [计数说明](OM_TORCH_NPU_PARITY.md)；
 - `draft_static_feature_rows=64`，`draft_dynamic_shape=false`，Draft 动态计划与 OM gear 数为 0；
 - `draft_static_physical_feature_rows = 64 * draft_propose_executions`，source + padding = physical；
 - phase 的 `allocated_weight_bytes` 符合上述分组公式；`peak_resident_models` 最多 2；
@@ -184,8 +192,9 @@ AIR 输入审计会验证所有四图的固定正整数 shape；Draft 必须有 
 及带 role 的执行 trace，不要用启动 ModelId 关联整个运行期间的 CSV。
 
 本地覆盖静态导出语义、fake ACL 分组生命周期/受限预算/故障清理及 C++→Python 报告门禁；
-均属主机模拟证据。还须在物理 310P 禁用 fallback 后取得 ordinary/DFlash token ID、EOS、
-stop reason 零差异，并完成 3 warmup + 10 次未 profiling 测量，才能声称设备跑通/性能改善。
+均属主机模拟证据。还须在物理 310P 禁用 **CPU fallback**，取得 OM ordinary/DFlash
+以及各自对当前分支 torch_npu 的 token ID、EOS、stop reason 零差异，并比较相同 K/
+fallback 规则下的接受计数。随后完成 3 warmup + 10 次未 profiling 测量，才能声称性能改善。
 若失败，回传新 manifest、model-query/分配诊断、第一条 GE/OP ERROR 上下文及完整 runner 日志；
 只看到末尾 ACL 500002 不能认定仍是同一个算子根因。
 
@@ -203,7 +212,7 @@ stop reason 零差异，并完成 3 warmup + 10 次未 profiling 测量，才能
 ```
 
 门禁通过后，失败的导出从 `export-air` 重跑；已生成且有效的 v41 OM 不因文档哈希修复而失效。
-这句话仅适用于文档哈希修复，不适用于 v42 的 Draft mask 修复；后者必须重新导出/编译。
+这句话仅适用于文档哈希修复，不适用于 v42/v43 的图内修复；后者必须重新导出/编译。
 不要关闭检查、删除锁条目、批量重算未知脏工作树的哈希或清理无关本地文件。
 以后包括纯文档提交在内，也应运行 `tests/test_source_lock_benchmark.py` 与静态四图回归中的
 真实源码锁正例 / 文档变更拒绝用例；最终提交前跑完整测试。

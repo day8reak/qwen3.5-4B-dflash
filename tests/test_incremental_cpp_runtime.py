@@ -211,7 +211,7 @@ def _report(
         for model_id, role in enumerate(_INCREMENTAL_GRAPH_ABI, start=1)
     ]
     return {
-        "schema_version": 12,
+        "schema_version": 13,
         "status": "PASS",
         "runner_id": INCREMENTAL_CPP_RUNNER_ID,
         "candidate_status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
@@ -230,6 +230,8 @@ def _report(
             "dflash_sync_window": dflash_sync_window,
             "maximum_supported_dflash_sync_window": MAX_DFLASH_SYNC_WINDOW,
             "zero_accept_fallback_policy": zero_accept_fallback_policy,
+            "proposal_budget_policy": "torch-npu-remaining-v1",
+            "target_only_execution_policy": "static-verify16-k0",
             "zero_accept_fallback_policy_description": (
                 "after the first completed zero-accept transaction, consume "
                 "the full synchronized window and use authoritative one-row "
@@ -379,8 +381,11 @@ def _report(
             "target_prefill_head_executions": request_count,
             "target_prefill_head_executions_elided": deferred_prefill,
             "target_decode1_executions": decode_executions,
+            "target_only_verify_executions": 0,
             "draft_propose_executions": draft_propose_executions,
             "target_verify_commit_executions": 26,
+            "target_step_input_rows": 16 * 26,
+            "target_step_padded_rows_elided": 0,
             "fused_speculative_step_executions": 0,
             "draft_to_verify_model_launches_elided": 0,
             "stream_synchronizations": (
@@ -550,6 +555,7 @@ def _unified_report(
         prompt_token_ids,
         decode_carrier_policy,
     )
+    report["protocol"]["target_only_execution_policy"] = "verify-t1"
     report["models"] = [
         item
         for item in report["models"]
@@ -621,6 +627,7 @@ def _unified_report(
 
 def _fused_report() -> dict[str, object]:
     report = _report()
+    report["protocol"]["target_only_execution_policy"] = "ordinary-decode1-legacy"
     hashes = {
         role: hashlib.sha256(role.encode("utf-8")).hexdigest()
         for role in _FUSED_SPECULATIVE_STEP_GRAPH_ABI
@@ -762,6 +769,34 @@ def test_incremental_runner_report_closes_state_and_transaction_counters(
 def test_incremental_runner_report_closes_multi_chunk_prefill() -> None:
     prompt = [1] * 69 + [10]
     _validate(_report(prompt_token_ids=prompt), prompt_token_ids=prompt)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("proposal_budget_policy", "remaining-minus-one"),
+    ("target_only_execution_policy", "ordinary-decode1-legacy"),
+])
+def test_runner_rejects_stale_torch_npu_semantic_policy(key, value) -> None:
+    report = _report()
+    report["protocol"][key] = value
+    with pytest.raises(RuntimeError, match="policy differs"):
+        _validate(report)
+
+
+@pytest.mark.parametrize("value", [-1, 66, True])
+def test_runner_rejects_invalid_target_only_verify_subset(value) -> None:
+    report = _report()
+    report["execution_io_counters"]["target_only_verify_executions"] = value
+    with pytest.raises(RuntimeError, match="Verify"):
+        _validate(report)
+
+
+def test_runner_verifies_physical_rows_for_target_only_subset() -> None:
+    report = _report()
+    report["execution_io_counters"]["target_only_verify_executions"] = 1
+    with pytest.raises(RuntimeError, match="Verify physical row"):
+        _validate(report)
+    report["execution_io_counters"]["target_step_input_rows"] += 16
+    _validate(report)
 
 
 def test_incremental_runner_accepts_huge_first_build_identity() -> None:
@@ -1480,7 +1515,10 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
         captured["command"] = command
         output = Path(command[command.index("--output") + 1])
         output.write_text(
-            json.dumps(_report(IMMUTABLE_ZERO_STATE_RESET_POLICY)),
+            json.dumps(_report(
+                IMMUTABLE_ZERO_STATE_RESET_POLICY,
+                zero_accept_fallback_policy=REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY,
+            )),
             encoding="utf-8",
         )
         return subprocess.CompletedProcess(command, 0, stdout="fake PASS\n")

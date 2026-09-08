@@ -354,7 +354,7 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
     zero_accept_fallback_policy = str(
         options.get(
             "zero_accept_fallback_policy",
-            DISABLED_ZERO_ACCEPT_FALLBACK_POLICY,
+            REQUEST_TARGET_ONLY_ZERO_ACCEPT_FALLBACK_POLICY,
         )
     ).strip()
     if zero_accept_fallback_policy not in (
@@ -900,7 +900,7 @@ def validate_incremental_cpp_runner_report(
     if phase_resident and not (fused_static_feature_rows or draft_static_feature_rows):
         raise RuntimeError("phase-resident requires static fused OM evidence")
 
-    if report.get("schema_version") != 12:
+    if report.get("schema_version") != 13:
         raise RuntimeError("incremental C++ report schema differs")
     if (
         report.get("status") != "PASS"
@@ -1100,6 +1100,14 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError(
             "incremental zero-accept fallback description differs"
         )
+    if protocol.get("proposal_budget_policy") != "torch-npu-remaining-v1":
+        raise RuntimeError("incremental proposal budget policy differs")
+    expected_target_only_policy = (
+        "ordinary-decode1-legacy" if fused_speculative_step else
+        "verify-t1" if unified_target_step else "static-verify16-k0"
+    )
+    if protocol.get("target_only_execution_policy") != expected_target_only_policy:
+        raise RuntimeError("incremental target-only execution policy differs")
     if protocol.get("prefill_control_policy") != (
         "each chunk uploads one prefix ending after IDs/effective length, "
         "final-Draft total count, a changed proposal count, or a changed "
@@ -1488,6 +1496,16 @@ def validate_incremental_cpp_runner_report(
     prefill, prefill_head, decode, draft, verify = (
         int(value) for value in role_counts
     )
+    fallback_verify = execution.get("target_only_verify_executions")
+    if type(fallback_verify) is not int or not 0 <= fallback_verify <= decode:
+        raise RuntimeError("incremental Target-only Verify counter is invalid")
+    if fused_speculative_step and fallback_verify:
+        raise RuntimeError("legacy fused bundle has no standalone Target-only Verify")
+    if not fused_speculative_step and not unified_target_step and (
+        execution.get("target_step_input_rows") != 16 * (verify + fallback_verify)
+        or execution.get("target_step_padded_rows_elided") != 0
+    ):
+        raise RuntimeError("incremental static Verify physical row counters differ")
     fused_execution = execution.get("fused_speculative_step_executions")
     if static_rows:
         physical = execution.get(static_prefix + "physical_feature_rows")
@@ -1572,7 +1590,7 @@ def validate_incremental_cpp_runner_report(
     expected_deferred = request_count * (prompt_chunks - 1)
     dflash_request_count = request_count // 2
     expected_prefill_draft = (
-        dflash_request_count if max_new_tokens > 2 else 0
+        dflash_request_count if max_new_tokens > 1 else 0
     )
     expected_prefill_draft_elided = (
         expected_prefill_draft * (prompt_chunks - 1)
@@ -1959,8 +1977,8 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental prefill control counters are invalid")
     expected_full_upload_operations = 1
     expected_proposal_count = (
-        min(max_draft_tokens, proposal_width, max_new_tokens - 2)
-        if max_new_tokens > 2
+        min(max_draft_tokens, proposal_width, max_new_tokens - 1)
+        if max_new_tokens > 1
         else 0
     )
     minimum_proposal_upload_operations = (
@@ -2041,7 +2059,7 @@ def validate_incremental_cpp_runner_report(
         1
         if prefill_completion_policy
         == COALESCE_FIRST_VERIFY_PREFILL_COMPLETION_POLICY
-        and max_new_tokens > 2
+        and max_new_tokens > 1
         else 0
     )
     for mode_name, mode_report, expected_window in (

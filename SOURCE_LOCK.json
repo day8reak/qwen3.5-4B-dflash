@@ -1,7 +1,7 @@
 {
   "schema_version": 6,
   "purpose": "runtime identity contract for Qwen3.5-4B DFlash rollback with the original GDR effective-length ABI and optional Target-only W8A8 dynamic quantization configured by the original inference YAML",
-  "package_revision": "r15",
+  "package_revision": "r16",
   "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-chunk-prefill-gdr-effective-length-air-copy-free-cache-update-private-v4444-quant-fp32-eager-scale-attention-length-abi-load-safe-rope-init-unfold-free-conv-bank",
   "package_layout": {
     "version": 6,
@@ -121,7 +121,8 @@
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
     "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
     "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
-    "hiai_modeling_sha256": "b79b7c84e421f98d0c8237e1a7f0577bbf2f6d37d05972303de4eb707bef4594",
+    "hiai_modeling_sha256": "1922e6e35866f8bc16ea374c05165a6f47618d4e81fc57276aea53f60372fb8d",
+    "ordinary_conv_commit_policy": "logical-effective-length-v1: commit history columns L..L+Kc-1 before padded physical rows; preserve selected native/Tensor convolution outputs",
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
     "wrapper_sha256": "a62e4a554cd566194455a993e37dd0bc045579424d99c85e789dd241b1408020",
     "shared_qlinear_source_file": "models/modeling_qwen3_5_hiai_nd.py",

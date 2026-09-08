@@ -15,6 +15,7 @@ if str(FRAMEWORK_PYTHON) not in sys.path:
 
 from qwen35_dflash.ascend310p.msprof_analysis import (  # noqa: E402
     MsprofAnalysisError,
+    _validate_runner_report,
     analyze_incremental_msprof,
 )
 
@@ -120,6 +121,27 @@ def _schema_nine_runner_report() -> dict[str, object]:
     counters["speculative_window_staging_device_bytes"] = 4096
     counters["speculative_window_staging_pinned_host_bytes"] = 4096
     return report
+
+
+@pytest.mark.parametrize("target_only_count", [1, 0, -1, 3, True])
+def test_static_target_only_verify_is_not_attributed_to_decode1(target_only_count):
+    report = _schema_ten_runner_report()
+    report["schema_version"] = 13
+    report["models"].insert(2, {"role": "target-decode1", "model_id": 5})
+    report["abi"]["physical_topology"] = "split-prefill-head-five-resident-v1"
+    report["execution_io_counters"]["target_only_verify_executions"] = target_only_count
+    trace = report["profile_model_execution_trace"]
+    trace[3].update(model_id=5, physical_rows=1)   # Ordinary Decode1.
+    trace[5]["physical_rows"] = 16                # Speculative Verify.
+    trace[7]["physical_rows"] = 16                # Target-only Verify K=0.
+    if type(target_only_count) is int and target_only_count == 1:
+        _, counts, _, unified, fused = _validate_runner_report(report)
+        assert not unified and not fused
+        assert counts["target-decode1"] == 1
+        assert counts["target-verify-commit"] == 2
+    else:
+        with pytest.raises(MsprofAnalysisError):
+            _validate_runner_report(report)
 
 
 def _schema_ten_runner_report() -> dict[str, object]:

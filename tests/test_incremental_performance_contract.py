@@ -33,7 +33,7 @@ def _batched_cache_update_proposal() -> dict[str, object]:
 def test_incremental_contract_has_exact_approval_but_is_not_active() -> None:
     contract = _contract()
     approval = json.loads(APPROVAL_PATH.read_text(encoding="utf-8"))
-    assert contract["schema_version"] == 10
+    assert contract["schema_version"] == 11
     assert contract["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
     assert approval["status"] == "APPROVED"
     assert approval["approval_statement"] == "批准多OM状态图"
@@ -247,7 +247,10 @@ def test_hot_loop_keeps_large_state_and_proposals_on_device() -> None:
     assert "forward/reverse-order" in contract["hot_loop"][
         "device_memory_allocation_selection_gate"
     ]
-    assert "max_new_tokens>2" in contract["hot_loop"][
+    assert "max_new_tokens>1" in contract["hot_loop"][
+        "prefill_first_verify_budget_guard"
+    ]
+    assert "K=min(max_draft,15,remaining)" in contract["hot_loop"][
         "prefill_first_verify_budget_guard"
     ]
     transaction = contract["strict_greedy_transaction"]
@@ -335,9 +338,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 42
+    assert framework_lock["schema_version"] == 43
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v42"
+        "qwen3.5-4b-quant-air-om-ascendcl-v43"
     )
     residency = framework_lock["runtime"]["incremental_model_residency"]
     assert residency["default"] == "phase-resident for merged static split; all-resident for legacy topologies"

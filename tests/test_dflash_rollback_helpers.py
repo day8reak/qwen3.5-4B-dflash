@@ -19,6 +19,8 @@ SOURCE = (
 )
 BASE_SOURCE = REPOSITORY_ROOT / "models" / "modeling_qwen3_5_hiai_nd.py"
 HELPERS = {
+    "causal_conv1d_update_logical",
+    "torch_causal_conv1d_update",
     "_normalize_gdr_effective_length",
     "_require_dflash_accepted_tokens",
     "_select_dflash_state_slot",

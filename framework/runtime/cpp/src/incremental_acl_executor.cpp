@@ -1469,6 +1469,65 @@ class AclIncrementalExecutor::Impl {
     return ReadCompactAndTrackCarrier(false, 1, target_state_index_);
   }
 
+  StatefulStep VerifyOne(std::int64_t input_token_id) {
+    // Legacy fused bundles have no separate Verify; retain their explicitly
+    // selected old fallback. The default split bundle never enters this case.
+    if (fused_speculative_step_) return DecodeOne(input_token_id);
+    if (unified_target_step_) {
+      auto result = DecodeOne(input_token_id);
+      ++stats_.target_only_verify_executions;
+      return result;
+    }
+    RequireReset();
+    RequirePrefilled();
+    RequireCompletedPrefill();
+    if (input_token_id < 0) throw std::invalid_argument("negative VerifyOne input");
+    // A zero-proposal Verify commits row zero from the FP32 GDR-MTP bank,
+    // exactly as torch_npu's target-only continuation. Decode1 uses ordinary
+    // GDR and downcasts its recurrent state, so it is not interchangeable.
+    Check(aclrtMemsetAsync(verify_ids_.data, verify_ids_.bytes, 0,
+                          verify_ids_.bytes, stream_),
+          "aclrtMemsetAsync(target-only verify IDs)");
+    stream_work_pending_ = true;
+    if (decode_carrier_valid_ && decode_carrier_token_id_ == input_token_id) {
+      const BufferView source = compact_carrier_is_staged_
+          ? StagedCompactView(compact_carrier_staging_index_,
+                              compact_token_offset_ + decode_carrier_row_ * sizeof(std::int64_t),
+                              sizeof(std::int64_t))
+          : CompactView(target_state_index_,
+                        compact_token_offset_ + decode_carrier_row_ * sizeof(std::int64_t),
+                        sizeof(std::int64_t));
+      Check(aclrtMemcpyAsync(verify_ids_.data, verify_ids_.bytes, source.data,
+                            sizeof(std::int64_t), ACL_MEMCPY_DEVICE_TO_DEVICE, stream_),
+            "aclrtMemcpyAsync(target-only anchor)");
+      ++stats_.decode_id_device_carrier_hits;
+      ++stats_.decode_id_h2d_operations_elided;
+      if (decode_carrier_row_ != 0) {
+        ++stats_.decode_id_multi_token_carrier_hits;
+        ++stats_.decode_id_device_compaction_operations;
+        stats_.decode_id_device_compaction_bytes += sizeof(std::int64_t);
+      }
+    } else {
+      *static_cast<std::int64_t*>(decode_id_.host) = input_token_id;
+      UploadFromHost(verify_ids_.View(), decode_id_.host, sizeof(std::int64_t));
+      ++stats_.decode_id_upload_operations;
+      stats_.decode_id_upload_bytes += sizeof(std::int64_t);
+    }
+    SetProposalCount(0);
+    Execute(verify_, verify_plans_[target_state_index_], verify_width_);
+    ++stats_.target_decode1_executions;
+    ++stats_.target_only_verify_executions;
+    stats_.target_step_input_rows += verify_width_;
+    target_state_index_ = 1 - target_state_index_;
+    proposal_ready_ = false;
+    feature_source_ = FeatureSource::kVerify;
+    committed_feature_rows_ = 1;
+    committed_feature_rows_valid_ = true;
+    DownloadCompact(false, target_state_index_);
+    Synchronize();
+    return ReadCompactAndTrackCarrier(false, 1, target_state_index_);
+  }
+
   StatefulStep SpeculativeStep(std::size_t logical_proposal_count) {
     const auto pending = EnqueueSpeculative(
         logical_proposal_count, false);
@@ -3331,7 +3390,8 @@ class AclIncrementalExecutor::Impl {
   }
 
   void SetProposalCount(std::size_t value) {
-    RequireProposalCount(value);
+    // K=0 is private to VerifyOne; speculative entry points still require K>=1.
+    if (value > proposal_width_) throw std::invalid_argument("proposal count exceeds width");
     if (proposal_value_valid_ && proposal_value_ == value) {
       return;
     }
@@ -4254,6 +4314,10 @@ AclIncrementalExecutor& AclIncrementalExecutor::operator=(
 
 std::size_t AclIncrementalExecutor::sequence_length() const noexcept {
   return impl_->sequence_length();
+}
+
+StatefulStep AclIncrementalExecutor::VerifyOne(std::int64_t input_token_id) {
+  return impl_->VerifyOne(input_token_id);
 }
 
 void AclIncrementalExecutor::ValidateRequest(

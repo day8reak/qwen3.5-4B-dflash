@@ -114,6 +114,12 @@ class StatefulGraphExecutor {
 
   virtual StatefulStep DecodeOne(std::int64_t input_token_id) = 0;
 
+  // The torch_npu request-target-only path retains the Verify/GDR-MTP state
+  // precision. It is not necessarily numerically identical to ordinary GDR.
+  virtual StatefulStep VerifyOne(std::int64_t input_token_id) {
+    return DecodeOne(input_token_id);
+  }
+
   virtual StatefulStep SpeculativeStep(
       std::size_t logical_proposal_count) = 0;
 
@@ -158,8 +164,7 @@ struct GenerationCounters {
   // Completed speculative transactions that accepted no Draft token.
   std::size_t zero_accept_transactions = 0;
   // At most one activation is possible per request.  Activation happens only
-  // when at least two generation slots remain, because a final one-row Target
-  // step would run without Draft under either policy.
+  // when another generation slot remains, including the final K=1 window.
   std::size_t zero_accept_fallback_activations = 0;
   // Authoritative one-row Target steps selected by an active fallback.  Each
   // step replaces one otherwise eligible Draft + Verify transaction.

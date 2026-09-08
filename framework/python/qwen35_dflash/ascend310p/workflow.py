@@ -57,6 +57,8 @@ QUANT_FUSED_SPECULATIVE_STEP_GRAPH_FACTORY = (
 )
 DEFAULT_GRAPH_FACTORY = QUANT_RECOMPUTE_GRAPH_FACTORY
 DEFAULT_CPP_GRAPH_FACTORY = QUANT_INCREMENTAL_GRAPH_FACTORY
+# The current-branch NPU benchmark locks endoftext, not tokenizer.im_end.
+TORCH_NPU_EOS_TOKEN_IDS = (248044,)
 BUILTIN_QUANT_GRAPH_FACTORIES = frozenset(
     {
         QUANT_RECOMPUTE_GRAPH_FACTORY,
@@ -530,6 +532,7 @@ def run_cpp_target_pipeline(
     model_dir: str | Path | None = None,
     model_asset_id: str | None = None,
     progress: bool = True,
+    eos_token_ids: Sequence[int] = TORCH_NPU_EOS_TOKEN_IDS,
 ) -> dict[str, Any]:
     """Build the selected OM topology and run paired 3+10 in the C++ ACL path."""
 
@@ -579,13 +582,6 @@ def run_cpp_target_pipeline(
     tokenize_start = time.perf_counter_ns()
     prompt_ids = tokenize_prompt(tokenizer, prompt, chat=chat)
     tokenize_end = time.perf_counter_ns()
-    eos_value = getattr(tokenizer, "eos_token_id", None)
-    if eos_value is None:
-        eos_ids: tuple[int, ...] = ()
-    elif isinstance(eos_value, int):
-        eos_ids = (int(eos_value),)
-    else:
-        eos_ids = tuple(int(item) for item in eos_value)
     report_root.mkdir(parents=True, exist_ok=True)
     run_root = Path(os.environ["AI_RUN_DIR"]).expanduser().resolve()
     payload = run_cpp_pair(
@@ -593,7 +589,7 @@ def run_cpp_target_pipeline(
         runner=runner_path,
         runner_options=runner_options,
         prompt_token_ids=prompt_ids,
-        eos_token_ids=eos_ids,
+        eos_token_ids=tuple(eos_token_ids),
         device_id=device_id,
         max_new_tokens=max_new_tokens,
         max_draft_tokens=max_draft_tokens,

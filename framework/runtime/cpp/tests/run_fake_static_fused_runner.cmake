@@ -59,8 +59,7 @@ foreach(reset async-memset immutable-zero)
   endforeach()
 endforeach()
 
-# Short requests need no Draft call. Their zero padding/work counters remain
-# valid and must not be mistaken for a missing static execution report.
+# One output token needs no Draft; two must perform eager terminal K=1.
 foreach(new_tokens 1 2)
   set(output "${OUTPUT}-short-${new_tokens}.json")
   file(REMOVE "${output}" "${output}.tmp")
@@ -77,8 +76,10 @@ foreach(new_tokens 1 2)
                 fused_static_source_feature_rows fused_static_padding_rows
                 fused_static_padding_operations)
     string(JSON count GET "${report}" execution_io_counters ${field})
-    if(NOT count EQUAL 0)
-      message(FATAL_ERROR "short request unexpectedly called Draft: ${report}")
+    if(new_tokens EQUAL 1 AND NOT count EQUAL 0)
+      message(FATAL_ERROR "one-token request unexpectedly called Draft: ${report}")
+    elseif(new_tokens EQUAL 2 AND NOT count GREATER 0)
+      message(FATAL_ERROR "two-token request omitted terminal Draft K=1: ${report}")
     endif()
   endforeach()
 endforeach()

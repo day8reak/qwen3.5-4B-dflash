@@ -51,14 +51,16 @@ void AppendCommitted(
     const std::unordered_set<std::int64_t>& eos,
     std::vector<std::int64_t>* generated,
     std::vector<std::int64_t>* prefix,
-    bool* finished) {
+    bool* finished,
+    bool discard_terminal_bonus = false) {
   if (values.empty()) {
     throw std::runtime_error("generation step committed no token");
   }
-  if (values.size() > remaining) {
+  if (values.size() > remaining &&
+      !(discard_terminal_bonus && values.size() == remaining + 1)) {
     throw std::runtime_error("generation step exceeded the remaining token budget");
   }
-  for (std::size_t index = 0; index < values.size(); ++index) {
+  for (std::size_t index = 0; index < std::min(values.size(), remaining); ++index) {
     const std::int64_t token = values[index];
     if (token < 0) {
       throw std::runtime_error("generation step returned a negative token ID");
@@ -493,8 +495,8 @@ void ValidateStatefulInputs(
     throw std::invalid_argument(
         "prefill/verify coalescing exceeds executor capability");
   }
-  if (prompt.size() + options.max_new_tokens - 1 >
-      executor.sequence_length()) {
+  if (prompt.size() > executor.sequence_length() ||
+      options.max_new_tokens - 1 > executor.sequence_length() - prompt.size()) {
     throw std::invalid_argument(
         "prompt plus requested generation exceeds the state cache capacity");
   }
@@ -554,6 +556,11 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
     std::size_t run_index,
     std::size_t run_total) {
   ValidateStatefulInputs(executor, prompt_token_ids, options);
+  if (mode == GenerationMode::kDFlash && options.max_new_tokens > 1 &&
+      options.max_new_tokens > executor.sequence_length() - prompt_token_ids.size()) {
+    throw std::invalid_argument(
+        "terminal DFlash verification needs prompt plus max_new_tokens cache rows");
+  }
   const std::unordered_set<std::int64_t> eos(
       options.eos_token_ids.begin(), options.eos_token_ids.end());
 
@@ -591,17 +598,17 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
         executor.prefill_width(), prompt_token_ids.size() - prompt_offset);
     const bool last_chunk =
         prompt_offset + chunk_size == prompt_token_ids.size();
-    // Prefill itself commits one token. A prepared speculative transaction
-    // additionally commits at most K+1, so it is useful and budget-safe only
-    // when at least two generation slots remain after the prefill token.
+    // Match torch_npu: K may fill the remaining budget. Only a terminal
+    // all-accepted bonus is discarded by AppendCommitted; no next window can
+    // consume that terminal state.
     const bool prepare_draft =
-        mode == GenerationMode::kDFlash && options.max_new_tokens > 2;
+        mode == GenerationMode::kDFlash && options.max_new_tokens > 1;
     const std::size_t proposal_count = prepare_draft
         ? (last_chunk
                ? std::min(
                      {options.max_draft_tokens,
                       executor.proposal_width(),
-                      options.max_new_tokens - 2})
+                      options.max_new_tokens - 1})
                : std::min(
                      options.max_draft_tokens,
                      executor.proposal_width()))
@@ -679,11 +686,13 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
         eos,
         &generated,
         &prefix,
-        &finished);
+        &finished,
+        coalesced_first_verify.accepted_draft_tokens == remaining &&
+            coalesced_first_verify.drafted_tokens == remaining);
     if (zero_accept && !finished &&
         options.zero_accept_fallback_policy ==
             ZeroAcceptFallbackPolicy::kRequestTargetOnly &&
-        options.max_new_tokens - generated.size() > 1) {
+        options.max_new_tokens - generated.size() > 0) {
       target_only_fallback_active = true;
       ++result.counters.zero_accept_fallback_activations;
     }
@@ -710,10 +719,12 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
     std::vector<std::size_t> proposal_counts;
     const bool target_only_fallback_iteration =
         mode == GenerationMode::kDFlash &&
-        target_only_fallback_active && remaining > 1;
-    if (mode == GenerationMode::kOrdinary || remaining == 1 ||
+        target_only_fallback_active;
+    if (mode == GenerationMode::kOrdinary ||
         target_only_fallback_iteration) {
-      steps.push_back(executor.DecodeOne(prefix.back()));
+      steps.push_back(target_only_fallback_iteration
+                          ? executor.VerifyOne(prefix.back())
+                          : executor.DecodeOne(prefix.back()));
       if (target_only_fallback_iteration) {
         ++result.counters.target_only_fallback_iterations;
       }
@@ -721,16 +732,15 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
       speculative = true;
       std::size_t worst_case_remaining = remaining;
       while (proposal_counts.size() < options.dflash_sync_window &&
-             worst_case_remaining > 1) {
+             worst_case_remaining > 0) {
         const std::size_t proposal_count = std::min(
             {options.max_draft_tokens,
              executor.proposal_width(),
-             worst_case_remaining - 1});
+             worst_case_remaining});
         proposal_counts.push_back(proposal_count);
-        // Reserve the largest possible commit (K accepted Draft tokens plus
-        // one authoritative Target token) before queueing another transaction.
-        // This makes every queued window exact even when all proposals match.
-        worst_case_remaining -= proposal_count + 1;
+        // Reserve K+1 between transactions, but permit terminal K=remaining
+        // like the eager scheduler. Saturation prevents unsigned underflow.
+        worst_case_remaining -= std::min(worst_case_remaining, proposal_count + 1);
       }
       steps = executor.SpeculativeWindow(proposal_counts);
       if (steps.empty() || steps.size() > proposal_counts.size()) {
@@ -775,12 +785,14 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
           eos,
           &generated,
           &prefix,
-          &finished);
+          &finished,
+          speculative && step.accepted_draft_tokens == current_remaining &&
+              step.drafted_tokens == current_remaining);
     }
     if (zero_accept_observed && !target_only_fallback_active && !finished &&
         options.zero_accept_fallback_policy ==
             ZeroAcceptFallbackPolicy::kRequestTargetOnly &&
-        options.max_new_tokens - generated.size() > 1) {
+        options.max_new_tokens - generated.size() > 0) {
       // The executor has already committed every transaction in this
       // synchronized window.  Switch only after consuming the full returned
       // window so the next one-row Target input observes the matching device

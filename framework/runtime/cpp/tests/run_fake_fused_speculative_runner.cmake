@@ -76,6 +76,8 @@ string(JSON verify_feature_rows GET "${report}" execution_io_counters draft_veri
 string(JSON verify_full_rows GET "${report}" execution_io_counters draft_verify_full_width_equivalent_rows)
 string(JSON verify_elided_rows GET "${report}" execution_io_counters draft_verify_feature_rows_elided)
 string(JSON pending_routes GET "${report}" execution_io_counters draft_verify_pending_upper_bound_executions)
+string(JSON committed_routes GET "${report}" execution_io_counters draft_verify_committed_prefix_executions)
+math(EXPR verify_routes "${pending_routes} + ${committed_routes}")
 string(JSON synchronizations GET "${report}" execution_io_counters stream_synchronizations)
 string(JSON speculative_windows GET "${report}" execution_io_counters speculative_sync_windows)
 string(JSON speculative_syncs_elided GET "${report}" execution_io_counters speculative_synchronizations_elided)
@@ -158,7 +160,7 @@ math(EXPR logical_transactions
   "${prefill_completions} + ${decode_executions} + ${verify_executions}"
 )
 
-if(NOT schema_version EQUAL 12 OR
+if(NOT schema_version EQUAL 13 OR
    NOT status STREQUAL "PASS" OR
    NOT topology STREQUAL "split-prefill-head-four-resident-fused-speculative-step-v1" OR
    NOT model_count EQUAL 4 OR
@@ -177,7 +179,7 @@ if(NOT schema_version EQUAL 12 OR
    NOT fused_verify_trace_count EQUAL verify_trace_expected OR
    NOT fused_verify_trace_rows EQUAL verify_feature_rows OR
    NOT verify_row_closure EQUAL verify_full_rows OR
-   NOT pending_routes EQUAL fused_verify_trace_count OR
+   NOT verify_routes EQUAL fused_verify_trace_count OR
    NOT closed_speculative_transactions EQUAL verify_executions OR
    NOT synchronizations EQUAL expected_synchronizations OR
    NOT closed_d2h EQUAL logical_transactions OR

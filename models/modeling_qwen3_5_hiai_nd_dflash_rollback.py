@@ -1117,6 +1117,29 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
     return hidden_states
 
 
+def causal_conv1d_update_logical(
+    hidden_states, conv_state, weight, bias, activation, effective_length, update
+):
+    """Run the existing convolution, but commit only the logical input prefix.
+
+    Static prefill executes padded rows. GDR already honors effective_length;
+    its companion conv history must end at the same logical row. Capture the
+    history before update mutates conv_state, including for a native updater.
+    Keep all physical output rows and the chosen updater's arithmetic intact.
+    """
+    history = torch.cat((conv_state, hidden_states), dim=-1).to(weight.dtype)
+    columns = torch.arange(
+        conv_state.shape[-1], dtype=torch.long, device=hidden_states.device
+    ).reshape(1, 1, -1)
+    indices = effective_length.to(torch.long).reshape(-1, 1, 1) + columns
+    # Only repeat the static channel extent, avoiding dynamic BroadcastTo
+    # shape-tensor construction on the receiver's CANN tiling path.
+    committed = torch.gather(history, -1, indices.repeat(1, conv_state.shape[1], 1))
+    output = update(hidden_states, conv_state, weight, bias, activation)
+    conv_state.copy_(committed)
+    return output
+
+
 def torch_causal_conv1d_update(
     hidden_states, conv_state, weight, bias, activation
 ):
@@ -1210,12 +1233,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
         if accepted_tokens is None:
-            mixed_qkv = self.causal_conv1d_update(
+            if gdr_effective_length is None:
+                raise ValueError("ordinary GDN requires gdr_effective_length")
+            mixed_qkv = causal_conv1d_update_logical(
                 mixed_qkv,
                 conv_state,
                 self.conv1d.weight.squeeze(1),
                 self.conv1d.bias,
                 self.activation,
+                gdr_effective_length,
+                self.causal_conv1d_update,
             ).transpose(1, 2)
         else:
             scalar_state = conv_state.ndim == 3 and recurrent_state.ndim == 4
@@ -1461,6 +1488,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
     dflash_state_contract_id = "qwen3.5-4b-dflash-target-state-bank-v1"
     dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
     dflash_cache_index_policy = "once-per-verify-v1"
+    dflash_conv_state_commit_policy = "logical-effective-length-v1"
 
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__(config)
@@ -1618,6 +1646,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
     dflash_state_contract_id = "qwen3.5-4b-dflash-target-state-bank-v1"
     dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
     dflash_cache_index_policy = "once-per-verify-v1"
+    dflash_conv_state_commit_policy = "logical-effective-length-v1"
 
     def __init__(self, config):
         super().__init__(config)

@@ -1,5 +1,5 @@
 {
-  "schema_version": 10,
+  "schema_version": 11,
   "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
   "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
   "default_static_split": {
@@ -12,6 +12,9 @@
     "prefill": "64 physical rows per chunk; body plus exact Top1/EOS; only final chunk result observed",
     "feature_policy": "fixed-16/committed-prefix describe source rows only; every static Draft binds N rows with same-stream zero padding",
     "draft_attention_mask_policy": "per-layer-logical-prefix-v1",
+    "target_conv_state_commit_policy": "logical-effective-length-v1",
+    "scheduler_since": "v43 / runner 1.26.0 / report schema 13; eager K=min(max_draft,remaining), request-target-only by default, Verify16 K=0 fallback",
+    "cpp_eos_token_ids": [248044],
     "draft_attention": "v42 preserves per-layer causal/sliding/full attention over live cache and K+1 block rows; physical T16 padding is never visible as a key, including in the non-causal layer; AIR/OM regeneration required",
     "request_gate": "tokenized prompt<=N; prompt+max_new_tokens+N<=KV capacity; no truncation",
     "model_residency_policy": "phase-resident",
@@ -79,7 +82,7 @@
     {
       "role": "target-decode1",
       "rows": 1,
-      "purpose": "ordinary greedy and the exact zero-accept fallback without Draft execution",
+      "purpose": "ordinary greedy; v43 split DFlash fallback uses Verify K=0, not ordinary GDR Decode1",
       "required_outputs": [
         "next_target_top1",
         "committed scalar target GDR/conv state",
@@ -97,7 +100,7 @@
     },
     {
       "role": "target-verify-commit",
-      "rows": "fixed physical T=16: anchor plus 15 proposal rows; logical_proposal_count selects the exact prefix in 1..15",
+      "rows": "fixed physical T=16: anchor plus 15 proposal rows; logical_proposal_count is 1..15 for speculation, 0 for target-only Verify continuation",
       "purpose": "verify once, ignore the causal scratch suffix, compute the longest matching logical proposal prefix, select the committed Target state slot, and emit a compact transaction result",
       "required_outputs": [
         "committed token IDs and count",
@@ -363,16 +366,16 @@
     "synchronization": "default window 1 exposes one host-visible synchronization after each verify/commit; exact candidates 2..8 queue that many budget-safe dependent Draft-to-verify transactions; an independent exact prefill completion candidate queues final prefill plus first verify before one contiguous D2H and one stream synchronization",
     "prefill_completion_policies": {
       "separate": "default rollback baseline; final prefill compact result is downloaded and synchronized before the first verify",
-      "coalesce-first-verify": "inactive exact candidate; when max_new_tokens is greater than two, final prefill and the already-prepared first verify share one contiguous compact D2H and one stream synchronization"
+      "coalesce-first-verify": "inactive exact candidate; when max_new_tokens is greater than one, final prefill and the already-prepared first verify share one contiguous compact D2H and one stream synchronization"
     },
     "zero_accept_fallback_policies": {
-      "disabled": "default matched baseline; every eligible DFlash iteration continues Draft plus Target verify regardless of prior acceptance",
-      "request-target-only": "inactive exact low-acceptance candidate; after the first completed transaction with accepted_count=0, consume the complete synchronized window and route every remaining eligible iteration in that request through authoritative one-row Target without Draft"
+      "disabled": "explicit legacy comparison policy; every eligible DFlash iteration continues Draft plus Target verify regardless of prior acceptance",
+      "request-target-only": "v43 source default matching torch_npu with window 1; after the first completed transaction with accepted_count=0, consume the complete synchronized window and route every remaining eligible iteration in that request through authoritative one-row Target without Draft"
     },
-    "zero_accept_fallback_exactness": "a zero-accept verify has already committed its authoritative correction token and selected the matching Target state slot; after the complete synchronized window is consumed, one-row Target continuation therefore produces the same strict-greedy suffix while omitting future Draft calls; no AIR/OM input, output, weight or custom-operator ABI changes",
+    "zero_accept_fallback_exactness": "a zero-accept verify has already committed its authoritative correction token and selected the matching Target state slot; after the complete synchronized window is consumed, split Target-only continuation uses Verify16 K=0 and selects FP32 recurrent bank row zero, not the ordinary GDR/FP16-state Decode1 branch; fixed-T16 versus eager-T1 numerical parity still requires a device gate; no AIR/OM input, output, weight or custom-operator ABI changes",
     "zero_accept_fallback_window_policy": "window 1 switches immediately after its zero-accept result; windows 2..8 must consume every already-enqueued transaction in order before switching because device state has advanced through the full synchronized window; later queued results are never discarded solely because the fallback triggered",
-    "zero_accept_fallback_selection_gate": "hold runner binary, OM hashes, prompt/token limits, reset, decode carrier, Draft feature, prefill completion, sync window and device identity fixed; run disabled versus request-target-only in forward and reverse order on representative low-acceptance and high-acceptance cases; require zero token/EOS mismatch and closed zero_accept_transactions, zero_accept_fallback_activations and target_only_fallback_iterations counters; select request-target-only only when real Ascend310P unprofiled 3+10 median and p90 improve without a high-acceptance regression outside measurement noise",
-    "prefill_first_verify_budget_guard": "prefill commits one token and verify may commit K+1, so Draft is prepared only when max_new_tokens>2 and its K is min(max_draft,15,max_new_tokens-2); max_new_tokens=2 executes ordinary decode without a wasted Draft",
+    "zero_accept_fallback_selection_gate": "hold runner binary, OM hashes, prompt/token limits, reset, decode carrier, Draft feature, prefill completion, sync window and device identity fixed; run disabled versus request-target-only in forward and reverse order on representative low-acceptance and high-acceptance cases; require zero token/EOS mismatch and closed zero_accept_transactions, zero_accept_fallback_activations and target_only_fallback_iterations counters; v43 selects request-target-only for reference-policy parity only; performance promotion still requires real Ascend310P unprofiled 3+10 median and p90 improvement without a high-acceptance regression outside measurement noise",
+    "prefill_first_verify_budget_guard": "prefill commits one token; prepare Draft when max_new_tokens>1 with K=min(max_draft,15,max_new_tokens-1); later K=min(max_draft,15,remaining); only a terminal full-accept bonus beyond the generation budget is discarded",
     "prefill_first_verify_compact_download": "the alternating compact slots share one contiguous arena; prefill slot 0 downloads slot_bytes+verify_bytes and pays slot_bytes-ordinary_bytes padding, while prefill slot 1 downloads slot_bytes+ordinary_bytes and pays slot_bytes-verify_bytes padding",
     "prefill_first_verify_timing_scope": "coalesce-first-verify delays first-token host visibility until verify completes, so prefill_ms/TTFT includes the first verify; compare model_total median/p90 and TTFT separately",
     "prefill_first_verify_eos_policy": "the first verify may already be queued when the prefill result is EOS; host commit stops at prefill EOS and ignores the verify result, preserving exact tokens with bounded useless device work",
@@ -394,6 +397,8 @@
     "profile_execution_trace_policy": "profile 1+1 preallocates and records ordinal, runtime aclmdl model ID and physical T for every model execution; formal evidence 3+10 must report profile_model_execution_trace_enabled=false and an empty trace",
     "verify": "never recompute the committed historical prefix",
     "runtime_counter_invariants": [
+      "0 <= target_only_verify_executions <= target_decode1_executions; the former is a logical-step subset, never an extra model execution",
+      "split static target_step_input_rows == 16 * (target_verify_commit_executions + target_only_verify_executions); physical Decode1 calls == target_decode1_executions - target_only_verify_executions",
       "prefill_control_full_upload_operations + prefill_control_base_upload_operations + prefill_control_count_upload_operations + prefill_control_proposal_upload_operations == prefill_control_upload_operations",
       "prefill_control_upload_bytes + prefill_control_h2d_bytes_elided == prefill_control_upload_operations * prefill_control_bytes_per_slot",
       "decode_id_device_carrier_hits + decode_id_upload_operations == target_decode1_executions",
@@ -425,6 +430,7 @@
       "five-artifact target_step_zero_count_device_bytes == 0 and target_step_zero_count_bindings == 0",
       "compact_ping_pong_device_bytes and speculative_window_staging_device_bytes are positive and included in carrier_device_bytes"
     ],
+    "historical_fixture_scope": "all fake_acl_* snapshots below predate runner 1.26 K=remaining and Verify-based target-only fallback; they are retained historical host evidence, not current-default expected counts. Current executable gates live in C++ tests and test_static_split_runner_reports.py",
     "fake_acl_70_token_paired_3_plus_10": {
       "classification": "host structural evidence only; not Ascend310P latency",
       "target_decode1_executions": 78,
@@ -483,7 +489,7 @@
       "verify_executions_request_target_only": 13,
       "target_decode_executions_disabled": 130,
       "target_decode_executions_request_target_only": 221,
-      "claim_boundary": "the exact scheduler preserves authoritative tokens and replaces seven later Draft-plus-Verify pairs per measured low-acceptance request with seven one-row Target calls in this deterministic Fake ACL case; physical Ascend310P latency remains unmeasured and disabled remains default"
+      "claim_boundary": "historical pre-1.26 scheduler/Decode1-fallback host evidence only; these counts are not the v43 eager-policy fixture. v43 uses K=remaining and Verify-based target-only fallback by default; physical Ascend310P accuracy and latency remain unmeasured"
     },
     "fake_acl_prefill_first_verify_70_token_paired_3_plus_10": {
       "classification": "matched host structural evidence only; Fake ACL timing is not Ascend310P latency",

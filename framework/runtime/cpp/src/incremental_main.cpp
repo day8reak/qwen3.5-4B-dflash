@@ -72,7 +72,7 @@ struct Arguments {
   std::size_t dflash_sync_window = 1;
   bool coalesce_prefill_with_first_verify = false;
   ZeroAcceptFallbackPolicy zero_accept_fallback_policy =
-      ZeroAcceptFallbackPolicy::kDisabled;
+      ZeroAcceptFallbackPolicy::kRequestTargetOnly;
   std::size_t warmup = 3;
   std::size_t repetitions = 10;
   int device_id = 0;
@@ -112,7 +112,7 @@ void Usage(std::ostream& stream) {
       << "  --max-draft-tokens N                     default 15\n"
       << "  --dflash-sync-window N                   exact window in 1..8 (default 1)\n"
       << "  --prefill-completion-policy POLICY       separate (default) or coalesce-first-verify\n"
-      << "  --zero-accept-fallback-policy POLICY    disabled (default) or request-target-only\n"
+      << "  --zero-accept-fallback-policy POLICY    request-target-only (default) or disabled\n"
       << "  --warmup N                               evidence=3, profile=1\n"
       << "  --repetitions N                          evidence=10, profile=1\n"
       << "  --device-id N                            default 0\n"
@@ -365,7 +365,7 @@ Arguments ParseArguments(int argc, char** argv) {
         "prefill-completion-policy must be separate or coalesce-first-verify");
   }
   const std::string zero_accept_fallback_policy = TakeOptional(
-      &values, "zero-accept-fallback-policy", "disabled");
+      &values, "zero-accept-fallback-policy", "request-target-only");
   if (zero_accept_fallback_policy == "disabled") {
     result.zero_accept_fallback_policy =
         ZeroAcceptFallbackPolicy::kDisabled;
@@ -670,6 +670,17 @@ void WriteReport(
            ? execution.fused_speculative_step_executions
            : execution.draft_propose_executions +
                  execution.target_verify_commit_executions);
+  if (execution.target_only_verify_executions > execution.target_decode1_executions ||
+      (fused_speculative_step && execution.target_only_verify_executions != 0)) {
+    throw std::runtime_error("Target-only Verify subset counters do not close");
+  }
+  if (!fused_speculative_step && !executor.unified_target_step() &&
+      (execution.target_step_input_rows != 16 * (
+           execution.target_verify_commit_executions +
+           execution.target_only_verify_executions) ||
+       execution.target_step_padded_rows_elided != 0)) {
+    throw std::runtime_error("static Verify physical row counters do not close");
+  }
   if (fused_speculative_step
           ? (execution.fused_speculative_step_executions !=
                  execution.draft_propose_executions ||
@@ -807,7 +818,7 @@ void WriteReport(
       : 0.0;
 
   output << std::setprecision(17)
-         << "{\"schema_version\":12,\"status\":\"PASS\","
+         << "{\"schema_version\":13,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
          << (phase_resident ? "phase" : resident_model_count)
          << "-resident-OM paired model loop\","
@@ -935,6 +946,11 @@ void WriteReport(
          << (formal_latency_evidence ? "false" : "true")
          << ",\"dflash_sync_window\":"
          << arguments.dflash_sync_window
+         << ",\"proposal_budget_policy\":\"torch-npu-remaining-v1\""
+         << ",\"target_only_execution_policy\":\""
+         << (fused_speculative_step ? "ordinary-decode1-legacy" :
+             (executor.unified_target_step() ? "verify-t1" : "static-verify16-k0"))
+         << "\""
          << ",\"maximum_supported_dflash_sync_window\":"
          << executor.max_speculative_sync_window()
          << ",\"zero_accept_fallback_policy\":\""
@@ -1089,6 +1105,8 @@ void WriteReport(
          << execution.target_prefill_head_executions_elided
          << ",\"target_decode1_executions\":"
          << execution.target_decode1_executions
+         << ",\"target_only_verify_executions\":"
+         << execution.target_only_verify_executions
          << ",\"draft_propose_executions\":"
          << execution.draft_propose_executions
          << ",\"target_verify_commit_executions\":"

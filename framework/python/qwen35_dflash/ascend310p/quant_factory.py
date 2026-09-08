@@ -844,6 +844,7 @@ def create_quant_incremental_state_graphs(
             "quant_matmul_export_qlinear_count"
         ],
         "kv_cache_max_len": max_sequence_length,
+        "target_conv_state_commit_policy": "logical-effective-length-v1",
         "eos_table_width": eos_table_width,
         "approval_record": "framework/abi/approvals/incremental-performance-v2.json",
         "approval_status": "APPROVED",

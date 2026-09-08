@@ -31,6 +31,7 @@ from .workflow import (
     DEFAULT_BACKEND_FACTORY,
     DEFAULT_CPP_GRAPH_FACTORY,
     DEFAULT_GRAPH_FACTORY,
+    TORCH_NPU_EOS_TOKEN_IDS,
     load_tokenizer,
     run_cpp_target_pipeline,
     run_declared_target_preflight,
@@ -216,13 +217,9 @@ def command_infer(args: argparse.Namespace) -> int:
     return 0
 
 
-def _eos_token_ids(tokenizer: Any) -> tuple[int, ...]:
-    value = getattr(tokenizer, "eos_token_id", None)
-    if value is None:
-        return ()
-    if isinstance(value, int):
-        return (int(value),)
-    return tuple(int(item) for item in value)
+def _cpp_eos_token_ids(args: argparse.Namespace) -> tuple[int, ...]:
+    value = args.eos_token_id
+    return TORCH_NPU_EOS_TOKEN_IDS if value is None else tuple(value)
 
 
 def command_infer_cpp(args: argparse.Namespace) -> int:
@@ -257,7 +254,9 @@ def command_infer_cpp(args: argparse.Namespace) -> int:
         runner=args.runner,
         runner_options=_config(args.runner_config),
         prompt_token_ids=prompt_ids,
-        eos_token_ids=_eos_token_ids(tokenizer),
+        # Match the locked current-branch torch_npu receiver, not a potentially
+        # different tokenizer.eos_token_id (e.g. im_end). Overrides are explicit.
+        eos_token_ids=_cpp_eos_token_ids(args),
         device_id=args.device_id,
         max_new_tokens=args.max_new_tokens,
         max_draft_tokens=args.max_draft_tokens,
@@ -336,6 +335,7 @@ def command_run_e2e_cpp(args: argparse.Namespace) -> int:
         model_dir=args.model_dir,
         model_asset_id=args.model_asset_id,
         progress=args.progress,
+        eos_token_ids=_cpp_eos_token_ids(args),
     )
     _print(payload)
     return 0
@@ -477,6 +477,10 @@ def build_parser() -> argparse.ArgumentParser:
     infer_cpp.add_argument("--device-id", type=int, default=0)
     infer_cpp.add_argument("--max-new-tokens", type=int, default=32)
     infer_cpp.add_argument("--max-draft-tokens", type=int, default=15)
+    infer_cpp.add_argument(
+        "--eos-token-id", type=int, action="append", default=None,
+        help="repeatable EOS override; default 248044 matches the locked torch_npu route",
+    )
     infer_cpp.add_argument("--output", type=Path, required=True)
     infer_cpp.add_argument(
         "--no-progress",
@@ -538,6 +542,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_e2e_cpp.add_argument("--device-id", type=int, default=0)
     run_e2e_cpp.add_argument("--max-new-tokens", type=int, default=32)
     run_e2e_cpp.add_argument("--max-draft-tokens", type=int, default=15)
+    run_e2e_cpp.add_argument(
+        "--eos-token-id", type=int, action="append", default=None,
+        help="explicit EOS override (repeatable); default: torch_npu locked 248044",
+    )
     run_e2e_cpp.add_argument("--report-dir", type=Path, required=True)
     run_e2e_cpp.add_argument(
         "--no-progress",

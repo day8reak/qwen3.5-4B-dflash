@@ -1,8 +1,9 @@
 """Explicit-state graph modules for the approved incremental OM candidate.
 
 These modules expose every request state tensor to AscendCL.  They deliberately
-do not claim target readiness: the fixed ``all_seq_lengths_q=max_cache`` policy
-and TorchAir dynamic Draft feature-tail gear remain real-device proof gates.
+do not claim target readiness: fixed physical rows versus compact eager,
+``all_seq_lengths_q=max_cache``, and the optional dynamic Draft feature gears
+remain real-device proof gates.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ PREFILL_ROWS = 64
 SCALAR_STATE_SEED_POLICY = "per-linear-layer-jit-v1"
 CACHE_INDEX_POLICY = "once-per-verify-v1"
 DRAFT_ATTENTION_MASK_POLICY = "per-layer-logical-prefix-v1"
+CONV_STATE_COMMIT_POLICY = "logical-effective-length-v1"
 
 
 class _ExplicitTargetGraph(nn.Module):
@@ -65,6 +67,14 @@ class _ExplicitTargetGraph(nn.Module):
                 f"{CACHE_INDEX_POLICY} cache-index reuse"
             )
         config = getattr(execution, "config", None)
+        if (
+            getattr(language_model, "dflash_conv_state_commit_policy", None)
+            != CONV_STATE_COMMIT_POLICY
+        ):
+            raise RuntimeError(
+                "incremental Target requires logical-effective-length-v1 conv commit; "
+                "update receiver modeling before re-exporting AIR"
+            )
         layer_types = tuple(getattr(config, "layer_types", ()))
         if not layer_types or any(
             item not in {"linear_attention", "full_attention"}

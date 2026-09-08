@@ -100,6 +100,8 @@ struct IncrementalAclExecutionStats {
   std::size_t target_prefill_head_executions = 0;
   std::size_t target_prefill_head_executions_elided = 0;
   std::size_t target_decode1_executions = 0;
+  // Subset of logical decode1 executions physically using Verify (K=0).
+  std::size_t target_only_verify_executions = 0;
   std::size_t draft_propose_executions = 0;
   std::size_t target_verify_commit_executions = 0;
   std::size_t fused_speculative_step_executions = 0;
@@ -207,11 +209,12 @@ using IncrementalModelProgress = std::function<void(
     std::size_t work_bytes,
     std::size_t weight_bytes)>;
 
-// Five baseline sessions or four sessions with one unified dynamic Target step
-// implement the approved exact state graph.
-// The prefill body excludes its QLinear LM head; a small head-only OM runs
-// once after the final physical prompt chunk. This moves the prefill head
-// weight instead of retaining a dead copy in the body artifact.
+// The default is four static OMs: merged Prefill, ordinary Decode1, Draft and
+// Verify. DFlash target-only continuation uses Verify K=0, retaining its
+// GDR-MTP FP32 state path; ordinary generation uses Decode1. Legacy split-head,
+// unified dynamic Target and fused speculative topologies remain explicit.
+// Split-head Prefill excludes its LM head; merged Prefill includes the head
+// per physical chunk, with only the final compact result observed.
 // Target/Draft states are ping-ponged in device arenas. Ordinary and short
 // speculative windows bind compact Target results to the matching ping-pong
 // slot; extended windows bind each result directly to a dedicated staging slot
@@ -270,6 +273,7 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
       bool prepare_draft,
       std::size_t logical_proposal_count) override;
   StatefulStep DecodeOne(std::int64_t input_token_id) override;
+  StatefulStep VerifyOne(std::int64_t input_token_id) override;
   StatefulStep SpeculativeStep(
       std::size_t logical_proposal_count) override;
   bool supports_prefill_verify_coalescing() const noexcept override;

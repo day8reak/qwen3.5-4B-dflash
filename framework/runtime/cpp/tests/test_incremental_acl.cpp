@@ -85,7 +85,7 @@ void RunPolicy(
   const std::vector<std::int64_t> expected{11, 12, 13, 14, 15, 16};
   Require(ordinary.generated_token_ids == expected, "fake ACL ordinary differs");
   Require(dflash.generated_token_ids == expected, "fake ACL DFlash differs");
-  Require(dflash.counters.accepted_draft_tokens == 3, "fake ACL acceptance differs");
+  Require(dflash.counters.accepted_draft_tokens == 4, "fake ACL acceptance differs");
 
   options.eos_token_ids = {13};
   const auto eos = qwen35::dflash::GenerateStatefulOnce(
@@ -158,7 +158,7 @@ void RunPolicy(
       stats.prefill_draft_propose_executions == 3 &&
           stats.prefill_draft_propose_executions_elided == 1 &&
           stats.prefill_feature_rows_batched == 256 &&
-          stats.draft_propose_executions == 3,
+          stats.draft_propose_executions == 5,
       "prefill did not batch exactly one Draft execution per DFlash request");
   Require(
       stats.prefill_feature_slab_bytes == 1024 &&
@@ -168,13 +168,13 @@ void RunPolicy(
           stats.draft_prefill_dynamic_gear_count == 2,
       "prefill feature arena or dynamic gear set differs");
   Require(
-      stats.draft_verify_feature_input_rows == 0 &&
-          stats.draft_verify_full_width_equivalent_rows == 0 &&
+      stats.draft_verify_feature_input_rows == 32 &&
+          stats.draft_verify_full_width_equivalent_rows == 32 &&
           stats.draft_verify_feature_rows_elided == 0 &&
-          stats.draft_verify_fixed_width_executions == 0 &&
+          stats.draft_verify_fixed_width_executions == 2 &&
           stats.draft_verify_committed_prefix_executions == 0 &&
           stats.draft_verify_pending_upper_bound_executions == 0,
-      "request set unexpectedly executed a verify-source Draft route");
+      "terminal K=1 must consume one Verify-source Draft per length-limited request");
   Require(
       stats.prefill_control_upload_operations ==
               stats.target_prefill_executions &&
@@ -202,7 +202,11 @@ void RunPolicy(
               stats.prefill_control_upload_operations *
                       stats.prefill_control_bytes_per_slot -
                   stats.prefill_control_upload_bytes,
-      "prefill variable/persistent control upload counters do not close");
+      "prefill control counters full/base/count/proposal=" +
+          std::to_string(stats.prefill_control_full_upload_operations) + "/" +
+          std::to_string(stats.prefill_control_base_upload_operations) + "/" +
+          std::to_string(stats.prefill_control_count_upload_operations) + "/" +
+          std::to_string(stats.prefill_control_proposal_upload_operations));
   Require(
       stats.decode_id_upload_operations +
                   stats.decode_id_device_carrier_hits ==
@@ -233,7 +237,7 @@ void RunPolicy(
         stats.decode_id_upload_operations == 0 &&
             stats.decode_id_device_carrier_hits ==
                 stats.target_decode1_executions &&
-            stats.decode_id_multi_token_carrier_hits > 0 &&
+            stats.decode_id_multi_token_carrier_hits == 0 &&
             stats.decode_id_multi_token_carrier_hits <
                 stats.decode_id_device_carrier_hits &&
             stats.decode_id_device_compaction_operations ==
@@ -241,7 +245,7 @@ void RunPolicy(
         "last-token D2D decode carrier counters differ");
   } else {
     Require(
-        stats.decode_id_upload_operations > 0 &&
+        stats.decode_id_upload_operations == 0 &&
             stats.decode_id_device_carrier_hits > 0 &&
             stats.decode_id_multi_token_carrier_hits == 0 &&
             stats.decode_id_device_compaction_operations == 0 &&
@@ -379,6 +383,35 @@ void TestExplicitDecodeOverride(
           after_override.decode_id_upload_bytes ==
               after_hit.decode_id_upload_bytes + sizeof(std::int64_t),
       "explicit decode override did not use the exact H2D fallback");
+
+  executor.Reset(0, {});
+  executor.PrefillChunk({10}, true, 3);
+  const auto spec = executor.SpeculativeStep(3);
+  const auto before_multi = executor.execution_stats();
+  const auto multi = executor.DecodeOne(spec.token_ids.back());
+  Require(multi.token_ids == std::vector<std::int64_t>({16}) &&
+              executor.execution_stats().decode_id_multi_token_carrier_hits ==
+                  before_multi.decode_id_multi_token_carrier_hits + 1,
+          "explicit ordinary continuation must compact the multi-token carrier");
+
+  executor.Reset(0, {});
+  executor.PrefillChunk({10}, true, 3);
+  const auto draft = executor.SpeculativeStep(3);
+  const auto before_verify = executor.execution_stats();
+  const auto fallback = executor.VerifyOne(draft.token_ids.back());
+  const auto overridden = executor.VerifyOne(99);
+  const auto after_verify = executor.execution_stats();
+  Require(fallback.token_ids == std::vector<std::int64_t>({16}) &&
+              overridden.token_ids == std::vector<std::int64_t>({100}) &&
+              fallback.drafted_tokens == 0 && fallback.accepted_draft_tokens == 0,
+          "zero-proposal Verify must return only the exact Target token");
+  Require(after_verify.target_only_verify_executions ==
+              before_verify.target_only_verify_executions + 2 &&
+              after_verify.target_step_input_rows == before_verify.target_step_input_rows + 32 &&
+              after_verify.target_verify_commit_executions == before_verify.target_verify_commit_executions &&
+              after_verify.draft_propose_executions == before_verify.draft_propose_executions &&
+              after_verify.decode_id_upload_operations == before_verify.decode_id_upload_operations + 1,
+          "VerifyOne must use static Verify16 K=0 without a Draft or Decode1 launch");
 }
 
 void TestUnifiedTargetStep(
@@ -675,7 +708,7 @@ void TestPrefillVerifyCoalescing(
       "prefill/verify coalescing changed exact generated tokens");
   Require(
       generated.counters.prefill_speculative_windows == 1 &&
-          generated.counters.speculative_transactions == 1 &&
+          generated.counters.speculative_transactions == 2 &&
           generated.counters.decode_iterations == 1,
       "prefill/verify generation counters differ");
 
@@ -743,19 +776,19 @@ void TestExtendedSpeculativeWindow(
     const auto& stats = executor.execution_stats();
     Require(
         stats.speculative_sync_windows == 1 &&
-            stats.speculative_synchronizations_elided == 3 &&
-            stats.speculative_d2h_operations_elided == 3 &&
+            stats.speculative_synchronizations_elided == 4 &&
+            stats.speculative_d2h_operations_elided == 4 &&
             stats.speculative_window_staging_operations == 0 &&
             stats.speculative_window_staging_bytes == 0 &&
-            stats.speculative_window_direct_output_bindings == 4 &&
+            stats.speculative_window_direct_output_bindings == 5 &&
             stats.speculative_window_direct_output_bytes ==
-                4 * stats.compact_verify_result_bytes,
-        "extended speculative window did not close four transactions in one barrier");
+                5 * stats.compact_verify_result_bytes,
+        "extended speculative window did not include terminal K=1 in one barrier");
     Require(
-        stats.decode_id_multi_token_carrier_hits > 0 &&
+        stats.decode_id_multi_token_carrier_hits == 0 &&
             stats.decode_id_device_compaction_operations ==
                 stats.decode_id_multi_token_carrier_hits,
-        "ordinary decode did not consume the final staged multi-token carrier");
+        "terminal K=1 must not fall back to ordinary decode");
   }
 
   qwen35::dflash::IncrementalOmPaths cross_paths{

@@ -11,6 +11,6 @@
   "draft_feature_policy": "fixed-16",
   "dflash_sync_window": 1,
   "prefill_completion_policy": "separate",
-  "zero_accept_fallback_policy": "disabled",
+  "zero_accept_fallback_policy": "request-target-only",
   "pad_token_id": 0
 }

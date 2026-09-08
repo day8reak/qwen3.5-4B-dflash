@@ -38,6 +38,7 @@ class _TokenHead(nn.Module):
 class _FakeLanguageModel(nn.Module):
     dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
     dflash_cache_index_policy = "once-per-verify-v1"
+    dflash_conv_state_commit_policy = "logical-effective-length-v1"
 
     def forward(
         self,
@@ -141,6 +142,14 @@ def _target_state() -> tuple[torch.Tensor, ...]:
 
 def _eos() -> tuple[torch.Tensor, torch.Tensor]:
     return torch.tensor([127, 0, 0, 0]), torch.tensor([1], dtype=torch.int32)
+
+
+@pytest.mark.parametrize("policy", [None, "physical-width-v0"])
+def test_target_graph_rejects_stale_receiver_conv_commit(policy) -> None:
+    target = _FakeTarget().eval()
+    target.dflash_execution_model.language_model.dflash_conv_state_commit_policy = policy
+    with pytest.raises(RuntimeError, match="update receiver modeling"):
+        TargetPrefillStateGraph(target, kv_cache_max_len=64)
 
 
 def test_target_prefill_decode_and_verify_have_explicit_scalar_state() -> None:

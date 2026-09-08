@@ -123,19 +123,19 @@ if(NOT baseline_status STREQUAL "PASS" OR
    NOT baseline_policy STREQUAL "disabled" OR
    NOT fallback_policy STREQUAL "request-target-only" OR
    NOT baseline_ordinary_graph_calls EQUAL fallback_ordinary_graph_calls OR
-   NOT baseline_zero_transactions EQUAL 80 OR
+   NOT baseline_zero_transactions EQUAL 90 OR
    NOT baseline_activations EQUAL 0 OR
    NOT baseline_target_only_iterations EQUAL 0 OR
    NOT fallback_zero_transactions EQUAL 10 OR
    NOT fallback_activations EQUAL 10 OR
-   NOT fallback_target_only_iterations EQUAL 70 OR
-   NOT baseline_dflash_graph_calls EQUAL 200 OR
+   NOT fallback_target_only_iterations EQUAL 80 OR
+   NOT baseline_dflash_graph_calls EQUAL 210 OR
    NOT fallback_dflash_graph_calls EQUAL 130 OR
-   NOT baseline_model_executions EQUAL 416 OR
+   NOT baseline_model_executions EQUAL 429 OR
    NOT fallback_model_executions EQUAL 325 OR
-   NOT baseline_draft_executions EQUAL 104 OR
+   NOT baseline_draft_executions EQUAL 117 OR
    NOT fallback_draft_executions EQUAL 13 OR
-   NOT baseline_verify_executions EQUAL 104 OR
+   NOT baseline_verify_executions EQUAL 117 OR
    NOT fallback_verify_executions EQUAL 13)
   message(FATAL_ERROR
     "fake zero-accept A/B did not preserve tokens or eliminate the expected "

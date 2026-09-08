@@ -1,5 +1,9 @@
 # v42：修复固定载体 Draft 与当前 torch_npu 的 attention 语义差异
 
+本页记录 v42 的历史修复与验证。当前 v43 继续保留该修复，并新增 Prefill conv state、
+K 调度、零接受回退及 EOS 对齐，见 [当前操作与验收说明](OM_TORCH_NPU_PARITY.md)。
+下文“本次不修改调度”和 runner 1.25.0 仅描述 v42，不能作为当前部署要求。
+
 ## 结论与范围
 
 OM 确实复用当前分支的 `DFlashDraftModel`、权重和算子数学，但不是把整个
@@ -90,9 +94,10 @@ preflight 没有发现可用 310P，ATC/真机门禁保留待执行。
 
 - `run_npu --block-size` 包含 anchor；K=15 对应 `--block-size 16`，不能把默认值当作 16。
 - 当前 eager 按 `min(Kmax, remaining)` 选 K，C++ 为 correction/bonus 预留一个位置，按
-  `min(Kmax, remaining-1)` 选 K，最后一个 token 走 Decode1。这次没有修改该调度差异。
+  `min(Kmax, remaining-1)` 选 K，最后一个 token 走 Decode1。v42 没有修改，v43 已修正。
 - 当前 eager 首次零接受后转 target-only；用户 OM 报告为 fallback disabled，仍持续 Draft。
-  后续是否继续提议会改变统计分母。本次没有自动改这个设置来提高数字。
+  后续是否继续提议会改变统计分母。v43 的默认配置已对齐 eager，但旧 JSON 中的
+  显式 disabled 仍需用户更新。
 - 对齐统计口径：报告的 token acceptance 是 `accepted_draft_tokens / drafted_tokens`，
   不等于“至少接受一个 token 的事务比例”。用户该用例为 19/97=19.59%，但非零接受事务
   为 7/11=63.64%；没有 eager 原始计数，不能断定其 60% 使用了哪一种口径。

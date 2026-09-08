@@ -270,7 +270,7 @@ math(EXPR closed_state_bytes "${working_state_bytes} + ${zero_state_bytes}")
 math(EXPR expected_prefill_executions "2 * ${EXPECTED_RESETS}")
 math(EXPR expected_dflash_requests "${EXPECTED_RESETS} / 2")
 if(PREFILL_COMPLETION_POLICY STREQUAL "coalesce-first-verify")
-  if(MAX_NEW_TOKENS GREATER 2)
+  if(MAX_NEW_TOKENS GREATER 1)
     set(expected_prefill_verify_windows "${expected_dflash_requests}")
   else()
     set(expected_prefill_verify_windows 0)
@@ -282,13 +282,45 @@ else()
 endif()
 math(EXPR expected_prefill_feature_rows "${expected_dflash_requests} * 128")
 math(EXPR expected_prefill_control_full_uploads "1")
-if(ADAPTIVE_PROPOSAL_COUNTS)
-  set(expected_prefill_control_proposal_uploads "${expected_dflash_requests}")
-  set(expected_prefill_control_count_uploads 0)
-else()
-  set(expected_prefill_control_proposal_uploads 1)
-  math(EXPR expected_prefill_control_count_uploads "${expected_dflash_requests} - 1")
+# Independent eager scheduler: K=min(max_draft,remaining), including K=1.
+math(EXPR remaining "${MAX_NEW_TOKENS} - 1")
+set(initial_k ${MAX_DRAFT_TOKENS})
+if(initial_k GREATER remaining)
+  set(initial_k ${remaining})
 endif()
+set(last_k ${initial_k})
+set(k_uploads 0)
+while(remaining GREATER 0)
+  set(k ${MAX_DRAFT_TOKENS})
+  if(k GREATER remaining)
+    set(k ${remaining})
+  endif()
+  if(NOT k EQUAL last_k)
+    math(EXPR k_uploads "${k_uploads} + 1")
+  endif()
+  set(last_k ${k})
+  if(FAKE_ZERO_ACCEPT)
+    if(ZERO_ACCEPT_FALLBACK_POLICY STREQUAL "request-target-only")
+      set(last_k 0)
+      math(EXPR k_uploads "${k_uploads} + 1")
+      set(remaining 0)
+    else()
+      math(EXPR remaining "${remaining} - 1")
+    endif()
+  else()
+    math(EXPR remaining "${remaining} - ${k} - 1")
+  endif()
+endwhile()
+math(EXPR expected_proposal_uploads "${k_uploads} * ${expected_dflash_requests}")
+if(NOT initial_k EQUAL last_k)
+  set(expected_prefill_control_proposal_uploads "${expected_dflash_requests}")
+elseif(NOT initial_k EQUAL 1)
+  set(expected_prefill_control_proposal_uploads 1)
+else()
+  set(expected_prefill_control_proposal_uploads 0)
+endif()
+math(EXPR expected_prefill_control_count_uploads
+  "${expected_dflash_requests} - ${expected_prefill_control_proposal_uploads}")
 math(EXPR expected_prefill_control_base_uploads
   "${prefill_executions} - ${expected_prefill_control_full_uploads} - ${expected_prefill_control_proposal_uploads} - ${expected_prefill_control_count_uploads}"
 )
@@ -403,14 +435,9 @@ if(DECODE_CARRIER_POLICY STREQUAL "last-token-d2d")
      NOT decode_device_compactions EQUAL decode_multi_token_carrier_hits)
     message(FATAL_ERROR "fake last-token D2D counters failed: ${report}")
   endif()
-  if(NOT FAKE_ZERO_ACCEPT AND NOT ADAPTIVE_PROPOSAL_COUNTS AND
-     DFLASH_SYNC_WINDOW LESS_EQUAL 2 AND
-     NOT decode_multi_token_carrier_hits GREATER 0)
-    message(FATAL_ERROR "fake last-token D2D route had no multi-token hit: ${report}")
-  endif()
 elseif(DECODE_CARRIER_POLICY STREQUAL "one-token-h2d")
   if(NOT report_decode_carrier_policy STREQUAL DECODE_CARRIER_POLICY OR
-     NOT decode_uploads GREATER 0 OR
+     NOT decode_uploads EQUAL 0 OR
      NOT decode_carrier_hits GREATER 0 OR
      NOT decode_multi_token_carrier_hits EQUAL 0 OR
      NOT decode_device_compactions EQUAL 0 OR
@@ -472,11 +499,10 @@ else()
     message(FATAL_ERROR "extended window did not bind direct compact outputs: ${report}")
   endif()
 endif()
-if(ADAPTIVE_PROPOSAL_COUNTS AND
-   NOT proposal_uploads EQUAL expected_dflash_requests)
-  message(FATAL_ERROR "adaptive-K proposal uploads differ: ${report}")
+if(NOT proposal_uploads EQUAL expected_proposal_uploads)
+  message(FATAL_ERROR "eager-K proposal uploads differ: ${report}")
 endif()
-if(NOT schema_version EQUAL 12 OR
+if(NOT schema_version EQUAL 13 OR
    NOT status STREQUAL "PASS" OR
    NOT runner_id STREQUAL "qwen35-dflash-ascendcl-cpp-incremental-v3" OR
    NOT mismatch EQUAL 0 OR NOT eos_mismatch EQUAL 0 OR

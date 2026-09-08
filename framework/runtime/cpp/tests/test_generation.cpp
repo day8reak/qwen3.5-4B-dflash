@@ -75,6 +75,7 @@ class FakeStatefulExecutor final
     prepared_count_ = 0;
     speculative_windows_.clear();
     prefill_verify_windows_.clear();
+    verify_one_calls_ = 0;
   }
 
   qwen35::dflash::StatefulStep PrefillChunk(
@@ -110,6 +111,13 @@ class FakeStatefulExecutor final
     return qwen35::dflash::StatefulStep{
         {anchor_}, 1, 0, 0, 0, IsEos(anchor_)};
   }
+
+  qwen35::dflash::StatefulStep VerifyOne(std::int64_t input_token_id) override {
+    ++verify_one_calls_;
+    return DecodeOne(input_token_id);
+  }
+
+  std::size_t verify_one_calls() const { return verify_one_calls_; }
 
   qwen35::dflash::StatefulStep SpeculativeStep(
       std::size_t logical_proposal_count) override {
@@ -228,6 +236,7 @@ class FakeStatefulExecutor final
 
   bool corrupt_second_proposal_ = false;
   bool corrupt_first_proposal_ = false;
+  std::size_t verify_one_calls_ = 0;
   std::vector<std::int64_t> eos_;
   std::int64_t anchor_ = 0;
   bool prepared_ = false;
@@ -433,8 +442,8 @@ void TestTwoTransactionWindowUsesBudgetSafeSecondProposalCount() {
   Require(
       executor.speculative_windows().size() == 1 &&
           executor.speculative_windows().front() ==
-              std::vector<std::size_t>({15, 14}),
-      "two-transaction window did not use the budget-safe K=15/K=14 pair");
+              std::vector<std::size_t>({15, 15}),
+      "terminal transaction must use eager K=remaining, discarding only its bonus");
   Require(
       dflash.counters.speculative_transactions == 2 &&
           dflash.counters.decode_iterations == 1,
@@ -463,7 +472,7 @@ void TestTwoTransactionWindowStopsAtFirstTransactionEos() {
   Require(
       executor.speculative_windows().size() == 1 &&
           executor.speculative_windows().front() ==
-              std::vector<std::size_t>({3, 2}),
+              std::vector<std::size_t>({3, 3}),
       "EOS case did not exercise a queued two-transaction window");
   Require(
       dflash.counters.speculative_transactions == 2 &&
@@ -488,7 +497,7 @@ void TestEightTransactionWindowUsesBudgetSafeProposalCounts() {
       executor.speculative_windows().size() == 1 &&
           executor.speculative_windows().front() ==
               std::vector<std::size_t>(
-                  {15, 15, 15, 15, 15, 15, 15, 14}),
+                  {15, 15, 15, 15, 15, 15, 15, 15}),
       "eight-transaction window did not reserve the exact worst-case budget");
   Require(
       dflash.counters.speculative_transactions == 8 &&
@@ -515,7 +524,7 @@ void TestEightTransactionWindowStopsAtFirstTransactionEos() {
   Require(
       executor.speculative_windows().size() == 1 &&
           executor.speculative_windows().front() ==
-              std::vector<std::size_t>({3, 3, 3, 3, 3, 3, 3, 2}),
+              std::vector<std::size_t>({3, 3, 3, 3, 3, 3, 3, 3}),
       "EOS case did not queue the budget-safe eight-transaction window");
   Require(
       dflash.counters.speculative_transactions == 8 &&
@@ -535,9 +544,9 @@ void TestSmallGenerationBudgetsPrepareOnlyBudgetSafeDraft() {
       two.generated_token_ids == std::vector<std::int64_t>({11, 12}),
       "two-token budget changed authoritative output");
   Require(
-      two.counters.speculative_transactions == 0 &&
-          two.counters.drafted_tokens == 0,
-      "two-token budget executed an unusable Draft");
+      two.counters.speculative_transactions == 1 &&
+          two.counters.drafted_tokens == 1,
+      "two-token budget must use eager K=1");
 
   options.max_new_tokens = 3;
   const auto three = qwen35::dflash::GenerateStatefulOnce(
@@ -548,8 +557,8 @@ void TestSmallGenerationBudgetsPrepareOnlyBudgetSafeDraft() {
       "three-token budget changed authoritative output");
   Require(
       three.counters.speculative_transactions == 1 &&
-          three.counters.drafted_tokens == 1,
-      "three-token budget did not use exact K=1");
+          three.counters.drafted_tokens == 2,
+      "three-token budget did not use eager K=2");
 
   options.max_new_tokens = 4;
   const auto four = qwen35::dflash::GenerateStatefulOnce(
@@ -560,8 +569,8 @@ void TestSmallGenerationBudgetsPrepareOnlyBudgetSafeDraft() {
       "four-token budget changed authoritative output");
   Require(
       four.counters.speculative_transactions == 1 &&
-          four.counters.drafted_tokens == 2,
-      "four-token budget did not use exact K=2");
+          four.counters.drafted_tokens == 3,
+      "four-token budget did not use eager K=3");
 }
 
 void TestPrefillFirstVerifyCoalescingIsExactAndAccounted() {
@@ -650,6 +659,10 @@ void TestZeroAcceptFallbackSwitchesToExactTargetOnlyGeneration() {
           fallback.counters.target_only_fallback_iterations > 0,
       "zero-accept policy did not switch the request to Target-only");
   Require(
+      fallback_executor.verify_one_calls() ==
+          fallback.counters.target_only_fallback_iterations,
+      "DFlash fallback must use VerifyOne, not the ordinary DecodeOne path");
+  Require(
       fallback.counters.graph_calls < disabled.counters.graph_calls,
       "zero-accept Target-only route did not eliminate OM executions");
 }
@@ -688,6 +701,44 @@ void TestZeroAcceptFallbackConsumesAQueuedWindowBeforeSwitching() {
       "windowed zero-accept fallback counters differ");
 }
 
+void TestTerminalBudgetAndFallbackMatchEager() {
+  for (std::size_t budget : {1U, 2U, 3U, 16U, 17U, 32U}) {
+    for (std::int64_t eos : {999, 11, 12, 13, 27, 43}) {
+      FakeStatefulExecutor executor;
+      auto options = Options();
+      options.max_new_tokens = budget;
+      options.max_draft_tokens = 15;
+      options.eos_token_ids = {eos};
+      const auto ordinary = qwen35::dflash::GenerateStatefulOnce(
+          executor, {10}, qwen35::dflash::GenerationMode::kOrdinary, options);
+      const auto dflash = qwen35::dflash::GenerateStatefulOnce(
+          executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+      Require(ordinary.generated_token_ids == dflash.generated_token_ids &&
+                  ordinary.stop_reason == dflash.stop_reason,
+              "terminal budget/EOS handling differs from eager");
+    }
+  }
+  FakeStatefulExecutor executor(false, true);
+  auto options = Options();
+  options.max_new_tokens = 3;
+  options.zero_accept_fallback_policy =
+      qwen35::dflash::ZeroAcceptFallbackPolicy::kRequestTargetOnly;
+  const auto result = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(result.counters.drafted_tokens == 2 &&
+              result.counters.target_only_fallback_iterations == 1 &&
+              executor.verify_one_calls() == 1,
+          "remaining=1 after zero acceptance must use VerifyOne");
+  options.max_new_tokens = 256;
+  RequireThrows([&] { qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options); },
+      "terminal verification must reserve the final accepted input cache row");
+  options.max_new_tokens = static_cast<std::size_t>(-1);
+  RequireThrows([&] { qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options); },
+      "oversized token budget must not wrap cache admission arithmetic");
+}
+
 void TestSha256KnownVector() {
   Require(
       qwen35::dflash::Sha256("abc") ==
@@ -717,6 +768,7 @@ int main() {
     TestPrefillFirstVerifyCoalescingDoesNotCommitAfterPrefillEos();
     TestZeroAcceptFallbackSwitchesToExactTargetOnlyGeneration();
     TestZeroAcceptFallbackConsumesAQueuedWindowBeforeSwitching();
+    TestTerminalBudgetAndFallbackMatchEager();
     TestSha256KnownVector();
     std::cout << "PASS: recompute/stateful C++ schedulers, parity, EOS, "
                  "capacity and SHA-256\n";

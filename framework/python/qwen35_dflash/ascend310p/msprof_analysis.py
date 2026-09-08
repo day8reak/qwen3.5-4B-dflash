@@ -434,6 +434,16 @@ def _validate_runner_report(
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise MsprofAnalysisError(f"runner {role} execution count is invalid")
         expected_by_role[role] = value
+    target_only_verify = counters.get("target_only_verify_executions", 0)
+    if (type(target_only_verify) is not int or target_only_verify < 0
+            or target_only_verify > counters.get("target_decode1_executions", 0)
+            or (fused and target_only_verify)):
+        raise MsprofAnalysisError("runner Target-only Verify count is invalid")
+    if not fused and not unified:
+        # Logical one-token steps include Verify16 K=0 since runner 1.26.
+        # Attribute those physical calls to Verify, not ordinary Decode1.
+        expected_by_role["target-decode1"] -= target_only_verify
+        expected_by_role["target-verify-commit"] += target_only_verify
     if unified:
         expected_by_role["target-verify-commit"] += int(
             counters["target_decode1_executions"]
