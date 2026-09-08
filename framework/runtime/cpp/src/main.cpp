@@ -41,6 +41,7 @@ struct Arguments {
   std::size_t max_draft_tokens = 15;
   std::size_t warmup = 3;
   std::size_t repetitions = 10;
+  bool trace_rounds = false;
   int device_id = 0;
   std::string model_kind = "recompute";
   std::string mode = "paired";
@@ -63,6 +64,7 @@ void Usage(std::ostream& stream) {
       << "  --warmup N                   target evidence requires 3\n"
       << "  --repetitions N              target evidence requires 10\n"
       << "  --device-id N                default 0\n";
+  stream << "  --trace-rounds               record chunk proposals, verify and emitted tokens\n";
   stream << "  --profile-stage STAGE       diagnostic prefill/decode (ordinary), prefill/draft/verify (dflash), or all\n"
          << "  --profile-mode MODE         ordinary or dflash; use tools/run_msprof.sh --profile-backend cpp\n"
          << "  --profile-output PATH       new raw msprof directory (controller owned)\n"
@@ -152,7 +154,10 @@ std::map<std::string, std::string> ParseOptions(int argc, char** argv) {
     const std::size_t equals = argument.find('=');
     std::string name;
     std::string value;
-    if (equals != std::string::npos) {
+    if (argument == "--trace-rounds") {
+      name = "trace-rounds";
+      value = "true";
+    } else if (equals != std::string::npos) {
       name = argument.substr(2, equals - 2);
       value = argument.substr(equals + 1);
     } else {
@@ -207,6 +212,12 @@ Arguments ParseArguments(int argc, char** argv) {
   if (result.model_kind != "recompute" && result.model_kind != "chunk") {
     throw std::invalid_argument("model-kind must be recompute or chunk");
   }
+  const auto trace_rounds = TakeOptional(&values, "trace-rounds", "false");
+  if (trace_rounds != "true" && trace_rounds != "false")
+    throw std::invalid_argument("trace-rounds must be true or false");
+  result.trace_rounds = trace_rounds == "true";
+  if (result.trace_rounds && result.model_kind != "chunk")
+    throw std::invalid_argument("trace-rounds requires --model-kind chunk");
   result.output = TakeRequired(&values, "output");
   result.prompt_token_ids = ParseTokenIds(
       TakeRequired(&values, "prompt-token-ids"), false, "prompt-token-ids");
@@ -356,7 +367,11 @@ void WriteMeasurement(
          << ",\"rejected_draft_tokens\":"
          << value.counters.rejected_draft_tokens
          << ",\"decode_iterations\":"
-         << value.counters.decode_iterations << "},\"latency_ms\":{"
+         << value.counters.decode_iterations
+         << ",\"speculation_disable_events\":"
+         << value.counters.speculation_disable_events
+         << ",\"target_only_fallback_rounds\":"
+         << value.counters.target_only_fallback_rounds << "},\"latency_ms\":{"
          << "\"prefill\":" << value.prefill_ms
          << ",\"request_reset\":" << value.request_reset_ms
          << ",\"decode\":" << value.decode_ms
@@ -372,6 +387,29 @@ void WriteMeasurement(
     WriteDoubles(output, stage.second);
   }
   output << '}';
+  if (!value.rounds.empty()) {
+    output << ",\"rounds\":[";
+    bool first_round = true;
+    for (const auto& round : value.rounds) {
+      if (!first_round) output << ',';
+      first_round = false;
+      output << "{\"committed_prefix_length\":" << round.committed_prefix_length
+             << ",\"stage\":\"" << JsonEscape(round.stage) << "\""
+             << ",\"proposed_token_ids\":";
+      WriteTokenIds(output, round.proposed_token_ids);
+      output << ",\"target_token_ids\":";
+      WriteTokenIds(output, round.target_token_ids);
+      output << ",\"accepted_draft_token_ids\":";
+      WriteTokenIds(output, round.accepted_draft_token_ids);
+      output << ",\"emitted_token_ids\":";
+      WriteTokenIds(output, round.emitted_token_ids);
+      output << ",\"fallback_token_id\":";
+      if (round.fallback_token_id < 0) output << "null";
+      else output << round.fallback_token_id;
+      output << '}';
+    }
+    output << ']';
+  }
   output << '}';
 }
 
@@ -442,6 +480,7 @@ void WriteReport(
          << ",\"order\":\"alternating ordinary/DFlash in one loaded process\","
          << "\"synchronization\":\"one aclrtSynchronizeStream after queued H2D, execute, D2H\","
          << "\"model_load_excluded_from_latency\":true,"
+         << "\"round_trace_enabled\":" << (arguments.trace_rounds ? "true" : "false") << ","
          << "\"request_reset_excluded_from_latency\":" << (arguments.model_kind == "chunk" ? "true" : "false") << "},"
          << "\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
@@ -515,6 +554,7 @@ int main(int argc, char** argv) {
     options.max_new_tokens = arguments.max_new_tokens;
     options.max_draft_tokens = arguments.max_draft_tokens;
     options.eos_token_ids = arguments.eos_token_ids;
+    options.trace_rounds = arguments.trace_rounds;
     if (!arguments.profile.stage.empty()) {
       auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(*executor);
       auto report = qwen35::dflash::ProfileChunk(chunk, arguments.prompt_token_ids, options, arguments.profile);

@@ -94,8 +94,12 @@ def _quant_incremental_specs(monkeypatch):
             layer.self_attn.q_norm = modeling.Qwen3_5RMSNorm(16)
             layer.self_attn.k_norm = modeling.Qwen3_5RMSNorm(16)
     body.norm = modeling.Qwen3_5RMSNorm(32)
-    assert _enable_target_quant_matmul_export_mode(target) == 13
-    contracts = _target_custom_op_exports({}, incremental=True)
+    target.dflash_execution_model.lm_head = modeling.QLinear(
+        torch.ones(32, 64, dtype=torch.int8),
+        torch.ones(64, dtype=torch.float32), 0)
+    assert isinstance(target.get_output_embeddings(), nn.Linear)
+    assert _enable_target_quant_matmul_export_mode(target) == 14
+    contracts = _target_custom_op_exports({}, incremental=True, qlinear_count=14)
     metadata = {
         "custom_op_export_contracts": [
             {"torch_target": op.torch_target, "ge_op_type": op.ge_op_type,
@@ -193,9 +197,24 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
             assert attention.kwargs["actual_seq_lengths_kv"] == [capacity]
             quant_nodes = [node for node in nodes if str(node.target) ==
                            "qwen35_dflash.npu_quant_matmul_v4444.default"]
-            assert len(quant_nodes) == 13
+            assert len(quant_nodes) == 14
+            assert quant_nodes[-1].meta["val"].shape[-1] == 64  # vocabulary head
             assert all(node.args[2].meta["val"].dtype == torch.float32 for node in quant_nodes)
             assert all(node.meta["val"].dtype == torch.float16 for node in quant_nodes)
+
+
+def test_quant_audit_rejects_graph_missing_the_target_head(tmp_path):
+    _ensure_all_target_test_schemas()
+    spec = next(op for op in _target_custom_op_exports(
+        {}, incremental=True, qlinear_count=249)
+        if op.torch_op == FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP)
+    session = prepare_custom_op_export(spec, _FakeTorchAir())
+    graph_dir = tmp_path / "target-verify"
+    graph_dir.mkdir()
+    (graph_dir / "dynamo.pbtxt").write_text(
+        'op { op: "QuantBatchMatmulV4444" }\n' * 248)
+    with pytest.raises(RuntimeError, match="249"):
+        audit_custom_op_export((session,), graph_dir, relative_to=tmp_path)
 
 
 def test_production_preflight_checks_custom_ops_before_loading_weights(tmp_path, monkeypatch):

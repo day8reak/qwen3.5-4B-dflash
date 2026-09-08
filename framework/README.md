@@ -22,7 +22,7 @@ qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_graphs
 | 图 | 功能 |
 |---|---|
 | `target_prefill` | 64 行物理 gear，处理 prompt 并输出特征和状态 |
-| `target_decode` | 可选的一行普通 decode |
+| `target_decode` | 可选的一行普通 decode；已加载时也用于关闭 Draft 后的生成 |
 | `target_verify` | 16 行 verify，融合接受判断和第二次 GDR commit |
 | `draft` | 64 行特征 gear、16 行 Draft block，一次生成 15 个 proposal |
 
@@ -32,13 +32,18 @@ DFlash 部署需要 3 个 OM；加入普通模式对照后共 4 个。C++ 按模
 ## 3. 验证并采集
 
 1. 使用 `infer-cpp` 进行普通/DFlash 各 3 次预热和 10 次测量。
-2. 比较 NPU ordinary、OM ordinary、OM DFlash 的 token IDs、EOS 和停止原因。
+2. 比较 NPU ordinary/DFlash、OM ordinary/DFlash 的 token IDs、EOS 和停止原因。
 3. 使用 `prepare-chunk-plan` 生成所需模式的加载计划。
 4. 使用 `tools/run_msprof.sh --profile-backend cpp` 采集单个阶段或 `all`。
 
 普通模式支持 `prefill|decode|all`；DFlash 支持 `prefill|draft|verify|all`。
 `all` 在一个 C++ 进程中为各阶段分别创建一次采集窗口。全部命令、参数和报告路径均在
 [完整手册](../docs/GDR_CHUNK_AIR_OM.md)中。
+
+`infer-cpp --trace-rounds` 记录每轮 proposal、Target 验证、接受前缀和实际输出，
+`--eos-token-id` 可对齐 NPU 的 EOS 策略。
+`python -m qwen35_dflash.ascend310p.compare_rounds` 按相同的已提交前缀比较两份报告；
+最终 token 一致与每轮一致分别检查。逐轮记录用于诊断，性能基线不启用该参数。
 
 代码已通过主机模拟检查；真实 TorchAir/ATC、自定义 GE 算子、AscendCL 和设备精度/性能
 需要在目标机验证。

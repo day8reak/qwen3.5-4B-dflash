@@ -233,12 +233,13 @@ def command_infer_cpp(args: argparse.Namespace) -> int:
         runner=args.runner,
         runner_options=_config(args.runner_config),
         prompt_token_ids=prompt_ids,
-        eos_token_ids=_eos_token_ids(tokenizer),
+        eos_token_ids=(getattr(args, "eos_token_id", None) or _eos_token_ids(tokenizer)),
         device_id=args.device_id,
         max_new_tokens=args.max_new_tokens,
         max_draft_tokens=args.max_draft_tokens,
         raw_output=raw_output,
         log_output=log_output,
+        trace_rounds=getattr(args, "trace_rounds", False),
     )
     payload["control_plane"]["target_preflight"] = file_record(
         preflight_log, relative_to=run_root
@@ -429,6 +430,10 @@ def build_parser() -> argparse.ArgumentParser:
     infer_cpp.add_argument("--device-id", type=int, default=0)
     infer_cpp.add_argument("--max-new-tokens", type=int, default=32)
     infer_cpp.add_argument("--max-draft-tokens", type=int, default=15)
+    infer_cpp.add_argument("--trace-rounds", action="store_true",
+                           help="record chunk proposal/verify/accepted/emitted tokens per round")
+    infer_cpp.add_argument("--eos-token-id", action="append", type=int,
+                           help="override tokenizer EOS; repeat for multiple IDs")
     infer_cpp.add_argument("--output", type=Path, required=True)
     infer_cpp.set_defaults(handler=command_infer_cpp, model_asset_id=None)
 

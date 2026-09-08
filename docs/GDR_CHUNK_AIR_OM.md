@@ -6,12 +6,13 @@
 | OM | 物理输入 | 职责 |
 |---|---:|---|
 | `target_prefill.om` | 64 行，有效 1..64 | prompt 分块、末行 Top1、Target 特征和状态 |
-| `target_decode.om` | 1 行 | 普通 greedy 单 token decode |
+| `target_decode.om` | 1 行 | 普通 greedy decode；已加载时也供 DFlash 关闭草稿后使用 |
 | `target_verify.om` | 16 行，有效 1..16 | verify、Top1、接受判断、第二次 GDR 和 committed state |
 | `draft.om` | 64 行特征＋16 行 block | 特征投影、Draft KV 追加、一次 15 token proposal |
 
-下面配置导出四个 OM，便于普通/DFlash 对照。DFlash 运行只加载 prefill、verify、draft 三个；
-普通运行只加载 prefill、decode 两个。两种模式共用同一个 prefill OM。
+下面配置导出四个 OM，便于普通/DFlash 对照。paired 运行加载四个；单模式 DFlash 运行
+只加载 prefill、verify、draft 三个，普通运行只加载 prefill、decode 两个。
+两种模式共用同一个 prefill OM。
 verify 包含状态提交计算，没有独立 commit OM。
 
 设备适配状态：代码和主机模拟测试已具备；真实 TorchAir/ATC、AscendCL、token 精度和性能
@@ -187,8 +188,10 @@ Path(os.environ["QUANT_CONFIG"]).write_text(yaml.safe_dump(values, sort_keys=Fal
 PY
 ```
 
-YAML 中就是这三个绝对路径字段。Target Linear 和输入 embedding 使用量化数据，
-Draft embedding、Draft 主体和 LM head 使用 FP16。
+YAML 中就是这三个绝对路径字段。Target 的全部 Linear（包括 LM head）使用 W8A8，
+输入 embedding 使用 INT8 weight 和 FP32 scale。Draft embedding、Draft 主体和
+Draft LM head 使用 FP16。Target 图必须使用 `dflash_execution_model.lm_head`；
+bridge 的公开 `get_output_embeddings()` 保留的是供 Draft 使用的 FP16 checkpoint head。
 
 ## 5. 检查导出和 C++ 工具链
 
@@ -314,6 +317,9 @@ Draft 的公开输入顺序固定为 `features, start_position, valid_rows, anch
 以及 `SoftplusV2`。Draft 使用 Tensor 算子，不要求出现 Target 自定义节点。
 量化 matmul 在 AIR 捕获时使用专用前端，保留 FP32 weight/per-token scale 和 FP16 输出；
 普通 NPU 推理仍调用同一套 receiver 量化接口。
+每张 Target 图的 QuantBatchMatmulV4444 节点数不能少于加载器记录的
+QLinear 数量；标准 4B Target 为 249，包含词表输出 head。该检查用于发现启用了量化前端、
+但部分量化模块没有进入导出图的情况。
 保留整个 AIR 目录，不要只复制 `.air` 文件。
 
 卷积历史窗口通过切片加 `stack` 导出，保持每个有效前缀的状态。
@@ -427,12 +433,15 @@ PY
   --runner "$CPP_RUNNER" --runner-config "$AI_RUN_DIR/runner.json" \
   --model-dir "$TARGET_DIR" --prompt "$(cat "$AI_RUN_DIR/prompt.txt")" --chat \
   --max-new-tokens "$MAX_NEW_TOKENS" --max-draft-tokens 15 --device-id 0 \
+  --eos-token-id 248044 \
   --output "$AI_RUN_DIR/reports/cpp-paired.json"
 ```
 
 这里 Python 负责 tokenizer 和文本解码；生成循环、OM 执行、接受判断复核、EOS 处理在 C++。
 同一进程交错运行普通/DFlash，各 3 次 warmup＋10 次测量。
 报告的 `output.text` 是生成文本，`ordinary`、`dflash` 保存完整 token 和时延分布。
+`--eos-token-id` 与第 6 步 NPU 报告的 `request.eos_token_ids` 保持一致；多个 EOS 可以
+重复传入该参数。不传时使用 tokenizer 的 EOS，它可能与 Draft checkpoint 的 EOS 不同。
 
 C++ 会在执行推理前逐项比较 OM 描述与 chunk plan。若失败，Python 异常会附带第一项
 差异，例如 `graph=draft input[1] expected={...} actual={...}`；其中显示张量名、dtype、
@@ -450,7 +459,7 @@ cat "$AI_RUN_DIR/log/cpp-paired-cpp-runner.log"
 
 ## 12. 检查 token 一致性和时延范围
 
-将 NPU ordinary、OM ordinary 和 OM DFlash 三者作精确比较：
+将 NPU ordinary、NPU DFlash、OM ordinary 和 OM DFlash 四者作精确比较：
 
 ```bash
 "$MODEL_PYTHON" -B - <<'PY'
@@ -465,10 +474,13 @@ assert om["status"] == "PASS" and om["cpu_fallback"] is False
 assert om["ordinary_parity"]["token_id_mismatches"] == 0
 assert om["ordinary_parity"]["eos_mismatches"] == 0
 ordinary = native["ordinary"]
+assert native["dflash"]["prompt_token_ids"] == om["prompt_token_ids"]
+assert set(native["request"]["eos_token_ids"]) == set(om["eos_token_ids"])
+assert ordinary["generated_token_ids"] == native["dflash"]["generated_token_ids"]
 assert ordinary["generated_token_ids"] == om["ordinary"]["stable_generated_token_ids"]
 assert ordinary["generated_token_ids"] == om["dflash"]["stable_generated_token_ids"]
 assert ordinary["stop_reason"] == om["ordinary"]["stable_stop_reason"] == om["dflash"]["stable_stop_reason"]
-print("Native / OM ordinary / OM DFlash tokens: PASS")
+print("Native ordinary/DFlash / OM ordinary/DFlash tokens: PASS")
 print(om["output"]["text"])
 PY
 ```
@@ -476,6 +488,42 @@ PY
 普通/DFlash 两个 OM 路径一致，仍可能共有导出误差，所以不能省略 NPU ordinary 对照。
 继续覆盖长 prompt、跨 64 行边界、EOS、零/部分/全接受和重复请求。
 
+要比较每轮的草稿、验证结果和实际输出，启用逐轮记录：
+
+```bash
+"$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p infer-cpp \
+  --deployment-manifest "$AI_RUN_DIR/artifacts/deployment-manifest.json" \
+  --runner "$CPP_RUNNER" --runner-config "$AI_RUN_DIR/runner.json" \
+  --model-dir "$TARGET_DIR" --prompt "$(cat "$AI_RUN_DIR/prompt.txt")" --chat \
+  --max-new-tokens "$MAX_NEW_TOKENS" --max-draft-tokens 15 --device-id 0 \
+  --eos-token-id 248044 --trace-rounds \
+  --output "$AI_RUN_DIR/reports/cpp-rounds.json"
+
+"$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p.compare_rounds \
+  --native "$AI_RUN_DIR/reports/npu-validate.json" \
+  --cpp "$AI_RUN_DIR/reports/cpp-rounds.json" \
+  --output "$AI_RUN_DIR/reports/round-comparison.json"
+```
+
+`dflash.measurements[i].rounds` 包含 prefill 和之后每轮的
+`proposed_token_ids`、`target_token_ids`、`accepted_draft_token_ids`、
+`emitted_token_ids`、`fallback_token_id`，并记录所用 `stage`。
+`committed_prefix_length` 是本轮开始时的 prompt＋已输出 token 长度，包含当前 anchor。
+verify 记录只保留有效行，不包含物理图的 padding。
+
+比较工具检查所有测量轮次，按相同的已提交 token 前缀对齐；
+`first_difference` 给出首个可比较前缀的具体差异，
+`native_only_prefix_lengths/cpp_only_prefix_lengths` 表示两条执行路径的分轮边界不同。
+最终 token 相同不能证明每轮相同。缺少逐轮数据会显示 `NOT_AVAILABLE`，不会判为通过；
+EOS 策略、最终 token 或逐轮记录没有全部匹配时，比较命令返回 1 并保留报告。
+
+Draft OM 每次计算固定 16 行 anchor＋mask block，最多输出 15 个 proposal；
+NPU 路径在剩余输出预算不足 15 时缩短 block。Draft 含非因果注意力，
+缩短 block 与计算完整 block 后截取 proposal 可能产生不同草稿。
+逐轮差异需要结合这个输入形状差别，以及相同前缀的 Target 特征、量化 head 和状态检查。
+工具比较 token 记录，不代表中间张量已逐项对齐。
+
+`--trace-rounds` 用于诊断，会增加主机记录开销。性能基线使用不带该参数的命令。
 `latency_ms.model_total` 排除模型加载和 tokenizer；请求清零单独记录在
 `latency_ms.request_reset`，比较包含请求初始化的时延时需要加回。
 报告的 `stage_ms` 按图保留每次同步 OM 调用时间，包含必要的输入/输出复制。具体算子时间
@@ -599,8 +647,11 @@ decode 或 paired。不同 OM 不会自动共享权重，设备显存要覆盖�
 
 状态语义与开销：Target verify 用本轮初始 recurrent state 做两次 GDR，第二次
 `effective_length=accepted+1`；C++ 核对接受数后统一发布状态。零接受后关闭 Draft，以
-verify 的 `valid_rows=1` 继续生成。这个 fallback 仍是 16 行物理图，需要与一行 ordinary
-检查 token 等价。固定 64 行 Draft gear、非末尾 prompt 块的 Draft KV 初始化、每块 prefill
+已加载的 `target_decode` 执行后续单 token 生成。单模式 DFlash 只加载三个 OM，
+继续使用 verify 的 `valid_rows=1`，其物理图仍为 16 行。
+`speculation_disable_events` 和 `target_only_fallback_rounds` 记录关闭 Draft 及后续轮数；
+`stage_ms` 显示实际调用了 decode 还是 verify。两种后备路径都需要与 ordinary 检查
+token 等价。固定 64 行 Draft gear、非末尾 prompt 块的 Draft KV 初始化、每块 prefill
 的 LM head，以及 functional KV 更新，都可能增加开销，应按实际 msprof 数据评估。
 
 ## 17. 失败定位

@@ -365,6 +365,7 @@ def run_cpp_pair(
     max_draft_tokens: int,
     raw_output: str | Path,
     log_output: str | Path,
+    trace_rounds: bool = False,
     execute: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     """Run paired ordinary/DFlash generation entirely inside one C++ process."""
@@ -377,6 +378,8 @@ def run_cpp_pair(
     identity = _runtime_identity(runner_options, device_id)
     deployment = load_json_object(Path(deployment_manifest).expanduser().resolve())
     chunk = any(g.get("metadata", {}).get("incremental_contract") for g in deployment.get("graphs", []))
+    if trace_rounds and not chunk:
+        raise ValueError("round tracing requires an incremental chunk OM bundle")
     if chunk:
         from .incremental_plan import write_incremental_plan
         om_path, deployment, contract = write_incremental_plan(
@@ -420,6 +423,8 @@ def run_cpp_pair(
     ]
     if chunk:
         command.extend(("--model-kind", "chunk"))
+    if trace_rounds:
+        command.append("--trace-rounds")
     start_ns = time.perf_counter_ns()
     result = execute(
         command,
@@ -464,6 +469,7 @@ def run_cpp_pair(
         raise ValueError("AIR manifest integrity check failed after C++ execution")
     report["backend_metadata"] = {
         **identity,
+        "graph_name": str(graph["name"]),
         "artifacts": ({g["name"]: g["om"]["sha256"] for g in deployment["graphs"]} if chunk else {str(graph["name"]): str(om_record["sha256"])}),
         "state_policy": contract["state_policy"] if chunk else "recompute committed prefixes",
         "host_hot_path": "AscendCL C++",

@@ -230,7 +230,11 @@ class TargetRowsGraph(nn.Module):
             getattr(target, "_target_quantized_embedding", None)
             or target.get_input_embeddings()
         )
-        self.head = target.get_output_embeddings()
+        # The bridge's public embedding getters retain the FP16 checkpoint
+        # modules for Draft. Target must use the execution model's W8A8 head.
+        self.head = getattr(model, "lm_head", None)
+        if not isinstance(self.head, nn.Module):
+            raise TypeError("incremental Target requires execution-model lm_head")
         self.rows, self.verify, self.feature_layers = rows, verify, feature_layers
         self.cache_capacity = target.kv_cache_max_len
         self.blocks = nn.ModuleList(

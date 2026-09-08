@@ -133,6 +133,15 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
     valid_token(anchor);
     result.generated_token_ids.push_back(anchor);
     result.prefill_ms = Ms(prefill_start);
+    if (options.trace_rounds) {
+      GenerationRound round;
+      round.committed_prefix_length = prompt.size();
+      round.stage = "target_prefill";
+      round.target_token_ids = {anchor};
+      round.emitted_token_ids = {anchor};
+      round.fallback_token_id = anchor;
+      result.rounds.push_back(std::move(round));
+    }
     bool speculation = mode == GenerationMode::kDFlash;
     while (!eos.count(anchor) &&
            result.generated_token_ids.size() < options.max_new_tokens) {
@@ -140,8 +149,19 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
       const auto remaining =
           options.max_new_tokens - result.generated_token_ids.size();
       std::vector<std::int64_t> emitted;
-      if (mode == GenerationMode::kOrdinary) {
+      GenerationRound round;
+      if (options.trace_rounds)
+        round.committed_prefix_length = prompt.size() + result.generated_token_ids.size();
+      const bool target_only = mode == GenerationMode::kDFlash && !speculation;
+      if (target_only) ++result.counters.target_only_fallback_rounds;
+      if (mode == GenerationMode::kOrdinary ||
+          (target_only && executor.HasOrdinaryDecode())) {
         emitted.push_back(executor.Decode(anchor));
+        if (options.trace_rounds) {
+          round.stage = "target_decode";
+          round.target_token_ids = emitted;
+          round.fallback_token_id = emitted.front();
+        }
       } else {
         std::vector<std::int64_t> proposals;
         if (speculation) {
@@ -168,7 +188,10 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
         executor.Commit(
             accepted +
             1);  // publish/ack the fused OM result; no second OM call
-        if (!proposals.empty() && accepted == 0) speculation = false;
+        if (!proposals.empty() && accepted == 0) {
+          speculation = false;
+          ++result.counters.speculation_disable_events;
+        }
         emitted.assign(proposals.begin(), proposals.begin() + accepted);
         if (emitted.empty() ||
             (!eos.count(emitted.back()) && emitted.size() < remaining))
@@ -176,6 +199,13 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
         result.counters.drafted_tokens += proposals.size();
         result.counters.accepted_draft_tokens += accepted;
         result.counters.rejected_draft_tokens += proposals.size() - accepted;
+        if (options.trace_rounds) {
+          round.stage = "target_verify";
+          round.proposed_token_ids = proposals;
+          round.target_token_ids.assign(verified.begin(), verified.begin() + block.size());
+          round.accepted_draft_token_ids.assign(proposals.begin(), proposals.begin() + accepted);
+          if (emitted.size() > accepted) round.fallback_token_id = verified[accepted];
+        }
       }
       Require(!emitted.empty() && emitted.size() <= remaining,
               "invalid committed token count");
@@ -188,6 +218,10 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
       result.decode_iteration_ms.push_back(elapsed);
       result.decode_ms += elapsed;
       ++result.counters.decode_iterations;
+      if (options.trace_rounds) {
+        round.emitted_token_ids = emitted;
+        result.rounds.push_back(std::move(round));
+      }
     }
     result.stop_reason = eos.count(anchor) ? "eos" : "max_new_tokens";
     result.model_total_ms = result.prefill_ms + result.decode_ms;

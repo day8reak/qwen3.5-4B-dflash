@@ -397,7 +397,7 @@ def _enable_target_quant_matmul_export_mode(target: nn.Module) -> int:
     return enabled
 
 def _target_custom_op_exports(
-    config: Mapping[str, Any], *, incremental: bool,
+    config: Mapping[str, Any], *, incremental: bool, qlinear_count: int = 1,
 ) -> tuple[CustomOpExportSpec, ...]:
     """Declare operators actually retained by each Target graph."""
     rms_type = str(config.get("adn_rms_norm_ge_op_type", ADN_RMS_NORM_DEFAULT_GE_OP_TYPE))
@@ -405,8 +405,10 @@ def _target_custom_op_exports(
         raise ValueError("adn_rms_norm_ge_op_type must be RmsNorm or AdnRmsNorm")
     operators = [
         CustomOpExportSpec(ADN_RMS_NORM_TORCH_OP, rms_type),
+        # Shared activation inputs may reuse one DynamicQuant result.
         CustomOpExportSpec(NPU_DYNAMIC_QUANT_TORCH_OP, NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE),
-        CustomOpExportSpec(FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP, NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE),
+        CustomOpExportSpec(FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP, NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+                           minimum_occurrences=qlinear_count),
         CustomOpExportSpec(NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP, NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE),
         CustomOpExportSpec(ADN_FUSED_INFER_ATTENTION_TORCH_OP, ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE),
     ]
@@ -552,6 +554,11 @@ def create_quant_recompute_graph(
             dtype=dtype,
         )
     enabled_qlinear = _enable_target_quant_matmul_export_mode(target)
+    if _incremental:
+        # Every Target gear executes every QLinear, including its W8A8 head.
+        # Enabling frontends alone does not prove that all of them reach AIR.
+        custom_op_exports = _target_custom_op_exports(
+            config, incremental=True, qlinear_count=enabled_qlinear)
     if not _incremental:
         execution_model = getattr(target, "dflash_execution_model", target)
         for module in execution_model.modules():
@@ -626,6 +633,7 @@ def create_quant_recompute_graph(
             "gdr_effective_length_contract": "INT16[1] explicit call-local valid rows",
             "claim_boundary": "Explicit-state candidate; real TorchAir/ATC and device parity gates required.",
             "target_rollback_audit": dict(target.dflash_rollback_audit),
+            "target_lm_head_source": "dflash_execution_model.lm_head",
         })
         return incremental_graph_specs(target, draft, capacity=max_sequence_length,
             metadata=metadata, gdr=torch_npu.npu_chunk_gated_delta_rule,

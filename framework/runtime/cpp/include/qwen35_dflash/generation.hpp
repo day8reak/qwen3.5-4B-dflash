@@ -36,6 +36,7 @@ struct GenerationOptions {
   std::size_t max_new_tokens = 32;
   std::size_t max_draft_tokens = 15;
   std::vector<std::int64_t> eos_token_ids;
+  bool trace_rounds = false;
 };
 
 struct GenerationCounters {
@@ -44,6 +45,19 @@ struct GenerationCounters {
   std::size_t accepted_draft_tokens = 0;
   std::size_t rejected_draft_tokens = 0;
   std::size_t decode_iterations = 0;
+  std::size_t speculation_disable_events = 0;
+  std::size_t target_only_fallback_rounds = 0;
+};
+
+struct GenerationRound {
+  // Includes the current anchor after prefill, matching native ReplayRound.
+  std::size_t committed_prefix_length = 0;
+  std::string stage;
+  std::vector<std::int64_t> proposed_token_ids;
+  std::vector<std::int64_t> target_token_ids;
+  std::vector<std::int64_t> accepted_draft_token_ids;
+  std::vector<std::int64_t> emitted_token_ids;
+  std::int64_t fallback_token_id = -1;
 };
 
 struct GenerationMeasurement {
@@ -56,6 +70,7 @@ struct GenerationMeasurement {
   double model_total_ms = 0.0;
   std::vector<double> decode_iteration_ms;
   std::map<std::string, std::vector<double>> stage_ms;
+  std::vector<GenerationRound> rounds;
 };
 
 struct Distribution {

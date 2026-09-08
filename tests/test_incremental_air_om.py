@@ -160,6 +160,7 @@ class TinyTarget(nn.Module):
         self.dflash_execution_model.language_model.layers = layers
         self.dflash_execution_model.language_model.norm = nn.Identity()
         self.embedding, self.head = nn.Embedding(64, 32), nn.Linear(32, 64, bias=False)
+        self.dflash_execution_model.lm_head = self.head
         self.half()
 
     def get_input_embeddings(self):
@@ -520,6 +521,39 @@ def test_tensor_export_keeps_runtime_acceptance_and_state_inputs():
         assert int(exported(*args)[1][0]) == 1
 
 
+def test_target_gears_use_execution_head_and_draft_keeps_checkpoint_head():
+    target = TinyTarget().eval()
+    # The receiver retains one FP16 head for Draft while replacing the Target
+    # head during quantization. Distinct Top1s expose selecting the wrong one.
+    execution_head = nn.Linear(32, 64, bias=True).half()
+    draft_head = nn.Linear(32, 64, bias=True).half()
+    with torch.no_grad():
+        for head, token in ((execution_head, 7), (draft_head, 25)):
+            head.weight.zero_()
+            head.bias.zero_()
+            head.bias[token] = 1
+    target.head = draft_head
+    target.dflash_execution_model.lm_head = execution_head
+    graphs = incremental_graph_specs(
+        target, draft_model(), capacity=128, metadata={},
+        gdr=gdr, attention=attention_op, rotary=rotary, include_ordinary_decode=True)
+    with torch.inference_mode():
+        for spec in graphs:
+            if spec.name == "draft":
+                assert spec.model.propose.head is draft_head
+                assert spec.model.propose.head.weight.dtype == torch.float16
+            else:
+                assert torch.all(spec.model(*spec.example_args)[0] == 7)
+
+
+def test_target_missing_execution_head_fails_before_export():
+    target = TinyTarget().eval()
+    del target.dflash_execution_model.lm_head
+    with pytest.raises(TypeError, match="execution-model lm_head"):
+        TargetRowsGraph(target, rows=64, verify=False, feature_layers=(0, 1),
+                        gdr=gdr, attention=attention_op, rotary=rotary)
+
+
 def test_undefined_gdr_padding_cannot_pollute_later_kv():
     def poisoned(*args, **kwargs):
         output, state = gdr(*args, **kwargs)
@@ -772,12 +806,35 @@ def test_cpp_four_om_roundtrip_with_fake_acl(
         max_draft_tokens=15,
         raw_output=tmp_path / "cpp.json",
         log_output=tmp_path / "cpp.log",
+        trace_rounds=True,
     )
     assert result["ordinary_parity"]["token_id_mismatches"] == 0
     assert result["abi"]["graph_count"] == 4
     for row in result["dflash"]["measurements"]:
-        assert "target_decode" not in row["stage_ms"]
+        assert ("target_decode" in row["stage_ms"]) == (accepted == 0)
         assert "target_verify" in row["stage_ms"]
+        assert row["counters"]["speculation_disable_events"] == (accepted == 0)
+        if accepted == 0:
+            assert len(row["stage_ms"]["target_verify"]) == 1
+            assert len(row["stage_ms"]["target_decode"]) == 38
+            assert row["counters"]["target_only_fallback_rounds"] == 38
+    assert result["protocol"]["round_trace_enabled"] is True
+    for mode in ("ordinary", "dflash"):
+        for row in result[mode]["measurements"]:
+            emitted = []
+            for round in row["rounds"]:
+                assert round["committed_prefix_length"] == 65 + len(emitted)
+                proposed, verified = round["proposed_token_ids"], round["target_token_ids"]
+                accepted_ids = round["accepted_draft_token_ids"]
+                assert accepted_ids == proposed[:len(accepted_ids)] == verified[:len(accepted_ids)]
+                assert len(verified) == len(proposed) + 1
+                expected = list(accepted_ids)
+                if round["fallback_token_id"] is not None:
+                    expected.append(round["fallback_token_id"])
+                    assert round["fallback_token_id"] == verified[len(accepted_ids)]
+                assert round["emitted_token_ids"] == expected
+                emitted.extend(expected)
+            assert emitted == row["generated_token_ids"]
 
 
 @pytest.mark.parametrize(
@@ -820,13 +877,14 @@ def test_cpp_rejects_failed_or_inconsistent_verify(
         assert "host acceptance disagrees" in result.stderr
 
 
-def test_pure_dflash_does_not_load_or_require_decode_om(chunk_bundle, tmp_path):
+def test_pure_dflash_does_not_load_or_require_decode_om(chunk_bundle, tmp_path, monkeypatch):
     from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
     from qwen35_dflash.ascend310p.utils import sha256_file
 
     runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
     if not runner:
         pytest.skip("set QWEN35_CPP_TEST_RUNNER")
+    monkeypatch.setenv("QWEN35_FAKE_ACCEPT", "0")
     plan, deployment, _ = write_incremental_plan(chunk_bundle, tmp_path / "plan.txt")
     decode = next(g for g in deployment["graphs"] if g["name"] == "target_decode")
     (chunk_bundle.parent / decode["om"]["path"]).unlink()
@@ -852,4 +910,10 @@ def test_pure_dflash_does_not_load_or_require_decode_om(chunk_bundle, tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "loaded_models=3" in result.stderr
-    assert json.loads(output.read_text())["ordinary_parity"]["status"] == "NOT_RUN"
+    report = json.loads(output.read_text())
+    assert report["ordinary_parity"]["status"] == "NOT_RUN"
+    for row in report["benchmark"]["measurements"]:
+        assert "target_decode" not in row["stage_ms"]
+        assert len(row["stage_ms"]["target_verify"]) == 31
+        assert row["counters"]["target_only_fallback_rounds"] == 30
+        assert "rounds" not in row

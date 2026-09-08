@@ -501,6 +501,9 @@ void AclChunkExecutor::Commit(std::size_t rows) { impl_->Commit(rows); }
 std::int64_t AclChunkExecutor::Decode(std::int64_t anchor) {
   return impl_->Decode(anchor);
 }
+bool AclChunkExecutor::HasOrdinaryDecode() const noexcept {
+  return impl_->models.count("target_decode") != 0;
+}
 std::size_t AclChunkExecutor::graph_calls() const noexcept {
   return impl_->calls;
 }

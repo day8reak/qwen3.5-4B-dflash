@@ -44,6 +44,7 @@ class ChunkExecutor : public GraphExecutor {
       const std::vector<std::int64_t>& block) = 0;
   virtual void Commit(std::size_t rows) = 0;
   virtual std::int64_t Decode(std::int64_t anchor) = 0;
+  virtual bool HasOrdinaryDecode() const noexcept { return false; }
   virtual std::size_t graph_calls() const noexcept = 0;
   virtual const std::map<std::string, std::vector<double>>& stage_ms()
       const = 0;
@@ -68,6 +69,7 @@ class AclChunkExecutor final : public ChunkExecutor {
   std::vector<std::int64_t> Verify(const std::vector<std::int64_t>&) override;
   void Commit(std::size_t) override;
   std::int64_t Decode(std::int64_t) override;
+  bool HasOrdinaryDecode() const noexcept override;
   std::size_t graph_calls() const noexcept override;
   const std::map<std::string, std::vector<double>>& stage_ms() const override;
 

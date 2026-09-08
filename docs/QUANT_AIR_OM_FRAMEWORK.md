@@ -16,8 +16,9 @@ Target + Draft checkpoint + W8A8 输入 + receiver 加载器
     → 时延报告和分阶段 msprof
 ```
 
-DFlash 运行加载 `target_prefill`、`target_verify`、`draft`；普通运行加载
-`target_prefill`、`target_decode`。prefill 共用，verify 内部完成接受判断与状态提交。
+单模式 DFlash 加载 `target_prefill`、`target_verify`、`draft`；普通运行加载
+`target_prefill`、`target_decode`；paired 加载四个。
+prefill 共用，verify 内部完成接受判断与状态提交。
 
 ## 2. 输入和导出配置
 
@@ -29,7 +30,8 @@ DFlash 运行加载 `target_prefill`、`target_verify`、`draft`；普通运行�
 | `embedding_weight_path` | INT8 Target embedding raw binary |
 | `embedding_scale_path` | 每词表行的 FP32 scale raw binary |
 
-只量化 Target Linear 和输入 embedding。Draft 使用 FP16 embedding、LM head 和主体。
+Target 的全部 Linear（包含 `dflash_execution_model.lm_head`）及输入 embedding 使用量化数据。
+Draft 使用 FP16 embedding、LM head 和主体；公开 embedding getter 保留的是 Draft head。
 配置和量化输入须来自同一 Target；加载器检查 QLinear 结构和 buffer，拒绝不完整转换。
 
 增量工厂是 `qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_graphs`。
@@ -222,6 +224,10 @@ ATC 的 `--soc-version` 同样要求设备支持的精确型号。
 | 5 | `prepare-chunk-plan` | `--deployment-manifest`、`--mode ordinary\|dflash\|paired`、`--output` | 单模式或配对计划 |
 
 `infer-cpp` 还支持 `--max-new-tokens`、`--max-draft-tokens`、`--device-id`。
+`--eos-token-id` 可重复传入，用于覆盖 tokenizer 的 EOS 并对齐 NPU 报告。
+`--trace-rounds` 为 chunk bundle 记录每轮的 proposal、Target token、接受前缀和输出；
+直接 C++ 入口也支持此开关。记录位于每条 measurement 的 `rounds` 中，
+性能基线不启用逐轮记录。
 Python 处理 tokenizer、文本和报告；生成热循环在 C++ 内执行。
 直接调用 C++ 时使用 `--model-kind chunk --mode ordinary|dflash|paired`，
 配合 `--model`、`--model-sha256`、`--prompt-token-ids`、`--eos-token-ids` 和 `--output`。
@@ -234,10 +240,20 @@ paired 推理，runner 须已构建。两者都应显式传入本参考第 2 节
 C++ 只加载所选模式的模型一次，持久保留 current/next device buffer。
 verify 完成后，主机复核接受数并统一发布状态；异常使本次请求失效，清零后才能继续。
 correction 或 bonus 成为下一轮 anchor，本轮不提前把它写入已提交状态。
+零接受后关闭 Draft，后续轮次优先使用已加载的 `target_decode`；
+只加载三图的 DFlash 模式使用 `target_verify` 的 `valid_rows=1`。
+报告的 `speculation_disable_events`、`target_only_fallback_rounds` 与 `stage_ms`
+分别记录关闭事件、后备轮数和实际调用图。
 
 paired 运行按模式交错执行 3 次预热和 10 次测量，要求普通/DFlash token、EOS 和停止原因
 一致。还需与 Python NPU ordinary 比较，覆盖零/部分/全接受、跨 64 行块、长 prompt 和重复
 请求，才能排除两个 OM 路径共有的导出误差。
+
+最终 token 相同不代表逐轮一致。模块
+`qwen35_dflash.ascend310p.compare_rounds --native NPU_JSON --cpp CPP_JSON --output REPORT`
+验证逐轮输出能重建完整 token 序列，并按相同的已提交前缀比较每次 proposal、verify 和接受结果。
+固定 16 行 Draft OM 与 NPU 在尾部缩短的 Draft block 可能产生不同 proposal，
+需结合输入形状和中间张量继续定位，不能仅按相同轮次编号比较。
 
 | 时延字段 | 范围 |
 |---|---|
