@@ -310,8 +310,12 @@ manifest 保存有序输入/输出的 dtype、shape、文件 hash、算子预检
 普通 NPU 推理仍调用同一套 receiver 量化接口。
 保留整个 AIR 目录，不要只复制 `.air` 文件。
 
-卷积历史窗口通过切片加 `stack` 导出，保持每个有效前缀的状态；不使用
-`aten.unfold.default`。若日志以 `ERR03007 GRAPH feature not supported` 结束，
+卷积历史窗口通过切片加 `stack` 导出，保持每个有效前缀的状态。
+verify 接受长度使用 INT32 `Cumsum → Equal → ReduceSum`，最后输出 INT64 接受数；
+短块的 padding 不参与接受判断，第二次 GDR 提交 `accepted_count+1` 行。
+缓存写入索引与 Draft 的 KV head 复制使用静态 `repeat/Tile`。
+这些路径不调用 `unfold`、`index_copy`、`amin`、`min(dim=...)` 或 `cumprod`。
+若日志以 `ERR03007 GRAPH feature not supported` 结束，
 查看完整日志中第一条 `NotImplementedError` 或 converter 异常及其对应的 `Original traceback`，
 不要只截取末尾的 FX 图代码。FakeTensor 检查通过不代表所有标准算子都能转为 GE。
 

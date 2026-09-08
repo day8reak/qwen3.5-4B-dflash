@@ -125,8 +125,11 @@ GDR 累加及算子 initial/final state 使用 FP32；OM 之间持久保存的 r
 
 增量四图的缓存写入使用函数式 `scatter`，由 TorchAir 映射到 `ScatterElements`，
 不要求 `CacheUpdate` 或 `ScatterNdUpdate` 节点。Target 在展平的 paged KV 第 0 维写入，
-Draft 在 `[B,H,C,D]` 的第 2 维写入；位置索引广播到更新值的形状，输入缓存保持不变。
+Draft 在 `[B,H,C,D]` 的第 2 维写入；位置索引用静态 `repeat/Tile` 复制到更新值的形状，
+输入缓存保持不变。索引重复因子来自固定形状，不构造动态 `BroadcastTo` shape 输入。
 写入位置由连续且不重复的 token 位置构造，结果与整行 `index_copy` 相同。
+Draft 的 GQA 在新插入的 group 维使用 `repeat/Tile`，head 顺序为
+`[h0,h0,...,h1,h1,...]`，不重复整个 head 序列。
 Draft 图使用 Tensor 算子。完整前缀工厂按其实际缓存路径声明算子依赖。
 本分支的 verify 和 commit 都使用 `ChunkGatedDeltaRule`，不依赖 `GatedDeltaRuleMTP`。
 
@@ -134,6 +137,15 @@ Draft 图使用 Tensor 算子。完整前缀工厂按其实际缓存路径声明
 `aten.unfold.default`。卷积宽度 K=4 时只构造四个移位切片，得到
 `bank[b,r,c,k] = history[b,c,r+1+k]`；`bank[:,v-1]` 就是消费 v 行后的状态。
 prefill、decode 和 verify 的接受前缀提交共用该规则，卷积与 SiLU 计算保持同一公式。
+
+verify 接受长度在图内以整数计算：有效 proposal 范围是 `valid_rows-1`；
+将范围内的 mismatch 转为 INT32，经过 `Cumsum` 后，以累计 mismatch 为 0 的有效行
+形成连续接受前缀，最后用 INT32 `ReduceSum` 计数并转回 `INT64[1] accepted_count`。
+该路径不调用 `amin`、`min(dim=...)` 或 `cumprod`。零接受、全接受及短块 padding
+均使用同一规则；第二次 GDR 仍以 `INT16[1](accepted_count+1)` 提交 anchor 和接受前缀。
+主机回归覆盖全部 32768 种 proposal 匹配模式和 1～16 的有效行数，并检查捕获图中的
+INT32 scan/reduction 及缓存、head 复制的 Tensor 算子。
+
 PyTorch 的 FakeTensor/严格捕获通过，只证明 PyTorch 图有效；标准算子的 GE 支持
 仍需单独检查，最终以目标机 TorchAir 导出及 ATC 编译为准。
 

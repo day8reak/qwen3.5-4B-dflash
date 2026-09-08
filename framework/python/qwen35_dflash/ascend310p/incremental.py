@@ -40,17 +40,41 @@ def prefix_state(bank: Tensor, rows: Tensor) -> Tensor:
     return torch.index_select(bank, 1, rows.to(torch.long) - 1).squeeze(1).contiguous()
 
 
+def accepted_prefix_length(input_ids: Tensor, top1: Tensor, valid_rows: Tensor) -> Tensor:
+    """Count matching proposals before the first mismatch, ignoring padding.
+
+    Use the INT32 Cumsum/ReduceSum route from the quant AIR transaction graph:
+    TorchAir has no amin/min.dim/cumprod converter on the receiver toolchain.
+    The scan contains at most 15 bits, so integer accumulation is exact. Keep
+    the public accepted_count INT64 ABI and accepted+1 GDR commit unchanged.
+    """
+    indices = torch.arange(input_ids.shape[1] - 1, device=input_ids.device)
+    proposal_count = valid_rows.to(torch.long) - 1
+    within_requested = indices[None, :] < proposal_count[:, None]
+    mismatch = (input_ids[:, 1:] != top1[:, :-1]) & within_requested
+    cumulative_mismatches = torch.cumsum(
+        mismatch.to(torch.int32), dim=1, dtype=torch.int32
+    )
+    accepted_mask = within_requested & cumulative_mismatches.eq(0)
+    return accepted_mask.to(torch.int32).sum(dim=1, dtype=torch.int32).to(torch.long)
+
+
 def copy_cache_rows(cache: Tensor, dim: int, positions: Tensor, values: Tensor) -> Tensor:
     """Replace complete cache rows at distinct positions without mutating input.
 
     Every caller constructs consecutive positions within the locked capacity.
-    Broadcasting the row indices makes scatter equivalent to index_copy here;
+    Repeating the row indices makes scatter equivalent to index_copy here;
     TorchAir lowers scatter.src to ScatterElements, while index_copy has no GE
     converter on the receiver route.
     """
     index_shape = [1] * cache.ndim
     index_shape[dim] = -1
-    indices = positions.reshape(index_shape).expand_as(values)
+    # Materialize the static head/channel repeats with Tile. This is the quant
+    # AIR branch's cache-index route; dynamic BroadcastTo shape inputs can fail
+    # receiver ATC auto-tiling even when the inferred index shape is correct.
+    repeats = list(values.shape)
+    repeats[dim] = 1
+    indices = positions.reshape(index_shape).repeat(*repeats)
     return torch.scatter(cache, dim, indices, values)
 
 
@@ -266,14 +290,7 @@ class TargetRowsGraph(nn.Module):
         top1 = torch.argmax(self.head(head_rows), dim=-1)
         acceptance_output = ()
         if self.verify:
-            indices = torch.arange(self.rows - 1, device=input_ids.device)
-            proposal_count = valid_rows.to(torch.long) - 1
-            mismatch = (input_ids[:, 1:] != top1[:, :-1]) & (
-                indices < proposal_count[:, None]
-            )
-            accepted = torch.where(
-                mismatch, indices[None, :], proposal_count[:, None]
-            ).amin(dim=1)
+            accepted = accepted_prefix_length(input_ids, top1, valid_rows)
             committed = self.commit((accepted + 1).to(torch.int16), *capsules)
             for offset, layer_index in enumerate(self.linear_indices):
                 next_state[2 * layer_index : 2 * layer_index + 2] = committed[

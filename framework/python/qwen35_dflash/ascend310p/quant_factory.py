@@ -218,9 +218,10 @@ def _repeat_kv(states: Tensor, repetitions: int) -> Tensor:
     if repetitions == 1:
         return states
     batch, heads, sequence, head_dim = states.shape
-    expanded = states[:, :, None, :, :].expand(
-        batch, heads, repetitions, sequence, head_dim
-    )
+    # Repeat the inserted group axis, preserving [h0,h0,...,h1,h1,...].
+    # Tile follows the quant AIR branch's receiver-compatible GQA lowering;
+    # BroadcastTo can fail ATC auto-tiling for the full physical KV carrier.
+    expanded = states.unsqueeze(2).repeat(1, 1, repetitions, 1, 1)
     return expanded.reshape(batch, heads * repetitions, sequence, head_dim)
 
 

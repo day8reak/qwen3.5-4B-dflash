@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "framework/python"))
 from qwen35_dflash.ascend310p.incremental import (
     DraftGraph,
     TargetRowsGraph,
+    accepted_prefix_length,
     conv_chunk,
     copy_cache_rows,
     incremental_graph_specs,
@@ -26,7 +27,7 @@ from qwen35_dflash.ascend310p.incremental import (
     update_paged,
 )
 from qwen35_dflash.ascend310p.incremental_plan import validate_incremental_bundle
-from qwen35_dflash.ascend310p.quant_factory import AirDFlashOps
+from qwen35_dflash.ascend310p.quant_factory import AirDFlashOps, _repeat_kv
 from models.dflash_v1.dflash_config import Qwen35DFlashConfig
 from models.dflash_v1.modeling_dflash import DFlashDraftModel
 
@@ -294,8 +295,11 @@ def test_exactly_four_graphs_and_complete_signatures():
     assert len(specs(include_ordinary_decode=False)) == 3
 
 
-@pytest.mark.parametrize("accepted", [0, 3, 15])
-def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(accepted):
+@pytest.mark.parametrize(
+    "valid_rows,accepted",
+    [(16, 0), (16, 3), (16, 15), (1, 0), (4, 0), (4, 1), (4, 3)],
+)
+def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(valid_rows, accepted):
     values = {s.name: s for s in specs()}
     verify, decode = values["target_verify"], values["target_decode"]
     initial = tuple(t.clone() for t in verify.example_args[3:])
@@ -314,10 +318,13 @@ def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(accepted):
             state = out[1:]
         if accepted < 15:
             ids[accepted + 1] = (ids[accepted + 1] + 1) % 64
+        # Invalid tail tokens deliberately mismatch; they cannot reduce the
+        # accepted count or enter the committed GDN/visible KV prefix.
+        ids[valid_rows:] = [63] * (16 - valid_rows)
         out = verify.model(
             torch.tensor([ids]),
             torch.tensor([0]),
-            torch.tensor([16], dtype=torch.int16),
+            torch.tensor([valid_rows], dtype=torch.int16),
             *initial,
         )
         assert int(out[1][0]) == accepted
@@ -421,6 +428,79 @@ def test_draft_fused_context_matches_original_cached_draft_with_padding():
                     atol=1e-3,
                     rtol=1e-3,
                 )
+
+
+class AcceptanceGraph(nn.Module):
+    def forward(self, input_ids, top1, valid_rows):
+        return accepted_prefix_length(input_ids, top1, valid_rows)
+
+
+@pytest.mark.parametrize("capture", ["eager", "export", "aot"])
+def test_acceptance_all_mismatch_patterns_and_valid_lengths(capture):
+    # Exhaust all 2**15 match/mismatch patterns for every valid_rows in 1..16.
+    # The oracle uses integer bits, independently of Tensor scans/reductions.
+    width, batch = 15, 1 << 15
+    patterns = torch.arange(batch, dtype=torch.long)
+    bits = (patterns[:, None] >> torch.arange(width)) & 1
+    top1 = torch.arange(width + 1)[None, :].expand(batch, -1) + 248000
+    input_ids = torch.cat((torch.full((batch, 1), 42), top1[:, :-1] ^ bits), dim=1)
+    valid = torch.full((batch,), 16, dtype=torch.int16)
+    graph = AcceptanceGraph()
+    captured_graphs = []
+    if capture == "export":
+        exported = torch.export.export(graph, (input_ids, top1, valid), strict=True)
+        exported = exported.run_decompositions({})
+        captured_graphs.append(exported.graph_module)
+        run = exported.module()
+    elif capture == "aot":
+        from torch._dynamo.backends.common import aot_autograd
+
+        def compiler(module, args):
+            captured_graphs.append(module)
+            return module.forward
+
+        run = torch.compile(graph, backend=aot_autograd(fw_compiler=compiler),
+                            fullgraph=True, dynamic=False)
+    else:
+        run = graph
+    with torch.inference_mode():
+        for length in range(1, width + 2):
+            valid = torch.full((batch,), length, dtype=torch.int16)
+            actual = run(input_ids, top1, valid)
+            expected = []
+            for pattern in range(batch):
+                mismatches = pattern & ((1 << (length - 1)) - 1)
+                expected.append((mismatches & -mismatches).bit_length() - 1
+                                if mismatches else length - 1)
+            assert actual.dtype == torch.int64 and actual.shape == (batch,)
+            torch.testing.assert_close(actual, torch.tensor(expected), rtol=0, atol=0)
+    if capture != "eager":
+        # Changing runtime valid_rows must reuse one graph and retain integer
+        # scan/reduction. PyTorch's implicit default would promote to INT64.
+        assert len(captured_graphs) == 1
+        nodes = [n for n in captured_graphs[0].graph.nodes if n.op == "call_function"]
+        targets = {str(n.target) for n in nodes}
+        assert not targets & {"aten.amin.default", "aten.min.dim", "aten.cumprod.default"}
+        for target in ("aten.cumsum.default", "aten.sum.dim_IntList"):
+            reductions = [n for n in nodes if str(n.target) == target]
+            assert len(reductions) == 1
+            assert reductions[0].kwargs["dtype"] == torch.int32
+            assert reductions[0].meta["val"].dtype == torch.int32
+
+
+@pytest.mark.parametrize("repetitions", [1, 2, 4])
+@pytest.mark.parametrize("sequence", [16, 2064])
+def test_draft_kv_head_repeat_preserves_group_order(repetitions, sequence):
+    # Multiple distinct heads and noncontiguous values detect repetition of
+    # the head axis instead of the inserted group axis, even at full KV width.
+    states = (torch.arange(2 * 8 * sequence * 16) % 2048).half()
+    states = states.reshape(2, sequence, 8, 16).transpose(1, 2)
+    actual = _repeat_kv(states, repetitions)
+    expected = torch.stack([states[:, head]
+                            for head in range(8) for _ in range(repetitions)], dim=1)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if repetitions == 1:
+        assert actual is states
 
 
 def test_tensor_export_keeps_runtime_acceptance_and_state_inputs():

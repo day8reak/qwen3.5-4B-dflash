@@ -135,6 +135,7 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
                 if str(node.target) in {
                     "aten.unfold.default", "aten.unfold_copy.default",
                     "aten.index_copy.default",
+                    "aten.amin.default", "aten.min.dim", "aten.cumprod.default",
                 }:
                     raise AssertionError(f"unsupported AIR operator: {node.target}")
                 converter = self.converters.get(node.target)
@@ -162,11 +163,21 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
         nodes = list(exported.graph.nodes)
         cache_writes = [node for node in nodes if str(node.target) == "aten.scatter.src"]
         assert len(cache_writes) == (4 if name == "draft" else 2)
+        # Cache indices use static Tile repeats, matching the receiver-tested
+        # quant branch and avoiding dynamic BroadcastTo auto-tiling failures.
+        assert all(str(node.args[2].target) == "aten.repeat.default" for node in cache_writes)
+        scans = [node for node in nodes if str(node.target) == "aten.cumsum.default"]
+        assert len(scans) == (1 if name == "target_verify" else 0)
+        assert all(node.meta["val"].dtype == torch.int32 for node in scans)
         calls = [node for node in nodes if str(node.target) == "npu.npu_chunk_gated_delta_rule.default"]
         if name == "draft":
             assert audit == [] and not calls
             assert "custom_op_export_contracts" not in graph["metadata"]
             assert graph["standard_op_overrides"] == []
+            # Each of the two fixture layers repeats both K and V heads.
+            head_repeats = [node for node in nodes if str(node.target) == "aten.repeat.default"
+                            and node.meta["val"].ndim == 5]
+            assert len(head_repeats) == 4
         else:
             assert len(audit) == 5
             assert len(calls) == (2 if name == "target_verify" else 1)
