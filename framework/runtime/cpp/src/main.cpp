@@ -1,6 +1,8 @@
 #include "qwen35_dflash/acl_executor.hpp"
+#include "qwen35_dflash/chunk.hpp"
 #include "qwen35_dflash/generation.hpp"
 #include "qwen35_dflash/sha256.hpp"
+#include "qwen35_dflash/stage_profile.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -40,6 +42,9 @@ struct Arguments {
   std::size_t warmup = 3;
   std::size_t repetitions = 10;
   int device_id = 0;
+  std::string model_kind = "recompute";
+  std::string mode = "paired";
+  qwen35::dflash::ProfileOptions profile;
 };
 
 void Usage(std::ostream& stream) {
@@ -47,6 +52,8 @@ void Usage(std::ostream& stream) {
       << "Usage: qwen35_dflash_acl_runner [options]\n"
       << "  --model PATH                 hash-locked integrated OM\n"
       << "  --model-sha256 HEX           expected OM SHA-256\n"
+      << "  --model-kind TYPE            recompute or chunk (model is a loading plan)\n"
+      << "  --mode MODE                  paired, ordinary or dflash; default paired\n"
       << "  --output PATH                paired JSON report\n"
       << "  --prompt-token-ids CSV       non-empty pretokenized prompt\n"
       << "  --eos-token-ids CSV          optional EOS token IDs\n"
@@ -56,6 +63,11 @@ void Usage(std::ostream& stream) {
       << "  --warmup N                   target evidence requires 3\n"
       << "  --repetitions N              target evidence requires 10\n"
       << "  --device-id N                default 0\n";
+  stream << "  --profile-stage STAGE       diagnostic prefill/decode (ordinary), prefill/draft/verify (dflash), or all\n"
+         << "  --profile-mode MODE         ordinary or dflash; use tools/run_msprof.sh --profile-backend cpp\n"
+         << "  --profile-output PATH       new raw msprof directory (controller owned)\n"
+         << "  --profile-warmup N          unprofiled fresh-state warmups; default 1\n"
+         << "  --profile-aic-metrics NAME  default PipeUtilization\n";
 }
 
 std::string Trim(std::string value) {
@@ -187,6 +199,14 @@ Arguments ParseArguments(int argc, char** argv) {
   Arguments result;
   result.model = TakeRequired(&values, "model");
   result.model_sha256 = TakeRequired(&values, "model-sha256");
+  result.model_kind = TakeOptional(&values, "model-kind", "recompute");
+  result.mode = TakeOptional(&values, "mode", "paired");
+  if (result.mode != "paired" && result.mode != "ordinary" && result.mode != "dflash") {
+    throw std::invalid_argument("mode must be paired, ordinary or dflash");
+  }
+  if (result.model_kind != "recompute" && result.model_kind != "chunk") {
+    throw std::invalid_argument("model-kind must be recompute or chunk");
+  }
   result.output = TakeRequired(&values, "output");
   result.prompt_token_ids = ParseTokenIds(
       TakeRequired(&values, "prompt-token-ids"), false, "prompt-token-ids");
@@ -208,6 +228,25 @@ Arguments ParseArguments(int argc, char** argv) {
     throw std::invalid_argument("device-id must be non-negative");
   }
   result.device_id = static_cast<int>(device_id);
+  result.profile.stage = TakeOptional(&values, "profile-stage", "");
+  result.profile.mode = TakeOptional(&values, "profile-mode", "dflash");
+  result.profile.output = TakeOptional(&values, "profile-output", "");
+  result.profile.metrics = TakeOptional(&values, "profile-aic-metrics", "PipeUtilization");
+  const auto profile_warmup = ParseInt64(TakeOptional(&values, "profile-warmup", "1"), "profile-warmup");
+  if (profile_warmup < 0) throw std::invalid_argument("profile-warmup must be non-negative");
+  result.profile.warmup = static_cast<std::size_t>(profile_warmup);
+  result.profile.device_id = result.device_id;
+  if (!result.profile.stage.empty()) {
+    if (result.model_kind != "chunk") throw std::invalid_argument("stage capture requires --model-kind chunk");
+    if (result.mode != "paired" && result.mode != result.profile.mode) throw std::invalid_argument("mode disagrees with profile-mode");
+    result.mode = result.profile.mode;
+    qwen35::dflash::ValidateProfileOptions(result.profile);
+    if (std::filesystem::exists(result.output) || std::filesystem::is_symlink(result.output)) {
+      throw std::invalid_argument("profile report must be a new file");
+    }
+  } else if (!result.profile.output.empty() || result.profile.mode != "dflash") {
+    throw std::invalid_argument("profile-output/profile-mode requires profile-stage");
+  }
   if (!values.empty()) {
     throw std::invalid_argument("unknown option --" + values.begin()->first);
   }
@@ -319,10 +358,20 @@ void WriteMeasurement(
          << ",\"decode_iterations\":"
          << value.counters.decode_iterations << "},\"latency_ms\":{"
          << "\"prefill\":" << value.prefill_ms
+         << ",\"request_reset\":" << value.request_reset_ms
          << ",\"decode\":" << value.decode_ms
          << ",\"model_total\":" << value.model_total_ms
          << "},\"decode_iteration_ms\":";
   WriteDoubles(output, value.decode_iteration_ms);
+  output << ",\"stage_ms\":{";
+  bool first_stage = true;
+  for (const auto& stage : value.stage_ms) {
+    if (!first_stage) output << ',';
+    first_stage = false;
+    output << '\"' << JsonEscape(stage.first) << "\":";
+    WriteDoubles(output, stage.second);
+  }
+  output << '}';
   output << '}';
 }
 
@@ -361,7 +410,7 @@ void WriteBenchmark(std::ostream& output, const BenchmarkResult& value) {
 void WriteReport(
     std::ostream& output,
     const Arguments& arguments,
-    const qwen35::dflash::AclExecutor& executor,
+    const qwen35::dflash::GraphExecutor& executor,
     double load_ms,
     double benchmark_wall_ms,
     const PairedBenchmarkResult& result) {
@@ -378,17 +427,22 @@ void WriteReport(
          << "\"cpu_fallback\":false,\"device_id\":"
          << arguments.device_id << ",\"model\":{\"path\":\""
          << JsonEscape(std::filesystem::absolute(arguments.model).string())
-         << "\",\"sha256\":\"" << arguments.model_sha256 << "\"},"
-         << "\"abi\":{\"input_names\":[\"input_ids\",\"attention_mask\"],"
+         << "\",\"sha256\":\"" << arguments.model_sha256 << "\"},";
+  if (arguments.model_kind == "chunk") {
+    output << "\"abi\":{\"id\":\"qwen35-dflash-chunk-v1\",\"graph_count\":4,\"sequence_length\":";
+  } else {
+    output << "\"abi\":{\"input_names\":[\"input_ids\",\"attention_mask\"],"
          << "\"output_names\":[\"target_top1\",\"draft_top1\"],"
-         << "\"dtype\":\"int64\",\"sequence_length\":"
-         << executor.sequence_length() << ",\"draft_width\":"
+         << "\"dtype\":\"int64\",\"sequence_length\":";
+  }
+  output << executor.sequence_length() << ",\"draft_width\":"
          << executor.draft_width() << "},\"protocol\":{\"warmup\":"
          << arguments.warmup << ",\"repetitions\":"
          << arguments.repetitions
          << ",\"order\":\"alternating ordinary/DFlash in one loaded process\","
          << "\"synchronization\":\"one aclrtSynchronizeStream after queued H2D, execute, D2H\","
-         << "\"model_load_excluded_from_latency\":true},"
+         << "\"model_load_excluded_from_latency\":true,"
+         << "\"request_reset_excluded_from_latency\":" << (arguments.model_kind == "chunk" ? "true" : "false") << "},"
          << "\"prompt_token_ids\":";
   WriteTokenIds(output, arguments.prompt_token_ids);
   output << ",\"eos_token_ids\":";
@@ -449,16 +503,47 @@ int main(int argc, char** argv) {
     }
 
     const auto load_start = std::chrono::steady_clock::now();
-    qwen35::dflash::AclExecutor executor(arguments.model, arguments.device_id);
+    std::unique_ptr<qwen35::dflash::GraphExecutor> executor;
+    if (arguments.model_kind == "chunk") {
+      executor = std::make_unique<qwen35::dflash::AclChunkExecutor>(arguments.model, arguments.device_id, arguments.mode);
+    } else {
+      executor = std::make_unique<qwen35::dflash::AclExecutor>(arguments.model, arguments.device_id);
+    }
     const auto load_end = std::chrono::steady_clock::now();
     qwen35::dflash::GenerationOptions options;
     options.pad_token_id = arguments.pad_token_id;
     options.max_new_tokens = arguments.max_new_tokens;
     options.max_draft_tokens = arguments.max_draft_tokens;
     options.eos_token_ids = arguments.eos_token_ids;
+    if (!arguments.profile.stage.empty()) {
+      auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(*executor);
+      auto report = qwen35::dflash::ProfileChunk(chunk, arguments.prompt_token_ids, options, arguments.profile);
+      report.pop_back();
+      report += ",\"runner_version\":\"" + JsonEscape(QWEN35_DFLASH_RUNNER_VERSION) +
+          "\",\"model_sha256\":\"" + arguments.model_sha256 + "\"}";
+      AtomicWrite(arguments.output, report);
+      std::cout << report << '\n';
+      return 0;
+    }
     const auto benchmark_start = std::chrono::steady_clock::now();
+    if (arguments.mode != "paired") {
+      const auto mode = arguments.mode == "dflash" ? qwen35::dflash::GenerationMode::kDFlash : qwen35::dflash::GenerationMode::kOrdinary;
+      const auto result = qwen35::dflash::Benchmark(*executor, arguments.prompt_token_ids, mode, options, arguments.warmup, arguments.repetitions);
+      std::ostringstream report;
+      report << std::setprecision(17) << "{\"schema_version\":1,\"status\":\"PASS\",\"scope\":\"single-mode execution; no ordinary parity claim\",\"runner_version\":\""
+             << JsonEscape(QWEN35_DFLASH_RUNNER_VERSION) << "\",\"model_kind\":\"" << arguments.model_kind
+             << "\",\"cpu_fallback\":false,\"device_id\":" << arguments.device_id
+             << ",\"model_sha256\":\"" << arguments.model_sha256 << "\",\"prompt_token_ids\":";
+      WriteTokenIds(report, arguments.prompt_token_ids);
+      report << ",\"ordinary_parity\":{\"status\":\"NOT_RUN\"},\"benchmark\":";
+      WriteBenchmark(report, result);
+      report << '}';
+      AtomicWrite(arguments.output, report.str());
+      std::cout << report.str() << '\n';
+      return 0;
+    }
     const PairedBenchmarkResult result = qwen35::dflash::BenchmarkPair(
-        executor,
+        *executor,
         arguments.prompt_token_ids,
         options,
         arguments.warmup,
@@ -471,7 +556,7 @@ int main(int argc, char** argv) {
             benchmark_end - benchmark_start)
             .count();
     std::ostringstream report;
-    WriteReport(report, arguments, executor, load_ms, benchmark_ms, result);
+    WriteReport(report, arguments, *executor, load_ms, benchmark_ms, result);
     AtomicWrite(arguments.output, report.str());
     std::cout << report.str() << '\n';
     return 0;

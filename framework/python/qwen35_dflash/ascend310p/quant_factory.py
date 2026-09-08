@@ -360,6 +360,8 @@ class QuantFullPrefixExportTarget(nn.Module):
 
 def create_quant_recompute_graph(
     config: Mapping[str, Any],
+    *,
+    _incremental: bool = False,
 ) -> tuple[AirGraphSpec, ...]:
     """Load the locked quant Target/Draft pair and return one AIR graph spec."""
 
@@ -381,6 +383,9 @@ def create_quant_recompute_graph(
     if dtype_name not in _DTYPES:
         raise ValueError("quant AIR export supports Target/Draft float16 only")
     dtype = _DTYPES[dtype_name]
+    include_ordinary_decode = config.get("include_ordinary_decode", True)
+    if type(include_ordinary_decode) is not bool:
+        raise TypeError("include_ordinary_decode must be a bool")
     device = str(config.get("device", "npu:0"))
     if not device.startswith("npu"):
         raise ValueError("formal quant AIR export requires an explicit NPU device")
@@ -439,16 +444,21 @@ def create_quant_recompute_graph(
 
     # Fail before loading 4B weights if the NPU extension is unavailable.
     try:
-        importlib.import_module("torch_npu")
+        npu_module = importlib.import_module("torch_npu")
     except ImportError as error:
         raise RuntimeError("torch_npu is required for quant AIR export") from error
+    if _incremental:
+        missing = [name for name in ("npu_chunk_gated_delta_rule", "adn_fused_infer_attention")
+                   if not callable(getattr(npu_module, name, None))]
+        if missing:
+            raise RuntimeError("incremental AIR export needs receiver NPU operations: " + ", ".join(missing))
 
     from models.dflash_v1.modeling_dflash import DFlashDraftModel
-    from models.internal_dflash_bridge import load_qwen35_target
+    from models.internal_dflash_bridge import load_qwen35_target, load_qwen35_rollback_target
 
     with _quant_environment(
         quant_config=quant_config,
-        kv_cache_max_len=max_sequence_length,
+        kv_cache_max_len=max_sequence_length + (64 if _incremental else 0),
     ) as quant_identity:
         quant_paths = {
             Path(str(quant_identity["quant_weight_path"])).resolve(),
@@ -463,7 +473,8 @@ def create_quant_recompute_graph(
             raise ValueError(
                 "quant YAML artifact paths differ from the input_manifest"
             )
-        target = load_qwen35_target(
+        loader = load_qwen35_rollback_target if _incremental else load_qwen35_target
+        target = loader(
             str(target_dir),
             device=torch.device(device),
             dtype=dtype,
@@ -474,8 +485,6 @@ def create_quant_recompute_graph(
         device=device,
         dtype=dtype,
     ).eval()
-    enable_padded_draft_context(draft)
-    target_adapter = QuantFullPrefixExportTarget(target).eval()
     pad_token_id = int(config.get("pad_token_id", 0))
     metadata = {
         "factory_id": QUANT_GRAPH_FACTORY_ID,
@@ -522,6 +531,23 @@ def create_quant_recompute_graph(
             "separate later optimization"
         ),
     }
+    if _incremental:
+        import torch_npu
+        from models.modeling_qwen3_5_hiai_nd_dflash_rollback import apply_rotary_pos_emb
+        from .incremental import incremental_graph_specs
+
+        metadata.update({
+            "factory_id": "qwen3.5-4b-quant-w8a8-dflash-chunk-v1",
+            "gdr_effective_length_contract": "INT16[1] explicit call-local valid rows",
+            "claim_boundary": "Explicit-state candidate; real TorchAir/ATC and device parity gates required.",
+            "target_rollback_audit": dict(target.dflash_rollback_audit),
+        })
+        return incremental_graph_specs(target, draft, capacity=max_sequence_length,
+            metadata=metadata, gdr=torch_npu.npu_chunk_gated_delta_rule,
+            attention=torch_npu.adn_fused_infer_attention, rotary=apply_rotary_pos_emb,
+            custom_ops=(adn_rms_norm_export,), include_ordinary_decode=include_ordinary_decode)
+    enable_padded_draft_context(draft)
+    target_adapter = QuantFullPrefixExportTarget(target).eval()
     return (
         integrated_recompute_graph_spec(
             target_adapter,
@@ -537,10 +563,16 @@ def create_quant_recompute_graph(
     )
 
 
+def create_quant_incremental_graphs(config: Mapping[str, Any]) -> tuple[AirGraphSpec, ...]:
+    """Load the same locked weights with the branch's rollback target class."""
+    return create_quant_recompute_graph(config, _incremental=True)
+
+
 __all__ = [
     "AirDFlashOps",
     "QUANT_BASE_REVISION",
     "QUANT_GRAPH_FACTORY_ID",
     "QuantFullPrefixExportTarget",
     "create_quant_recompute_graph",
+    "create_quant_incremental_graphs",
 ]

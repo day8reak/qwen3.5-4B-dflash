@@ -25,7 +25,7 @@ from .dflash_rollback_decode import (
 )
 from .msprof_cli import (
     COLLECTOR, CONTROL_FD_ENV, PROFILE_STAGES, SINGLE_STAGES,
-    MsprofStageProfiler, captured_calls,
+    ORDINARY_STAGES, MsprofStageProfiler, captured_calls, stages_for_mode,
 )
 from .target_quant import (
     TARGET_EMBEDDING_SCALE_PATH_ENV,
@@ -104,6 +104,8 @@ def _snapshot_gdr_calls(target):
 
 
 def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--profile-mode", choices=("ordinary", "dflash"), default="dflash",
+                        help="diagnostic execution route (default: dflash)")
     parser.add_argument(
         "--profile-stage", choices=PROFILE_STAGES,
         help="NPU diagnostic: collect one selected stage, or all stages separately in one process",
@@ -120,9 +122,11 @@ def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
 
 def validate_profile_request(args, *, source_root: Path) -> None:
     if args.profile_stage is None:
-        if args.profile_output is not None:
-            raise ValueError("--profile-output requires --profile-stage")
+        if args.profile_output is not None or getattr(args, "profile_mode", "dflash") != "dflash":
+            raise ValueError("--profile-output/--profile-mode requires --profile-stage")
         return
+    if args.profile_stage != "all" and args.profile_stage not in stages_for_mode(getattr(args, "profile_mode", "dflash")):
+        raise ValueError("stage is unavailable for the selected --profile-mode")
     if str(args.device).split(":", 1)[0] != "npu":
         raise ValueError("--profile-stage requires a real NPU")
     if os.environ.get("ASCEND310P_SIMULATION_ONLY") == "1":
@@ -308,6 +312,7 @@ def profile_one_stage(
     return {
         "schema_version": 3,
         "route": "qwen3.5-dflash-single-stage-profile",
+        "profile_mode": "dflash", "profile_backend": "python",
         "status": "PASS_CAPTURE",
         "formal_latency_evidence": False,
         "strict_greedy_exact_match": None,
@@ -354,6 +359,7 @@ def profile_all_stages(adapter, prompt_token_ids, *, block_size, eos_token_ids, 
         )
     return {
         "schema_version": 4, "route": "qwen3.5-dflash-all-stage-profile",
+        "profile_mode": "dflash", "profile_backend": "python",
         "status": "PASS_CAPTURE", "profile_stage": "all",
         "profile_output": profiler.output, "collector": COLLECTOR,
         "aic_metrics": profiler.metrics, "capture_windows": len(reports),
@@ -363,5 +369,109 @@ def profile_all_stages(adapter, prompt_token_ids, *, block_size, eos_token_ids, 
         "correctness_gate": {"status": "NOT_RUN_STAGE_DIAGNOSTIC"},
         "model_loads": 1, "warmup_iterations_per_stage": warmup,
         "state_policy": "same prompt, fresh first-round state per warmup and capture",
+        "max_new_tokens_applies": False,
+    }
+
+
+def profile_ordinary_stage(target, prompt_token_ids, *, stage, device, eos_token_ids, warmup, profiler):
+    """One native ordinary prefill or one real single-token decode, no Draft load."""
+    if stage not in ORDINARY_STAGES or warmup < 0:
+        raise ValueError("invalid ordinary stage or warmup count")
+    prompt, device = _normalize_prompt(prompt_token_ids, device)
+    prompt_ids = _input_ids(prompt, device)
+    eos = _normalize_eos(eos_token_ids)
+    measured_counts = None
+    measured_gdr = None
+
+    def snapshot():
+        audit = target.dflash_rollback_audit
+        result = {key: audit.get(key) for key in ("ordinary_prefill_token_calls", "ordinary_decode_calls")}
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in result.values()):
+            raise RuntimeError("ordinary target is missing execution counters")
+        return result
+
+    @contextmanager
+    def capture(measured):
+        nonlocal measured_counts, measured_gdr
+        if not measured:
+            yield
+            return
+        before, gdr_before = snapshot(), _snapshot_gdr_calls(target)
+        with profiler.capture():
+            yield
+        after, gdr_after = snapshot(), _snapshot_gdr_calls(target)
+        measured_counts = {k: after[k] - before[k] for k in before}
+        measured_gdr = {k: gdr_after[k] - gdr_before[k] for k in gdr_before}
+
+    @torch.inference_mode()
+    def once(measured):
+        if stage == "prefill":
+            with capture(measured):
+                output = target.begin_ordinary(prompt_ids)
+            return {"anchor_token_id": _top1_rows(output, expected_rows=None, source="ordinary prefill")[-1]}
+        output = target.begin_ordinary(prompt_ids)
+        anchor = _top1_rows(output, expected_rows=None, source="ordinary bootstrap")[-1]
+        if anchor in eos:
+            raise RuntimeError("prefill anchor is EOS; no ordinary decode to profile")
+        token_ids = _input_ids([anchor], device)
+        with capture(measured):
+            output = target.advance_ordinary(token_ids)
+        return {"anchor_token_id": anchor,
+                "next_token_id": _top1_rows(output, expected_rows=1, source="ordinary decode")[0]}
+
+    reference = None
+    for _ in range(warmup):
+        reference = once(False)
+        profiler.synchronize()
+    measured = once(True)
+    stable = None if reference is None else reference == measured
+    if stable is False or profiler.windows != 1:
+        raise RuntimeError("ordinary capture must be one repeatable window")
+    expected = {"ordinary_prefill_token_calls": (len(prompt) + 63) // 64 if stage == "prefill" else 0,
+                "ordinary_decode_calls": int(stage == "decode")}
+    if measured_counts != expected or measured_gdr != {"verify": 0, "commit": 0}:
+        raise RuntimeError("captured ordinary calls differ from the selected stage")
+    return {
+        "schema_version": 3, "route": "qwen3.5-ordinary-single-stage-profile",
+        "status": "PASS_CAPTURE", "profile_mode": "ordinary", "profile_backend": "python",
+        "profile_stage": stage, "profile_output": profiler.output,
+        "collector": COLLECTOR, "aic_metrics": profiler.metrics, "capture_windows": 1,
+        "captured_calls": captured_calls(stage, "ordinary"),
+        "captured_ordinary_calls": measured_counts, "captured_gdr_layer_calls": measured_gdr,
+        "gdr_backend": GDR_BACKEND, "operator_rows_required": True,
+        "warmup_iterations": warmup, "warmup_output_match": stable,
+        "profiled_elapsed_ms": profiler.elapsed_ms, "prompt_tokens": len(prompt),
+        "stage_scope": (
+            "one complete Target.begin_ordinary: cache reset, all real prompt chunks and final LM head; "
+            "excludes input upload and anchor Top1; no Draft feature collection or projection"
+            if stage == "prefill" else
+            "one Target.advance_ordinary with [1,1] input: single-row target forward, LM head and state update; "
+            "excludes prefill/cache preparation, input upload, anchor and next-token Top1"
+        ),
+        "profiled_elapsed_excludes": "msprof attach/start/stop/quit and controller waits",
+        "formal_latency_evidence": False, "strict_greedy_exact_match": None,
+        "correctness_gate": {"status": "NOT_RUN_STAGE_DIAGNOSTIC"},
+        "max_new_tokens_applies": False, "draft_model_loaded": False, "result": measured,
+    }
+
+
+def profile_ordinary_all(target, prompt_token_ids, *, device, eos_token_ids, warmup, profiler):
+    reports = []
+    for stage in ORDINARY_STAGES:
+        print(f"[stage-profile] preparing ordinary stage={stage} warmup={warmup}", flush=True)
+        reports.append(profile_ordinary_stage(
+            target, prompt_token_ids, stage=stage, device=device, eos_token_ids=eos_token_ids,
+            warmup=warmup, profiler=profiler.for_stage(stage),
+        ))
+    return {
+        "schema_version": 4, "route": "qwen3.5-ordinary-all-stage-profile",
+        "status": "PASS_CAPTURE", "profile_mode": "ordinary", "profile_backend": "python",
+        "profile_stage": "all", "profile_output": profiler.output, "collector": COLLECTOR,
+        "aic_metrics": profiler.metrics, "capture_windows": len(reports),
+        "stages": list(ORDINARY_STAGES), "captures": reports,
+        "formal_latency_evidence": False, "strict_greedy_exact_match": None,
+        "correctness_gate": {"status": "NOT_RUN_STAGE_DIAGNOSTIC"},
+        "model_loads": 1, "draft_model_loaded": False, "warmup_iterations_per_stage": warmup,
+        "state_policy": "same prompt, fresh ordinary cache per warmup and capture",
         "max_new_tokens_applies": False,
     }

@@ -12,11 +12,18 @@ Qwen3.5-4B persistent DFlash rollback，并支持同一套代码在两种 Target
 Qwen3.5 DFlash port，不是 z-lab/dflash 全部 generation API 的逐行复制，也尚未取得 Ascend
 310P 端到端加速结论。
 
-`framework/quant-air-om` 分支在这份 `quant` 实现上增加了独立部署层：用现有 W8A8 Target
-和 FP16 Draft 导出 TorchAir AIR，通过 ATC 生成 OM，并由 C++ AscendCL runner 加载 OM、
-循环生成 token。入口和完整验证方法见
-[基于 quant 的 AIR/OM/C++ 框架](docs/QUANT_AIR_OM_FRAMEWORK.md)。第一版 OM 使用静态完整前缀
-重算来冻结功能 ABI；现有 persistent rollback 仍是后续增量 OM 状态 ABI 的语义基线。
+本分支新增 [增量 AIR → OM → C++ 路径](docs/GDR_CHUNK_AIR_OM.md)：DFlash 使用 prefill、
+Draft、融合 verify/accept/commit 三个 OM，普通对照增加第四个一行 decode OM。
+Target prefill 共用，DFlash 不调用 decode OM。显式 KV/GDN 状态保留在 C++ device buffer。
+旧 [完整前缀重算框架](docs/QUANT_AIR_OM_FRAMEWORK.md) 继续作为对照。
+新增路径通过 host Tensor/export fixture 和真实 C++ + fake ACL 检查，实际 TorchAir/ATC、
+原生 ordinary 对照与 Ascend 310P 性能门禁仍待目标机验证。
+
+普通模式在 **Python NPU 和 C++ OM 两个入口**均支持
+`--profile-mode ordinary --profile-stage prefill|decode|all`；`all` 分别只采一次 prefill
+和一次真实一行 decode。C++ 再加 `--profile-backend cpp`。完整可复制命令见
+[Python NPU 文档](docs/DFLASH_RUN_AND_VALIDATE.md#74-只采一次-prefill-或-draft-生成--target-verify)
+和 [C++ OM 文档](docs/GDR_CHUNK_AIR_OM.md#c-和-python-的单次-msprof)。
 
 ## 当前实现
 

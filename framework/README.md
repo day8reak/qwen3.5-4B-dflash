@@ -1,5 +1,10 @@
 # Quant AIR/OM 推理框架
 
+`feature/gdr-chunk-verify` 增加了显式状态增量工厂：DFlash 使用 prefill、Draft、verify
+（含接受判断和第二次 GDR）三个 OM，普通对照可选第四个 decode OM。
+见 [增量 AIR/OM/C++ 文档](../docs/GDR_CHUNK_AIR_OM.md)。下文两输入/两输出针对旧重算基线；
+增量代码通过 host 检查，真实 TorchAir/ATC 和 Ascend 310P 门禁仍待实机执行。
+
 这个目录是直接加在仓库 `quant` 分支之上的部署层，不替换现有量化、rollback 或 DFlash
 实现。基线提交固定为 `28f93e784a2beed87020a80bd93c8788754eab1c`。
 

@@ -98,6 +98,14 @@ def command_build_cpp(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_chunk_plan(args: argparse.Namespace) -> int:
+    from .incremental_plan import write_incremental_plan
+    from .utils import sha256_file
+    path, _, contract = write_incremental_plan(args.deployment_manifest, args.output, mode=args.mode)
+    _print({"plan": str(path), "sha256": sha256_file(path), "mode": args.mode, "abi": contract["abi"]})
+    return 0
+
+
 def _synchronize_tensor_device(value: torch.Tensor) -> None:
     if value.device.type == "npu":
         torch.npu.synchronize(value.device)  # type: ignore[attr-defined]
@@ -329,6 +337,11 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    chunk_plan = subparsers.add_parser("prepare-chunk-plan", help="validate incremental OMs and write the native loading plan")
+    chunk_plan.add_argument("--deployment-manifest", type=Path, required=True)
+    chunk_plan.add_argument("--output", type=Path, required=True)
+    chunk_plan.add_argument("--mode", choices=("paired", "ordinary", "dflash"), default="paired")
+    chunk_plan.set_defaults(handler=command_chunk_plan)
 
     export = subparsers.add_parser("export-air", help="export factory graphs to AIR")
     export.add_argument("--factory", required=True, help="module:function graph factory")

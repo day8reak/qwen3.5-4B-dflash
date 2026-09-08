@@ -75,6 +75,7 @@ assert "DFLASH_MSPROF_PROCESS_CAPTURE" not in os.environ
 if failure == "application": sys.exit(7)
 def value(flag): return args[args.index(flag) + 1]
 stage = value("--profile-stage")
+mode = value("--profile-mode") if "--profile-mode" in args else "dflash"
 root = pathlib.Path(value("--profile-output"))
 spec = importlib.util.spec_from_file_location("real_msprof_cli", os.environ["TEST_CONTROLLER"])
 module = importlib.util.module_from_spec(spec)
@@ -88,12 +89,13 @@ reports = []
 with module.MsprofStageProfiler(
     str(root), 0, value("--profile-aic-metrics"), synchronize,
     stage="incorrect" if failure == "mismatched-ready" else stage,
+    mode=mode,
 ) as profiler:
     assert not active.exists()
     if failure == "control-eof":
         profiler.close()
         time.sleep(30)
-    stages = module.SINGLE_STAGES if stage == "all" else (stage,)
+    stages = module.stages_for_mode(mode) if stage == "all" else (stage,)
     for selected in stages:
         current_failure = failure_for_stage(selected)
         if current_failure == "skip-stage": continue
@@ -115,7 +117,8 @@ with module.MsprofStageProfiler(
             "profile_stage": selected, "capture_windows": 1,
             "profile_output": window.output, "operator_fallback_enabled": False,
             "profiled_elapsed_ms": window.elapsed_ms,
-            "captured_calls": module.captured_calls(selected),
+            "captured_calls": module.captured_calls(selected, mode),
+            "profile_mode": mode, "profile_backend": "python",
             "gdr_backend": "npu_chunk_gated_delta_rule_two_pass",
             "operator_rows_required": True,
             "captured_gdr_layer_calls": {
@@ -139,6 +142,7 @@ report = reports[0] if stage != "all" else {
     "status": "PASS_CAPTURE", "collector": module.COLLECTOR, "profile_stage": "all",
     "capture_windows": len(reports), "profile_output": str(root),
     "operator_fallback_enabled": False, "stages": list(stages), "captures": reports,
+    "profile_mode": mode, "profile_backend": "python",
 }
 if failure == "invalid-report": report["capture_windows"] = 2
 pathlib.Path(value("--report")).write_text(json.dumps(report))
@@ -206,6 +210,23 @@ for line in sys.stdin:
 
 def read_events(sandbox):
     return [json.loads(line) for line in sandbox["events"].read_text().splitlines()]
+
+
+@pytest.mark.parametrize("stage", ["prefill", "decode", "all"])
+def test_ordinary_wrapper_uses_two_stage_protocol(sandbox, stage):
+    output = sandbox["tmp"] / "ordinary"
+    result = subprocess.run([
+        "bash", str(SCRIPT), "--label", "ordinary", "--output-dir", str(output),
+        "--python", sys.executable, "--msprof-bin", sandbox["msprof"],
+        "--profile-mode", "ordinary", "--profile-stage", stage,
+        "--profile-timeout", "5", "--", sandbox["app"], "-m", "models.dflash_v1.run_npu",
+    ], env=sandbox["env"], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    control = json.loads((output / "manifest/ordinary-control.json").read_text())
+    assert control["profile_mode"] == "ordinary"
+    stages = ["prefill", "decode"] if stage == "all" else [stage]
+    assert [e[1] for e in read_events(sandbox) if e[0] == "captured-work"] == stages
+    assert len([e for e in read_events(sandbox) if e == ["command", "start"]]) == len(stages)
 
 
 def assert_processes_reaped(control):

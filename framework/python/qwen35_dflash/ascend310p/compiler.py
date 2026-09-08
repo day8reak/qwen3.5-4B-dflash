@@ -138,6 +138,16 @@ def compile_air_bundle(
         raise ValueError("unexpected AIR artifact kind")
     exact_soc_version = validate_soc_version(soc_version)
     atc_path = resolve_atc_executable(atc_bin)
+    graphs = air_manifest.get("graphs")
+    if not isinstance(graphs, list) or not graphs:
+        raise ValueError("AIR manifest requires a non-empty graph list")
+    names = [graph.get("name") if isinstance(graph, Mapping) else None for graph in graphs]
+    if any(not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None for name in names):
+        raise ValueError("AIR graph has an invalid name")
+    if len(set(names)) != len(names):
+        raise ValueError("AIR graph names must be unique")
+    from .incremental_plan import validate_incremental_bundle
+    validate_incremental_bundle(graphs)
 
     arguments = _validate_extra_args(extra_args)
     execute = runner or _default_runner
@@ -150,7 +160,7 @@ def compile_air_bundle(
     log_root.mkdir(parents=True, exist_ok=True)
 
     compiled: list[dict[str, Any]] = []
-    for graph in air_manifest.get("graphs", []):
+    for graph in graphs:
         if not isinstance(graph, Mapping):
             raise TypeError("AIR graph manifest entry must be an object")
         name = str(graph["name"])
@@ -187,7 +197,7 @@ def compile_air_bundle(
         result = execute(command, air_path.parent)
         log_path = log_root / f"{name}.log"
         log_path.write_text(result.stdout or "", encoding="utf-8")
-        om_path = output_prefix.with_suffix(".om")
+        om_path = Path(str(output_prefix) + ".om")
         if result.returncode != 0:
             raise AtcCompileError(
                 f"ATC failed for {name!r} with exit {result.returncode}; log={log_path}"
@@ -200,6 +210,7 @@ def compile_air_bundle(
             {
                 "name": name,
                 "role": graph["role"],
+                "metadata": dict(graph.get("metadata", {})),
                 "input_names": list(graph.get("input_names", [])),
                 "output_names": list(graph.get("output_names", [])),
                 "custom_op_audit": custom_op_audit,

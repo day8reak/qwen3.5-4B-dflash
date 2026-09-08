@@ -38,6 +38,8 @@ from .stage_profile import (
     add_profile_arguments,
     profile_all_stages,
     profile_one_stage,
+    profile_ordinary_stage,
+    profile_ordinary_all,
     validate_profile_request,
 )
 
@@ -284,7 +286,7 @@ def _run(args, *, request_started: float, cleanup: ExitStack) -> int:
         profiler = cleanup.enter_context(MsprofStageProfiler(
             args.profile_output, int(torch.npu.current_device()),
             args.profile_aic_metrics, lambda: _synchronize_device(args.device),
-            stage=args.profile_stage,
+            stage=args.profile_stage, mode=args.profile_mode,
         ))
 
     target_root = Path(args.target_dir).expanduser().resolve()
@@ -324,6 +326,36 @@ def _run(args, *, request_started: float, cleanup: ExitStack) -> int:
         "target_load_end",
         {"route": target_route, "transactional": True},
     )
+    if profiler is not None and args.profile_mode == "ordinary":
+        required_rows = len(prompt_ids) + int(args.profile_stage in {"decode", "all"})
+        capacity = getattr(target, "kv_cache_max_len", None)
+        if capacity is not None and required_rows > int(capacity):
+            raise ValueError("KV capacity must cover prompt plus one ordinary decode row")
+        profile = profile_ordinary_all if args.profile_stage == "all" else profile_ordinary_stage
+        stage_arguments = {} if args.profile_stage == "all" else {"stage": args.profile_stage}
+        report = profile(
+            target, prompt_ids, **stage_arguments, device=torch.device(args.device),
+            eos_token_ids=args.eos_token_id, warmup=args.profile_warmup, profiler=profiler,
+        )
+        profiler.close()
+        source_identity_after = _rollback_runtime_identity(package_dir)
+        if source_identity_after != source_identity_before:
+            raise RuntimeError("runtime source identity changed during ordinary profiling")
+        report.update({
+            "execution_mode": "profile", "device": args.device, "dtype": str(dtype),
+            "runtime_identity": _legacy._runtime_identity(torch.device(args.device)),
+            "rollback_runtime_identity": source_identity_after, "target_route": target_route,
+            "operator_fallback_enabled": False, "target_checkpoint": target_checkpoint,
+            "draft_checkpoint": draft_checkpoint, "draft_model_loaded": False,
+            "target_rollback_audit": dict(target.dflash_rollback_audit),
+            "target_quantization": dict(target.dflash_target_quantization_audit),
+            "request": {"prompt_token_ids": prompt_ids, "profile_mode": "ordinary"},
+        })
+        serialized = json.dumps(report, indent=2, sort_keys=True)
+        _atomic_report(args.report, serialized)
+        print(serialized)
+        return 0
+
     # Query free memory after the Target is resident.  Running this check
     # before Target load can report enough space for the Draft and then OOM
     # immediately because the multi-gigabyte Target allocation was omitted.

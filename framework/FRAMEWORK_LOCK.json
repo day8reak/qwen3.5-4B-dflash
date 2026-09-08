@@ -1,6 +1,6 @@
 {
-  "schema_version": 3,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v3",
+  "schema_version": 4,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v4",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -21,19 +21,49 @@
     "name": "quant_dflash_recompute",
     "role": "generation-recompute",
     "inputs": [
-      {"name": "input_ids", "dtype": "int64", "shape": [1, "S"]},
-      {"name": "attention_mask", "dtype": "int64", "shape": [1, "S"]}
+      {
+        "name": "input_ids",
+        "dtype": "int64",
+        "shape": [
+          1,
+          "S"
+        ]
+      },
+      {
+        "name": "attention_mask",
+        "dtype": "int64",
+        "shape": [
+          1,
+          "S"
+        ]
+      }
     ],
     "outputs": [
-      {"name": "target_top1", "dtype": "int64", "shape": [1, "S"]},
-      {"name": "draft_top1", "dtype": "int64", "shape": [1, 15]}
+      {
+        "name": "target_top1",
+        "dtype": "int64",
+        "shape": [
+          1,
+          "S"
+        ]
+      },
+      {
+        "name": "draft_top1",
+        "dtype": "int64",
+        "shape": [
+          1,
+          15
+        ]
+      }
     ],
     "shape_policy": "static S divisible by 64 and at most 32767; right-padded valid prefix",
     "gdr_effective_length": {
       "external_om_input": false,
       "source": "count nonzero attention_mask rows along S inside the graph",
       "dtype": "int16",
-      "shape": ["B"],
+      "shape": [
+        "B"
+      ],
       "semantics": "call-local logical valid rows; not physical S, cumulative KV length, or MTP accepted_tokens"
     },
     "custom_operator_export": {
@@ -71,5 +101,39 @@
     "warmup": 3,
     "measured_repetitions": 10
   },
-  "claim_boundary": "Host and fake-ACL tests do not prove AIR export, OM conversion, physical 310P correctness, or latency. Those gates require the real locked target environment."
+  "claim_boundary": "Host and fake-ACL tests do not prove AIR export, OM conversion, physical 310P correctness, or latency. Those gates require the real locked target environment.",
+  "incremental_graphs": {
+    "factory": "qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_graphs",
+    "abi": "qwen35-dflash-chunk-v1",
+    "contract_file": "framework/abi/dflash-chunk-v1.json",
+    "dflash_oms": [
+      "target_prefill",
+      "target_verify",
+      "draft"
+    ],
+    "optional_ordinary_om": "target_decode",
+    "om_limit": 4,
+    "commit": "acceptance and accepted+1 second GDR are internal to target_verify",
+    "state": "explicit FP16 persistent GDN/conv/KV; FP32 GDR accumulator; current/next device banks and logical cursor",
+    "status": "HOST_VERIFIED_DEVICE_GATES_PENDING"
+  },
+  "profiling": {
+    "collector": "msprof dynamic CLI",
+    "wrapper": "tools/run_msprof.sh",
+    "python_ordinary_stages": [
+      "prefill",
+      "decode"
+    ],
+    "cpp_ordinary_stages": [
+      "prefill",
+      "decode"
+    ],
+    "cpp_dflash_stages": [
+      "prefill",
+      "draft",
+      "verify"
+    ],
+    "all": "one fresh-state window per declared stage, same loaded application PID",
+    "python_profile_api": false
+  }
 }

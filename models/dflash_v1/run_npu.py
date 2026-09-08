@@ -224,6 +224,8 @@ def _configure_target_quantization(args: argparse.Namespace) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.profile_stage is None and args.profile_mode != "dflash":
+        raise ValueError("--profile-mode requires --profile-stage")
     if not str(args.device).startswith("npu"):
         raise ValueError("run_npu requires --device npu or npu:N")
     if args.reset_hook is not None:
@@ -302,6 +304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.profile_stage is not None:
         adapter_args.extend([
             "--profile-stage", args.profile_stage,
+            "--profile-mode", args.profile_mode,
             "--profile-warmup", str(args.profile_warmup),
             "--profile-aic-metrics", args.profile_aic_metrics,
         ])

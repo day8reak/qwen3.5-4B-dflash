@@ -328,6 +328,52 @@ profile 时长当作单次 measurement latency。
 
 ### 7.4 只采一次 prefill 或 Draft 生成 + Target verify
 
+**普通模式也支持单次采集**，Python NPU 和新增 C++ OM 入口均可使用。
+保留下面默认 DFlash 命令不变；普通模式在 wrapper 的 `--` 前加
+`--profile-mode ordinary --profile-stage prefill|decode|all`（实际填写其中一个阶段名）。
+`all` 在普通模式下只有两个窗口：完整 prefill 一次、一行 decode 一次。
+
+```bash
+tools/run_msprof.sh \
+  --label ordinary-all --output-dir "$BENCH_DIR/ordinary-all" \
+  --python "$MODEL_PYTHON" \
+  --profile-mode ordinary --profile-stage all --profile-warmup 1 \
+  --aic-metrics PipeUtilization \
+  -- "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+    --target-dir /path/to/Qwen3.5-4B \
+    --draft-dir /path/to/Qwen3.5-4B-DFlash \
+    --kv-cache-max-len 2048 --device npu:0 \
+    --prompt "请用一句话解释为什么天空是蓝色的。" \
+    --prompt-mode chat --enable-thinking
+```
+
+只采一次 prefill 或 decode，替换上面的 `all` 并换新输出路径即可。
+W8A8 在应用参数中照常加 `--config /path/to/qwen3.5.ymal --quant_mode enable`。
+此 ordinary 调用本分支 Target 的 `begin_ordinary` / `advance_ordinary`，与 rollback
+benchmark ordinary 对照一致；不运行原 main `inference.py`。沿用现有 `--draft-dir` 配置和
+checkpoint 审计，但不加载 Draft 模型，也不调用 Draft 投影/生成或 Target verify/commit。
+
+- `prefill` 窗口包含 cache reset、完整 prompt 的分块 Target forward 和最后一行 LM head；
+  不采集 prompt tensor 上传、anchor Top1、Draft 特征收集/投影。
+- `decode` 先在窗口外执行真实 ordinary prefill，取首 token 并上传 `[1,1]` 输入；只采一次
+  `advance_ordinary` 的 Target forward、LM head 和状态更新。下一 token 的 Top1 在窗口外。
+- 所有 warmup 都从相同 prompt 新建状态，采集前也重新准备；`--max-new-tokens` 不控制窗口。
+  KV 要容纳 prompt 加一行；anchor 为 EOS 时明确退出，不生成空 decode 采集。
+
+`all` 的两份算子数据在 `profile/msprof/ordinary-all/prefill/` 和 `decode/`，
+同步耗时见 `ordinary-all-stage-summary.csv`。`ordinary-all-stage-report.json` 记录
+`captured_ordinary_calls`，其中 decode 窗口必须是 prefill=0、decode=1，Draft/verify/commit=0。
+prefill 的 `ordinary_prefill_token_calls` 历史字段名实际计数 64 行分块，不能当作 token 数。
+
+C++ 同样用此 wrapper，新增 `--profile-backend cpp`，应用换成
+`qwen35_dflash_acl_runner --model-kind chunk`，模型输入是 hash-locked 加载计划。
+完整命令、四图/三图准备、融合 verify 的范围与输出说明见
+[增量 OM 文档的单次 msprof 部分](GDR_CHUNK_AIR_OM.md#c-和-python-的单次-msprof)。
+C++ 采集控制只需要 Python 标准库，不依赖 torch_npu 或 pyACL；普通只加载 prefill/decode
+两个 OM。C++ 的 Top1 融合在 OM 内，计时范围与 Python 有差异，不能直接比较窗口时长。
+
+以下继续说明默认 `--profile-mode dflash` 的 Python 9 阶段诊断。
+
 本分支的 verify/commit 使用两次原 chunk GDR：第一次生成全部 verify rows 的输出，
 第二次按 `accepted + 1` 重算 committed GDN state。单独测第一次使用 `verify`，
 单独测第二次及提交使用 `accept-commit`；测 Draft 到提交的首轮事务使用 `decode-round`。

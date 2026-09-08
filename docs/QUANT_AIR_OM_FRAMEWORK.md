@@ -1,5 +1,9 @@
 # 基于 `quant` 分支的 AIR → OM → C++ token 推理框架
 
+`feature/gdr-chunk-verify` 的增量路线已另行实现，见
+[GDR_CHUNK_AIR_OM.md](GDR_CHUNK_AIR_OM.md)：DFlash 三个 OM，普通对照可选四图；
+verify/接受判断/第二次 GDR 合在同一个 OM。本文保留原重算基线及其命令。
+
 ## 1. 目标和边界
 
 本框架直接建立在远端 `quant` 分支提交

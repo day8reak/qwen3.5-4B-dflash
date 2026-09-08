@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -50,9 +51,11 @@ struct GenerationMeasurement {
   std::string stop_reason;
   GenerationCounters counters;
   double prefill_ms = 0.0;
+  double request_reset_ms = 0.0;
   double decode_ms = 0.0;
   double model_total_ms = 0.0;
   std::vector<double> decode_iteration_ms;
+  std::map<std::string, std::vector<double>> stage_ms;
 };
 
 struct Distribution {

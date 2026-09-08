@@ -1,4 +1,5 @@
 #include "qwen35_dflash/generation.hpp"
+#include "qwen35_dflash/chunk.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -180,6 +181,9 @@ GenerationMeasurement GenerateOnce(
     const std::vector<std::int64_t>& prompt_token_ids,
     GenerationMode mode,
     const GenerationOptions& options) {
+  if (auto* chunk = dynamic_cast<ChunkExecutor*>(&executor)) {
+    return GenerateChunk(*chunk, prompt_token_ids, mode, options);
+  }
   ValidateInputs(executor, prompt_token_ids, options);
   const std::unordered_set<std::int64_t> eos(
       options.eos_token_ids.begin(), options.eos_token_ids.end());

@@ -15,6 +15,7 @@ import torch
 from models.dflash_v1 import run_npu, run_rollback
 from models.dflash_v1.stage_profile import (
     MsprofStageProfiler, profile_all_stages, profile_one_stage, validate_profile_request,
+    profile_ordinary_stage, profile_ordinary_all,
 )
 from models.dflash_v1.msprof_cli import SINGLE_STAGES, PROFILE_STAGES
 
@@ -64,7 +65,22 @@ class FakeTarget:
             "gdr_backend": "npu_chunk_gated_delta_rule_two_pass",
             "rollback_gdr_verify_layer_calls": self.adapter.gdr_verify_calls,
             "rollback_gdr_commit_layer_calls": self.adapter.gdr_commit_calls,
+            "ordinary_prefill_token_calls": getattr(self, "prefill_calls", 0),
+            "ordinary_decode_calls": getattr(self, "decode_calls", 0),
         }
+
+    def begin_ordinary(self, ids):
+        self.prefill_calls = getattr(self, "prefill_calls", 0) + (ids.shape[1] + 63) // 64
+        return self.begin_rollback(ids)
+
+    def advance_ordinary(self, ids):
+        assert tuple(ids.shape) == (1, 1) and self.adapter.cursor > 0
+        self.adapter.events.append(("ordinary-decode", self.adapter.collector.active))
+        if self.adapter.fail_verify:
+            raise RuntimeError("injected ordinary failure")
+        self.decode_calls = getattr(self, "decode_calls", 0) + 1
+        self.adapter.cursor += 1
+        return {"logits": logits([int(ids[0, 0]) + 1])}
 
     def begin_rollback(self, ids):
         a = self.adapter
@@ -153,7 +169,7 @@ class FakeAdapter:
 def setup_profiler(tmp_path, monkeypatch):
     controllers = []
 
-    def create(stage="draft-verify"):
+    def create(stage="draft-verify", mode="dflash"):
         events = []
         server, client = socket.socketpair()
         collector = SocketController(events, server)
@@ -162,7 +178,7 @@ def setup_profiler(tmp_path, monkeypatch):
         monkeypatch.setenv("DFLASH_MSPROF_CONTROL_TIMEOUT", "3")
         profiler = MsprofStageProfiler(
             str(tmp_path / "raw"), 2, "MemoryUB",
-            lambda: events.append(("sync", collector.active)), stage=stage,
+            lambda: events.append(("sync", collector.active)), stage=stage, mode=mode,
         )
         thread = threading.Thread(target=collector.run, daemon=True)
         thread.start()
@@ -437,6 +453,43 @@ def test_all_captures_each_stage_once_in_order_with_fresh_state(setup_profiler):
     assert [Path(p).name for p in outputs] == list(SINGLE_STAGES)
     assert all(c["warmup_output_match"] for c in report["captures"])
     assert events.count(("start",)) == events.count(("stop",)) == len(SINGLE_STAGES)
+
+
+@pytest.mark.parametrize("stage", ["prefill", "decode", "all"])
+def test_ordinary_windows_exclude_bootstrap_and_draft(setup_profiler, stage):
+    events, collector, profiler = setup_profiler(stage, mode="ordinary")
+    adapter = FakeAdapter(collector, events)
+    function = profile_ordinary_all if stage == "all" else profile_ordinary_stage
+    args = {} if stage == "all" else {"stage": stage}
+    with profiler:
+        report = function(adapter.target, [1] * 129, device=torch.device("cpu"),
+                          eos_token_ids=[], warmup=2, profiler=profiler, **args)
+    stages = ["prefill", "decode"] if stage == "all" else [stage]
+    assert [m["stage"] for m in collector.messages if m["event"] == "ready"] == stages
+    assert adapter.requests == 3 * len(stages)
+    assert report["capture_windows"] == len(stages)
+    assert [e[0] for e in events if len(e) > 1 and e[1] is True and e[0] != "sync"] == (
+        (["prefill-chunk"] * 3 if "prefill" in stages else [])
+        + (["ordinary-decode"] if "decode" in stages else []))
+    assert not any(e[0] in {"draft", "verify", "projection", "commit"} for e in events)
+    reports = report["captures"] if stage == "all" else [report]
+    assert all(c["warmup_output_match"] and c["draft_model_loaded"] is False for c in reports)
+    if "decode" in stages:
+        assert reports[-1]["captured_calls"]["target_decode"] == 1
+
+
+@pytest.mark.parametrize("failure", ["eos", "execute"])
+def test_ordinary_decode_failure_never_reports_success(setup_profiler, failure):
+    events, collector, profiler = setup_profiler("decode", mode="ordinary")
+    adapter = FakeAdapter(collector, events, anchor=99 if failure == "eos" else 10,
+                          fail_verify=failure == "execute")
+    with profiler, pytest.raises(RuntimeError, match="EOS|injected ordinary"):
+        profile_ordinary_stage(adapter.target, [1], stage="decode", device=torch.device("cpu"),
+                               eos_token_ids=[99], warmup=0, profiler=profiler)
+    if failure == "eos":
+        assert not collector.messages
+    else:
+        assert collector.messages[-1] == {"event": "done", "success": False}
 
 
 def test_all_stops_before_later_stages_after_verify_failure(setup_profiler):

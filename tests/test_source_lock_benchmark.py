@@ -105,6 +105,15 @@ class BenchmarkSourceLockTests(unittest.TestCase):
         self.assertIn("do not require GDR-MTP", lock["rollback_runtime"]["policy"])
         self.assertIn("Draft stays FP16", lock["rollback_runtime"]["policy"])
 
+    def test_incremental_framework_files_match_source_lock(self) -> None:
+        lock = json.loads((REPOSITORY / "SOURCE_LOCK.json").read_text("utf-8"))
+        files = lock["incremental_om_framework"]["files"]
+        names = {item["source_file"] for item in files}
+        self.assertIn("framework/runtime/cpp/src/stage_profile.cpp", names)
+        self.assertIn("framework/python/qwen35_dflash/ascend310p/incremental.py", names)
+        for item in files:
+            self._assert_locked_files(item, (("source_file", "source_sha256"),))
+
 
 if __name__ == "__main__":
     unittest.main()

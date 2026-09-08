@@ -33,15 +33,28 @@ SINGLE_STAGES = (
     "prefill", "feature-project", "draft", "verify-input", "verify",
     "target-top1", "accept-commit", "draft-verify", "decode-round",
 )
-PROFILE_STAGES = (*SINGLE_STAGES, "all")
+ORDINARY_STAGES = ("prefill", "decode")
+CPP_DFLASH_STAGES = ("prefill", "draft", "verify")
+PROFILE_STAGES = (*SINGLE_STAGES, "decode", "all")
 
 
-def captured_calls(stage):
-    return {
+def stages_for_mode(mode="dflash", backend="python"):
+    if mode not in {"ordinary", "dflash"} or backend not in {"python", "cpp"}:
+        raise ValueError("invalid profiling mode or backend")
+    return ORDINARY_STAGES if mode == "ordinary" else (
+        CPP_DFLASH_STAGES if backend == "cpp" else SINGLE_STAGES
+    )
+
+
+def captured_calls(stage, mode="dflash"):
+    result = {
         "prefill": int(stage == "prefill"),
         "draft": int(stage in {"draft", "draft-verify", "decode-round"}),
         "target_verify": int(stage in {"verify", "draft-verify", "decode-round"}),
     }
+    if mode == "ordinary":
+        result["target_decode"] = int(stage == "decode")
+    return result
 
 
 def positive_timeout(value) -> float:
@@ -54,9 +67,11 @@ def positive_timeout(value) -> float:
 class MsprofStageProfiler:
     """Application-side barriers; the parent process owns msprof collection."""
 
-    def __init__(self, output, device_id, metrics, synchronize, *, stage):
+    def __init__(self, output, device_id, metrics, synchronize, *, stage, mode="dflash"):
         self.output, self.device_id, self.metrics = output, device_id, metrics
         self.synchronize, self.stage = synchronize, stage
+        self.mode = mode
+        self.stages = stages_for_mode(mode)
         self.windows = 0
         self.elapsed_ms = None
         self._channel = None
@@ -68,13 +83,13 @@ class MsprofStageProfiler:
         if self.stage != "all" or self._channel is None:
             raise RuntimeError("stage views require an active all-stage profiler")
         index = len(self._children)
-        if index >= len(SINGLE_STAGES) or stage != SINGLE_STAGES[index]:
+        if index >= len(self.stages) or stage != self.stages[index]:
             raise RuntimeError("all-stage captures must follow the declared stage order")
         if self._children and self._children[-1].windows != 1:
             raise RuntimeError("previous stage did not capture exactly one window")
         child = MsprofStageProfiler(
             str(Path(self.output) / stage), self.device_id, self.metrics,
-            self.synchronize, stage=stage,
+            self.synchronize, stage=stage, mode=self.mode,
         )
         child._channel, child._reader = self._channel, self._reader
         self._children.append(child)
@@ -180,6 +195,7 @@ class DynamicCapture:
 
     def __init__(self, args):
         self.args = args
+        self.stages = stages_for_mode(getattr(args, "mode", "dflash"), getattr(args, "backend", "python"))
         self.app = self.prof = None
         self.channel = None
         self.terminal = None
@@ -199,7 +215,9 @@ class DynamicCapture:
         self.capture_evidence = self.evidence
         self.current_stage = args.stage
         if args.stage == "all":
-            self.evidence.update(schema_version=2, stages=list(SINGLE_STAGES), captures=[])
+            self.evidence.update(schema_version=2, stages=list(self.stages), captures=[])
+        self.evidence.update(profile_mode=getattr(args, "mode", "dflash"),
+                             profile_backend=getattr(args, "backend", "python"))
 
     def event(self, name):
         event = {"event": name, "monotonic_seconds": monotonic()}
@@ -333,7 +351,7 @@ class DynamicCapture:
         self.evidence["application_pid"] = self.app.pid
         self.selector.register(parent, selectors.EVENT_READ, "control")
         self.selector.register(self.app.stdout, selectors.EVENT_READ, "application")
-        stages = SINGLE_STAGES if self.args.stage == "all" else (self.args.stage,)
+        stages = self.stages if self.args.stage == "all" else (self.args.stage,)
         for stage in stages:
             output = str(Path(self.args.output) / stage) if self.args.stage == "all" else self.args.output
             self.current_stage = stage
@@ -445,7 +463,7 @@ class DynamicCapture:
             self.evidence.setdefault("msprof_exit_code", None)
         if self.args.stage == "all":
             self.evidence["msprof_exit_code"] = (
-                0 if len(self.evidence["captures"]) == len(SINGLE_STAGES)
+                0 if len(self.evidence["captures"]) == len(self.stages)
                 and all(c.get("msprof_exit_code") == 0 for c in self.evidence["captures"])
                 else None
             )
@@ -456,11 +474,15 @@ def main(argv=None):
     parser.add_argument("--msprof-bin", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--stage", required=True, choices=PROFILE_STAGES)
+    parser.add_argument("--mode", choices=("ordinary", "dflash"), default="dflash")
+    parser.add_argument("--backend", choices=("python", "cpp"), default="python")
     parser.add_argument("--metrics", default="PipeUtilization", choices=("PipeUtilization", "Memory", "MemoryUB"))
     parser.add_argument("--timeout", type=positive_timeout, default=DEFAULT_TIMEOUT)
     parser.add_argument("--control-report", required=True)
     parser.add_argument("application", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    if args.stage != "all" and args.stage not in stages_for_mode(args.mode, args.backend):
+        parser.error("stage is unavailable for the selected mode/backend")
     if args.application[:1] == ["--"]:
         args.application.pop(0)
     if not args.application:

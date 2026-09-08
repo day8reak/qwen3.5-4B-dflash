@@ -457,9 +457,11 @@ def test_padded_draft_context_matches_compact_quant_draft() -> None:
     assert len(list(exported.graph.nodes)) > 100
 
 
+@pytest.mark.parametrize("graph_name", ["quant_dflash_recompute", "target.verify"])
 def test_compile_uses_air_framework_and_hash_locks_payload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    graph_name: str,
 ) -> None:
     run_dir = tmp_path / "run"
     bundle = run_dir / "bundle"
@@ -515,6 +517,7 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
             }
         ],
     }
+    manifest["graphs"][0]["name"] = graph_name
     manifest_path = bundle / "air-manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     atc = tmp_path / "atc"
@@ -537,6 +540,7 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
         atc_identity="fake-atc",
     )
     assert result["status"] == "PASS"
+    assert Path(result["graphs"][0]["om"]["path"]).name == graph_name + ".om"
     assert result["graphs"][0]["custom_op_audit"][0]["status"] == "PASS"
     assert commands[0][1:3] == ["--mode=0", "--framework=1"]
     assert commands[0][-1] == "--soc_version=Ascend310P3"

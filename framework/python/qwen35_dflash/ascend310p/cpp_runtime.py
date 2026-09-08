@@ -298,6 +298,7 @@ def validate_cpp_runner_report(
     device_id: int,
     max_new_tokens: int,
     max_draft_tokens: int,
+    chunk_abi: bool = False,
 ) -> None:
     if report.get("status") != "PASS" or report.get("runner_id") != CPP_RUNNER_ID:
         raise RuntimeError("C++ ACL runner did not produce a passing known report")
@@ -319,11 +320,13 @@ def validate_cpp_runner_report(
     if protocol.get("warmup") != 3 or protocol.get("repetitions") != 10:
         raise RuntimeError("C++ runner protocol is not the locked 3+10")
     abi = report.get("abi", {})
-    if abi.get("input_names") != ["input_ids", "attention_mask"]:
+    if chunk_abi and (abi.get("id") != "qwen35-dflash-chunk-v1" or abi.get("graph_count") != 4):
+        raise RuntimeError("C++ runner incremental ABI differs")
+    if not chunk_abi and abi.get("input_names") != ["input_ids", "attention_mask"]:
         raise RuntimeError("C++ runner input ABI differs")
-    if abi.get("output_names") != ["target_top1", "draft_top1"]:
+    if not chunk_abi and abi.get("output_names") != ["target_top1", "draft_top1"]:
         raise RuntimeError("C++ runner output ABI differs")
-    if str(abi.get("dtype", "")).lower() != "int64":
+    if not chunk_abi and str(abi.get("dtype", "")).lower() != "int64":
         raise RuntimeError("C++ runner ABI dtype differs")
     ordinary = report.get("ordinary")
     dflash = report.get("dflash")
@@ -372,10 +375,16 @@ def run_cpp_pair(
     if not tokens:
         raise ValueError("C++ runner prompt tokens must not be empty")
     identity = _runtime_identity(runner_options, device_id)
-    om_path, deployment, graph = _resolve_integrated_om(
-        deployment_manifest,
-        graph_name=identity["graph_name"],
-    )
+    deployment = load_json_object(Path(deployment_manifest).expanduser().resolve())
+    chunk = any(g.get("metadata", {}).get("incremental_contract") for g in deployment.get("graphs", []))
+    if chunk:
+        from .incremental_plan import write_incremental_plan
+        om_path, deployment, contract = write_incremental_plan(
+            deployment_manifest, Path(raw_output).with_suffix(".chunk-plan.txt"))
+        graph = {"name": "qwen35-dflash-chunk-v1", "om": file_record(om_path, relative_to=om_path.parent)}
+    else:
+        om_path, deployment, graph = _resolve_integrated_om(
+            deployment_manifest, graph_name=identity["graph_name"])
     om_record = dict(graph["om"])
     executable = resolve_cpp_runner(runner)
     raw_path = require_run_output(raw_output)
@@ -409,6 +418,8 @@ def run_cpp_pair(
         "--device-id",
         str(int(device_id)),
     ]
+    if chunk:
+        command.extend(("--model-kind", "chunk"))
     start_ns = time.perf_counter_ns()
     result = execute(
         command,
@@ -433,6 +444,7 @@ def run_cpp_pair(
         device_id=device_id,
         max_new_tokens=max_new_tokens,
         max_draft_tokens=max_draft_tokens,
+        chunk_abi=chunk,
     )
     run_root = Path(os.environ["AI_RUN_DIR"]).expanduser().resolve()
     air_record = deployment.get("air_manifest")
@@ -449,8 +461,8 @@ def run_cpp_pair(
         raise ValueError("AIR manifest integrity check failed after C++ execution")
     report["backend_metadata"] = {
         **identity,
-        "artifacts": {str(graph["name"]): str(om_record["sha256"])},
-        "state_policy": "recompute committed prefixes",
+        "artifacts": ({g["name"]: g["om"]["sha256"] for g in deployment["graphs"]} if chunk else {str(graph["name"]): str(om_record["sha256"])}),
+        "state_policy": contract["state_policy"] if chunk else "recompute committed prefixes",
         "host_hot_path": "AscendCL C++",
     }
     report["control_plane"] = {

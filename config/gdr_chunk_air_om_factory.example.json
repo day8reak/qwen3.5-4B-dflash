@@ -1,0 +1,12 @@
+{
+  "target_dir": "/ABSOLUTE/PATH/Qwen3.5-4B",
+  "draft_dir": "/ABSOLUTE/PATH/Qwen3.5-4B-DFlash",
+  "quant_config": "/ABSOLUTE/PATH/qwen3.5.yaml",
+  "input_manifest": "/ABSOLUTE/RUN/PATH/quant-input-manifest.json",
+  "receiver_models_dir": "/ABSOLUTE/PATH/qwen35-runtime/models",
+  "max_sequence_length": 512,
+  "include_ordinary_decode": true,
+  "dtype": "float16",
+  "device": "npu:0",
+  "adn_rms_norm_ge_op_type": "RmsNorm"
+}

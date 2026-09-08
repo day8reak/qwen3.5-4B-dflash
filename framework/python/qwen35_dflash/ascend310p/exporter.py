@@ -90,6 +90,12 @@ def export_air_bundle(
     # expensive and memory-heavy operation starts.
     factory_callable = resolve_callable(factory)
     specs = _normalize_specs(factory_callable(dict(factory_config)))
+    from .incremental_plan import validate_incremental_bundle
+    validate_incremental_bundle([
+        {"name": spec.name, "role": spec.role, "input_names": list(spec.input_names),
+         "output_names": list(spec.output_names), "metadata": dict(spec.metadata)}
+        for spec in specs
+    ])
     root.mkdir(parents=True, exist_ok=True)
     air_root = root / "air"
     air_root.mkdir()

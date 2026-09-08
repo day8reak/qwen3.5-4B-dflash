@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(qwen35_dflash_core STATIC
   src/generation.cpp
+  src/chunk.cpp
   src/sha256.cpp
 )
 target_include_directories(qwen35_dflash_core PUBLIC include)
@@ -46,6 +47,8 @@ if(QWEN35_DFLASH_BUILD_ACL_RUNNER)
 
   add_executable(qwen35_dflash_acl_runner
     src/acl_executor.cpp
+    src/acl_chunk.cpp
+    src/stage_profile.cpp
     src/main.cpp
   )
   target_include_directories(qwen35_dflash_acl_runner PRIVATE
@@ -78,6 +81,8 @@ if(QWEN35_DFLASH_BUILD_TESTS)
 
   add_executable(qwen35_dflash_acl_runner_fake
     src/acl_executor.cpp
+    src/acl_chunk.cpp
+    src/stage_profile.cpp
     src/main.cpp
   )
   target_include_directories(qwen35_dflash_acl_runner_fake PRIVATE tests/fake_acl)
