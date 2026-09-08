@@ -24,6 +24,7 @@ PROPOSAL_ROWS = VERIFY_ROWS - 1
 PREFILL_ROWS = 64
 SCALAR_STATE_SEED_POLICY = "per-linear-layer-jit-v1"
 CACHE_INDEX_POLICY = "once-per-verify-v1"
+DRAFT_ATTENTION_MASK_POLICY = "per-layer-logical-prefix-v1"
 
 
 class _ExplicitTargetGraph(nn.Module):
@@ -623,31 +624,68 @@ class DraftProposeStateGraph(nn.Module):
         self.kv_cache_max_len = kv_cache_max_len
         if int(getattr(draft.config, "block_size", 0)) != VERIFY_ROWS:
             raise ValueError("approved Draft graph requires block_size=16")
+        policies = []
+        for index, layer in enumerate(draft.layers):
+            attention = getattr(layer, "self_attn", None)
+            causal = getattr(attention, "is_causal", None)
+            window = getattr(attention, "sliding_window", None)
+            if not isinstance(causal, bool) or not hasattr(attention, "sliding_window"):
+                raise ValueError(f"Draft layer {index} must declare its attention policy")
+            if window is not None and (
+                isinstance(window, bool) or not isinstance(window, int) or window <= 0
+            ):
+                raise ValueError(f"Draft layer {index} sliding_window must be positive or None")
+            # Freeze the effective eager policy, not a topology-specific guess
+            # such as 'all causal' or 'only the final layer is non-causal'.
+            policies.append((causal, window))
+        self.attention_policies = tuple(policies)
 
     def _attention_mask(
         self,
         cursor: Tensor,
         context_count: Tensor,
+        proposal_count: Tensor,
         *,
+        is_causal: bool,
+        sliding_window: int | None,
         device: torch.device,
     ) -> Tensor:
+        context_end = (
+            cursor.to(torch.long) + context_count.to(torch.long)
+        ).reshape(-1, 1, 1, 1)
+        last_block_column = proposal_count.to(torch.long).reshape(-1, 1, 1, 1)
         cache_columns = torch.arange(
             self.kv_cache_max_len, dtype=torch.long, device=device
         ).reshape(1, 1, 1, -1)
-        cache_visible = cache_columns < (
-            cursor.to(torch.long) + context_count.to(torch.long)
-        ).reshape(-1, 1, 1, 1)
         query = torch.arange(VERIFY_ROWS, dtype=torch.long, device=device).reshape(
             1, 1, VERIFY_ROWS, 1
         )
         block = torch.arange(VERIFY_ROWS, dtype=torch.long, device=device).reshape(
             1, 1, 1, VERIFY_ROWS
         )
-        block_visible = block <= query
+        # Eager uses K+1 block rows. Fixed T16 must hide the padded key columns
+        # even in full-attention layers. Give discarded query rows the last
+        # live query's visibility so a short sliding window cannot create an
+        # all-masked softmax/NaN. These rows never become visible as keys.
+        query = torch.minimum(query, last_block_column)
+        cache_visible = cache_columns < context_end
+        block_visible = block <= last_block_column
+        if is_causal:
+            block_visible = block_visible & (block <= query)
+        if sliding_window is not None:
+            # The block follows the logical context, NOT the physical cache
+            # capacity. Apply the same strict distance bound as eager to both
+            # old context and block keys, including across cache reuse rounds.
+            cache_visible = cache_visible & (
+                context_end + query - cache_columns < sliding_window
+            )
+            block_visible = block_visible & (query - block < sliding_window)
+            if not is_causal:
+                block_visible = block_visible & (block - query < sliding_window)
         return torch.cat(
             (
                 cache_visible.expand(-1, 1, VERIFY_ROWS, -1),
-                block_visible,
+                block_visible.expand(-1, 1, VERIFY_ROWS, -1),
             ),
             dim=-1,
         )
@@ -715,13 +753,18 @@ class DraftProposeStateGraph(nn.Module):
             context_capacity=context_capacity,
             block_rows=VERIFY_ROWS,
         )
-        attention_mask = self._attention_mask(
-            logical_draft_cursor,
-            committed_input_count,
-            device=anchor.device,
-        )
         hidden = noise
-        for layer in self.draft.layers:
+        for layer, (is_causal, sliding_window) in zip(
+            self.draft.layers, self.attention_policies
+        ):
+            attention_mask = self._attention_mask(
+                logical_draft_cursor,
+                committed_input_count,
+                logical_proposal_count,
+                is_causal=is_causal,
+                sliding_window=sliding_window,
+                device=anchor.device,
+            )
             hidden = layer.forward_cached(
                 hidden,
                 projected,
@@ -994,6 +1037,11 @@ def incremental_state_graph_specs(
                     "draft_kv_repeat_policy": DRAFT_KV_REPEAT_POLICY,
                     "draft_kv_repeat_layers": draft_layers,
                     "draft_kv_repeat_groups": int(draft.config.num_key_value_groups),
+                    "draft_attention_mask_policy": DRAFT_ATTENTION_MASK_POLICY,
+                    "draft_attention_layers": [
+                        {"index": index, "is_causal": causal, "sliding_window": window}
+                        for index, (causal, window) in enumerate(propose.attention_policies)
+                    ],
                 }
                 if role in {"draft-propose", "fused-speculative-step"}
                 else {}

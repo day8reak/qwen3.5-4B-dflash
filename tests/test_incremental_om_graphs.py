@@ -382,6 +382,7 @@ class _FakeDraftLayer(nn.Module):
     def __init__(self, layer_index: int) -> None:
         super().__init__()
         self.layer_index = layer_index
+        self.self_attn = SimpleNamespace(is_causal=True, sliding_window=None)
 
     def forward_cached(
         self,
@@ -691,6 +692,12 @@ def test_five_physical_specs_freeze_binding_order_and_reuse_state_examples() -> 
     assert specs[3].metadata["draft_kv_repeat_policy"] == "gqa-head-repeat-tile-v1"
     assert specs[3].metadata["draft_kv_repeat_layers"] == len(draft.layers)
     assert specs[3].metadata["draft_kv_repeat_groups"] == 1
+    assert specs[3].metadata["draft_attention_mask_policy"] == "per-layer-logical-prefix-v1"
+    assert specs[3].metadata["draft_attention_layers"] == [
+        {"index": i, "is_causal": True, "sliding_window": None} for i in range(2)
+    ]
+    assert all("draft_attention_mask_policy" not in item.metadata
+               for item in specs if item.role != "draft-propose")
     assert all("draft_kv_repeat_policy" not in item.metadata
                for item in specs if item.role != "draft-propose")
     assert all("draft_cache_index_policy" not in item.metadata
@@ -797,6 +804,8 @@ def test_four_physical_specs_fuse_draft_and_verify_without_external_carrier() ->
     assert fused.metadata["draft_cache_index_layers"] == 2
     assert fused.metadata["draft_kv_repeat_policy"] == "gqa-head-repeat-tile-v1"
     assert fused.metadata["draft_kv_repeat_layers"] == 2
+    assert fused.metadata["draft_attention_mask_policy"] == "per-layer-logical-prefix-v1"
+    assert len(fused.metadata["draft_attention_layers"]) == 2
     assert all("draft_kv_repeat_policy" not in item.metadata for item in specs[:-1])
     assert isinstance(fused.model, FusedSpeculativeStepStateGraph)
     assert fused.dynamic is True

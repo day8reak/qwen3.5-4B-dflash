@@ -33,7 +33,7 @@ def _batched_cache_update_proposal() -> dict[str, object]:
 def test_incremental_contract_has_exact_approval_but_is_not_active() -> None:
     contract = _contract()
     approval = json.loads(APPROVAL_PATH.read_text(encoding="utf-8"))
-    assert contract["schema_version"] == 9
+    assert contract["schema_version"] == 10
     assert contract["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
     assert approval["status"] == "APPROVED"
     assert approval["approval_statement"] == "批准多OM状态图"
@@ -335,9 +335,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 41
+    assert framework_lock["schema_version"] == 42
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v41"
+        "qwen3.5-4b-quant-air-om-ascendcl-v42"
     )
     residency = framework_lock["runtime"]["incremental_model_residency"]
     assert residency["default"] == "phase-resident for merged static split; all-resident for legacy topologies"
@@ -348,6 +348,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert split["roles"] == default["roles"]
     assert split["public_input_output_counts"] == default["public_input_output_counts"]
     assert split["draft_static_feature_rows"] == 64
+    correction = framework_lock["draft_attention_correction"]
+    assert correction["policy"] == split["draft_attention_mask_policy"]
+    assert correction["scope"] == ["draft-propose", "fused-speculative-step"]
     assert split["resident_groups"][-1] == ["draft-propose", "target-verify-commit"]
     assert default["roles"] == ["target-prefill", "target-decode1", "draft-propose", "target-verify-commit"]
     assert default["public_input_output_counts"] == [[9, 11], [8, 8], [8, 4], [9, 13]]

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +30,7 @@ class _MaskReadingLayer(nn.Module):
     def __init__(self, index):
         super().__init__()
         self.index = index
+        self.self_attn = SimpleNamespace(is_causal=True, sliding_window=None)
 
     def forward_cached(self, hidden, projected, cosine, sine, cache, attention_mask):
         combined = torch.cat((projected, hidden), dim=1).unsqueeze(1)

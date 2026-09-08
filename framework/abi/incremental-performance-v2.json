@@ -1,5 +1,5 @@
 {
-  "schema_version": 9,
+  "schema_version": 10,
   "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
   "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
   "default_static_split": {
@@ -11,6 +11,8 @@
     "physical_verify_rows": 16,
     "prefill": "64 physical rows per chunk; body plus exact Top1/EOS; only final chunk result observed",
     "feature_policy": "fixed-16/committed-prefix describe source rows only; every static Draft binds N rows with same-stream zero padding",
+    "draft_attention_mask_policy": "per-layer-logical-prefix-v1",
+    "draft_attention": "v42 preserves per-layer causal/sliding/full attention over live cache and K+1 block rows; physical T16 padding is never visible as a key, including in the non-causal layer; AIR/OM regeneration required",
     "request_gate": "tokenized prompt<=N; prompt+max_new_tokens+N<=KV capacity; no truncation",
     "model_residency_policy": "phase-resident",
     "resident_groups": [["target-prefill"], ["target-decode1"], ["draft-propose", "target-verify-commit"]],

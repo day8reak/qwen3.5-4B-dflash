@@ -1,8 +1,14 @@
-# v41 默认：合并 Prefill + Decode1 + 静态 Draft + Verify16
+# 默认：合并 Prefill + Decode1 + 静态 Draft + Verify16
 
 从 v41 / C++ runner 1.25.0 起，默认构图采用四个静态 OM。先在此路径跑通并完成严格
 greedy 对齐，再另建动态候选；本次不缩减模型、量化精度、KV 容量或请求长度。
 这是用户选择的源码默认值，不代表已经取得 Ascend310P 真机正确性或性能结论。
+
+**v42 修复 Draft mask 语义，四图默认拓扑仍保持 v41。** 旧显式状态 Draft 把最后一层
+full attention 错误覆盖成 causal；新实现保留逐层策略，并在 K<15 时屏蔽物理 block padding。
+已经跑通 v41 的用户也需从 `export-air → compile-om` 重建新 bundle；只更新 C++ 无效。
+详见 [Draft/eager 对齐与重跑说明](DRAFT_OM_ATTENTION_PARITY.md)。这次没有重新量化或修改
+C++ ABI，匹配四图 ABI 的 runner 1.25.0 可继续使用；接受率改善仍需真机测量。
 
 ## 文档入口与版本范围
 
@@ -17,7 +23,7 @@ greedy 对齐，再另建动态候选；本次不缩减模型、量化精度、K
 | 旧 fused 静态导出或动态排错 | [静态 fused 基线](STATIC_FUSED_OM_BASELINE.md)、[性能候选参考](INCREMENTAL_OM_PERFORMANCE.md) | 显式回退 / 独立候选 |
 | PyTorch eager rollback 对照 | [rollback 运行与验证](DFLASH_RUN_AND_VALIDATE.md) | 不是 OM 生成或 OM 验收 |
 
-本页默认值对应源码提交 `acb43d5b3d975e3204e75d915e7a41375ed0f6b0`。
+四图拓扑默认值最初对应源码提交 `acb43d5b3d975e3204e75d915e7a41375ed0f6b0`。
 该源码的主机验证为 Python 676 passed（另 43 subtests）、C++/fake ACL 32/32、
 ASan/UBSan 生命周期专项 4/4，以及 31 个 C++ 报告正例 / 186 个损坏报告拒绝用例。
 这些不是新 OM 的 ATC 编译、真机显存、零 token 差异或加速证据；设备门禁仍待执行。
@@ -197,6 +203,7 @@ stop reason 零差异，并完成 3 warmup + 10 次未 profiling 测量，才能
 ```
 
 门禁通过后，失败的导出从 `export-air` 重跑；已生成且有效的 v41 OM 不因文档哈希修复而失效。
+这句话仅适用于文档哈希修复，不适用于 v42 的 Draft mask 修复；后者必须重新导出/编译。
 不要关闭检查、删除锁条目、批量重算未知脏工作树的哈希或清理无关本地文件。
 以后包括纯文档提交在内，也应运行 `tests/test_source_lock_benchmark.py` 与静态四图回归中的
 真实源码锁正例 / 文档变更拒绝用例；最终提交前跑完整测试。
@@ -205,7 +212,7 @@ stop reason 零差异，并完成 3 warmup + 10 次未 profiling 测量，才能
 
 - 旧静态 fused 四图：使用 `create_quant_fused_speculative_step_graphs` 和
   [原静态 fused 配置](../config/quant_air_om_static_fused_factory.example.json)，runner 可显式选
-  phase-resident 或 all-resident；保留的旧正确 bundle 可复用。
+  phase-resident 或 all-resident；旧 bundle 只作为对照，修复 Draft mask 需重导 fused AIR/OM。
 - 旧 split-head 五图：仍用 `create_quant_incremental_state_graphs`，但设
   `merged_prefill: false`、`draft_static_feature_rows: 0`，Draft 回到动态契约；默认 all-resident。
 - 原 unified Target-step 或 recompute：显式选择对应旧 factory 与匹配配置，不与新四图混装。
