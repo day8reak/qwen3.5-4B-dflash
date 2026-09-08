@@ -216,6 +216,26 @@ def _execute_streaming(
     )
 
 
+def _runner_failure_details(stdout: str, failure_path: Path) -> str:
+    """Keep the actionable child error; never replace it with a JSON read error."""
+    try:
+        diagnostic = load_json_object(failure_path)
+        if (
+            diagnostic.get("report_kind") == "cpp-ascendcl-generation-failure"
+            and diagnostic.get("status") == "FAIL"
+        ):
+            return (
+                f"; diagnostics={failure_path}; "
+                f"runner_error={str(diagnostic.get('error', 'unknown'))[:4096]}"
+            )
+    except (OSError, ValueError, TypeError):
+        pass
+    # Older runners, signals, or unwritable output directories may have no
+    # sidecar. Retain a bounded tail instead of hiding the original exception.
+    tail = "\n".join((stdout or "").splitlines()[-20:])[-4096:]
+    return f"; runner_output_tail:\n{tail}" if tail else ""
+
+
 def resolve_cpp_runner(path: str | Path) -> Path:
     executable = Path(path).expanduser().resolve()
     if not executable.is_file() or not os.access(executable, os.X_OK):
@@ -2219,7 +2239,10 @@ def run_cpp_pair(
     )
     raw_path = require_run_output(raw_output)
     log_path = require_run_output(log_output)
-    if raw_path.exists() or log_path.exists():
+    failure_path = Path(str(raw_path) + ".failure.json")
+    invocation_path = Path(str(raw_path) + ".invocation.json")
+    if any(path.exists() or Path(str(path) + ".tmp").exists()
+           for path in (raw_path, log_path, failure_path, invocation_path)):
         raise FileExistsError("C++ runner output/log already exists in this run")
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2291,6 +2314,28 @@ def run_cpp_pair(
             ]
         )
     command.extend(["--progress", "true" if progress else "false"])
+    deployment_path = Path(deployment_manifest).expanduser().resolve()
+    # Persist before launch: even a signal or failure before JSON output must
+    # retain the exact command, executable and declared deployment identity.
+    atomic_write_json(invocation_path, {
+        "schema_version": 1,
+        "report_kind": "cpp-ascendcl-runner-invocation",
+        "execution_status": "not_recorded",
+        "command": command,
+        "runner": {
+            "path": str(executable), "bytes": executable.stat().st_size,
+            "sha256": sha256_file(executable),
+        },
+        "deployment_manifest": {
+            "path": str(deployment_path), "bytes": deployment_path.stat().st_size,
+            "sha256": sha256_file(deployment_path),
+        },
+        "backend_metadata": identity,
+        "artifacts": artifacts,
+        "raw_output": str(raw_path),
+        "log_output": str(log_path),
+        "failure_output": str(failure_path),
+    })
     _progress(
         progress,
         "stage=runner-start live child output follows; "
@@ -2320,6 +2365,8 @@ def run_cpp_pair(
     if result.returncode != 0:
         raise RuntimeError(
             f"C++ ACL runner failed with exit {result.returncode}; log={log_path}"
+            f"; invocation={invocation_path}"
+            + _runner_failure_details(result.stdout, failure_path)
         )
     if not raw_path.is_file():
         raise RuntimeError("C++ ACL runner returned success without a JSON report")
@@ -2385,6 +2432,7 @@ def run_cpp_pair(
     }
     report["control_plane"] = {
         "process_wall_ms": (end_ns - start_ns) / 1_000_000.0,
+        "runner_invocation": file_record(invocation_path, relative_to=run_root),
         "runner": {
             "path": str(executable),
             "bytes": executable.stat().st_size,

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -207,7 +208,72 @@ void EmitProgress(
   });
 }
 
+std::string MismatchMessage(const GenerationMismatch& value) {
+  std::ostringstream out;
+  out << (value.kind == "ordinary_dflash_parity"
+              ? "stateful DFlash output differs from ordinary greedy authority"
+              : "stateful generation differs from its first measured repetition")
+      << "; kind=" << value.kind << " phase=" << value.phase
+      << " run=" << value.run_index << " reference_run=" << value.reference_run_index
+      << " expected_mode=" << ModeName(value.expected_mode)
+      << " actual_mode=" << ModeName(value.actual_mode)
+      << " token_id_mismatches=" << value.token_id_mismatches;
+  if (value.first_mismatch_index) {
+    const auto index = *value.first_mismatch_index;
+    out << " first_mismatch_index=" << index
+        << " absolute_token_index=" << value.prompt_tokens + index
+        << " expected_token=";
+    if (index < value.expected.generated_token_ids.size())
+      out << value.expected.generated_token_ids[index];
+    else out << "<missing>";
+    out << " actual_token=";
+    if (index < value.actual.generated_token_ids.size())
+      out << value.actual.generated_token_ids[index];
+    else out << "<missing>";
+  } else {
+    out << " first_mismatch_index=none";
+  }
+  out << " expected_length=" << value.expected.generated_token_ids.size()
+      << " actual_length=" << value.actual.generated_token_ids.size()
+      << " expected_stop=" << value.expected.stop_reason
+      << " actual_stop=" << value.actual.stop_reason;
+  return out.str();
+}
+
+void RequireMatching(
+    const GenerationMeasurement& expected, const GenerationMeasurement& actual,
+    const char* kind, const char* phase, std::size_t run,
+    std::size_t reference_run, std::size_t prompt_tokens,
+    GenerationMode expected_mode, GenerationMode actual_mode) {
+  if (expected.generated_token_ids == actual.generated_token_ids &&
+      expected.stop_reason == actual.stop_reason) return;
+  GenerationMismatch value;
+  value.kind = kind;
+  value.phase = phase;
+  value.run_index = run;
+  value.reference_run_index = reference_run;
+  value.prompt_tokens = prompt_tokens;
+  value.expected_mode = expected_mode;
+  value.actual_mode = actual_mode;
+  value.stop_reason_mismatch = expected.stop_reason != actual.stop_reason;
+  const auto& left = expected.generated_token_ids;
+  const auto& right = actual.generated_token_ids;
+  for (std::size_t index = 0; index < std::max(left.size(), right.size()); ++index) {
+    if (index >= left.size() || index >= right.size() || left[index] != right[index]) {
+      if (!value.first_mismatch_index) value.first_mismatch_index = index;
+      ++value.token_id_mismatches;
+    }
+  }
+  value.expected = expected;
+  value.actual = actual;
+  throw GenerationMismatchError(std::move(value));
+}
+
 }  // namespace
+
+GenerationMismatchError::GenerationMismatchError(GenerationMismatch diagnostic)
+    : std::runtime_error(MismatchMessage(diagnostic)),
+      diagnostic_(std::move(diagnostic)) {}
 
 const char* ModeName(GenerationMode mode) noexcept {
   return mode == GenerationMode::kOrdinary ? "ordinary-greedy"
@@ -502,7 +568,7 @@ void ValidateStatefulInputs(
   }
 }
 
-void ValidateStatefulStep(
+void ValidateStatefulStepImpl(
     const StatefulStep& step,
     const std::unordered_set<std::int64_t>& eos,
     bool speculative,
@@ -546,6 +612,32 @@ void ValidateStatefulStep(
   }
 }
 
+void ValidateStatefulStep(
+    const StatefulStep& step, const std::unordered_set<std::int64_t>& eos,
+    bool speculative, std::size_t proposal_limit) {
+  try {
+    ValidateStatefulStepImpl(step, eos, speculative, proposal_limit);
+  } catch (const std::exception& error) {
+    std::ostringstream message;
+    message << error.what() << "; speculative=" << speculative
+            << " proposal_limit=" << proposal_limit
+            << " commit_count=" << step.token_ids.size()
+            << " drafted=" << step.drafted_tokens
+            << " accepted=" << step.accepted_draft_tokens
+            << " rejected=" << step.rejected_draft_tokens
+            << " finished=" << step.finished
+            << " compact_slot=" << step.compact_slot
+            << " compact_is_staged=" << step.compact_is_staged
+            << " token_ids=[";
+    for (std::size_t index = 0; index < std::min<std::size_t>(16, step.token_ids.size()); ++index) {
+      if (index) message << ',';
+      message << step.token_ids[index];
+    }
+    message << ']';
+    throw std::runtime_error(message.str());
+  }
+}
+
 GenerationMeasurement GenerateStatefulOnceWithContext(
     StatefulGraphExecutor& executor,
     const std::vector<std::int64_t>& prompt_token_ids,
@@ -577,6 +669,18 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
   std::vector<std::int64_t> generated;
   generated.reserve(options.max_new_tokens);
   GenerationMeasurement result;
+  if (options.collect_transaction_trace) {
+    result.transaction_trace.reserve(options.max_new_tokens);
+  }
+  const auto record = [&](const char* path, std::size_t iteration,
+                          std::size_t window_step, std::size_t begin,
+                          std::int64_t anchor, std::size_t proposal_limit,
+                          bool fallback, const StatefulStep& step) {
+    if (!options.collect_transaction_trace) return;
+    result.transaction_trace.push_back(TransactionTrace{
+        path, iteration, window_step, begin, generated.size(),
+        prompt_token_ids.size() + begin, anchor, proposal_limit, fallback, step});
+  };
 
   EmitProgress(
       progress, phase, mode, run_index, run_total, "run-start", 0,
@@ -663,6 +767,7 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
       &generated,
       &prefix,
       &finished);
+  record("prefill", 0, 0, 0, prompt_token_ids.back(), 0, false, final_prefill);
   if (has_coalesced_first_verify && !finished) {
     ValidateStatefulStep(
         coalesced_first_verify, eos, true,
@@ -680,6 +785,8 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
     }
     const std::size_t remaining =
         options.max_new_tokens - generated.size();
+    const auto begin = generated.size();
+    const auto anchor = prefix.back();
     AppendCommitted(
         coalesced_first_verify.token_ids,
         remaining,
@@ -689,6 +796,8 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
         &finished,
         coalesced_first_verify.accepted_draft_tokens == remaining &&
             coalesced_first_verify.drafted_tokens == remaining);
+    record("prefill-coalesced-verify", 0, 1, begin, anchor,
+           coalesced_first_proposal_count, false, coalesced_first_verify);
     if (zero_accept && !finished &&
         options.zero_accept_fallback_policy ==
             ZeroAcceptFallbackPolicy::kRequestTargetOnly &&
@@ -779,6 +888,8 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
       }
       const std::size_t current_remaining =
           options.max_new_tokens - generated.size();
+      const auto begin = generated.size();
+      const auto anchor = prefix.back();
       AppendCommitted(
           step.token_ids,
           current_remaining,
@@ -788,6 +899,12 @@ GenerationMeasurement GenerateStatefulOnceWithContext(
           &finished,
           speculative && step.accepted_draft_tokens == current_remaining &&
               step.drafted_tokens == current_remaining);
+      record(speculative ? "speculative-verify"
+                         : target_only_fallback_iteration ? "target-only-verify"
+                                                         : "ordinary-decode1",
+             decode_iteration, step_index, begin, anchor,
+             speculative ? proposal_counts.at(step_index) : 0,
+             target_only_fallback_iteration, step);
     }
     if (zero_accept_observed && !target_only_fallback_active && !finished &&
         options.zero_accept_fallback_policy ==
@@ -1027,44 +1144,51 @@ PairedBenchmarkResult BenchmarkPairStateful(
   if (repetitions == 0) {
     throw std::invalid_argument("benchmark repetitions must be positive");
   }
-  for (std::size_t index = 0; index < warmup; ++index) {
-    if (index % 2 == 0) {
-      static_cast<void>(GenerateStatefulOnceWithContext(
-          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
-          progress, "warmup", index + 1, warmup));
-      static_cast<void>(GenerateStatefulOnceWithContext(
-          executor, prompt_token_ids, GenerationMode::kDFlash, options,
-          progress, "warmup", index + 1, warmup));
-    } else {
-      static_cast<void>(GenerateStatefulOnceWithContext(
-          executor, prompt_token_ids, GenerationMode::kDFlash, options,
-          progress, "warmup", index + 1, warmup));
-      static_cast<void>(GenerateStatefulOnceWithContext(
-          executor, prompt_token_ids, GenerationMode::kOrdinary, options,
-          progress, "warmup", index + 1, warmup));
-    }
-  }
-
   std::vector<GenerationMeasurement> ordinary;
   std::vector<GenerationMeasurement> dflash;
   ordinary.reserve(repetitions);
   dflash.reserve(repetitions);
-  for (std::size_t index = 0; index < repetitions; ++index) {
+  const auto run_pair = [&](const char* phase, std::size_t index, std::size_t total,
+                            bool measured) {
+    GenerationMeasurement left, right;
     if (index % 2 == 0) {
-      ordinary.push_back(GenerateStatefulOnceWithContext(
+      left = GenerateStatefulOnceWithContext(
           executor, prompt_token_ids, GenerationMode::kOrdinary, options,
-          progress, "measurement", index + 1, repetitions));
-      dflash.push_back(GenerateStatefulOnceWithContext(
+          progress, phase, index + 1, total);
+      right = GenerateStatefulOnceWithContext(
           executor, prompt_token_ids, GenerationMode::kDFlash, options,
-          progress, "measurement", index + 1, repetitions));
+          progress, phase, index + 1, total);
     } else {
-      dflash.push_back(GenerateStatefulOnceWithContext(
+      right = GenerateStatefulOnceWithContext(
           executor, prompt_token_ids, GenerationMode::kDFlash, options,
-          progress, "measurement", index + 1, repetitions));
-      ordinary.push_back(GenerateStatefulOnceWithContext(
+          progress, phase, index + 1, total);
+      left = GenerateStatefulOnceWithContext(
           executor, prompt_token_ids, GenerationMode::kOrdinary, options,
-          progress, "measurement", index + 1, repetitions));
+          progress, phase, index + 1, total);
     }
+    // Check outside model timers, including warmup: never spend the remaining
+    // benchmark budget on a pair already known to violate authority.
+    if (measured && !ordinary.empty()) {
+      RequireMatching(ordinary.front(), left, "repetition_stability", phase,
+                      index + 1, 1, prompt_token_ids.size(),
+                      GenerationMode::kOrdinary, GenerationMode::kOrdinary);
+      RequireMatching(dflash.front(), right, "repetition_stability", phase,
+                      index + 1, 1, prompt_token_ids.size(),
+                      GenerationMode::kDFlash, GenerationMode::kDFlash);
+    }
+    RequireMatching(left, right, "ordinary_dflash_parity", phase,
+                    index + 1, index + 1, prompt_token_ids.size(),
+                    GenerationMode::kOrdinary, GenerationMode::kDFlash);
+    if (measured) {
+      ordinary.push_back(std::move(left));
+      dflash.push_back(std::move(right));
+    }
+  };
+  for (std::size_t index = 0; index < warmup; ++index) {
+    run_pair("warmup", index, warmup, false);
+  }
+  for (std::size_t index = 0; index < repetitions; ++index) {
+    run_pair("measurement", index, repetitions, true);
   }
 
   PairedBenchmarkResult result{
@@ -1075,23 +1199,6 @@ PairedBenchmarkResult BenchmarkPairStateful(
       0,
       0,
   };
-  const auto& expected = result.ordinary.stable_generated_token_ids;
-  const auto& actual = result.dflash.stable_generated_token_ids;
-  const std::size_t width = std::max(expected.size(), actual.size());
-  for (std::size_t index = 0; index < width; ++index) {
-    if (index >= expected.size() || index >= actual.size() ||
-        expected[index] != actual[index]) {
-      ++result.token_id_mismatches;
-    }
-  }
-  result.eos_mismatches =
-      result.ordinary.stable_stop_reason == result.dflash.stable_stop_reason
-          ? 0
-          : 1;
-  if (result.token_id_mismatches != 0 || result.eos_mismatches != 0) {
-    throw std::runtime_error(
-        "stateful DFlash output differs from ordinary greedy authority");
-  }
   return result;
 }
 

@@ -1446,9 +1446,11 @@ def test_resolve_incremental_oms_locks_fused_speculative_step_abi_and_gears(
         _resolve_incremental_oms(manifest_path)
 
 
+@pytest.mark.parametrize("child_failure", [False, True])
 def test_run_cpp_pair_routes_all_five_hash_locked_oms(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    child_failure: bool,
 ) -> None:
     run_root = tmp_path / "run"
     bundle = run_root / "bundle"
@@ -1514,6 +1516,15 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
     def execute(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         captured["command"] = command
         output = Path(command[command.index("--output") + 1])
+        invocation = json.loads(Path(str(output) + ".invocation.json").read_text())
+        assert invocation["command"] == command
+        assert invocation["runner"]["sha256"] == hashlib.sha256(b"fake").hexdigest()
+        if child_failure:
+            Path(str(output) + ".failure.json").write_text(json.dumps({
+                "report_kind": "cpp-ascendcl-generation-failure",
+                "status": "FAIL", "error": "first_mismatch_index=1 expected_token=12 actual_token=112",
+            }), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 1, stdout="child parity failure")
         output.write_text(
             json.dumps(_report(
                 IMMUTABLE_ZERO_STATE_RESET_POLICY,
@@ -1523,7 +1534,7 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
         )
         return subprocess.CompletedProcess(command, 0, stdout="fake PASS\n")
 
-    payload = cpp_runtime.run_cpp_pair(
+    arguments = dict(
         deployment_manifest=deployment,
         runner=runner,
         runner_options={
@@ -1547,6 +1558,16 @@ def test_run_cpp_pair_routes_all_five_hash_locked_oms(
         progress=False,
         execute=execute,
     )
+    if child_failure:
+        with pytest.raises(RuntimeError, match="expected_token=12 actual_token=112") as caught:
+            cpp_runtime.run_cpp_pair(**arguments)
+        assert "diagnostics=" in str(caught.value)
+        assert "invocation=" in str(caught.value)
+        assert not arguments["raw_output"].exists()
+        with pytest.raises(FileExistsError, match="already exists"):
+            cpp_runtime.run_cpp_pair(**arguments)
+        return
+    payload = cpp_runtime.run_cpp_pair(**arguments)
     command = captured["command"]
     assert preflight_policies == [INCREMENTAL_STATE_POLICY]
     for role in _INCREMENTAL_GRAPH_ABI:

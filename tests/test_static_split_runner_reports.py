@@ -25,7 +25,10 @@ def split_reports(tmp_path_factory):
     ):
         result = subprocess.run(command, capture_output=True, text=True, timeout=180)
         assert result.returncode == 0, result.stdout + result.stderr
-    paths = sorted(build.glob("fake-static-split-report-*.json"))
+    # Expected fault tests now preserve separate FAIL diagnostics. They are not
+    # successful model reports and must never enter the PASS fixture set.
+    paths = sorted(path for path in build.glob("fake-static-split-report-*.json")
+                   if not path.name.endswith(".failure.json"))
     assert len(paths) == 31
     return [json.loads(path.read_text()) for path in paths]
 

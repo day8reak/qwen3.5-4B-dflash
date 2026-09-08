@@ -3667,9 +3667,18 @@ class AclIncrementalExecutor::Impl {
     // A failing asynchronous API may already have enqueued part of the graph.
     // Cleanup must drain that work before freeing weights or application I/O.
     stream_work_pending_ = true;
-    Check(
-        aclmdlExecuteAsync(session.id, plan.input, plan.output, stream_),
-        session.role + ": aclmdlExecuteAsync");
+    const aclError code =
+        aclmdlExecuteAsync(session.id, plan.input, plan.output, stream_);
+    if (code != ACL_SUCCESS) {
+      std::ostringstream message;
+      message << session.role << ": aclmdlExecuteAsync failed with ACL error "
+              << code << "; model_id=" << session.id
+              << " physical_rows=" << physical_rows
+              << " target_state_slot=" << target_state_index_
+              << " draft_state_slot=" << draft_state_index_
+              << " (launch context; async failure may originate in earlier queued work)";
+      throw std::runtime_error(message.str());
+    }
   }
 
   void CompactDecodeIdToAlignedInput(
@@ -3872,7 +3881,11 @@ class AclIncrementalExecutor::Impl {
             source, slot_offset + compact_commit_offset_);
     if (commit_count <= 0 ||
         static_cast<std::size_t>(commit_count) > verify_width_) {
-      throw std::runtime_error("Target graph returned an invalid commit count");
+      throw std::runtime_error(
+          "Target graph returned an invalid commit count: commit_count=" +
+          std::to_string(commit_count) + " verify_width=" +
+          std::to_string(verify_width_) + " compact_slot=" +
+          std::to_string(state_index));
     }
     std::vector<std::int64_t> tokens(
         static_cast<std::size_t>(commit_count));
@@ -3899,7 +3912,11 @@ class AclIncrementalExecutor::Impl {
           ReadAt<std::int32_t>(
               source, slot_offset + compact_rejected_offset_);
       if (drafted <= 0 || accepted < 0 || rejected < 0) {
-        throw std::runtime_error("verify graph returned negative/zero counters");
+        throw std::runtime_error(
+            "verify graph returned negative/zero counters: drafted=" +
+            std::to_string(drafted) + " accepted=" + std::to_string(accepted) +
+            " rejected=" + std::to_string(rejected) + " compact_slot=" +
+            std::to_string(state_index));
       }
       result.drafted_tokens = static_cast<std::size_t>(drafted);
       result.accepted_draft_tokens = static_cast<std::size_t>(accepted);
@@ -3946,6 +3963,8 @@ class AclIncrementalExecutor::Impl {
       StatefulStep result,
       bool compact_is_staged,
       std::size_t compact_index) {
+    result.compact_slot = static_cast<int>(compact_index);
+    result.compact_is_staged = compact_is_staged;
     if ((compact_is_staged &&
          compact_index >= kMaxSpeculativeSyncWindow) ||
         (!compact_is_staged && compact_index >= kCompactSlotCount)) {

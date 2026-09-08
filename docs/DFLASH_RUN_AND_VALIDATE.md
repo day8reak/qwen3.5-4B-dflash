@@ -7,6 +7,8 @@
 请使用 [合并 Prefill + Decode1 + 静态 Draft + Verify16 指南](STATIC_SPLIT_OM_DEFAULT.md)。
 eager 验证、OM 元数据检查与真实 OM 推理是不同证据；不能拿本页的 Python 运行结果
 替代新四图的 ATC、AscendCL、显存或端到端验收。
+OM 跑完后若报告 ordinary/DFlash 不一致，使用
+[v44 首对即停与失败诊断](OM_FAILURE_DIAGNOSTICS.md)，不要把 run-done 当成正确性通过。
 
 ## 1. 证据分级
 

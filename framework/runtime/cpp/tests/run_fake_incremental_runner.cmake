@@ -66,7 +66,8 @@ endif()
 string(REPEAT "1," 69 PROMPT_PREFIX)
 set(PROMPT_IDS "${PROMPT_PREFIX}10")
 
-file(REMOVE "${OUTPUT}" "${OUTPUT}.tmp")
+file(REMOVE "${OUTPUT}" "${OUTPUT}.tmp"
+            "${OUTPUT}.failure.json" "${OUTPUT}.failure.json.tmp")
 if(FAKE_ZERO_ACCEPT)
   set(ENV{QWEN35_DFLASH_FAKE_ZERO_ACCEPT} "1")
 endif()

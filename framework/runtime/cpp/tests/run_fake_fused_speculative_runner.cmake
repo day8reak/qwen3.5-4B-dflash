@@ -10,7 +10,8 @@ endforeach()
 
 string(REPEAT "1," 69 PROMPT_PREFIX)
 set(PROMPT_IDS "${PROMPT_PREFIX}10")
-file(REMOVE "${OUTPUT}" "${OUTPUT}.tmp")
+file(REMOVE "${OUTPUT}" "${OUTPUT}.tmp"
+            "${OUTPUT}.failure.json" "${OUTPUT}.failure.json.tmp")
 
 execute_process(
   COMMAND "${RUNNER}"

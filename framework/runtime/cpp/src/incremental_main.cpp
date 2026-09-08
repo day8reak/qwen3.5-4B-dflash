@@ -16,6 +16,7 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1076,6 +1077,8 @@ void WriteReport(
                  ? "true"
                  : "false")
          << ','
+         << "\"pair_validation_policy\":\"each-warmup-and-measurement-pair-v1\","
+         << "\"failure_diagnostic_policy\":\"compact-transactions-v1\","
          << "\"progress_emission_excluded_from_model_timers\":true,"
          << "\"live_progress_enabled\":"
          << (arguments.progress ? "true" : "false") << "},"
@@ -1356,11 +1359,143 @@ void AtomicWrite(const std::filesystem::path& path, const std::string& payload) 
   std::filesystem::rename(temporary, absolute);
 }
 
+void WriteTransactions(std::ostream& out, const GenerationMeasurement& measurement) {
+  out << '[';
+  for (std::size_t index = 0; index < measurement.transaction_trace.size(); ++index) {
+    if (index) out << ',';
+    const auto& t = measurement.transaction_trace[index];
+    out << "{\"path\":\"" << JsonEscape(t.path)
+        << "\",\"decode_iteration\":" << t.decode_iteration
+        << ",\"window_step\":" << t.window_step
+        << ",\"generated_begin\":" << t.generated_begin
+        << ",\"generated_end\":" << t.generated_end
+        << ",\"prefix_tokens_before\":" << t.prefix_tokens_before
+        << ",\"anchor_token_id\":" << t.anchor_token_id
+        << ",\"proposal_limit\":" << t.proposal_limit
+        << ",\"fallback_active\":" << (t.fallback_active ? "true" : "false")
+        << ",\"model_executions\":" << t.result.model_executions
+        << ",\"drafted_tokens\":" << t.result.drafted_tokens
+        << ",\"accepted_draft_tokens\":" << t.result.accepted_draft_tokens
+        << ",\"rejected_draft_tokens\":" << t.result.rejected_draft_tokens
+        << ",\"finished\":" << (t.result.finished ? "true" : "false")
+        << ",\"compact_slot\":" << t.result.compact_slot
+        << ",\"compact_is_staged\":" << (t.result.compact_is_staged ? "true" : "false")
+        << ",\"returned_token_ids\":";
+    WriteTokenIds(out, t.result.token_ids);
+    out << '}';
+  }
+  out << ']';
+}
+
+void WriteFailureReport(
+    std::ostream& out, const Arguments& args, const std::exception& error,
+    const std::string& stage, const std::optional<ProgressEvent>& progress,
+    bool models_verified, int argc, char** argv) {
+  out << std::setprecision(17)
+      << "{\"schema_version\":1,\"report_kind\":\"cpp-ascendcl-generation-failure\","
+      << "\"status\":\"FAIL\",\"formal_latency_evidence\":false,"
+      << "\"runner_version\":\"" << JsonEscape(QWEN35_DFLASH_RUNNER_VERSION)
+      << "\",\"error\":\"" << JsonEscape(error.what())
+      << "\",\"stage\":\"" << JsonEscape(stage)
+      << "\",\"device_id\":" << args.device_id
+      << ",\"model_hashes_verified\":" << (models_verified ? "true" : "false")
+      << ",\"command\":[";
+  for (int index = 0; index < argc; ++index) {
+    if (index) out << ',';
+    out << '"' << JsonEscape(argv[index]) << '"';
+  }
+  out << "],\"models\":[";
+  bool first = true;
+  for (const auto& model : args.models) {
+    if (model.path.empty()) continue;
+    if (!first) out << ',';
+    first = false;
+    out << "{\"role\":\"" << JsonEscape(model.role) << "\",\"path\":\""
+        << JsonEscape(std::filesystem::absolute(model.path).string())
+        << "\",\"expected_sha256\":\"" << JsonEscape(model.sha256) << "\"}";
+  }
+  out << "],\"prompt_token_ids\":";
+  WriteTokenIds(out, args.prompt_token_ids);
+  out << ",\"eos_token_ids\":";
+  WriteTokenIds(out, args.eos_token_ids);
+  out << ",\"max_new_tokens\":" << args.max_new_tokens
+      << ",\"max_draft_tokens\":" << args.max_draft_tokens
+      << ",\"dflash_sync_window\":" << args.dflash_sync_window
+      << ",\"zero_accept_fallback_policy\":\""
+      << (args.zero_accept_fallback_policy == ZeroAcceptFallbackPolicy::kRequestTargetOnly
+              ? "request-target-only" : "disabled")
+      << "\",\"target_only_execution_policy\":\""
+      << (!args.models[5].path.empty() ? "ordinary-decode1-legacy"
+              : args.models[2].path.empty() ? "verify-t1" : "static-verify16-k0")
+      << "\",\"state_capture\":\"host compact results and logical prefix only; "
+         "KV/conv/GDR tensors not downloaded\",\"last_progress\":";
+  if (progress) {
+    const auto& p = *progress;
+    out << "{\"phase\":\"" << p.phase << "\",\"run_index\":" << p.run_index
+        << ",\"mode\":\"" << qwen35::dflash::ModeName(p.mode)
+        << "\",\"stage\":\"" << p.stage
+        << "\",\"decode_iteration\":" << p.decode_iteration
+        << ",\"generated_tokens\":" << p.generated_tokens
+        << ",\"prefix_tokens\":" << p.prefix_tokens
+        << ",\"graph_calls\":" << p.graph_calls << '}';
+  } else out << "null";
+  const auto* mismatch = dynamic_cast<const qwen35::dflash::GenerationMismatchError*>(&error);
+  out << ",\"comparison\":";
+  if (mismatch) {
+    const auto& d = mismatch->diagnostic();
+    out << "{\"kind\":\"" << d.kind << "\",\"phase\":\"" << d.phase
+        << "\",\"run_index\":" << d.run_index
+        << ",\"reference_run_index\":" << d.reference_run_index
+        << ",\"token_id_mismatches\":" << d.token_id_mismatches
+        << ",\"stop_reason_mismatch\":" << (d.stop_reason_mismatch ? "true" : "false")
+        << ",\"first_mismatch_index\":";
+    if (d.first_mismatch_index) out << *d.first_mismatch_index;
+    else out << "null";
+    out << ",\"absolute_token_index\":";
+    if (d.first_mismatch_index) out << d.prompt_tokens + *d.first_mismatch_index;
+    else out << "null";
+    const auto write_side = [&](const char* name, qwen35::dflash::GenerationMode mode,
+                                const GenerationMeasurement& measurement,
+                                std::size_t run) {
+      out << ",\"" << name << "\":{\"mode\":\""
+          << qwen35::dflash::ModeName(mode) << "\",\"token_at_mismatch\":";
+      if (d.first_mismatch_index &&
+          *d.first_mismatch_index < measurement.generated_token_ids.size())
+        out << measurement.generated_token_ids[*d.first_mismatch_index];
+      else out << "null";
+      out << ",\"measurement\":";
+      WriteMeasurement(out, measurement, run - 1);
+      out << ",\"transactions\":";
+      WriteTransactions(out, measurement);
+      out << '}';
+    };
+    write_side("expected", d.expected_mode, d.expected, d.reference_run_index);
+    write_side("actual", d.actual_mode, d.actual, d.run_index);
+    out << '}';
+  } else out << "null";
+  out << '}';
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::optional<Arguments> active_arguments;
+  std::optional<ProgressEvent> last_progress;
+  std::string failure_stage = "parse-arguments";
+  bool models_verified = false;
+  bool failure_output_available = false;
   try {
-    const Arguments arguments = ParseArguments(argc, argv);
+    const Arguments& arguments = active_arguments.emplace(ParseArguments(argc, argv));
+    failure_stage = "validate-output";
+    const auto failure_path = arguments.output.string() + ".failure.json";
+    // Admission before model loading; never confuse an old PASS/FAIL with this run.
+    if (std::filesystem::exists(arguments.output) || std::filesystem::exists(failure_path) ||
+        std::filesystem::exists(arguments.output.string() + ".tmp") ||
+        std::filesystem::exists(failure_path + ".tmp")) {
+      throw std::runtime_error("output or failure diagnostic already exists; use a new --output");
+    }
+    failure_output_available = true;
+    failure_stage = "validate-models";
     const bool fused_speculative_step = !arguments.models[5].path.empty();
     const bool unified_target_step =
         !fused_speculative_step && arguments.models[2].path.empty();
@@ -1388,6 +1523,8 @@ int main(int argc, char** argv) {
           arguments.progress,
           std::string("stage=validate-om-done role=") + model.role);
     }
+    models_verified = true;
+    failure_stage = "load-models";
     PrintProgress(
         arguments.progress,
         std::string("stage=load-") + topology_count + "-om-start");
@@ -1448,12 +1585,19 @@ int main(int argc, char** argv) {
     options.zero_accept_fallback_policy =
         arguments.zero_accept_fallback_policy;
     options.eos_token_ids = arguments.eos_token_ids;
+    options.collect_transaction_trace = true;
     PrintProgress(
         arguments.progress,
         arguments.measurement_protocol == MeasurementProtocol::kEvidence
             ? "stage=benchmark-start protocol=evidence-paired-3-plus-10"
             : "stage=benchmark-start protocol=profile-paired-1-plus-1");
     const auto benchmark_start = std::chrono::steady_clock::now();
+    failure_stage = "benchmark";
+    const auto print_progress = MakeProgressCallback(arguments.progress);
+    const auto record_progress = [&](const ProgressEvent& event) {
+      last_progress = event;  // Also retained when --progress=false.
+      if (print_progress) print_progress(event);
+    };
     const PairedBenchmarkResult result =
         qwen35::dflash::BenchmarkPairStateful(
             executor,
@@ -1461,7 +1605,7 @@ int main(int argc, char** argv) {
             options,
             arguments.warmup,
             arguments.repetitions,
-            MakeProgressCallback(arguments.progress));
+            record_progress);
     const auto benchmark_end = std::chrono::steady_clock::now();
     const double benchmark_ms = std::chrono::duration<double, std::milli>(
         benchmark_end - benchmark_start).count();
@@ -1472,6 +1616,7 @@ int main(int argc, char** argv) {
       PrintProgress(arguments.progress, message.str());
     }
     PrintProgress(arguments.progress, "stage=write-report-start");
+    failure_stage = "write-report";
     std::ostringstream report;
     WriteReport(report, arguments, executor, load_ms, benchmark_ms, result);
     AtomicWrite(arguments.output, report.str());
@@ -1480,6 +1625,21 @@ int main(int argc, char** argv) {
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "qwen35_dflash_incremental_acl_runner: " << error.what() << '\n';
+    if (active_arguments && failure_output_available) {
+      try {
+        const auto path = active_arguments->output.string() + ".failure.json";
+        std::ostringstream failure;
+        WriteFailureReport(failure, *active_arguments, error, failure_stage,
+                           last_progress, models_verified, argc, argv);
+        AtomicWrite(path, failure.str());
+        std::cerr << "[qwen35-dflash-incremental] stage=failure-report-done"
+                  << " status=FAIL diagnostics=" << std::filesystem::absolute(path) << '\n';
+      } catch (const std::exception& diagnostic_error) {
+        // Preserve the original failure and exit status even if disk is full.
+        std::cerr << "[qwen35-dflash-incremental] failure report unavailable: "
+                  << diagnostic_error.what() << '\n';
+      }
+    }
     return 1;
   }
 }

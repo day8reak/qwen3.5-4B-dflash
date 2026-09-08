@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -57,6 +59,9 @@ struct StatefulStep {
   std::size_t accepted_draft_tokens = 0;
   std::size_t rejected_draft_tokens = 0;
   bool finished = false;
+  // Host-visible compact result location, not a snapshot of KV/GDR state.
+  int compact_slot = -1;
+  bool compact_is_staged = false;
 };
 
 // The implementation owns all input/output storage. Execute must not allocate
@@ -150,6 +155,7 @@ struct GenerationOptions {
   ZeroAcceptFallbackPolicy zero_accept_fallback_policy =
       ZeroAcceptFallbackPolicy::kDisabled;
   std::vector<std::int64_t> eos_token_ids;
+  bool collect_transaction_trace = false;
 };
 
 struct GenerationCounters {
@@ -174,6 +180,20 @@ struct GenerationCounters {
   std::size_t decode_iterations = 0;
 };
 
+struct TransactionTrace {
+  // Logical generator route; the concrete OM role depends on the topology.
+  std::string path;
+  std::size_t decode_iteration = 0;
+  std::size_t window_step = 0;
+  std::size_t generated_begin = 0;
+  std::size_t generated_end = 0;
+  std::size_t prefix_tokens_before = 0;
+  std::int64_t anchor_token_id = -1;
+  std::size_t proposal_limit = 0;
+  bool fallback_active = false;
+  StatefulStep result;
+};
+
 struct GenerationMeasurement {
   std::vector<std::int64_t> generated_token_ids;
   std::string stop_reason;
@@ -182,6 +202,31 @@ struct GenerationMeasurement {
   double decode_ms = 0.0;
   double model_total_ms = 0.0;
   std::vector<double> decode_iteration_ms;
+  std::vector<TransactionTrace> transaction_trace;
+};
+
+// Preserves the failing pair even when the benchmark aborts before a report.
+struct GenerationMismatch {
+  std::string kind;
+  std::string phase;
+  std::size_t run_index = 0;  // One-based, matching progress.
+  std::size_t reference_run_index = 0;
+  std::size_t prompt_tokens = 0;
+  GenerationMode expected_mode = GenerationMode::kOrdinary;
+  GenerationMode actual_mode = GenerationMode::kDFlash;
+  std::size_t token_id_mismatches = 0;
+  bool stop_reason_mismatch = false;
+  std::optional<std::size_t> first_mismatch_index;  // Zero-based, generated IDs.
+  GenerationMeasurement expected;
+  GenerationMeasurement actual;
+};
+
+class GenerationMismatchError : public std::runtime_error {
+ public:
+  explicit GenerationMismatchError(GenerationMismatch diagnostic);
+  const GenerationMismatch& diagnostic() const noexcept { return diagnostic_; }
+ private:
+  GenerationMismatch diagnostic_;
 };
 
 struct Distribution {

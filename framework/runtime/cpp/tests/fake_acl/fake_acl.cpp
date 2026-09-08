@@ -641,6 +641,15 @@ aclError ExecuteVerify(const aclmdlDataset* input, aclmdlDataset* output) {
   if (!accepted_eos) {
     committed.push_back(verify[accepted] + 1);
   }
+  // Test-only fault injection: exercise real runner failure reporting, not
+  // the arithmetic validity of any NPU model.
+  if (const char* fault = std::getenv("QWEN35_DFLASH_FAKE_PARITY_FAULT")) {
+    if (std::string(fault) == "token") committed.front() += 100;
+    if (std::string(fault) == "eos") {
+      committed = {99};
+      accepted = 0;
+    }
+  }
   FillCommitted(output->buffers[0], committed);
   SetScalar<std::int32_t>(output->buffers[1], committed.size());
   SetScalar<std::int32_t>(output->buffers[2], proposals.size());

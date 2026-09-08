@@ -11,7 +11,8 @@ set(ENV{QWEN35_DFLASH_FAKE_WEIGHT_SCALE} 4096)
 set(ENV{QWEN35_DFLASH_FAKE_DEVICE_LIMIT} 2097152)
 foreach(policy all-resident phase-resident)
   set(output "${OUTPUT}-budget-${policy}.json")
-  file(REMOVE "${output}" "${output}.tmp")
+  file(REMOVE "${output}" "${output}.tmp"
+              "${output}.failure.json" "${output}.failure.json.tmp")
   execute_process(COMMAND "${RUNNER}" ${model_args}
     --model-residency-policy "${policy}"
     --output "${output}" --prompt-token-ids "${prompt}"
@@ -50,7 +51,8 @@ foreach(fallback disabled request-target-only)
     set(ENV{QWEN35_DFLASH_FAKE_ZERO_ACCEPT} 1)
   endif()
   set(output "${OUTPUT}-trace-${fallback}.json")
-  file(REMOVE "${output}" "${output}.tmp")
+  file(REMOVE "${output}" "${output}.tmp"
+              "${output}.failure.json" "${output}.failure.json.tmp")
   execute_process(COMMAND "${RUNNER}" ${model_args}
     --output "${output}" --prompt-token-ids "${prompt}"
     --fused-static-feature-rows 64 --max-new-tokens 32 --max-draft-tokens 3
@@ -97,7 +99,8 @@ endforeach()
 # EOS in prefill, inside the first window, or in a later window.
 foreach(eos 11 15 40)
   set(output "${OUTPUT}-coalesced-eos-${eos}.json")
-  file(REMOVE "${output}" "${output}.tmp")
+  file(REMOVE "${output}" "${output}.tmp"
+              "${output}.failure.json" "${output}.failure.json.tmp")
   execute_process(COMMAND "${RUNNER}" ${model_args}
     --output "${output}" --prompt-token-ids "${prompt}" --eos-token-ids "${eos}"
     --fused-static-feature-rows 64 --max-new-tokens 32 --max-draft-tokens 3
@@ -119,7 +122,8 @@ endforeach()
 foreach(fault FAIL_RELOAD FAIL_UNLOAD RELOAD_ABI_DRIFT FAIL_EXECUTE)
   set(ENV{QWEN35_DFLASH_FAKE_${fault}} 1)
   set(output "${OUTPUT}-${fault}.json")
-  file(REMOVE "${output}" "${output}.tmp")
+  file(REMOVE "${output}" "${output}.tmp"
+              "${output}.failure.json" "${output}.failure.json.tmp")
   execute_process(COMMAND "${RUNNER}" ${model_args}
     --output "${output}" --prompt-token-ids "${prompt}"
     --fused-static-feature-rows 64 --max-new-tokens 32 --max-draft-tokens 3

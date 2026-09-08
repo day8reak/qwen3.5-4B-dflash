@@ -15,7 +15,8 @@ foreach(reset async-memset immutable-zero)
     foreach(window 1 2 8)
       set(output "${OUTPUT}-${reset}-${feature}-${window}.json")
       # These files belong to this test's current build directory only.
-      file(REMOVE "${output}" "${output}.tmp")
+      file(REMOVE "${output}" "${output}.tmp"
+                  "${output}.failure.json" "${output}.failure.json.tmp")
       execute_process(COMMAND "${RUNNER}" ${model_args}
         --output "${output}" --prompt-token-ids "${prompt}"
         --fused-static-feature-rows 64 --max-new-tokens 32 --max-draft-tokens 3
@@ -62,7 +63,8 @@ endforeach()
 # One output token needs no Draft; two must perform eager terminal K=1.
 foreach(new_tokens 1 2)
   set(output "${OUTPUT}-short-${new_tokens}.json")
-  file(REMOVE "${output}" "${output}.tmp")
+  file(REMOVE "${output}" "${output}.tmp"
+              "${output}.failure.json" "${output}.failure.json.tmp")
   execute_process(COMMAND "${RUNNER}" ${model_args}
     --output "${output}" --prompt-token-ids "${prompt}"
     --fused-static-feature-rows 64 --max-new-tokens "${new_tokens}" --max-draft-tokens 3
@@ -102,7 +104,8 @@ foreach(fault missing-opt-in wrong-shape oversized-prompt capacity-budget dynami
     unset(ENV{QWEN35_DFLASH_FAKE_STATIC_FUSED})
   endif()
   set(output "${OUTPUT}-${fault}.json")
-  file(REMOVE "${output}" "${output}.tmp")
+  file(REMOVE "${output}" "${output}.tmp"
+              "${output}.failure.json" "${output}.failure.json.tmp")
   execute_process(COMMAND "${RUNNER}" ${model_args}
     --output "${output}" --prompt-token-ids "${tokens}"
     --fused-static-feature-rows "${rows}" --max-new-tokens "${new_tokens}"

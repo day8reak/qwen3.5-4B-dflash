@@ -1,5 +1,9 @@
 # v43：对齐当前分支 torch_npu 的状态与调度
 
+后续真机日志报告了 ordinary/DFlash 一致性失败，不能把 v43 的源码/主机测试当作真机 PASS。
+v44 / runner 1.27.0 增加[首对即停和失败诊断](OM_FAILURE_DIAGNOSTICS.md)，不改变本页
+模型逻辑；已有 v43 bundle 时无需为诊断功能重新导出。以下保留 v43 的变更范围与历史证据。
+
 ## 范围与结论
 
 基线是当前分支的 `models.dflash_v1.run_npu → run_rollback → dflash_rollback_greedy`，

@@ -49,7 +49,7 @@ class FakeExecutor final : public qwen35::dflash::GraphExecutor {
   qwen35::dflash::GraphOutputs outputs_;
 };
 
-class FakeStatefulExecutor final
+class FakeStatefulExecutor
     : public qwen35::dflash::StatefulGraphExecutor {
  public:
   explicit FakeStatefulExecutor(
@@ -426,6 +426,119 @@ void TestStatefulPairedBenchmarkAndProgress() {
   Require(saw_decode, "stateful progress omitted decode");
 }
 
+class ParityFaultExecutor final : public FakeStatefulExecutor {
+ public:
+  std::size_t resets = 0;
+  bool late_drift = false;
+  bool early_eos = false;
+  void Reset(std::int64_t pad, const std::vector<std::int64_t>& eos) override {
+    ++resets;
+    FakeStatefulExecutor::Reset(pad, eos);
+  }
+  qwen35::dflash::StatefulStep SpeculativeStep(std::size_t count) override {
+    auto step = FakeStatefulExecutor::SpeculativeStep(count);
+    if (!late_drift || resets >= 3) {
+      if (early_eos) {
+        step.token_ids = {99};
+        step.accepted_draft_tokens = 0;
+        step.rejected_draft_tokens = step.drafted_tokens;
+        step.finished = true;
+      } else step.token_ids[0] += 100;
+    }
+    return step;
+  }
+};
+
+void TestPairedValidationFailsFastWithEvidence() {
+  for (const std::size_t warmup : {0U, 3U}) {
+    for (const bool early_eos : {false, true}) {
+      ParityFaultExecutor executor;
+      executor.early_eos = early_eos;
+      auto options = Options();
+      options.eos_token_ids = {99};
+      options.collect_transaction_trace = true;
+      bool failed = false;
+      try {
+        qwen35::dflash::BenchmarkPairStateful(executor, {10}, options, warmup, 10);
+      } catch (const qwen35::dflash::GenerationMismatchError& error) {
+        failed = true;
+        const auto& d = error.diagnostic();
+        Require(executor.resets == 2, "parity failure did not stop after first pair");
+        Require(d.phase == (warmup ? "warmup" : "measurement"), "wrong failing phase");
+        Require(d.run_index == 1 && d.first_mismatch_index == 1,
+                "wrong first mismatch position");
+        Require(d.expected.generated_token_ids[1] == 12 &&
+                    d.actual.generated_token_ids[1] == (early_eos ? 99 : 112),
+                "failing token arrays were lost");
+        Require(d.stop_reason_mismatch == early_eos, "stop mismatch was lost");
+        Require(d.actual.transaction_trace[1].path == "speculative-verify" &&
+                    d.actual.transaction_trace[1].anchor_token_id == 11 &&
+                    d.actual.transaction_trace[1].generated_begin == 1,
+                "failing transaction provenance was lost");
+        Require(std::string(error.what()).find("first_mismatch_index=1") != std::string::npos,
+                "actionable stderr mismatch missing");
+      }
+      Require(failed, "mismatch was silently accepted");
+    }
+  }
+  ParityFaultExecutor executor;
+  executor.late_drift = true;
+  try {
+    qwen35::dflash::BenchmarkPairStateful(executor, {10}, Options(), 0, 10);
+    throw std::logic_error("late drift was accepted");
+  } catch (const qwen35::dflash::GenerationMismatchError& error) {
+    const auto& d = error.diagnostic();
+    Require(executor.resets == 4 && d.run_index == 2 && d.reference_run_index == 1,
+            "late drift was not stopped at the second pair");
+    Require(d.kind == "repetition_stability" &&
+                d.expected_mode == qwen35::dflash::GenerationMode::kDFlash &&
+                d.actual_mode == qwen35::dflash::GenerationMode::kDFlash,
+            "drift was misreported as ordinary authority");
+  }
+}
+
+void TestMismatchMessageHandlesMissingTokensAndStopOnly() {
+  qwen35::dflash::GenerationMismatch d;
+  d.kind = "ordinary_dflash_parity";
+  d.phase = "measurement";
+  d.run_index = d.reference_run_index = 1;
+  d.expected.generated_token_ids = {1, 2};
+  d.actual.generated_token_ids = {1};
+  d.first_mismatch_index = 1;
+  d.token_id_mismatches = 1;
+  Require(std::string(qwen35::dflash::GenerationMismatchError(d).what()).find(
+              "actual_token=<missing>") != std::string::npos, "missing token unsafe");
+  d.first_mismatch_index.reset();
+  d.actual.generated_token_ids = d.expected.generated_token_ids;
+  d.token_id_mismatches = 0;
+  d.stop_reason_mismatch = true;
+  d.expected.stop_reason = "length";
+  d.actual.stop_reason = "eos";
+  Require(std::string(qwen35::dflash::GenerationMismatchError(d).what()).find(
+              "first_mismatch_index=none") != std::string::npos, "stop-only index unsafe");
+}
+
+void TestTransactionTracePreservesFallbackAndTerminalBudget() {
+  FakeStatefulExecutor executor(false, true);
+  auto options = Options();
+  options.collect_transaction_trace = true;
+  options.zero_accept_fallback_policy = qwen35::dflash::ZeroAcceptFallbackPolicy::kRequestTargetOnly;
+  auto measured = qwen35::dflash::GenerateStatefulOnce(
+      executor, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  Require(measured.transaction_trace[1].result.accepted_draft_tokens == 0 &&
+              measured.transaction_trace[2].path == "target-only-verify" &&
+              measured.transaction_trace[2].fallback_active,
+          "zero-accept boundary was lost");
+  FakeStatefulExecutor accepting;
+  options.max_new_tokens = 2;
+  measured = qwen35::dflash::GenerateStatefulOnce(
+      accepting, {10}, qwen35::dflash::GenerationMode::kDFlash, options);
+  const auto& terminal = measured.transaction_trace.back();
+  Require(terminal.generated_end - terminal.generated_begin == 1 &&
+              terminal.result.token_ids.size() == 2,
+          "trace confused emitted tokens with discarded terminal bonus");
+}
+
 void TestTwoTransactionWindowUsesBudgetSafeSecondProposalCount() {
   FakeStatefulExecutor executor;
   auto options = Options();
@@ -759,6 +872,9 @@ int main() {
     TestStatefulOrdinaryAndDFlashMatchAcrossPromptChunks();
     TestStatefulCorrectionAndEosRemainExact();
     TestStatefulPairedBenchmarkAndProgress();
+    TestPairedValidationFailsFastWithEvidence();
+    TestMismatchMessageHandlesMissingTokensAndStopOnly();
+    TestTransactionTracePreservesFallbackAndTerminalBudget();
     TestTwoTransactionWindowUsesBudgetSafeSecondProposalCount();
     TestTwoTransactionWindowStopsAtFirstTransactionEos();
     TestEightTransactionWindowUsesBudgetSafeProposalCounts();

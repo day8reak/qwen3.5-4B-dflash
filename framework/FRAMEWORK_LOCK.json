@@ -1,6 +1,25 @@
 {
-  "schema_version": 43,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v43",
+  "schema_version": 44,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v44",
+  "failure_diagnostics": {
+    "runner_version": "1.27.0",
+    "pass_report_schema": 13,
+    "failure_report_schema": 1,
+    "invocation_schema": 1,
+    "pair_validation_policy": "each-warmup-and-measurement-pair-v1",
+    "stability_policy": "each measured pair compared with first measured results",
+    "capture": "full generated IDs, first difference, stop reasons, compact transaction results, anchor, K, fallback path and compact slot; no KV/conv/GDR tensor download",
+    "failure_output": "<raw-output>.failure.json; nonzero exit; never a PASS report",
+    "invocation_output": "<raw-output>.invocation.json; command, runner/manifest hashes and declared runtime identity before launch",
+    "regeneration": "rebuild runner and update Python control plane only; reuse existing v43 AIR/OM unchanged; older graph corrections still require regeneration",
+    "latest_user_observation": {
+      "status": "FAIL",
+      "error": "stateful DFlash output differs from ordinary greedy authority",
+      "failing_artifact_identity": "not provided for the reported invocation",
+      "claim_boundary": "diagnostic-only change; no device parity fix or acceptance improvement claimed"
+    },
+    "documentation": "docs/OM_FAILURE_DIAGNOSTICS.md"
+  },
   "torch_npu_parity_correction": {
     "reference": "current-branch models.dflash_v1.run_npu -> run_rollback -> dflash_rollback_greedy",
     "target_conv_state_commit_policy": "logical-effective-length-v1",
@@ -13,7 +32,7 @@
     "runner_report_schema": 13,
     "regeneration": "rebuild runner and regenerate AIR/OM; retain prior bundles; no re-quantization",
     "evidence": ["tests/test_prefill_conv_parity.py", "framework/runtime/cpp/tests/test_generation.cpp", "framework/runtime/cpp/tests/test_incremental_acl.cpp", "tests/test_static_split_runner_reports.py"],
-    "device_accuracy_status": "PENDING",
+    "device_accuracy_status": "FAIL_REPORTED_AWAITING_DIAGNOSTICS",
     "documentation": "docs/OM_TORCH_NPU_PARITY.md"
   },
   "draft_attention_correction": {

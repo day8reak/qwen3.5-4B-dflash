@@ -10,7 +10,8 @@ string(REPEAT "1," 16 prefix)
 set(prompt "${prefix}10")
 function(run_case name)
   set(output "${OUTPUT}-${name}.json")
-  file(REMOVE "${output}" "${output}.tmp")
+  file(REMOVE "${output}" "${output}.tmp"
+              "${output}.failure.json" "${output}.failure.json.tmp")
   execute_process(COMMAND "${RUNNER}" ${model_args} --output "${output}"
     --prompt-token-ids "${prompt}" --max-draft-tokens 3 ${ARGN}
     RESULT_VARIABLE result OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
@@ -94,7 +95,8 @@ if(NOT allocated EQUAL 2097152)
   message(FATAL_ERROR "Draft+Verify weight slices were not simultaneously budgeted")
 endif()
 set(output "${OUTPUT}-budget-all.json")
-file(REMOVE "${output}" "${output}.tmp")
+file(REMOVE "${output}" "${output}.tmp"
+            "${output}.failure.json" "${output}.failure.json.tmp")
 execute_process(COMMAND "${RUNNER}" ${model_args} --output "${output}"
   --prompt-token-ids "${prompt}" --model-residency-policy all-resident
   RESULT_VARIABLE result ERROR_VARIABLE stderr)
@@ -107,7 +109,8 @@ unset(ENV{QWEN35_DFLASH_FAKE_DEVICE_LIMIT})
 foreach(fault FAIL_RELOAD FAIL_VERIFY_GROUP_LOAD FAIL_UNLOAD RELOAD_ABI_DRIFT FAIL_EXECUTE)
   set(ENV{QWEN35_DFLASH_FAKE_${fault}} 1)
   set(output "${OUTPUT}-${fault}.json")
-  file(REMOVE "${output}" "${output}.tmp")
+  file(REMOVE "${output}" "${output}.tmp"
+              "${output}.failure.json" "${output}.failure.json.tmp")
   execute_process(COMMAND "${RUNNER}" ${model_args} --output "${output}"
     --prompt-token-ids "${prompt}" RESULT_VARIABLE result ERROR_VARIABLE stderr)
   if(result EQUAL 0 OR EXISTS "${output}" OR stderr MATCHES "fake ACL cleanup left live")

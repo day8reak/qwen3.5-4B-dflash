@@ -54,6 +54,30 @@ def test_infer_cpp_progress_is_on_by_default_and_can_be_disabled() -> None:
     assert parser.parse_args(_infer_cpp_args("--no-progress")).progress is False
 
 
+@pytest.mark.parametrize("payload", [None, "invalid json", "[]", '{"status":"PASS"}'])
+def test_runner_error_tail_survives_missing_or_invalid_diagnostics(tmp_path: Path, payload: str | None) -> None:
+    path = tmp_path / "raw.json.failure.json"
+    if payload is not None:
+        path.write_text(payload, encoding="utf-8")
+    detail = cpp_runtime._runner_failure_details(
+        "shutdown noise\nfirst_mismatch_index=3 expected_token=12 actual_token=99\n", path
+    )
+    assert "first_mismatch_index=3" in detail
+    assert "runner_output_tail" in detail
+
+
+def test_runner_error_prefers_structured_failure_and_bounds_fallback(tmp_path: Path) -> None:
+    path = tmp_path / "raw.json.failure.json"
+    path.write_text(json.dumps({
+        "status": "FAIL", "report_kind": "cpp-ascendcl-generation-failure",
+        "error": "first_mismatch_index=3 expected_token=12 actual_token=99",
+    }), encoding="utf-8")
+    detail = cpp_runtime._runner_failure_details("uninformative wrapper", path)
+    assert f"diagnostics={path}" in detail
+    assert "expected_token=12 actual_token=99" in detail
+    assert len(cpp_runtime._runner_failure_details("x" * 10000, tmp_path / "absent")) < 4200
+
+
 def test_cpp_eos_defaults_to_current_torch_npu_and_allows_explicit_override() -> None:
     parser = build_parser()
     assert _cpp_eos_token_ids(parser.parse_args(_infer_cpp_args())) == (248044,)

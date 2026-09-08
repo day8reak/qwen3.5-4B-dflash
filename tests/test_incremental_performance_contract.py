@@ -338,10 +338,22 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 43
+    assert framework_lock["schema_version"] == 44
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v43"
+        "qwen3.5-4b-quant-air-om-ascendcl-v44"
     )
+    diagnostics = framework_lock["failure_diagnostics"]
+    assert diagnostics["runner_version"] == "1.27.0"
+    assert diagnostics["pass_report_schema"] == 13
+    assert diagnostics["failure_report_schema"] == diagnostics["invocation_schema"] == 1
+    assert diagnostics["pair_validation_policy"] == "each-warmup-and-measurement-pair-v1"
+    assert "no KV/conv/GDR tensor download" in diagnostics["capture"]
+    assert "reuse existing v43 AIR/OM unchanged" in diagnostics["regeneration"]
+    assert diagnostics["latest_user_observation"]["status"] == "FAIL"
+    assert framework_lock["torch_npu_parity_correction"]["device_accuracy_status"] == (
+        "FAIL_REPORTED_AWAITING_DIAGNOSTICS"
+    )
+    assert (ROOT / diagnostics["documentation"]).is_file()
     residency = framework_lock["runtime"]["incremental_model_residency"]
     assert residency["default"] == "phase-resident for merged static split; all-resident for legacy topologies"
     assert "all-resident rollback" in residency["candidate"]

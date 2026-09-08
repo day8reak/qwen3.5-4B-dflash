@@ -1,5 +1,9 @@
 # Quant AIR/OM 推理框架
 
+当前 v44 / runner 1.27.0 增加[首对即停与失败诊断](../docs/OM_FAILURE_DIAGNOSTICS.md)。
+本次只需重建 runner、更新 Python 控制面，可复用已有 v43 AIR/OM；不代表已修复真机
+ordinary/DFlash 分歧。更早版本缺失的图内修复仍需重新导出。
+
 这个目录是直接加在仓库 `quant` 分支之上的部署层，不替换现有量化、rollback 或 DFlash
 实现。基线提交固定为 `28f93e784a2beed87020a80bd93c8788754eab1c`。
 
