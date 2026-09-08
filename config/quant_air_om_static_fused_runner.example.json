@@ -1,0 +1,16 @@
+{
+  "device_model": "REPLACE_WITH_EXACT_310P_PRODUCT",
+  "cann": "REPLACE_WITH_CANN_VERSION",
+  "driver": "REPLACE_WITH_DRIVER_VERSION",
+  "firmware": "REPLACE_WITH_FIRMWARE_VERSION",
+  "runtime": "AscendCL C++ static fused phase-resident runtime",
+  "state_policy": "incremental-explicit-state-v2",
+  "model_residency_policy": "phase-resident",
+  "state_reset_policy": "async-memset",
+  "decode_carrier_policy": "last-token-d2d",
+  "draft_feature_policy": "fixed-16",
+  "dflash_sync_window": 1,
+  "prefill_completion_policy": "separate",
+  "zero_accept_fallback_policy": "disabled",
+  "pad_token_id": 0
+}

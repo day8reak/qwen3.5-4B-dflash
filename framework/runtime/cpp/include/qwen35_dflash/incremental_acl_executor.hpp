@@ -34,6 +34,27 @@ struct IncrementalModelExecutionTrace {
   std::size_t ordinal = 0;
   std::uint32_t model_id = 0;
   std::size_t physical_rows = 0;
+  std::string role;
+};
+
+enum class IncrementalModelResidencyPolicy {
+  kAllResident,
+  // Static fused bring-up: prefill/head are transient; the selected decode
+  // model stays loaded for consecutive calls. No model or state approximation.
+  kPhaseResident,
+};
+
+const char* IncrementalModelResidencyPolicyName(
+    IncrementalModelResidencyPolicy policy) noexcept;
+
+struct IncrementalModelResidencyStats {
+  std::size_t allocated_weight_bytes = 0;
+  std::size_t peak_resident_models = 0;
+  std::size_t model_loads = 0;
+  std::size_t model_unloads = 0;
+  std::size_t model_switches = 0;
+  std::size_t model_switch_synchronizations = 0;
+  double model_switch_wall_ms = 0;
 };
 
 enum class IncrementalStateResetPolicy {
@@ -219,7 +240,9 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
           IncrementalDecodeCarrierPolicy::kLastTokenDeviceCompact,
       bool profile_model_executions = false,
       IncrementalDraftFeaturePolicy draft_feature_policy =
-          IncrementalDraftFeaturePolicy::kFixedVerifyWidth);
+          IncrementalDraftFeaturePolicy::kFixedVerifyWidth,
+      IncrementalModelResidencyPolicy model_residency_policy =
+          IncrementalModelResidencyPolicy::kAllResident);
   ~AclIncrementalExecutor() override;
 
   AclIncrementalExecutor(const AclIncrementalExecutor&) = delete;
@@ -256,6 +279,7 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
       const std::vector<std::size_t>& logical_proposal_counts) override;
 
   const std::vector<IncrementalModelMemory>& model_memory() const noexcept;
+  const IncrementalModelResidencyStats& model_residency_stats() const noexcept;
   const std::vector<IncrementalModelExecutionTrace>&
   model_execution_trace() const noexcept;
   const IncrementalAclExecutionStats& execution_stats() const noexcept;

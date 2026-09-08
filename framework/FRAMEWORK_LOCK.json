@@ -1,6 +1,6 @@
 {
-  "schema_version": 39,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v39",
+  "schema_version": 40,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v40",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -277,7 +277,16 @@
     "incremental_draft_feature_prefix": "the separate Draft OM and fused speculative-step candidate expose verify feature N=1..16 and prompt N=64,128,... gears; fixed-16 remains the default rollback route, while committed-prefix binds accepted+1 leading rows after synchronization and each predecessor's K+1 causal upper bound for later unsynchronized transactions; only KV below logical_draft_cursor is authoritative, row counters and msprof trace attribution must close, and real-device zero-mismatch 3+10 evidence is required before promotion",
     "incremental_verify_scalar_state_seed": "per-linear-layer-jit-v1 keeps committed GDN state scalar at the target-verify-commit graph boundary, lets causal-conv consume scalar state directly, and seeds only the fixed 16-slot recurrent input immediately before each linear-attention layer; it preserves the GDR-MTP ABI and requires regenerated AIR/OM workspace and latency evidence",
     "incremental_verify_cache_indices": "once-per-verify-v1 derives the 16 target-block and in-block-offset values once from the logical cursor and reuses them across K/V in all eight full-attention layers; the exact source graph removes 510 repeated div/remainder and 510 repeated cast constructions while retaining all 256 single-row CacheUpdate nodes until batched update receives separate approval",
-    "incremental_device_suballocation": "control, compact-result and Target/Draft state arenas reserve ALIGN_UP(payload,32)+32 bytes per segment and begin every segment at a 64-byte-aligned address"
+    "incremental_device_suballocation": "control, compact-result and Target/Draft state arenas reserve ALIGN_UP(payload,32)+32 bytes per segment and begin every segment at a 64-byte-aligned address",
+    "incremental_model_residency": {
+      "default": "all-resident",
+      "candidate": "phase-resident",
+      "supported_topology": "four static OMs with fused-speculative-step; no graph/precision/KV-capacity changes",
+      "ownership": "one max-sized serial workspace and one max-sized weight arena; complete pending stream work and successfully unload before reusing model weights; application-owned KV/recurrent state and datasets survive model switches",
+      "hot_path": "prefill/head transient per request; ordinary decode1 or DFlash fused stays loaded until the next distinct role; decode1 remains required for tail or explicit target-only fallback",
+      "evidence": "report actual reserved weights, elided weight sum, peak resident count and successful load/unload/switch/synchronization counts; model switch cost is included in generation latency; inspection IDs are not live-model IDs",
+      "claim_boundary": "host fake-ACL lifecycle and constrained-budget tests only; real CANN reload, memory fit, zero token/EOS mismatch and 3+10 latency remain required"
+    }
   },
   "correctness_gate": {
     "token_id_mismatches": 0,

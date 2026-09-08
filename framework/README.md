@@ -34,6 +34,9 @@ ordinary greedy 与 strict-greedy DFlash 逐 token 生成
 当前排查优先走 [固定 64 行静态 fused 基线](../docs/STATIC_FUSED_OM_BASELINE.md)，
 真机跑通并完成严格 greedy 对齐后再恢复动态；v39 使用同一四图拓扑和 runner 1.23.0，
 并将 Draft K/V 头复制改为带逐路导出审计的 Tile。此修复须从新 AIR 开始重跑，不能复用旧 AIR/OM。
+v40 / runner 1.24.0 增加 [按阶段常驻的显存候选](../docs/STATIC_OM_MEMORY.md)：
+prefill/head 用后卸载，当前 decode 热循环常驻，权重由总和改为最大单 OM 大小的复用区。
+此运行时改动可复用已正确生成的 v39 静态 OM；原 all-resident 默认策略保留。
 增量状态 ABI、2/3/4 OM 选择门禁和内存检查命令见
 [docs/INCREMENTAL_OM_PERFORMANCE.md](../docs/INCREMENTAL_OM_PERFORMANCE.md)。
 

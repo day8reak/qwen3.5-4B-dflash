@@ -167,6 +167,16 @@ def _validate_runner_report(
         raise MsprofAnalysisError(
             "runner report predates model IDs/profile execution tracing"
         )
+    residency = report.get("model_residency", {})
+    if (isinstance(residency, Mapping) and
+            residency.get("policy", "all-resident") != "all-resident"):
+        # ModelId/InferId can be recycled across load epochs. The resident
+        # analysis below cannot safely join that CSV with inspection IDs.
+        raise MsprofAnalysisError(
+            "phase-resident msprof attribution needs load-epoch evidence; "
+            "startup inspection model IDs are not live-model IDs. "
+            "Keep raw profiling files and the role-labelled execution trace."
+        )
     protocol = report.get("protocol")
     if not isinstance(protocol, Mapping) or (
         protocol.get("kind") != "profile"

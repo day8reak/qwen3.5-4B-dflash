@@ -699,6 +699,7 @@ def _validate(
     unified_target_step: bool = False,
     fused_speculative_step: bool = False,
     fused_static_feature_rows: int = 0,
+    model_residency_policy: str = "all-resident",
 ) -> None:
     prompt = [10] if prompt_token_ids is None else list(prompt_token_ids)
     hashes = _hashes()
@@ -726,6 +727,7 @@ def _validate(
         prefill_completion_policy=prefill_completion_policy,
         zero_accept_fallback_policy=zero_accept_fallback_policy,
         fused_static_feature_rows=fused_static_feature_rows,
+        model_residency_policy=model_residency_policy,
     )
 
 
@@ -842,8 +844,7 @@ def test_unified_incremental_runner_report_closes_resident_zero_count() -> None:
     _validate(_unified_report(), unified_target_step=True)
 
 
-@pytest.mark.parametrize("damage", [None, "rows", "padding", "gears", "dynamic", "memsets"])
-def test_static_fused_report_locks_shape_and_accounts_for_real_padding(damage):
+def _static_fused_report():
     report = _fused_report()
     report["protocol"]["draft_feature_policy_description"] = (
         "static fused always binds fixed N; the feature policy selects "
@@ -869,6 +870,13 @@ def test_static_fused_report_locks_shape_and_accounts_for_real_padding(damage):
         fused_static_padding_rows=calls * 64 - source,
         fused_static_padding_operations=calls,
     )
+    return report
+
+
+@pytest.mark.parametrize("damage", [None, "rows", "padding", "gears", "dynamic", "memsets"])
+def test_static_fused_report_locks_shape_and_accounts_for_real_padding(damage):
+    report = _static_fused_report()
+    counts = report["execution_io_counters"]
     if damage == "rows": report["model_memory_query"]["fused_static_feature_rows"] = 128
     if damage == "padding": counts["fused_static_padding_rows"] += 1
     if damage == "gears": report["model_memory_query"]["draft_om_dynamic_gear_count"] = 1

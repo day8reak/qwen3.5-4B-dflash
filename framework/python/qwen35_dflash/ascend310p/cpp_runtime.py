@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -299,6 +300,11 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
             f"{ASYNC_MEMSET_STATE_RESET_POLICY!r} or "
             f"{IMMUTABLE_ZERO_STATE_RESET_POLICY!r}"
         )
+    model_residency_policy = str(options.get("model_residency_policy", "all-resident")).strip()
+    if model_residency_policy not in {"all-resident", "phase-resident"}:
+        raise ValueError("model_residency_policy must be all-resident or phase-resident")
+    if model_residency_policy == "phase-resident" and state_policy != INCREMENTAL_STATE_POLICY:
+        raise ValueError("phase-resident requires the incremental static fused runtime")
     decode_carrier_policy = str(
         options.get(
             "decode_carrier_policy", LAST_TOKEN_D2D_DECODE_CARRIER_POLICY
@@ -364,6 +370,7 @@ def _runtime_identity(options: Mapping[str, Any], device_id: int) -> dict[str, A
         "graph_name": graph_name,
         "state_policy": state_policy,
         "state_reset_policy": state_reset_policy,
+        "model_residency_policy": model_residency_policy,
         "decode_carrier_policy": decode_carrier_policy,
         "draft_feature_policy": draft_feature_policy,
         "dflash_sync_window": dflash_sync_window,
@@ -867,8 +874,15 @@ def validate_incremental_cpp_runner_report(
     prefill_completion_policy: str = SEPARATE_PREFILL_COMPLETION_POLICY,
     zero_accept_fallback_policy: str = DISABLED_ZERO_ACCEPT_FALLBACK_POLICY,
     fused_static_feature_rows: int = 0,
+    model_residency_policy: str = "all-resident",
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
+
+    if model_residency_policy not in {"all-resident", "phase-resident"}:
+        raise RuntimeError("unknown model residency policy")
+    phase_resident = model_residency_policy == "phase-resident"
+    if phase_resident and not fused_static_feature_rows:
+        raise RuntimeError("phase-resident requires static fused OM evidence")
 
     if report.get("schema_version") != 12:
         raise RuntimeError("incremental C++ report schema differs")
@@ -925,7 +939,7 @@ def validate_incremental_cpp_runner_report(
             or value < 0
             for value in model_ids
         )
-        or len(set(model_ids)) != len(model_ids)
+        or (not phase_resident and len(set(model_ids)) != len(model_ids))
     ):
         raise RuntimeError("incremental model IDs are invalid or duplicated")
     model_by_role = {str(item["role"]): item for item in models}
@@ -946,6 +960,8 @@ def validate_incremental_cpp_runner_report(
     protocol = report.get("protocol", {})
     if protocol.get("warmup") != 3 or protocol.get("repetitions") != 10:
         raise RuntimeError("incremental runner protocol is not locked 3+10")
+    if phase_resident and protocol.get("model_load_excluded_from_latency") is not False:
+        raise RuntimeError("phase-resident timing must include model switches")
     if (
         protocol.get("device_memory_allocation_policy")
         not in DEVICE_MEMORY_ALLOCATION_POLICIES
@@ -1123,6 +1139,8 @@ def validate_incremental_cpp_runner_report(
             else _BASELINE_INCREMENTAL_TOPOLOGY
         )
     )
+    if phase_resident:
+        expected_topology = "split-prefill-head-four-artifact-phase-resident-fused-v1"
     if abi.get("physical_topology") != expected_topology:
         raise RuntimeError("incremental runner physical topology differs")
     if abi.get("state_policy") != "explicit device-resident ping-pong":
@@ -1170,16 +1188,73 @@ def validate_incremental_cpp_runner_report(
         )
     if memory.get("source") != "aclmdlQuerySize":
         raise RuntimeError("incremental runner omitted model memory queries")
-    if memory.get("load_policy") != (
+    expected_load_policy = (
         f"{'four' if unified_target_step or fused_speculative_step else 'five'} "
         "aclmdlLoadFromFileWithMem sessions; one max-sized serial "
         "workspace; separate per-artifact weights; no cross-OM weight sharing "
         "assumed"
-    ):
+    )
+    if phase_resident:
+        expected_load_policy = (
+            "phase-resident static fused; one live OM; synchronized unload before "
+            "reusing max-sized workspace and weight arena; hot decode stays loaded"
+        )
+    if memory.get("load_policy") != expected_load_policy:
         raise RuntimeError("incremental runner did not share the serial workspace")
     expected_sum_work = sum(int(item["work_bytes"]) for item in models)
     expected_max_work = max(int(item["work_bytes"]) for item in models)
     expected_sum_weight = sum(int(item["weight_bytes"]) for item in models)
+    allocated_weights = (
+        max(int(item["weight_bytes"]) for item in models) if phase_resident else expected_sum_weight
+    )
+    residency = report.get("model_residency")
+    switch_syncs = 0
+    if residency is not None or phase_resident:
+        if not isinstance(residency, Mapping) or residency.get("policy") != model_residency_policy:
+            raise RuntimeError("model residency policy/evidence differs")
+        if residency.get("model_id_scope") != (
+            "startup-metadata-inspection" if phase_resident else "resident-model"
+        ):
+            raise RuntimeError("model residency ID lifetime differs")
+        if protocol.get("model_load_excluded_from_latency") is not (not phase_resident):
+            raise RuntimeError("model residency latency accounting differs")
+        if residency.get("timing_scope") != (
+            "model switch synchronization/unload/load/ABI validation is included "
+            "in generation and benchmark wall times; startup inspection is separate"
+        ):
+            raise RuntimeError("model residency timing scope differs")
+        values = [residency.get(key) for key in (
+            "peak_resident_models", "model_loads", "model_unloads",
+            "model_switches", "model_switch_synchronizations",
+        )]
+        if any(type(value) is not int or value < 0 for value in values):
+            raise RuntimeError("model residency counters are invalid")
+        peak, loads, unloads, switches, switch_syncs = values
+        switch_ms = residency.get("model_switch_wall_ms")
+        if (isinstance(switch_ms, bool) or not isinstance(switch_ms, (int, float))
+                or not math.isfinite(switch_ms) or switch_ms < 0):
+            raise RuntimeError("model residency switch timing is invalid")
+        if phase_resident:
+            actual = report.get("execution_io_counters", {})
+            calls = [actual.get(key) for key in (
+                "target_prefill_executions", "target_prefill_head_executions",
+                "target_decode1_executions", "fused_speculative_step_executions",
+            )]
+            # Two modes per repetition; each request enters prefill and head.
+            minimum_switches = 4 * (protocol["warmup"] + protocol["repetitions"])
+            if (any(type(v) is not int or v < 0 for v in calls)
+                    or peak != 1 or loads != len(models) + switches
+                    or unloads != loads - 1 or not minimum_switches <= switches <= sum(calls)
+                    or switch_syncs > switches):
+                raise RuntimeError("phase-resident load/unload accounting does not close")
+        elif (peak != len(models) or loads != len(models)
+              or unloads or switches or switch_syncs or switch_ms):
+            raise RuntimeError("all-resident report unexpectedly switched models")
+        if (type(memory.get("allocated_weight_bytes")) is not int
+                or memory["allocated_weight_bytes"] != allocated_weights
+                or type(memory.get("weight_bytes_elided")) is not int
+                or memory["weight_bytes_elided"] != expected_sum_weight - allocated_weights):
+            raise RuntimeError("model residency weight allocation does not close")
     if (
         memory.get("sum_work_bytes") != expected_sum_work
         or memory.get("max_work_bytes") != expected_max_work
@@ -1306,7 +1381,7 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental prefill feature arena or gears differ")
     expected_allocated = (
         expected_max_work
-        + expected_sum_weight
+        + allocated_weights
         + int(memory["state_device_bytes"])
         + int(memory["carrier_device_bytes"])
     )
@@ -1643,7 +1718,7 @@ def validate_incremental_cpp_runner_report(
             - memory["compact_verify_result_bytes"]
         )
         or execution.get("stream_synchronizations")
-        != int(prefill_completions) + decode + speculative_windows
+        != int(prefill_completions) + decode + speculative_windows + switch_syncs
         or execution.get("device_to_host_operations")
         + speculative_d2h_elided
         + prefill_verify_d2h_elided
@@ -2035,6 +2110,8 @@ def run_cpp_pair(
             )
         if fused_static_shape is not None:
             validate_static_request(fused_static_shape, len(tokens), max_new_tokens)
+        if identity["model_residency_policy"] == "phase-resident" and fused_static_shape is None:
+            raise ValueError("phase-resident requires a validated static fused manifest")
         if "fused-speculative-step" in resolved_incremental:
             fused_path, _, fused_record = resolved_incremental["fused-speculative-step"]
             mode = "static" if fused_static_shape is not None else "dynamic"
@@ -2111,6 +2188,8 @@ def run_cpp_pair(
         str(int(device_id)),
     ])
     if incremental:
+        if identity["model_residency_policy"] != "all-resident":
+            command.extend(["--model-residency-policy", identity["model_residency_policy"]])
         command.extend(
             [
                 "--measurement-protocol",
@@ -2185,6 +2264,7 @@ def run_cpp_pair(
             fused_static_feature_rows=(
                 0 if fused_static_shape is None else fused_static_shape["feature_rows"]
             ),
+            model_residency_policy=identity["model_residency_policy"],
         )
     else:
         assert om_record is not None

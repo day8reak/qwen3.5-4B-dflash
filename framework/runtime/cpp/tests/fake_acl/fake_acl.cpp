@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -98,6 +99,29 @@ std::uint32_t g_next_model_id = 1;
 void* g_incremental_shared_work = nullptr;
 std::vector<void*> g_incremental_weights;
 std::vector<const void*> g_pending_h2d_sources;
+std::map<void*, std::size_t> g_device_allocations;
+bool g_model_work_pending = false;
+std::size_t g_model_execution_count = 0;
+bool g_unload_fault_injected = false;
+
+std::size_t EnvSize(const char* name, std::size_t fallback) {
+  const auto* value = std::getenv(name);
+  return value == nullptr ? fallback : std::stoull(value);
+}
+
+std::size_t DeviceBytes() {
+  std::size_t bytes = 0;
+  for (const auto& item : g_device_allocations) bytes += item.second;
+  return bytes;
+}
+
+Role RoleFromPath(const char* path);
+
+std::size_t ModelWeightBytes(const char* path) {
+  return (RoleFromPath(path) == Role::kTargetPrefillHead
+              ? kPrefillHeadWeightBytes : kModelWeightBytes) *
+      EnvSize("QWEN35_DFLASH_FAKE_WEIGHT_SCALE", 1);
+}
 
 Role RoleFromPath(const char* path) {
   const std::string value = path == nullptr ? "" : path;
@@ -675,7 +699,13 @@ struct aclmdlDesc {
 extern "C" {
 
 aclError aclInit(const char*) { return ACL_SUCCESS; }
-aclError aclFinalize() { return ACL_SUCCESS; }
+aclError aclFinalize() {
+  if (g_model_work_pending || !g_models.empty() || !g_device_allocations.empty()) {
+    std::fputs("fake ACL cleanup left live model/work/device allocations\n", stderr);
+    return 9007;
+  }
+  return ACL_SUCCESS;
+}
 aclError aclrtSetDevice(int) { return ACL_SUCCESS; }
 aclError aclrtResetDevice(int) { return ACL_SUCCESS; }
 
@@ -709,6 +739,7 @@ aclError aclrtDestroyStream(aclrtStream stream) {
 
 aclError aclrtSynchronizeStream(aclrtStream) {
   g_pending_h2d_sources.clear();
+  g_model_work_pending = false;
   return ACL_SUCCESS;
 }
 
@@ -730,12 +761,23 @@ aclError aclrtMalloc(void** device_ptr, std::size_t size, aclrtMemMallocPolicy) 
     return 1;
   }
   const std::size_t aligned_size = (size + 63) / 64 * 64;
+  const auto limit = EnvSize("QWEN35_DFLASH_FAKE_DEVICE_LIMIT", 64 * 1024 * 1024);
+  if (DeviceBytes() > limit || aligned_size > limit - DeviceBytes()) return 207001;
   *device_ptr = std::aligned_alloc(64, aligned_size);
+  if (*device_ptr != nullptr) g_device_allocations[*device_ptr] = aligned_size;
   return *device_ptr == nullptr ? 1 : ACL_SUCCESS;
 }
 
 aclError aclrtFree(void* device_ptr) {
+  g_device_allocations.erase(device_ptr);
   std::free(device_ptr);
+  return ACL_SUCCESS;
+}
+
+aclError aclrtGetMemInfo(aclrtMemAttr, std::size_t* free_bytes, std::size_t* total_bytes) {
+  if (free_bytes == nullptr || total_bytes == nullptr) return 1;
+  *total_bytes = EnvSize("QWEN35_DFLASH_FAKE_DEVICE_LIMIT", 64 * 1024 * 1024);
+  *free_bytes = *total_bytes - std::min(*total_bytes, DeviceBytes());
   return ACL_SUCCESS;
 }
 
@@ -791,10 +833,9 @@ aclError aclmdlLoadFromFileWithMem(
     std::size_t work_size,
     void* weight_ptr,
     std::size_t weight_size) {
-  const std::size_t required_weight =
-      RoleFromPath(path) == Role::kTargetPrefillHead
-      ? kPrefillHeadWeightBytes
-      : kModelWeightBytes;
+  const std::size_t required_weight = ModelWeightBytes(path);
+  if (g_model_work_pending || !g_pending_h2d_sources.empty()) return 9001;
+  if (EnvSize("QWEN35_DFLASH_FAKE_FAIL_RELOAD", 0) && g_model_execution_count) return 9002;
   if (work_ptr == nullptr || work_size < kModelWorkBytes ||
       weight_ptr == nullptr || weight_size < required_weight) {
     return 1;
@@ -825,13 +866,17 @@ aclError aclmdlQuerySize(
     return 1;
   }
   *work_size = kModelWorkBytes;
-  *weight_size = RoleFromPath(path) == Role::kTargetPrefillHead
-      ? kPrefillHeadWeightBytes
-      : kModelWeightBytes;
+  *weight_size = ModelWeightBytes(path);
   return ACL_SUCCESS;
 }
 
 aclError aclmdlUnload(std::uint32_t model_id) {
+  if (g_model_work_pending) return 9003;
+  if (EnvSize("QWEN35_DFLASH_FAKE_FAIL_UNLOAD", 0) &&
+      g_model_execution_count && !g_unload_fault_injected) {
+    g_unload_fault_injected = true;
+    return 9004;
+  }
   g_models.erase(model_id);
   if (g_models.empty()) {
     g_incremental_shared_work = nullptr;
@@ -873,6 +918,12 @@ aclError aclmdlGetInputDims(
   }
   const Spec& spec = Inputs(description->role)[index];
   const aclError status = SetDims(dimensions, spec);
+  if (status == ACL_SUCCESS && g_model_execution_count &&
+      EnvSize("QWEN35_DFLASH_FAKE_RELOAD_ABI_DRIFT", 0) &&
+      description->role == Role::kTargetPrefillHead && index == 0) {
+    // Same byte count, different shape: stale datasets must still be rejected.
+    std::swap(dimensions->dims[1], dimensions->dims[2]);
+  }
   const char* force_zero_rank_public =
       std::getenv("QWEN35_DFLASH_FAKE_ZERO_RANK_PUBLIC_INPUT");
   if (status == ACL_SUCCESS && description->role == Role::kTargetPrefill &&
@@ -1127,6 +1178,9 @@ aclError aclmdlExecuteAsync(
   if (iterator == g_models.end() || input == nullptr || output == nullptr) {
     return 1;
   }
+  g_model_work_pending = true;
+  ++g_model_execution_count;
+  if (EnvSize("QWEN35_DFLASH_FAKE_FAIL_EXECUTE", 0)) return 9006;
   if (DynamicShapeMode(iterator->second) && !input->uses_tensor_descriptor) {
     return 1;
   }

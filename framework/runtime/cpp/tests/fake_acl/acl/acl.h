@@ -46,6 +46,9 @@ typedef enum aclrtMemcpyKind {
   ACL_MEMCPY_DEFAULT = 4,
 } aclrtMemcpyKind;
 
+typedef enum aclrtMemAttr { ACL_DDR_MEM = 0, ACL_HBM_MEM = 1 } aclrtMemAttr;
+aclError aclrtGetMemInfo(aclrtMemAttr attr, std::size_t* free_bytes, std::size_t* total_bytes);
+
 typedef void* aclrtContext;
 typedef void* aclrtStream;
 

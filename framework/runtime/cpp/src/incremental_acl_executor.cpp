@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -78,6 +79,16 @@ void Check(aclError code, const std::string& operation) {
     message << operation << " failed with ACL error " << code;
     throw std::runtime_error(message.str());
   }
+}
+
+std::string DeviceMemorySnapshot() {
+  std::size_t free_bytes = 0, total_bytes = 0;
+  const aclError status = aclrtGetMemInfo(ACL_HBM_MEM, &free_bytes, &total_bytes);
+  return " mem_info_status=" + std::to_string(status) +
+      (status == ACL_SUCCESS
+           ? " device_free_bytes=" + std::to_string(free_bytes) +
+                 " device_total_bytes=" + std::to_string(total_bytes)
+           : "");
 }
 
 std::size_t Align(std::size_t value, std::size_t alignment) {
@@ -299,9 +310,9 @@ bool SameTensor(const TensorSpec& first, const TensorSpec& second) {
 void RequireSameTensor(
     const TensorSpec& first,
     const TensorSpec& second,
-    const char* description) {
+    const std::string& description) {
   if (!SameTensor(first, second)) {
-    throw std::runtime_error(std::string(description) + " tensor ABI differs");
+    throw std::runtime_error(description + " tensor ABI differs");
   }
 }
 
@@ -358,6 +369,9 @@ struct ModelSession {
       std::size_t allocated_weight_bytes,
       bool require_dynamic_gears,
       const IncrementalModelProgress& progress) {
+    if (loaded || description != nullptr) {
+      throw std::logic_error(role + ": model already loaded");
+    }
     if ((work_bytes != 0 && shared_work == nullptr) ||
         shared_work_bytes < work_bytes ||
         (weight_bytes != 0 && weight == nullptr) ||
@@ -384,6 +398,25 @@ struct ModelSession {
     Check(aclmdlGetDesc(description, id), role + ": aclmdlGetDesc");
     const std::size_t input_count = aclmdlGetNumInputs(description);
     const std::size_t output_count = aclmdlGetNumOutputs(description);
+    if (!inputs.empty()) {
+      // Only phase-resident static models may reload. Descriptors are rebuilt
+      // and checked so cached datasets cannot silently outlive a changed ABI.
+      if (input_count != inputs.size() || output_count != outputs.size()) {
+        throw std::runtime_error(role + ": reloaded static OM I/O count differs");
+      }
+      for (std::size_t index = 0; index < input_count; ++index) {
+        RequireSameTensor(inputs[index],
+            ReadTensorSpec(description, index, true, false, role),
+            role + ": reloaded static OM input " + std::to_string(index));
+      }
+      for (std::size_t index = 0; index < output_count; ++index) {
+        RequireSameTensor(outputs[index],
+            ReadTensorSpec(description, index, false, false, role),
+            role + ": reloaded static OM output " + std::to_string(index));
+      }
+      if (progress) progress(role.c_str(), "reload-done", work_bytes, weight_bytes);
+      return;
+    }
     // A canonical static fused OM has exactly 15 ordinary, fixed-shape inputs.
     // Detect that contract from physical tensor metadata first: dynamic-only
     // queries need not be supported by a static OM (nor return a zero gear count).
@@ -573,6 +606,18 @@ struct ModelSession {
       loaded = false;
     }
   }
+
+  void UnloadChecked() {
+    if (!loaded) throw std::logic_error(role + ": model is not loaded");
+    Check(aclmdlUnload(id), role + ": aclmdlUnload");
+    loaded = false;
+    if (description != nullptr) {
+      Check(aclmdlDestroyDesc(description), role + ": aclmdlDestroyDesc");
+      description = nullptr;
+    }
+    // Keep the copied TensorSpecs, not a live model/descriptor. State and
+    // datasets are application-owned allocations outside the weight arena.
+  }
 };
 
 struct BufferView {
@@ -584,14 +629,16 @@ struct DeviceAllocation {
   void* data = nullptr;
   std::size_t bytes = 0;
 
-  void Allocate(std::size_t requested) {
+  void Allocate(std::size_t requested, const std::string& owner = "device buffer") {
     if (requested == 0 || data != nullptr) {
       throw std::logic_error("invalid device allocation request");
     }
     bytes = requested;
-    Check(
-        aclrtMalloc(&data, bytes, kDeviceMemoryAllocationPolicy),
-        "aclrtMalloc");
+    const aclError status = aclrtMalloc(&data, bytes, kDeviceMemoryAllocationPolicy);
+    if (status != ACL_SUCCESS) {
+      Check(status, "aclrtMalloc owner=" + owner +
+            " requested_bytes=" + std::to_string(requested) + DeviceMemorySnapshot());
+    }
   }
 
   BufferView View(std::size_t requested = 0) const {
@@ -877,6 +924,15 @@ const char* IncrementalDraftFeaturePolicyName(
   return "unknown";
 }
 
+const char* IncrementalModelResidencyPolicyName(
+    IncrementalModelResidencyPolicy policy) noexcept {
+  switch (policy) {
+    case IncrementalModelResidencyPolicy::kAllResident: return "all-resident";
+    case IncrementalModelResidencyPolicy::kPhaseResident: return "phase-resident";
+  }
+  return "unknown";
+}
+
 class AclIncrementalExecutor::Impl {
  public:
   Impl(
@@ -886,7 +942,8 @@ class AclIncrementalExecutor::Impl {
       IncrementalStateResetPolicy state_reset_policy,
       IncrementalDecodeCarrierPolicy decode_carrier_policy,
       bool profile_model_executions,
-      IncrementalDraftFeaturePolicy draft_feature_policy)
+      IncrementalDraftFeaturePolicy draft_feature_policy,
+      IncrementalModelResidencyPolicy model_residency_policy)
       : device_id_(device_id),
         fused_speculative_step_(!paths.fused_speculative_step.empty()),
         unified_target_step_(
@@ -895,7 +952,9 @@ class AclIncrementalExecutor::Impl {
         state_reset_policy_(state_reset_policy),
         decode_carrier_policy_(decode_carrier_policy),
         draft_feature_policy_(draft_feature_policy),
-        profile_model_executions_(profile_model_executions) {
+        profile_model_executions_(profile_model_executions),
+        model_residency_policy_(model_residency_policy),
+        model_progress_(progress) {
     if (device_id < 0) {
       throw std::invalid_argument("device ID must be non-negative");
     }
@@ -928,6 +987,13 @@ class AclIncrementalExecutor::Impl {
     }
     if (profile_model_executions_) {
       model_execution_trace_.reserve(4096);
+    }
+    if (model_residency_policy_ != IncrementalModelResidencyPolicy::kAllResident &&
+        model_residency_policy_ != IncrementalModelResidencyPolicy::kPhaseResident) {
+      throw std::invalid_argument("unknown model residency policy");
+    }
+    if (PhaseResident() && !fused_speculative_step_) {
+      throw std::invalid_argument("phase-resident requires static fused topology");
     }
     try {
       Check(aclInit(nullptr), "aclInit");
@@ -967,7 +1033,8 @@ class AclIncrementalExecutor::Impl {
            fused_speculative_step_ ? 0 : verify_.work_bytes,
            fused_.work_bytes});
       if (shared_work_bytes != 0) {
-        shared_model_work_.Allocate(shared_work_bytes);
+        if (progress) progress("shared-workspace", "allocate-start", shared_work_bytes, 0);
+        shared_model_work_.Allocate(shared_work_bytes, "shared model workspace");
       }
       const std::array<std::size_t, 6> weight_bytes{
           prefill_.weight_bytes,
@@ -977,22 +1044,45 @@ class AclIncrementalExecutor::Impl {
           verify_.weight_bytes,
           fused_.weight_bytes,
       };
-      for (std::size_t index = 0; index < model_weights_.size(); ++index) {
-        if (weight_bytes[index] != 0) {
-          model_weights_[index].Allocate(weight_bytes[index]);
+      const std::array<const char*, 6> roles{
+          "target-prefill", "target-prefill-head", "target-decode1",
+          "draft-propose", "target-verify-commit", "fused-speculative-step"};
+      if (PhaseResident()) {
+        const auto maximum = *std::max_element(weight_bytes.begin(), weight_bytes.end());
+        if (progress) progress("phase-weight-arena", "allocate-start", 0, maximum);
+        if (maximum) phase_model_weights_.Allocate(maximum, "phase-resident weight arena");
+        residency_.allocated_weight_bytes = maximum;
+      } else {
+        for (std::size_t index = 0; index < model_weights_.size(); ++index) {
+          if (weight_bytes[index] != 0) {
+            if (progress) progress(roles[index], "allocate-weights-start", 0, weight_bytes[index]);
+            model_weights_[index].Allocate(weight_bytes[index], std::string(roles[index]) + " weights");
+            residency_.allocated_weight_bytes += weight_bytes[index];
+          }
         }
       }
       const auto load = [this, &progress](
                             ModelSession& session,
                             DeviceAllocation& weight,
                             bool dynamic) {
+        auto& storage = PhaseResident() ? phase_model_weights_ : weight;
         session.LoadWithMemory(
             shared_model_work_.data,
             shared_model_work_.bytes,
-            weight.data,
-            weight.bytes,
+            storage.data,
+            storage.bytes,
             dynamic,
             progress);
+        ++residency_.model_loads;
+        residency_.peak_resident_models = PhaseResident() ? 1 : residency_.model_loads;
+        if (PhaseResident()) {
+          if ((session.role == "fused-speculative-step" && !session.static_fused) ||
+              std::any_of(session.inputs.begin(), session.inputs.end(), HasDynamicDimension)) {
+            throw std::runtime_error("phase-resident requires a static fused OM; re-export static AIR");
+          }
+          session.UnloadChecked();
+          ++residency_.model_unloads;
+        }
       };
       load(prefill_, model_weights_[0], false);
       load(prefill_head_, model_weights_[1], false);
@@ -1075,6 +1165,9 @@ class AclIncrementalExecutor::Impl {
   std::size_t eos_table_width() const noexcept { return eos_table_width_; }
   const std::vector<IncrementalModelMemory>& model_memory() const noexcept {
     return memory_;
+  }
+  const IncrementalModelResidencyStats& model_residency_stats() const noexcept {
+    return residency_;
   }
   const std::vector<IncrementalModelExecutionTrace>&
   model_execution_trace() const noexcept {
@@ -3421,21 +3514,51 @@ class AclIncrementalExecutor::Impl {
     draft_reset_pending_ = false;
   }
 
+  bool PhaseResident() const noexcept {
+    return model_residency_policy_ == IncrementalModelResidencyPolicy::kPhaseResident;
+  }
+
+  void EnsureResident(ModelSession& session) {
+    if (!PhaseResident() || resident_model_ == &session) return;
+    const auto start = std::chrono::steady_clock::now();
+    // Finish all queued compute/copies before unloading or overwriting weights.
+    if (stream_work_pending_) {
+      Synchronize();
+      ++residency_.model_switch_synchronizations;
+    }
+    if (resident_model_ != nullptr) {
+      resident_model_->UnloadChecked();
+      ++residency_.model_unloads;
+      resident_model_ = nullptr;
+    }
+    session.LoadWithMemory(shared_model_work_.data, shared_model_work_.bytes,
+                          phase_model_weights_.data, phase_model_weights_.bytes,
+                          session.static_fused, model_progress_);
+    resident_model_ = &session;
+    ++residency_.model_loads;
+    ++residency_.model_switches;
+    residency_.model_switch_wall_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+  }
+
   void Execute(
-      const ModelSession& session,
+      ModelSession& session,
       DatasetPlan& plan,
       std::size_t physical_rows) {
     if (physical_rows == 0) {
       throw std::invalid_argument("model execution rows must be positive");
     }
+    EnsureResident(session);
     if (profile_model_executions_) {
       model_execution_trace_.push_back(
-          {model_execution_trace_.size(), session.id, physical_rows});
+          {model_execution_trace_.size(), session.id, physical_rows, session.role});
     }
+    // A failing asynchronous API may already have enqueued part of the graph.
+    // Cleanup must drain that work before freeing weights or application I/O.
+    stream_work_pending_ = true;
     Check(
         aclmdlExecuteAsync(session.id, plan.input, plan.output, stream_),
         session.role + ": aclmdlExecuteAsync");
-    stream_work_pending_ = true;
   }
 
   void CompactDecodeIdToAlignedInput(
@@ -3882,6 +4005,7 @@ class AclIncrementalExecutor::Impl {
     for (auto& weight : model_weights_) {
       weight.Release();
     }
+    phase_model_weights_.Release();
     shared_model_work_.Release();
     if (stream_ != nullptr) {
       static_cast<void>(aclrtDestroyStream(stream_));
@@ -3911,6 +4035,11 @@ class AclIncrementalExecutor::Impl {
   IncrementalDraftFeaturePolicy draft_feature_policy_ =
       IncrementalDraftFeaturePolicy::kFixedVerifyWidth;
   bool profile_model_executions_ = false;
+  IncrementalModelResidencyPolicy model_residency_policy_ =
+      IncrementalModelResidencyPolicy::kAllResident;
+  IncrementalModelProgress model_progress_;
+  IncrementalModelResidencyStats residency_;
+  ModelSession* resident_model_ = nullptr;
   bool initialized_ = false;
   bool device_set_ = false;
   bool reset_ = false;
@@ -3927,6 +4056,7 @@ class AclIncrementalExecutor::Impl {
   std::vector<IncrementalModelExecutionTrace> model_execution_trace_;
   DeviceAllocation shared_model_work_;
   std::array<DeviceAllocation, 6> model_weights_;
+  DeviceAllocation phase_model_weights_;
 
   std::size_t sequence_length_ = 0;
   std::size_t prefill_width_ = 0;
@@ -4051,7 +4181,8 @@ AclIncrementalExecutor::AclIncrementalExecutor(
     IncrementalStateResetPolicy state_reset_policy,
     IncrementalDecodeCarrierPolicy decode_carrier_policy,
     bool profile_model_executions,
-    IncrementalDraftFeaturePolicy draft_feature_policy)
+    IncrementalDraftFeaturePolicy draft_feature_policy,
+    IncrementalModelResidencyPolicy model_residency_policy)
     : impl_(std::make_unique<Impl>(
           model_paths,
           device_id,
@@ -4059,7 +4190,8 @@ AclIncrementalExecutor::AclIncrementalExecutor(
           state_reset_policy,
           decode_carrier_policy,
           profile_model_executions,
-          draft_feature_policy)) {}
+          draft_feature_policy,
+          model_residency_policy)) {}
 
 AclIncrementalExecutor::~AclIncrementalExecutor() = default;
 AclIncrementalExecutor::AclIncrementalExecutor(
@@ -4156,6 +4288,11 @@ std::vector<StatefulStep> AclIncrementalExecutor::SpeculativeWindow(
 const std::vector<IncrementalModelMemory>&
 AclIncrementalExecutor::model_memory() const noexcept {
   return impl_->model_memory();
+}
+
+const IncrementalModelResidencyStats&
+AclIncrementalExecutor::model_residency_stats() const noexcept {
+  return impl_->model_residency_stats();
 }
 
 const std::vector<IncrementalModelExecutionTrace>&

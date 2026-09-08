@@ -4,6 +4,9 @@ set(model_args
   --target-decode1 "${DECODE}" --target-decode1-sha256 "${DECODE_SHA}"
   --fused-speculative-step "${FUSED}" --fused-speculative-step-sha256 "${FUSED_SHA}"
 )
+if(RESIDENCY)
+  list(APPEND model_args --model-residency-policy "${RESIDENCY}")
+endif()
 string(REPEAT "1," 16 prefix)
 set(prompt "${prefix}10")
 set(ENV{QWEN35_DFLASH_FAKE_STATIC_FUSED} 1)
@@ -65,7 +68,7 @@ foreach(new_tokens 1 2)
     --output "${output}" --prompt-token-ids "${prompt}"
     --fused-static-feature-rows 64 --max-new-tokens "${new_tokens}" --max-draft-tokens 3
     --warmup 3 --repetitions 10 --measurement-protocol evidence
-    RESULT_VARIABLE result ERROR_VARIABLE stderr)
+    RESULT_VARIABLE result OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
   if(NOT result EQUAL 0)
     message(FATAL_ERROR "static short request failed: ${stderr}")
   endif()
@@ -102,9 +105,9 @@ foreach(fault missing-opt-in wrong-shape oversized-prompt capacity-budget dynami
   execute_process(COMMAND "${RUNNER}" ${model_args}
     --output "${output}" --prompt-token-ids "${tokens}"
     --fused-static-feature-rows "${rows}" --max-new-tokens "${new_tokens}"
-    RESULT_VARIABLE result ERROR_VARIABLE stderr)
+    RESULT_VARIABLE result OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
   if(result EQUAL 0 OR EXISTS "${output}" OR
-     NOT stderr MATCHES "(static.*(carrier|shape|budget)|loaded fused OM shape)")
+     NOT stderr MATCHES "(static.*(carrier|shape|budget)|loaded fused OM shape|phase-resident requires.*static)")
     message(FATAL_ERROR "static admission did not reject ${fault}: ${stderr}")
   endif()
 endforeach()

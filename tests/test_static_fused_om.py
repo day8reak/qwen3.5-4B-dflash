@@ -231,11 +231,12 @@ def test_static_contract_survives_compile_to_runtime_manifest(tmp_path, monkeypa
     assert fused["runtime_input_abi"]["bindings"][0]["serialized_shape"] == [1, 64, 4]
 
 
+@pytest.mark.parametrize("residency", ["all-resident", "phase-resident"])
 @pytest.mark.parametrize("prompt_rows,max_tokens,error", [
     (17, 32, "exit 96"), (65, 1, "prompt tokens"), (64, 129, "free KV slots"),
 ])
 def test_static_control_plane_forwards_explicit_carrier_and_rejects_before_launch(
-    tmp_path, monkeypatch, capsys, prompt_rows, max_tokens, error,
+    tmp_path, monkeypatch, capsys, prompt_rows, max_tokens, error, residency,
 ):
     deployment, _ = _compile_static_fixture(tmp_path, monkeypatch)
     commands = []
@@ -257,6 +258,7 @@ def test_static_control_plane_forwards_explicit_carrier_and_rejects_before_launc
                 "device_model": "Ascend310P3", "cann": "fake", "driver": "fake",
                 "firmware": "fake", "runtime": "fake",
                 "state_policy": cpp_runtime.INCREMENTAL_STATE_POLICY,
+                "model_residency_policy": residency,
             },
             prompt_token_ids=[10] * prompt_rows, eos_token_ids=[], device_id=0,
             max_new_tokens=max_tokens, max_draft_tokens=15,
@@ -269,6 +271,10 @@ def test_static_control_plane_forwards_explicit_carrier_and_rejects_before_launc
         assert "sha256=" in stderr
         command, = commands
         assert command[command.index("--fused-static-feature-rows") + 1] == "64"
+        if residency == "phase-resident":
+            assert command[command.index("--model-residency-policy") + 1] == residency
+        else:
+            assert "--model-residency-policy" not in command
         for role in _FUSED_SPECULATIVE_STEP_GRAPH_ABI:
             assert f"--{role}" in command
         assert "--draft-propose" not in command and "--target-verify-commit" not in command

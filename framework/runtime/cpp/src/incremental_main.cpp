@@ -34,6 +34,7 @@ using qwen35::dflash::IncrementalModelMemory;
 using qwen35::dflash::IncrementalDecodeCarrierPolicy;
 using qwen35::dflash::IncrementalDraftFeaturePolicy;
 using qwen35::dflash::IncrementalStateResetPolicy;
+using qwen35::dflash::IncrementalModelResidencyPolicy;
 using qwen35::dflash::PairedBenchmarkResult;
 using qwen35::dflash::ProgressCallback;
 using qwen35::dflash::ProgressEvent;
@@ -66,6 +67,8 @@ struct Arguments {
   std::size_t max_new_tokens = 32;
   std::size_t max_draft_tokens = 15;
   std::size_t fused_static_feature_rows = 0;
+  IncrementalModelResidencyPolicy model_residency_policy =
+      IncrementalModelResidencyPolicy::kAllResident;
   std::size_t dflash_sync_window = 1;
   bool coalesce_prefill_with_first_verify = false;
   ZeroAcceptFallbackPolicy zero_accept_fallback_policy =
@@ -99,6 +102,7 @@ void Usage(std::ostream& stream) {
       << "  --fused-speculative-step PATH            exact Draft+verify supergraph; replaces separate pair\n"
       << "  --fused-speculative-step-sha256 HEX      expected fused OM SHA-256\n"
       << "  --fused-static-feature-rows N            opt in to a fixed fused carrier (multiple of 64)\n"
+      << "  --model-residency-policy POLICY          all-resident (default) or phase-resident (static fused)\n"
       << "  --output PATH                            paired JSON report\n"
       << "  --prompt-token-ids CSV                   non-empty prompt\n"
       << "  --eos-token-ids CSV                      optional EOS token IDs\n"
@@ -323,6 +327,15 @@ Arguments ParseArguments(int argc, char** argv) {
     throw std::invalid_argument("static fused carrier rows must be non-negative");
   }
   result.fused_static_feature_rows = static_cast<std::size_t>(static_feature_rows);
+  const auto residency = TakeOptional(&values, "model-residency-policy", "all-resident");
+  if (residency == "phase-resident") {
+    if (!fused || result.fused_static_feature_rows == 0) {
+      throw std::invalid_argument("phase-resident requires a static fused carrier");
+    }
+    result.model_residency_policy = IncrementalModelResidencyPolicy::kPhaseResident;
+  } else if (residency != "all-resident") {
+    throw std::invalid_argument("model-residency-policy must be all-resident or phase-resident");
+  }
   if (result.fused_static_feature_rows != 0 &&
       (!fused || result.fused_static_feature_rows % 64 != 0 ||
        result.prompt_token_ids.size() > result.fused_static_feature_rows)) {
@@ -608,12 +621,17 @@ void WriteReport(
         return left.work_bytes < right.work_bytes;
       })->work_bytes;
   const auto& execution = executor.execution_stats();
+  const auto& residency = executor.model_residency_stats();
+  const bool phase_resident =
+      arguments.model_residency_policy == IncrementalModelResidencyPolicy::kPhaseResident;
   const bool fused_speculative_step = executor.fused_speculative_step();
   const char* resident_model_count =
       (executor.unified_target_step() || fused_speculative_step)
       ? "four"
       : "five";
-  const char* physical_topology = fused_speculative_step
+  const char* physical_topology = phase_resident
+      ? "split-prefill-head-four-artifact-phase-resident-fused-v1"
+      : fused_speculative_step
       ? "split-prefill-head-four-resident-fused-speculative-step-v1"
       : (executor.unified_target_step()
              ? "split-prefill-head-four-resident-unified-target-step-v1"
@@ -712,13 +730,15 @@ void WriteReport(
       execution.stream_synchronizations !=
           execution.prefill_completion_synchronizations +
               execution.target_decode1_executions +
-              execution.speculative_sync_windows ||
+              execution.speculative_sync_windows +
+              residency.model_switch_synchronizations ||
       execution.stream_synchronizations +
               execution.speculative_synchronizations_elided +
               execution.prefill_verify_synchronizations_elided !=
           execution.prefill_completion_synchronizations +
               execution.target_decode1_executions +
-              execution.target_verify_commit_executions ||
+              execution.target_verify_commit_executions +
+              residency.model_switch_synchronizations ||
       execution.device_to_host_operations +
               execution.speculative_d2h_operations_elided +
               execution.prefill_verify_d2h_operations_elided !=
@@ -780,7 +800,7 @@ void WriteReport(
   output << std::setprecision(17)
          << "{\"schema_version\":12,\"status\":\"PASS\","
          << "\"scope\":\"AscendCL C++ "
-         << resident_model_count
+         << (phase_resident ? "phase" : resident_model_count)
          << "-resident-OM paired model loop\","
          << "\"runner_id\":\"qwen35-dflash-ascendcl-cpp-incremental-v3\","
          << "\"runner_version\":\"" << JsonEscape(QWEN35_DFLASH_RUNNER_VERSION)
@@ -815,6 +835,8 @@ void WriteReport(
          << "\"sum_work_bytes\":" << sum_work
          << ",\"max_work_bytes\":" << max_work
          << ",\"sum_weight_bytes\":" << sum_weight
+         << ",\"allocated_weight_bytes\":" << residency.allocated_weight_bytes
+         << ",\"weight_bytes_elided\":" << sum_weight - residency.allocated_weight_bytes
          << ",\"state_device_bytes\":" << execution.state_device_bytes
          << ",\"working_state_device_bytes\":"
          << execution.working_state_device_bytes
@@ -868,14 +890,29 @@ void WriteReport(
          << ",\"target_step_zero_count_device_bytes\":"
          << execution.target_step_zero_count_device_bytes
          << ",\"explicit_allocated_device_bytes_excluding_runtime\":"
-         << max_work + sum_weight + execution.state_device_bytes +
+         << max_work + residency.allocated_weight_bytes + execution.state_device_bytes +
                 execution.carrier_device_bytes
-         << ",\"load_policy\":\""
-         << resident_model_count
-         << " aclmdlLoadFromFileWithMem sessions; "
-            "one max-sized serial workspace; separate per-artifact weights; "
-            "no cross-OM weight sharing assumed\"},"
-         << "\"protocol\":{\"warmup\":" << arguments.warmup
+         << ",\"load_policy\":\"";
+  if (phase_resident) {
+    output << "phase-resident static fused; one live OM; synchronized unload before "
+              "reusing max-sized workspace and weight arena; hot decode stays loaded";
+  } else {
+    output << resident_model_count << " aclmdlLoadFromFileWithMem sessions; "
+              "one max-sized serial workspace; separate per-artifact weights; "
+              "no cross-OM weight sharing assumed";
+  }
+  output << "\"},\"model_residency\":{\"policy\":\""
+         << qwen35::dflash::IncrementalModelResidencyPolicyName(arguments.model_residency_policy)
+         << "\",\"model_id_scope\":\""
+         << (phase_resident ? "startup-metadata-inspection" : "resident-model")
+         << "\",\"peak_resident_models\":" << residency.peak_resident_models
+         << ",\"model_loads\":" << residency.model_loads
+         << ",\"model_unloads\":" << residency.model_unloads
+         << ",\"model_switches\":" << residency.model_switches
+         << ",\"model_switch_synchronizations\":" << residency.model_switch_synchronizations
+         << ",\"model_switch_wall_ms\":" << residency.model_switch_wall_ms
+         << ",\"timing_scope\":\"model switch synchronization/unload/load/ABI validation is included in generation and benchmark wall times; startup inspection is separate\"}"
+         << ",\"protocol\":{\"warmup\":" << arguments.warmup
          << ",\"repetitions\":" << arguments.repetitions
          << ",\"kind\":\""
          << (formal_latency_evidence ? "evidence" : "profile")
@@ -904,7 +941,8 @@ void WriteReport(
          << ",\"order\":\"alternating ordinary/DFlash in one "
          << resident_model_count
          << "-model process\","
-         << "\"model_load_excluded_from_latency\":true,"
+         << "\"model_load_excluded_from_latency\":"
+         << (phase_resident ? "false," : "true,")
          << "\"device_memory_allocation_policy\":\""
          << qwen35::dflash::kDeviceMemoryAllocationPolicyName << "\","
          << "\"prefill_completion_policy\":\""
@@ -1222,6 +1260,7 @@ void WriteReport(
     const auto& event = model_execution_trace[index];
     output << "{\"ordinal\":" << event.ordinal
            << ",\"model_id\":" << event.model_id
+           << ",\"role\":\"" << JsonEscape(event.role) << "\""
            << ",\"physical_rows\":" << event.physical_rows << '}';
   }
   output << "],\"prompt_token_ids\":";
@@ -1337,7 +1376,8 @@ int main(int argc, char** argv) {
         arguments.state_reset_policy,
         arguments.decode_carrier_policy,
         arguments.measurement_protocol == MeasurementProtocol::kProfile,
-        arguments.draft_feature_policy);
+        arguments.draft_feature_policy,
+        arguments.model_residency_policy);
     const auto load_end = std::chrono::steady_clock::now();
     const std::size_t static_rows = executor.execution_stats().fused_static_feature_rows;
     if (static_rows != arguments.fused_static_feature_rows) {

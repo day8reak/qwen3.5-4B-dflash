@@ -779,6 +779,17 @@ def test_msprof_analysis_rejects_coalesced_d2h_padding_drift(
         )
 
 
+def test_msprof_analysis_rejects_expired_phase_inspection_ids(tmp_path: Path) -> None:
+    report_path, profile = _case(tmp_path)
+    report = _runner_report()
+    report["model_residency"] = {
+        "policy": "phase-resident", "model_id_scope": "startup-metadata-inspection",
+    }
+    _write_json(report_path, report)
+    with pytest.raises(MsprofAnalysisError, match="load-epoch evidence"):
+        analyze_incremental_msprof(profile_dir=profile, runner_report=report_path)
+
+
 def test_msprof_analysis_rejects_formal_evidence_report(tmp_path: Path) -> None:
     report_path, profile = _case(tmp_path)
     report = _runner_report()
