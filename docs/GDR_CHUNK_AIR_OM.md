@@ -310,6 +310,11 @@ manifest 保存有序输入/输出的 dtype、shape、文件 hash、算子预检
 普通 NPU 推理仍调用同一套 receiver 量化接口。
 保留整个 AIR 目录，不要只复制 `.air` 文件。
 
+卷积历史窗口通过切片加 `stack` 导出，保持每个有效前缀的状态；不使用
+`aten.unfold.default`。若日志以 `ERR03007 GRAPH feature not supported` 结束，
+查看完整日志中第一条 `NotImplementedError` 或 converter 异常及其对应的 `Original traceback`，
+不要只截取末尾的 FX 图代码。FakeTensor 检查通过不代表所有标准算子都能转为 GE。
+
 导出失败后，使用新的空 bundle 目录重试，例如将 `--bundle-dir` 改为
 `"$AI_RUN_DIR/artifacts-custom-ops"`；后续 `--air-manifest` 和
 `--deployment-manifest` 的路径也须指向该目录。导出器不会覆盖非空目录。

@@ -130,6 +130,13 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
             for node in exported.graph.nodes:
                 if node.op != "call_function":
                     continue
+                # FakeTensor/AOT success alone does not prove TorchAir support.
+                # These standard-op converters raise NotImplementedError.
+                if str(node.target) in {
+                    "aten.unfold.default", "aten.unfold_copy.default",
+                    "aten.index_copy.default",
+                }:
+                    raise AssertionError(f"unsupported AIR operator: {node.target}")
                 converter = self.converters.get(node.target)
                 if converter is not None:
                     converter(*node.args, **node.kwargs)
@@ -153,6 +160,8 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
         audit = _validated_custom_op_audit(graph)
         exported = ta.captures[name]
         nodes = list(exported.graph.nodes)
+        cache_writes = [node for node in nodes if str(node.target) == "aten.scatter.src"]
+        assert len(cache_writes) == (4 if name == "draft" else 2)
         calls = [node for node in nodes if str(node.target) == "npu.npu_chunk_gated_delta_rule.default"]
         if name == "draft":
             assert audit == [] and not calls

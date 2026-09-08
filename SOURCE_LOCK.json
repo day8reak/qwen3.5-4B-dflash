@@ -157,11 +157,11 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "a4bc625ade3a8f8a7ea76706a323dd1fe22849174e9850a245cecdac517e2b03"
+        "source_sha256": "bb997304790eb69b466950485b5d3f690c2aee0eddb63404397fac7756076642"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "6c19aee656d1b64f30ca005f594aef3ba8165993c5de829060cdbc7f117e0bcb"
+        "source_sha256": "65337076df44b7e14739df0aa7e705c36cd70991ad15649f17badc719dbb44bb"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
@@ -233,7 +233,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/incremental.py",
-        "source_sha256": "0eb2eb976b760fad20aad22f903e8f6dae66e680c14c1483f4ab763b73ac8787"
+        "source_sha256": "9a7895c786e1baaf190ef986304c182b70a6817a4621548cb1f4707369f5a3ea"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/incremental_plan.py",
@@ -349,11 +349,11 @@
       },
       {
         "source_file": "tests/test_custom_op_export.py",
-        "source_sha256": "9435d615cfa95d07766271f20c0bbfc8b47d642da0e9c905e7d852fef6fe1719"
+        "source_sha256": "a16e53d04bb7de85e903243e323d47316e9a1e3b603e7f0181c9c71c219769b5"
       },
       {
         "source_file": "tests/test_incremental_air_om.py",
-        "source_sha256": "68e9f995c2f820bd12137360ae2e6bc52cf1fcc8af2b04255470675ad082086c"
+        "source_sha256": "a69d484b236406ee659516932ca2e50b3e31a92d6bf3fc81b5ffd22e58459295"
       },
       {
         "source_file": "tests/test_msprof_stage_script.py",

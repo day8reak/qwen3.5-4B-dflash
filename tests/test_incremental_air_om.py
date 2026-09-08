@@ -19,7 +19,10 @@ sys.path.insert(0, str(ROOT / "framework/python"))
 from qwen35_dflash.ascend310p.incremental import (
     DraftGraph,
     TargetRowsGraph,
+    conv_chunk,
+    copy_cache_rows,
     incremental_graph_specs,
+    prefix_state,
     update_paged,
 )
 from qwen35_dflash.ascend310p.incremental_plan import validate_incremental_bundle
@@ -231,6 +234,38 @@ def manifest_graphs(values):
     ]
 
 
+@pytest.mark.parametrize("rows", [1, 16, 64])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_conv_chunk_preserves_output_and_every_committed_prefix(rows, dtype, with_bias):
+    generator = torch.Generator().manual_seed(812)
+    batch, channels, width = 2, 8, 4
+    # Real GDN projections are transposed into [B,C,R], so include noncontiguous x.
+    x = torch.randn(batch, rows, channels, generator=generator, dtype=dtype).transpose(1, 2)
+    state = torch.randn(batch, channels, width, generator=generator, dtype=dtype)
+    weight = torch.randn(channels, width, generator=generator, dtype=dtype)
+    bias = torch.randn(channels, generator=generator, dtype=dtype) if with_bias else None
+    original_x, original_state = x.clone(), state.clone()
+    history = torch.cat((state, x), dim=-1).to(weight.dtype)
+    reference_output = F.silu(
+        F.conv1d(history, weight.unsqueeze(1), bias, groups=channels)
+    )[..., -rows:].to(dtype)
+    output, bank = conv_chunk(x, state, weight, bias)
+    torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
+    assert bank.shape == (batch, rows, channels, width)
+    assert bank.dtype == dtype and bank.is_contiguous()
+    # Independent sequential cache update: each prefix must keep exactly its
+    # last K values, including tails and zero-acceptance verify (anchor only).
+    window = state.clone()
+    for valid in range(1, rows + 1):
+        window = torch.cat((window[..., 1:], x[..., valid - 1 : valid]), dim=-1)
+        torch.testing.assert_close(bank[:, valid - 1], window, rtol=0, atol=0)
+        committed = prefix_state(bank, torch.tensor([valid], dtype=torch.int16))
+        torch.testing.assert_close(committed, window, rtol=0, atol=0)
+    torch.testing.assert_close(x, original_x, rtol=0, atol=0)
+    torch.testing.assert_close(state, original_state, rtol=0, atol=0)
+
+
 def test_exactly_four_graphs_and_complete_signatures():
     values = specs()
     assert {s.name for s in values} == {
@@ -307,6 +342,27 @@ def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(accepted):
             )
     for actual, expected in zip(initial, verify.example_args[3:]):
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("dim,shape", [(0, (192, 2, 16)), (2, (1, 2, 192, 16))])
+@pytest.mark.parametrize("rows", [1, 16, 64])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_cache_rows_match_index_copy_without_mutating_input(dim, shape, rows, dtype):
+    generator = torch.Generator().manual_seed(813)
+    cache = torch.randn(shape, generator=generator, dtype=dtype)
+    original = cache.clone()
+    value_shape = list(shape)
+    value_shape[dim] = rows
+    # Keep the value layout noncontiguous to exercise transposed Draft K/V.
+    values = torch.randn(value_shape, generator=generator, dtype=dtype)
+    values = values.transpose(-1, -2).contiguous().transpose(-1, -2)
+    for start in (0, 63, shape[dim] - rows):
+        positions = torch.arange(start, start + rows)
+        expected = torch.index_copy(cache, dim, positions, values)
+        actual = copy_cache_rows(cache, dim, positions, values)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(cache, original, rtol=0, atol=0)
+        assert actual.data_ptr() != cache.data_ptr()
 
 
 def test_cache_write_crosses_block_boundary_without_touching_prefix():

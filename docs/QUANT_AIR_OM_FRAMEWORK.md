@@ -123,9 +123,19 @@ GDR 累加及算子 initial/final state 使用 FP32；OM 之间持久保存的 r
 | 完整前缀图的缓存路径 | `qwen35_dflash::npu_cache_update` | `CacheUpdate`；功能化前端输出更新后的缓存，供 attention 消费 |
 | 完整前缀图的可选 scatter 路径 | `npu::npu_scatter_nd_update_` | `ScatterNdUpdate`；验证别名/Meta，保留内置 converter |
 
-增量四图的缓存写入使用 `index_copy`，不要求 `CacheUpdate` 或 `ScatterNdUpdate` 节点；
+增量四图的缓存写入使用函数式 `scatter`，由 TorchAir 映射到 `ScatterElements`，
+不要求 `CacheUpdate` 或 `ScatterNdUpdate` 节点。Target 在展平的 paged KV 第 0 维写入，
+Draft 在 `[B,H,C,D]` 的第 2 维写入；位置索引广播到更新值的形状，输入缓存保持不变。
+写入位置由连续且不重复的 token 位置构造，结果与整行 `index_copy` 相同。
 Draft 图使用 Tensor 算子。完整前缀工厂按其实际缓存路径声明算子依赖。
 本分支的 verify 和 commit 都使用 `ChunkGatedDeltaRule`，不依赖 `GatedDeltaRuleMTP`。
+
+卷积状态窗口使用静态切片加 `stack`，不调用 TorchAir 尚未实现 GE converter 的
+`aten.unfold.default`。卷积宽度 K=4 时只构造四个移位切片，得到
+`bank[b,r,c,k] = history[b,c,r+1+k]`；`bank[:,v-1]` 就是消费 v 行后的状态。
+prefill、decode 和 verify 的接受前缀提交共用该规则，卷积与 SiLU 计算保持同一公式。
+PyTorch 的 FakeTensor/严格捕获通过，只证明 PyTorch 图有效；标准算子的 GE 支持
+仍需单独检查，最终以目标机 TorchAir 导出及 ATC 编译为准。
 
 W8A8 的量化 activation/weight 保持 INT8，weight scale 和 per-token scale 保持 FP32，
 matmul 输出为 FP16。专用前端仅在工厂启用的 AIR 捕获期间生效。普通 NPU 推理的量化

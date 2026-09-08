@@ -23,7 +23,14 @@ def conv_chunk(x: Tensor, state: Tensor, weight: Tensor, bias: Tensor | None):
     rows = x.shape[-1]
     history = torch.cat((state, x), dim=-1).to(weight.dtype)
     output = F.silu(F.conv1d(history, weight.unsqueeze(1), bias, groups=x.shape[1]))
-    bank = history.unfold(-1, state.shape[-1], 1)[..., 1:, :]
+    # Window i is history[..., i+1:i+1+K], the state after input row i.
+    # TorchAir cannot lower aten.unfold. Stack K shifted slices instead of
+    # creating an overlapping view; K is the static convolution width (4).
+    bank = torch.stack(
+        [history[..., offset + 1 : offset + 1 + rows]
+         for offset in range(state.shape[-1])],
+        dim=-1,
+    )
     return output[..., -rows:].to(x.dtype), bank.permute(0, 2, 1, 3).contiguous().to(
         x.dtype
     )
@@ -31,6 +38,20 @@ def conv_chunk(x: Tensor, state: Tensor, weight: Tensor, bias: Tensor | None):
 
 def prefix_state(bank: Tensor, rows: Tensor) -> Tensor:
     return torch.index_select(bank, 1, rows.to(torch.long) - 1).squeeze(1).contiguous()
+
+
+def copy_cache_rows(cache: Tensor, dim: int, positions: Tensor, values: Tensor) -> Tensor:
+    """Replace complete cache rows at distinct positions without mutating input.
+
+    Every caller constructs consecutive positions within the locked capacity.
+    Broadcasting the row indices makes scatter equivalent to index_copy here;
+    TorchAir lowers scatter.src to ScatterElements, while index_copy has no GE
+    converter on the receiver route.
+    """
+    index_shape = [1] * cache.ndim
+    index_shape[dim] = -1
+    indices = positions.reshape(index_shape).expand_as(values)
+    return torch.scatter(cache, dim, indices, values)
 
 
 def update_paged(cache: Tensor, values: Tensor, positions: Tensor) -> Tensor:
@@ -42,7 +63,7 @@ def update_paged(cache: Tensor, values: Tensor, positions: Tensor) -> Tensor:
     blocks, width, block_size, tile = cache.shape
     rows = cache.permute(0, 2, 1, 3).reshape(blocks * block_size, width, tile)
     values = values.reshape(values.shape[1], width, tile)
-    rows = torch.index_copy(rows, 0, positions, values)
+    rows = copy_cache_rows(rows, 0, positions, values)
     return (
         rows.reshape(blocks, block_size, width, tile).permute(0, 2, 1, 3).contiguous()
     )
@@ -329,8 +350,8 @@ class DraftContextGraph(nn.Module):
             )
             result.extend(
                 (
-                    torch.index_copy(state[2 * index], 2, positions, key),
-                    torch.index_copy(state[2 * index + 1], 2, positions, value),
+                    copy_cache_rows(state[2 * index], 2, positions, key),
+                    copy_cache_rows(state[2 * index + 1], 2, positions, value),
                 )
             )
         return tuple(result)
