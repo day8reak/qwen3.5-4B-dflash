@@ -7,8 +7,9 @@ from pathlib import Path
 
 from .utils import contained_path, load_json_object, require_run_output, sha256_file
 
-ABI = "qwen35-dflash-chunk-v1"
+ABI = "qwen35-dflash-chunk-v2"
 ATTENTION_EXPORT_POLICY = "receiver_adn_all_seq_lengths_q_static_capacity_causal_mask"
+DRAFT_LENGTH_POLICY = "anchor_plus_runtime_K_masked_in_every_attention_layer"
 ROLES = ("target_prefill", "target_decode", "target_verify", "draft")
 DTYPES = {"int64": 8, "int16": 2, "float16": 2, "float32": 4}
 
@@ -75,6 +76,7 @@ def expected_signatures(c):
             start,
             valid,
             descriptor("anchor", "int64", [1]),
+            descriptor("proposal_count", "int16", [1]),
             *drafts,
         ],
         "outputs": [descriptor("draft_top1", "int64", [1, 15]), *drafts],
@@ -100,7 +102,9 @@ def validate_incremental_bundle(graphs):
         )
     c = candidates[0]["metadata"]["incremental_contract"]
     if c.get("abi") != ABI or c.get("block_size") != 16 or c.get("prefill_rows") != 64:
-        raise ValueError("unsupported incremental ABI")
+        raise ValueError("unsupported incremental ABI; regenerate AIR/OM and rebuild the C++ runner")
+    if c.get("draft_length_policy") != DRAFT_LENGTH_POLICY:
+        raise ValueError("incremental Draft requires runtime proposal_count in every layer")
     if c.get("attention_export") != ATTENTION_EXPORT_POLICY:
         raise ValueError(
             "unsupported attention export ABI: regenerate AIR with "

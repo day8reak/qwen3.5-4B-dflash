@@ -320,7 +320,7 @@ def validate_cpp_runner_report(
     if protocol.get("warmup") != 3 or protocol.get("repetitions") != 10:
         raise RuntimeError("C++ runner protocol is not the locked 3+10")
     abi = report.get("abi", {})
-    if chunk_abi and (abi.get("id") != "qwen35-dflash-chunk-v1" or abi.get("graph_count") != 4):
+    if chunk_abi and (abi.get("id") != "qwen35-dflash-chunk-v2" or abi.get("graph_count") != 4):
         raise RuntimeError("C++ runner incremental ABI differs")
     if not chunk_abi and abi.get("input_names") != ["input_ids", "attention_mask"]:
         raise RuntimeError("C++ runner input ABI differs")
@@ -384,7 +384,7 @@ def run_cpp_pair(
         from .incremental_plan import write_incremental_plan
         om_path, deployment, contract = write_incremental_plan(
             deployment_manifest, Path(raw_output).with_suffix(".chunk-plan.txt"))
-        graph = {"name": "qwen35-dflash-chunk-v1", "om": file_record(om_path, relative_to=om_path.parent)}
+        graph = {"name": "qwen35-dflash-chunk-v2", "om": file_record(om_path, relative_to=om_path.parent)}
     else:
         om_path, deployment, graph = _resolve_integrated_om(
             deployment_manifest, graph_name=identity["graph_name"])

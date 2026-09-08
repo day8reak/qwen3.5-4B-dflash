@@ -222,7 +222,8 @@ class AclChunkExecutor::Impl {
                   bool output) const {
     if (State(spec.name)) return spec.name + (output ? ".next" : ".current");
     if (spec.name == "features" || spec.name == "start_position" ||
-        spec.name == "valid_rows" || spec.name == "anchor")
+        spec.name == "valid_rows" || spec.name == "anchor" ||
+        spec.name == "proposal_count")
       return spec.name;
     return graph + "." + spec.name;
   }
@@ -399,18 +400,20 @@ class AclChunkExecutor::Impl {
       // Only the final chunk's proposal is needed. Earlier calls initialize
       // Draft KV; the extra block computation is an explicit four-OM tradeoff.
       if (draft && offset + rows < ids.size())
-        static_cast<void>(Propose(token));
+        static_cast<void>(Propose(token, 15));
     }
     return token;
   }
-  std::vector<std::int64_t> Propose(std::int64_t anchor) {
+  std::vector<std::int64_t> Propose(std::int64_t anchor, std::size_t proposal_count) {
     Healthy();
+    Require(proposal_count > 0 && proposal_count <= 15, "Draft proposal_count must be 1..15");
     Require(!pending && feature_rows > 0 && draft_cursor == feature_start &&
                 feature_start + feature_rows == cursor,
             "Draft context cursor is inconsistent");
     Scalar("start_position", static_cast<std::int64_t>(feature_start));
     Scalar("valid_rows", static_cast<std::int64_t>(feature_rows));
     Scalar("anchor", anchor);
+    Scalar("proposal_count", static_cast<std::int64_t>(proposal_count));
     Call("draft");
     Swap('d');
     draft_cursor = cursor;
@@ -490,8 +493,8 @@ std::int64_t AclChunkExecutor::Prefill(const std::vector<std::int64_t>& ids,
                                        bool draft) {
   return impl_->Prefill(ids, draft);
 }
-std::vector<std::int64_t> AclChunkExecutor::Propose(std::int64_t anchor) {
-  return impl_->Propose(anchor);
+std::vector<std::int64_t> AclChunkExecutor::Propose(std::int64_t anchor, std::size_t count) {
+  return impl_->Propose(anchor, count);
 }
 std::vector<std::int64_t> AclChunkExecutor::Verify(
     const std::vector<std::int64_t>& ids) {

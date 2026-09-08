@@ -39,7 +39,8 @@ class ChunkExecutor : public GraphExecutor {
   virtual void Abort() noexcept = 0;
   virtual std::int64_t Prefill(const std::vector<std::int64_t>& ids,
                                bool draft) = 0;
-  virtual std::vector<std::int64_t> Propose(std::int64_t anchor) = 0;
+  virtual std::vector<std::int64_t> Propose(std::int64_t anchor,
+                                           std::size_t proposal_count) = 0;
   virtual std::vector<std::int64_t> Verify(
       const std::vector<std::int64_t>& block) = 0;
   virtual void Commit(std::size_t rows) = 0;
@@ -65,7 +66,7 @@ class AclChunkExecutor final : public ChunkExecutor {
   void Reset(std::int64_t) override;
   void Abort() noexcept override;
   std::int64_t Prefill(const std::vector<std::int64_t>&, bool) override;
-  std::vector<std::int64_t> Propose(std::int64_t) override;
+  std::vector<std::int64_t> Propose(std::int64_t, std::size_t) override;
   std::vector<std::int64_t> Verify(const std::vector<std::int64_t>&) override;
   void Commit(std::size_t) override;
   std::int64_t Decode(std::int64_t) override;

@@ -14,9 +14,9 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .contracts import AirGraphSpec, CustomOpExportSpec
-from .incremental_plan import ATTENTION_EXPORT_POLICY
+from .incremental_plan import ABI, ATTENTION_EXPORT_POLICY, DRAFT_LENGTH_POLICY
 
-CHUNK_ABI = "qwen35-dflash-chunk-v1"
+CHUNK_ABI = ABI
 
 
 def conv_chunk(x: Tensor, state: Tensor, weight: Tensor, bias: Tensor | None):
@@ -389,7 +389,7 @@ class DraftProposeGraph(nn.Module):
         super().__init__()
         self.draft, self.embedding, self.head = draft, embedding, head
 
-    def forward(self, anchor, context_length, *state):
+    def forward(self, anchor, context_length, proposal_count, *state):
         draft, config = self.draft, self.draft.config
         block_ids = torch.cat(
             (
@@ -413,7 +413,10 @@ class DraftProposeGraph(nn.Module):
         valid = torch.cat(
             (
                 context_positions < context_length,
-                torch.ones_like(offsets, dtype=torch.bool),
+                # A short native block contains anchor + K masks. Hidden
+                # rows beyond K must never become attention keys, including
+                # in the final non-causal layer.
+                offsets <= proposal_count.to(torch.long),
             )
         )
         distance = positions[:, None] - key_positions[None, :]
@@ -464,7 +467,9 @@ class DraftProposeGraph(nn.Module):
             )
             hidden = hidden + base.o_proj(mixed)
             hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
-        return (draft.ops.top1(draft.norm(hidden)[:, 1:], self.head.weight),)
+        top1 = draft.ops.top1(draft.norm(hidden)[:, 1:], self.head.weight)
+        active = offsets[1:] <= proposal_count.to(torch.long)
+        return (torch.where(active[None], top1, torch.zeros_like(top1)),)
 
 
 class DraftGraph(nn.Module):
@@ -475,14 +480,14 @@ class DraftGraph(nn.Module):
         self.context = DraftContextGraph(draft, 64)
         self.propose = DraftProposeGraph(draft, embedding, head)
 
-    def forward(self, features, start_position, valid_rows, anchor, *state):
+    def forward(self, features, start_position, valid_rows, anchor, proposal_count, *state):
         visible = torch.arange(64, device=features.device) < valid_rows.to(torch.long)
         features = torch.where(
             visible[None, :, None], features, torch.zeros_like(features)
         )
         updated = self.context(features, start_position, *state)
         proposals = self.propose(
-            anchor, start_position + valid_rows.to(torch.long), *updated
+            anchor, start_position + valid_rows.to(torch.long), proposal_count, *updated
         )
         return (*proposals, *updated)
 
@@ -578,6 +583,7 @@ def incremental_graph_specs(
         "feature_width": draft.config.feature_size,
         "state_policy": "in-graph-acceptance-two-pass-gdr-atomic-fp16-state-output",
         "attention_export": ATTENTION_EXPORT_POLICY,
+        "draft_length_policy": DRAFT_LENGTH_POLICY,
         "single_row_policy": "ordinary_decode1_chunk1; speculative_fallback_verify16_valid1",
         "commit_capsules": "internal_to_target_verify_not_external_OM_IO",
     }
@@ -659,8 +665,9 @@ def incremental_graph_specs(
     add(
         "draft",
         DraftGraph(draft, embedding, target.get_output_embeddings()),
-        (features, start, valid, start.clone(), *draft_state),
-        ("features", "start_position", "valid_rows", "anchor", *draft_names),
+        (features, start, valid, start.clone(),
+         torch.full_like(valid, 15), *draft_state),
+        ("features", "start_position", "valid_rows", "anchor", "proposal_count", *draft_names),
         ("draft_top1", *draft_names),
         (torch.zeros((1, 15), dtype=torch.long, device=device), *draft_state),
     )

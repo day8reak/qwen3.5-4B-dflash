@@ -59,10 +59,17 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
   if (model.role == "draft") {
     if (*static_cast<std::uint16_t*>(in.at("features")->data) != start) return 24;
     const auto anchor = *static_cast<std::int64_t*>(in.at("anchor")->data);
+    const auto proposal_count = *static_cast<std::int16_t*>(in.at("proposal_count")->data);
+    if (proposal_count < 1 || proposal_count > 15) return 28;
+    if (const auto* path = std::getenv("QWEN35_FAKE_PROPOSAL_LOG")) {
+      std::ofstream log(path, std::ios::app);
+      log << start << ' ' << valid << ' ' << proposal_count << '\n';
+    }
     auto* proposals = static_cast<std::int64_t*>(out.at("draft_top1")->data);
     const char* requested = std::getenv("QWEN35_FAKE_ACCEPT");
     const int accepted = requested ? std::atoi(requested) : 15;
-    for (int i = 0; i < 15; ++i) proposals[i] = (anchor + i + 1 + (i == accepted ? 7 : 0)) % 64;
+    for (int i = 0; i < 15; ++i)
+      proposals[i] = i < proposal_count ? (anchor + i + 1 + (i == accepted ? 7 : 0)) % 64 : 0;
   } else {
     auto* ids = static_cast<std::int64_t*>(in.at("input_ids")->data);
     auto* predictions = static_cast<std::int64_t*>(out.at("target_top1")->data);

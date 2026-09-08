@@ -29,7 +29,8 @@ from qwen35_dflash.ascend310p.incremental import (
 from qwen35_dflash.ascend310p.incremental_plan import validate_incremental_bundle
 from qwen35_dflash.ascend310p.quant_factory import AirDFlashOps, _repeat_kv
 from models.dflash_v1.dflash_config import Qwen35DFlashConfig
-from models.dflash_v1.modeling_dflash import DFlashDraftModel
+from models.dflash_v1.modeling_dflash import DFlashDraftModel, DFlashRMSNorm
+from models.dflash_v1.dflash_ops import TorchDFlashOps
 
 
 @pytest.fixture(autouse=True)
@@ -386,21 +387,30 @@ def test_cache_write_crosses_block_boundary_without_touching_prefix():
     torch.testing.assert_close(cache, old)
 
 
-def test_draft_fused_context_matches_original_cached_draft_with_padding():
+@pytest.mark.parametrize("proposal_count", [1, 2, 7, 13, 15])
+def test_draft_fused_context_matches_original_cached_draft_with_padding(proposal_count):
     torch.manual_seed(10)
     draft, target = draft_model(), TinyTarget().eval()
+    # Unit RMS weights keep attention contributions material. Small random
+    # norm weights can hide an incorrect full-width non-causal Draft block.
+    with torch.no_grad():
+        for module in draft.modules():
+            if isinstance(module, DFlashRMSNorm):
+                module.weight.fill_(1)
+    native = copy.deepcopy(draft)
+    native.set_ops(TorchDFlashOps())
     graph = DraftGraph(draft, target.embedding, target.head)
-    cache = draft.new_kv_cache(max_length=192)
+    cache = native.new_kv_cache(max_length=192)
     states = tuple(torch.zeros(1, 1, 192, 16).half() for _ in range(4))
     start = 0
     with torch.inference_mode():
         for rows in (37, 4, 1, 16):
             features = torch.randn(1, rows, 64).half()
             padded = F.pad(features, (0, 0, 0, 64 - rows), value=float("nan"))
-            block = torch.tensor([[4] + [63] * 15])
-            position_ids = torch.arange(start, start + rows + 16)[None]
-            expected = draft.draft_top1_cached_projected(
-                draft.project_target_hidden(features),
+            block = torch.tensor([[4] + [63] * proposal_count])
+            position_ids = torch.arange(start, start + rows + proposal_count + 1)[None]
+            expected = native.draft_top1_cached_projected(
+                native.project_target_hidden(features),
                 target.embedding(block),
                 position_ids,
                 cache,
@@ -411,9 +421,11 @@ def test_draft_fused_context_matches_original_cached_draft_with_padding():
                 torch.tensor([start]),
                 torch.tensor([rows], dtype=torch.int16),
                 torch.tensor([4]),
+                torch.tensor([proposal_count], dtype=torch.int16),
                 *states,
             )
-            torch.testing.assert_close(actual[0], expected)
+            torch.testing.assert_close(actual[0][:, :proposal_count], expected)
+            assert torch.count_nonzero(actual[0][:, proposal_count:]) == 0
             states = actual[1:]
             start += rows
             for index in range(2):
@@ -429,6 +441,51 @@ def test_draft_fused_context_matches_original_cached_draft_with_padding():
                     atol=1e-3,
                     rtol=1e-3,
                 )
+
+
+@pytest.mark.parametrize("proposal_count", [1, 2, 7, 13, 15])
+def test_short_block_excludes_padding_from_noncausal_attention(proposal_count):
+    # Uniform final-layer attention exposes the logical K denominator.
+    # Context V points at channel 0, all noise V at channel 1; including
+    # fifteen masks instead of one changes the winning vocabulary ID.
+    draft, target = draft_model(), TinyTarget().eval()
+    with torch.no_grad():
+        for parameter in draft.parameters():
+            parameter.zero_()
+        for module in draft.modules():
+            if isinstance(module, DFlashRMSNorm):
+                module.weight.fill_(1)
+        draft.fc.weight[:, :32].copy_(torch.eye(32).half())
+        attention = draft.layers[-1].self_attn
+        attention.v_proj.weight[:, :16].copy_(torch.eye(16).half())
+        attention.o_proj.weight.copy_(torch.eye(32).half())
+        target.embedding.weight.zero_()
+        target.embedding.weight[:, 1] = 0.1
+        target.head.weight.zero_()
+        target.head.weight[0, 0] = 1
+        target.head.weight[1, 1] = 1
+    native = copy.deepcopy(draft)
+    native.set_ops(TorchDFlashOps())
+    graph = DraftGraph(draft, target.embedding, target.head)
+    features = torch.zeros(1, 4, 64).half()
+    features[..., 0] = 1
+    padded = F.pad(features, (0, 0, 0, 60), value=float("nan"))
+    states = tuple(torch.zeros(1, 1, 192, 16).half() for _ in range(4))
+    args = (padded, torch.tensor([0]), torch.tensor([4], dtype=torch.int16),
+            torch.tensor([4]))
+    with torch.inference_mode():
+        expected = native.draft_top1_cached_projected(
+            native.project_target_hidden(features),
+            target.embedding(torch.tensor([[4] + [63] * proposal_count])),
+            torch.arange(4 + proposal_count + 1)[None],
+            native.new_kv_cache(max_length=192), target.head.weight,
+        )
+        actual = graph(*args, torch.tensor([proposal_count], dtype=torch.int16), *states)[0]
+        torch.testing.assert_close(actual[:, :proposal_count], expected, rtol=0, atol=0)
+        if proposal_count <= 2:
+            legacy = graph(*args, torch.tensor([15], dtype=torch.int16), *states)[0]
+            assert torch.all(expected == 0)
+            assert torch.all(legacy[:, :proposal_count] == 1)
 
 
 class AcceptanceGraph(nn.Module):
@@ -627,8 +684,10 @@ def test_draft_graph_exports_with_dynamic_context_length():
         exported = torch.export.export(spec.model, spec.example_args).module()
         args = list(spec.example_args)
         args[2] = torch.tensor([37], dtype=torch.int16)
-        for lhs, rhs in zip(exported(*args), spec.model(*args)):
-            torch.testing.assert_close(lhs, rhs)
+        for count in (1, 7, 15):
+            args[4] = torch.tensor([count], dtype=torch.int16)
+            for lhs, rhs in zip(exported(*args), spec.model(*args)):
+                torch.testing.assert_close(lhs, rhs)
 
 
 @pytest.fixture
@@ -691,6 +750,9 @@ def test_fake_conversion_preserves_tensor_abi_and_hashes(chunk_bundle, tmp_path)
     )
     assert plan.read_text().count("\ngraph ") == 4
     assert len(deployment["graphs"]) == 4
+    assert deployment["compiler"]["precision_policy"] == "preserve_graph_dtypes"
+    for graph in deployment["graphs"]:
+        assert "--precision_mode=must_keep_origin_dtype" in graph["atc_command"]
     air = json.loads((chunk_bundle.parent / deployment["air_manifest"]["path"]).read_text())
     assert [g["runtime_input_abi"] for g in deployment["graphs"]] == [
         g["runtime_input_abi"] for g in air["graphs"]
@@ -703,6 +765,7 @@ def test_fake_conversion_preserves_tensor_abi_and_hashes(chunk_bundle, tmp_path)
 
 
 @pytest.mark.parametrize("failure", ["empty", "duplicate", "invalid-name", "attention-abi", "missing-attention-abi",
+                                      "stale-chunk-abi", "missing-draft-length-policy",
                                       "missing-input-abi", "failed-input-abi"])
 def test_compiler_rejects_invalid_graph_sets_before_atc(chunk_bundle, failure):
     from qwen35_dflash.ascend310p.compiler import compile_air_bundle
@@ -725,6 +788,10 @@ def test_compiler_rejects_invalid_graph_sets_before_atc(chunk_bundle, failure):
             contract = graph["metadata"]["incremental_contract"]
             if failure == "attention-abi":
                 contract["attention_export"] = "receiver_adn_fused_infer_attention_pse_shift_int64_logical_end"
+            elif failure == "stale-chunk-abi":
+                contract["abi"] = "qwen35-dflash-chunk-v1"
+            elif failure == "missing-draft-length-policy":
+                contract.pop("draft_length_policy", None)
             else:
                 contract.pop("attention_export", None)
     air_path.write_text(json.dumps(air))
@@ -766,7 +833,7 @@ def test_cpp_reports_actual_om_descriptors_before_execute(
         )
     text = log.read_text()
     assert "OM I/O descriptors graph=draft" in text
-    assert "inputs: plan=8 om=" in text and "outputs: plan=5 om=" in text
+    assert "inputs: plan=9 om=" in text and "outputs: plan=5 om=" in text
     assert not output.exists() and not events.exists()
     detail = str(caught.value)
     if failure == "input-order":
@@ -917,3 +984,56 @@ def test_pure_dflash_does_not_load_or_require_decode_om(chunk_bundle, tmp_path, 
         assert len(row["stage_ms"]["target_verify"]) == 31
         assert row["counters"]["target_only_fallback_rounds"] == 30
         assert "rounds" not in row
+
+
+@pytest.mark.parametrize("extra,expected", [
+    ([], ["--precision_mode=must_keep_origin_dtype"]),
+    (["--log=info"], ["--log=info", "--precision_mode=must_keep_origin_dtype"]),
+    (["--precision_mode=must_keep_origin_dtype"], ["--precision_mode=must_keep_origin_dtype"]),
+    (["--precision_mode_v2=origin"], ["--precision_mode_v2=origin"]),
+])
+def test_chunk_compilation_preserves_native_precision(extra, expected):
+    from qwen35_dflash.ascend310p.compiler import _chunk_precision_args
+    assert _chunk_precision_args(extra, incremental=True) == expected
+    assert _chunk_precision_args(extra, incremental=False) == extra
+
+
+@pytest.mark.parametrize("extra", [
+    ["--precision_mode=force_fp16"],
+    ["--precision_mode=allow_fp32_to_fp16"],
+    ["--precision_mode_v2=fp16"],
+    ["--precision_mode_v2=origin", "--precision_mode=must_keep_origin_dtype"],
+    ["--precision_mode=must_keep_origin_dtype", "--precision_mode=must_keep_origin_dtype"],
+])
+def test_chunk_compilation_rejects_precision_drift(extra):
+    from qwen35_dflash.ascend310p.compiler import _chunk_precision_args
+    with pytest.raises(ValueError, match="original graph precision"):
+        _chunk_precision_args(extra, incremental=True)
+
+
+@pytest.mark.parametrize("max_draft", [2, 7, 15])
+def test_cpp_passes_request_and_remaining_budget_to_draft(
+    chunk_bundle, tmp_path, monkeypatch, max_draft,
+):
+    from qwen35_dflash.ascend310p.cpp_runtime import run_cpp_pair
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER")
+    log = tmp_path / "proposals.log"
+    monkeypatch.setenv("QWEN35_FAKE_PROPOSAL_LOG", str(log))
+    result = run_cpp_pair(
+        deployment_manifest=chunk_bundle, runner=runner,
+        runner_options={"device_model":"host-fixture", "cann":"fake",
+                        "driver":"fake", "firmware":"fake", "runtime":"fake-acl"},
+        prompt_token_ids=[4] * 17, eos_token_ids=[], device_id=0,
+        max_new_tokens=20, max_draft_tokens=max_draft,
+        raw_output=tmp_path / "report.json", log_output=tmp_path / "runner.log",
+        trace_rounds=True,
+    )
+    observed = [tuple(map(int, line.split())) for line in log.read_text().splitlines()]
+    assert observed
+    for start, feature_rows, count in observed:
+        generated = start + feature_rows - 17 + 1
+        assert count == min(max_draft, 20 - generated)
+    assert min(count for _, _, count in observed) < max_draft
+    assert result["ordinary_parity"]["token_id_mismatches"] == 0

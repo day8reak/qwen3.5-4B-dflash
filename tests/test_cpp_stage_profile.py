@@ -17,21 +17,24 @@ SOURCE = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
-    "mode,stage,failure",
+    "mode,stage,failure,draft_limit,new_tokens",
     [
-        ("ordinary", "prefill", ""),
-        ("ordinary", "decode", ""),
-        ("ordinary", "all", ""),
-        ("dflash", "draft", ""),
-        ("dflash", "verify", ""),
-        ("dflash", "all", ""),
-        ("ordinary", "decode", "stop"),
-        ("dflash", "all", "execute"),
-        ("ordinary", "decode", "empty"),
-        ("ordinary", "decode", "eos"),
+        ("ordinary", "prefill", "", 15, 32),
+        ("ordinary", "decode", "", 15, 32),
+        ("ordinary", "all", "", 15, 32),
+        ("dflash", "draft", "", 15, 32),
+        ("dflash", "verify", "", 15, 32),
+        ("dflash", "all", "", 15, 32),
+        ("ordinary", "decode", "stop", 15, 32),
+        ("dflash", "all", "execute", 15, 32),
+        ("ordinary", "decode", "empty", 15, 32),
+        ("ordinary", "decode", "eos", 15, 32),
+        ("dflash", "draft", "", 2, 32),
+        ("dflash", "verify", "", 2, 32),
+        ("dflash", "all", "", 15, 4),
     ],
 )
-def test_cpp_stage_windows(chunk_bundle, sandbox, mode, stage, failure):
+def test_cpp_stage_windows(chunk_bundle, sandbox, mode, stage, failure, draft_limit, new_tokens):
     runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
     if not runner:
         pytest.skip("set QWEN35_CPP_TEST_RUNNER to the fake ACL runner")
@@ -85,6 +88,10 @@ def test_cpp_stage_windows(chunk_bundle, sandbox, mode, stage, failure):
             ",".join(["4"] * 65),
             "--eos-token-ids",
             "5" if failure == "eos" else "",
+            "--max-draft-tokens",
+            str(draft_limit),
+            "--max-new-tokens",
+            str(new_tokens),
         ],
         env=sandbox["env"],
         capture_output=True,
@@ -124,6 +131,12 @@ def test_cpp_stage_windows(chunk_bundle, sandbox, mode, stage, failure):
     assert control["status"] == "PASS_CONTROL"
     assert control["profile_backend"] == "cpp" and control["profile_mode"] == mode
     reports = report["captures"] if stage == "all" else [report]
+    count = min(15, draft_limit, new_tokens - 1)
+    for item in reports:
+        assert item["proposal_count"] == (count if item["profile_stage"] in {"draft", "verify"} else 0)
+    for role, measured, start, valid in rows:
+        if role == "target_verify":
+            assert valid == count + 1
     assert all(r["warmup_output_match"] for r in reports)
     if stage == "decode":
         assert all(not r[1] for r in rows if r[0] == "target_prefill")

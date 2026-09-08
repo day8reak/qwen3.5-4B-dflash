@@ -54,7 +54,7 @@ DFlash 部署需要 3 个 OM；加入普通模式对照后共 4 个。C++ 按模
 |---|---|
 | `python/qwen35_dflash/ascend310p/` | 图工厂、AIR 导出、ATC 编译、manifest、tokenizer 和 runner 控制面 |
 | `runtime/cpp/` | AscendCL 执行、增量状态、生成调度和阶段采集 |
-| `abi/dflash-chunk-v1.json` | 增量图、状态与设备验证合同 |
+| `abi/dflash-chunk-v2.json` | 增量图、状态与设备验证合同 |
 | `abi/performance-v1.json` | 性能计时和测量合同 |
 | `scripts/lock_quant_inputs.py` | 外部输入锁定 |
 | `scripts/compare_cpp_closed_runtime.py` | 相同设备、token 和计时范围的性能报告比较 |

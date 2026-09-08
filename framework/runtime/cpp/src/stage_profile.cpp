@@ -151,9 +151,14 @@ std::string ProfileChunk(AclChunkExecutor& executor,
                                    generation.eos_token_ids.end());
   const auto stages =
       p.stage == "all" ? Stages(p.mode) : std::vector<std::string>{p.stage};
+  const auto proposal_count = std::min({
+      generation.max_draft_tokens, executor.draft_width(),
+      generation.max_new_tokens > 0 ? generation.max_new_tokens - 1 : 0});
+  if (p.mode == "dflash" && p.stage != "prefill")
+    Require(proposal_count > 0, "Draft/verify profiling requires a nonempty proposal budget");
   const std::size_t extra = (p.stage == "prefill" || p.stage == "draft")
                                 ? 0
-                                : (p.mode == "ordinary" ? 1 : 16);
+                                : (p.mode == "ordinary" ? 1 : proposal_count + 1);
   Require(prompt.size() + extra <= executor.sequence_length(),
           "profile requires prompt plus full stage input capacity");
   Channel channel;
@@ -211,9 +216,13 @@ std::string ProfileChunk(AclChunkExecutor& executor,
         if (stage == "decode") {
           invoke(measured, [&] { result.push_back(executor.Decode(anchor)); });
         } else if (stage == "draft") {
-          invoke(measured, [&] { result = executor.Propose(anchor); });
+          invoke(measured, [&] {
+            result = executor.Propose(anchor, proposal_count);
+            result.resize(proposal_count);
+          });
         } else {
-          const auto proposals = executor.Propose(anchor);
+          auto proposals = executor.Propose(anchor, proposal_count);
+          proposals.resize(proposal_count);
           std::vector<std::int64_t> block{anchor};
           for (auto t : proposals) {
             token_ok(t);
@@ -263,6 +272,7 @@ std::string ProfileChunk(AclChunkExecutor& executor,
     report << "},\"captured_graph_calls\":{" << Quote(graph) << ':' << expected
            << "},\"stage_scope\":" << Quote(Scope(stage))
            << ",\"warmup_iterations\":" << p.warmup
+           << ",\"proposal_count\":" << ((stage == "draft" || stage == "verify") ? proposal_count : 0)
            << ",\"warmup_output_match\":" << (p.warmup ? "true" : "null")
            << ",\"formal_latency_evidence\":false,\"correctness_gate\":{"
               "\"status\":\"NOT_RUN_STAGE_DIAGNOSTIC\"}}";

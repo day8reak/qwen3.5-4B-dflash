@@ -9,7 +9,7 @@
     "target": "W8A8 dynamic QLinear with FP16 output",
     "target_embedding": "INT8 weight times FP32 row scale to FP16",
     "draft": "FP16",
-    "lm_head": "FP16"
+    "lm_head": "Target W8A8; Draft FP16"
   },
   "input_identity": {
     "repository_source": "verify every SOURCE_LOCK.json file/hash pair before checkpoint load",
@@ -139,7 +139,8 @@
           "threshold"
         ]
       }
-    ]
+    ],
+    "incremental_precision_mode": "must_keep_origin_dtype or precision_mode_v2=origin; downcasting modes rejected"
   },
   "runtime": {
     "language": "C++17",
@@ -160,8 +161,8 @@
   "claim_boundary": "Host and fake-ACL tests do not prove AIR export, OM conversion, physical 310P correctness, or latency. Those gates require the real locked target environment.",
   "incremental_graphs": {
     "factory": "qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_graphs",
-    "abi": "qwen35-dflash-chunk-v1",
-    "contract_file": "framework/abi/dflash-chunk-v1.json",
+    "abi": "qwen35-dflash-chunk-v2",
+    "contract_file": "framework/abi/dflash-chunk-v2.json",
     "dflash_oms": [
       "target_prefill",
       "target_verify",
@@ -206,7 +207,8 @@
         "logical_prefix": "runtime causal mask and key_position < start_position + valid_rows"
       }
     ],
-    "draft_custom_operators": []
+    "draft_custom_operators": [],
+    "draft_length_policy": "runtime proposal_count=K, every attention layer masks block keys after anchor+K, unused output tail zero"
   },
   "profiling": {
     "collector": "msprof dynamic CLI",

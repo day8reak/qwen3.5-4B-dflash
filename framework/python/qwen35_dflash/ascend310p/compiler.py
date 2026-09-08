@@ -74,6 +74,29 @@ def _validate_extra_args(arguments: Sequence[str]) -> list[str]:
     return result
 
 
+def _chunk_precision_args(arguments: Sequence[str], *, incremental: bool) -> list[str]:
+    """Preserve the FP32 islands specified by the native chunk/Draft graphs.
+
+    ATC's performance default can lower FP32 RMSNorm, Softmax, RoPE and
+    attention matmuls even though the Python graph contains explicit casts.
+    The FP16 checkpoint dtype is not permission to downcast these operations.
+    """
+    result = list(arguments)
+    if not incremental:
+        return result
+    precision = [value for value in result
+                 if value.split("=", 1)[0] in {"--precision_mode", "--precision_mode_v2"}]
+    allowed = {"--precision_mode=must_keep_origin_dtype", "--precision_mode_v2=origin"}
+    if len(precision) > 1 or (precision and precision[0] not in allowed):
+        raise ValueError(
+            "chunk AIR requires original graph precision: use "
+            "--precision_mode=must_keep_origin_dtype or --precision_mode_v2=origin"
+        )
+    if not precision:
+        result.append("--precision_mode=must_keep_origin_dtype")
+    return result
+
+
 def _default_runner(command: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         list(command),
@@ -240,7 +263,7 @@ def compile_air_bundle(
     if len(set(names)) != len(names):
         raise ValueError("AIR graph names must be unique")
     from .incremental_plan import validate_incremental_bundle
-    validate_incremental_bundle(graphs)
+    incremental = validate_incremental_bundle(graphs)
 
     # Validate the entire suite before starting any ATC process.
     for graph in graphs:
@@ -251,7 +274,9 @@ def compile_air_bundle(
             allow_test_double=runner is not None,
         )
 
-    arguments = _validate_extra_args(extra_args)
+    arguments = _chunk_precision_args(
+        _validate_extra_args(extra_args), incremental=incremental is not None,
+    )
     execute = runner or _default_runner
     om_root = root / "om"
     if om_root.exists() and any(om_root.iterdir()):
@@ -340,6 +365,7 @@ def compile_air_bundle(
             "identity": atc_identity or _atc_identity(atc_path),
             "framework": 1,
             "extra_args": arguments,
+            "precision_policy": "preserve_graph_dtypes" if incremental else "explicit_args_or_atc_default",
         },
         "graphs": compiled,
     }

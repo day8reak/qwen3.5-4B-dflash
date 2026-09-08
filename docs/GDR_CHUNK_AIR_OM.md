@@ -8,7 +8,7 @@
 | `target_prefill.om` | 64 行，有效 1..64 | prompt 分块、末行 Top1、Target 特征和状态 |
 | `target_decode.om` | 1 行 | 普通 greedy decode；已加载时也供 DFlash 关闭草稿后使用 |
 | `target_verify.om` | 16 行，有效 1..16 | verify、Top1、接受判断、第二次 GDR 和 committed state |
-| `draft.om` | 64 行特征＋16 行 block | 特征投影、Draft KV 追加、一次 15 token proposal |
+| `draft.om` | 64 行特征＋16 行 block | 特征投影、Draft KV 追加、一次 1..15 token proposal |
 
 下面配置导出四个 OM，便于普通/DFlash 对照。paired 运行加载四个；单模式 DFlash 运行
 只加载 prefill、verify、draft 三个，普通运行只加载 prefill、decode 两个。
@@ -351,6 +351,10 @@ AIR 无法改变错误的输入映射。编译器会提前拒绝使用整数 PSE
 ```
 
 编译流程使用 `atc --mode=0 --framework=1`，验证 AIR payload 后逐图编译。
+增量套件自动添加 `--precision_mode=must_keep_origin_dtype`，保留图中的 FP32
+归一化、RoPE、Softmax、attention matmul 和 GDR 累加。不能因为权重为 FP16，
+就把这些中间计算也降为 FP16。也支持显式传入 `--precision_mode_v2=origin`；
+编译器拒绝同时指定两种精度参数或使用降精度模式。
 启动 ATC 前还会检查整组图的 `runtime_input_abi`：要求 `status=PASS`，实际 Data 绑定
 与公开输入的顺序、dtype、静态 shape 一致。缺少或不通过这项审计时，须重新导出到空的
 bundle 目录；只编辑 manifest 无法修正 AIR 中的输入顺序。
@@ -378,6 +382,7 @@ from pathlib import Path
 root = Path(os.environ["AI_RUN_DIR"]) / "artifacts"
 report = json.loads((root / "deployment-manifest.json").read_text())
 assert report["status"] == "PASS"
+assert report["compiler"]["precision_policy"] == "preserve_graph_dtypes"
 assert {g["name"] for g in report["graphs"]} == {"target_prefill", "target_decode", "target_verify", "draft"}
 for graph in report["graphs"]:
     om = root / graph["om"]["path"]
@@ -517,10 +522,12 @@ verify 记录只保留有效行，不包含物理图的 padding。
 最终 token 相同不能证明每轮相同。缺少逐轮数据会显示 `NOT_AVAILABLE`，不会判为通过；
 EOS 策略、最终 token 或逐轮记录没有全部匹配时，比较命令返回 1 并保留报告。
 
-Draft OM 每次计算固定 16 行 anchor＋mask block，最多输出 15 个 proposal；
-NPU 路径在剩余输出预算不足 15 时缩短 block。Draft 含非因果注意力，
-缩短 block 与计算完整 block 后截取 proposal 可能产生不同草稿。
-逐轮差异需要结合这个输入形状差别，以及相同前缀的 Target 特征、量化 head 和状态检查。
+Draft OM 的物理 block 为 16 行。`proposal_count INT16[1]` 指定实际草稿数
+K=`min(max_draft_tokens, 剩余输出预算, 15)`，所有层的注意力都只允许
+anchor＋K 个 mask 作为有效 block key，包括非因果层。输出只读取前 K 项。
+该输入由 C++ 自动填写，推理命令无须增加参数。AIR、OM 和 C++ runner 使用同一
+`qwen35-dflash-chunk-v2` ABI；接口不一致时应从空 bundle 目录导出、编译并构建 runner。
+逐轮差异应按相同已提交 token 前缀对齐，再检查 Target 特征和 Draft 的输入、计算与状态。
 工具比较 token 记录，不代表中间张量已逐项对齐。
 
 `--trace-rounds` 用于诊断，会增加主机记录开销。性能基线使用不带该参数的命令。
@@ -596,12 +603,15 @@ PROFILE_STAGE=all
 |---|---|---|
 | `prefill` | 全部 Target prompt 分块，包含各块 Top1 | 状态清零；不执行 Draft |
 | `decode` | 一次一行 Target decode、LM head、Top1 和状态更新 | prefill、KV 初始化 |
-| `draft` | 一次 draft OM：末块特征投影、Draft KV 追加、15 token proposal | Target prefill、长 prompt 前面分块的 Draft KV 初始化 |
+| `draft` | 一次 draft OM：末块特征投影、Draft KV 追加、K token proposal | Target prefill、长 prompt 前面分块的 Draft KV 初始化 |
 | `verify` | 一次 verify OM：两次 GDR、Target Top1、接受判断和 committed state | prefill、Draft、EOS 截断、block 整理；之后的 C++ 状态指针发布 |
 
 一次 prefill 窗口可以有多次 64 行 OM 调用。verify 内部已经融合 commit，C++ 不提供
 独立 `accept-commit` 窗口；内部算子可从 verify 的算子 CSV 查看。
-普通 decode 需要 prompt 后至少留一行 KV，DFlash verify/all 需要完整 16 行空间。
+采集时 K=`min(max_draft_tokens, max_new_tokens-1, 15)`，减去的一项是 prefill
+已经输出的 anchor。可在 C++ runner 参数中设置 `--max-draft-tokens` 和
+`--max-new-tokens`；默认 K=15。各窗口的报告记录 `proposal_count`。
+普通 decode 需要 prompt 后至少留一行 KV，DFlash verify/all 需要 K+1 行空间。
 anchor 为 EOS 时退出，不伪造空的 decode/verify 采集。
 
 ## 15. 读取 msprof 输出

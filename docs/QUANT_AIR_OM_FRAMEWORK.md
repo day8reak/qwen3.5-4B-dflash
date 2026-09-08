@@ -56,8 +56,8 @@ Draft 使用 FP16 embedding、LM head 和主体；公开 embedding getter 保留
 
 ## 3. OM 有序输入/输出
 
-ABI 标识为 `qwen35-dflash-chunk-v1`，合同见
-[图与状态合同](../framework/abi/dflash-chunk-v1.json)。所有图固定 batch=1。
+ABI 标识为 `qwen35-dflash-chunk-v2`，合同见
+[图与状态合同](../framework/abi/dflash-chunk-v2.json)。所有图固定 batch=1。
 实际 tensor 顺序、dtype、shape 由加载后的模型推导，并冻结在 manifest 的
 `metadata.tensor_abi` 中。不要通过文件名猜测输入顺序。
 
@@ -102,11 +102,22 @@ GDR 累加及算子 initial/final state 使用 FP32；OM 之间持久保存的 r
 | `start_position` | INT64 `[1]` | 这批 feature 在上下文中的起始位置 |
 | `valid_rows` | INT16 `[1]` | 有效 feature 行数，1..64 |
 | `anchor` | INT64 `[1]` | 当前已输出、尚未作为 Target 输入提交的 token |
+| `proposal_count` | INT16 `[1]` | 本轮实际草稿数 K，1..15，受请求设置和剩余输出预算约束 |
 | `d0_key,d0_value,...,d5_key,d5_value` | FP16 `[1,8,C+64,128]` | 6 层 committed-context KV |
 
 输出为 `draft_top1 INT64[1,15]`，随后是相同顺序的 12 个更新后 Draft KV。
-一次调用完成 feature projection、context KV 追加和 anchor+15 mask 的并行 proposal。
+一次调用完成 feature projection、context KV 追加和 anchor+K mask 的并行 proposal。
+物理 block 固定 16 行，每层 attention 都排除 K 以后的 noise key，包括最后的非因果层。
+输出前 K 项有效，其余项为 0；不能用完整 block 的结果直接截断来替代短 block。
 用于 proposal 的 transient block KV 不作为 committed cache 输出。
+
+增量套件的 ATC 编译自动添加 `--precision_mode=must_keep_origin_dtype`，
+保留图中显式的 FP32 RMSNorm、RoPE、Softmax、注意力 matmul 和 GDR 状态计算。
+也可显式使用等价的 `--precision_mode_v2=origin`；两个参数不能同时使用。
+编译器拒绝对该套件使用降精度模式。FP16 checkpoint 不意味着全部中间计算都是 FP16。
+参数语义见 [ATC 精度模式说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta3/devaids/atctool/atlasatcparam_16_0068.html)。
+部署 manifest 的 `compiler.precision_policy` 为 `preserve_graph_dtypes`，
+每张图的 `atc_command` 记录最终参数。
 
 ## 4. 自定义算子导出要求
 

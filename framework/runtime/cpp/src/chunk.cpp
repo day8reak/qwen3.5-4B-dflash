@@ -42,8 +42,8 @@ ChunkPlan ReadChunkPlan(const std::filesystem::path& path,
   std::ifstream input(path);
   std::string word;
   ChunkPlan result;
-  Require(static_cast<bool>(input >> word) && word == "qwen35-dflash-chunk-v1",
-          "invalid chunk plan ABI");
+  Require(static_cast<bool>(input >> word) && word == "qwen35-dflash-chunk-v2",
+          "invalid chunk plan ABI; regenerate AIR/OM and rebuild the C++ runner");
   Require(static_cast<bool>(input >> word >> result.capacity >>
                             result.vocabulary) &&
               word == "capacity",
@@ -165,10 +165,12 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
       } else {
         std::vector<std::int64_t> proposals;
         if (speculation) {
-          const auto raw = executor.Propose(anchor);
+          const auto proposal_count =
+              std::min({remaining, options.max_draft_tokens, executor.draft_width()});
+          const auto raw = executor.Propose(anchor, proposal_count);
           Require(raw.size() == executor.draft_width(), "draft width mismatch");
           for (std::size_t i = 0;
-               i < std::min({remaining, options.max_draft_tokens, raw.size()});
+               i < proposal_count;
                ++i) {
             valid_token(raw[i]);
             proposals.push_back(raw[i]);
