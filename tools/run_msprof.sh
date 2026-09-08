@@ -15,6 +15,11 @@ Options:
   --msprof-bin PATH         msprof executable (default: MSPROF_BIN or msprof).
   --aic-metrics NAME        AI Core metrics (default: PipeUtilization).
   --task-time LEVEL         msprof task-time value (default: on).
+  --profile-stage STAGE     Collect one stage, or all stages separately (one model load).
+                           prefill, feature-project, draft, verify-input, verify,
+                           target-top1, accept-commit, draft-verify, decode-round, all.
+  --profile-warmup N        Unprofiled fresh-state warmups for a stage (default: 1).
+  --profile-timeout SEC     Deadline per stage-control transition (default: 600).
   --msprof-arg ARG          Append one safe msprof option; repeat as needed.
   --msproftx                Opt in to msproftx and benchmark MSTX ranges.
   --no-msproftx             Keep MSTX disabled (default; compatibility option).
@@ -36,6 +41,12 @@ python_bin="${PYTHON_BIN:-python3}"
 msprof_bin="${MSPROF_BIN:-msprof}"
 aic_metrics="PipeUtilization"
 task_time="on"
+profile_stage=""
+profile_warmup=1
+profile_warmup_set="false"
+profile_timeout=600
+profile_timeout_set="false"
+stage_report=""
 msproftx="off"
 extra_msprof_args=()
 
@@ -69,6 +80,30 @@ while (($#)); do
     --task-time)
       (($# >= 2)) || fail "--task-time requires a value"
       task_time="$2"
+      shift 2
+      ;;
+    --profile-stage)
+      (($# >= 2)) || fail "--profile-stage requires a stage name or all"
+      profile_stage="$2"
+      case "$profile_stage" in
+        prefill|feature-project|draft|verify-input|verify|target-top1|accept-commit|draft-verify|decode-round|all) ;;
+        *) fail "invalid --profile-stage; see --help for stages and all" ;;
+      esac
+      shift 2
+      ;;
+    --profile-warmup)
+      (($# >= 2)) || fail "--profile-warmup requires a count"
+      [[ "$2" =~ ^[0-9]+$ ]] || fail "--profile-warmup must be non-negative"
+      profile_warmup="$2"
+      profile_warmup_set="true"
+      shift 2
+      ;;
+    --profile-timeout)
+      (($# >= 2)) || fail "--profile-timeout requires seconds"
+      [[ "$2" =~ ^[0-9]+([.][0-9]+)?$ && "$2" =~ [1-9] ]] || \
+        fail "--profile-timeout must be positive seconds"
+      profile_timeout="$2"
+      profile_timeout_set="true"
       shift 2
       ;;
     --msprof-arg)
@@ -111,6 +146,34 @@ done
   fail "simulation-only target profiles cannot produce msprof evidence"
 
 application=("$@")
+stage_runner="false"
+for ((index=0; index<${#application[@]}; index++)); do
+  case "${application[index]}" in
+    --profile-stage|--profile-stage=*|--profile-output|--profile-output=*|--profile-warmup|--profile-warmup=*|--profile-aic-metrics|--profile-aic-metrics=*)
+      fail "put --profile-stage/--profile-warmup on run_msprof.sh before --"
+      ;;
+    -m)
+      case "${application[index+1]:-}" in
+        models.dflash_v1.run_npu|models.dflash_v1.run_rollback) stage_runner="true" ;;
+      esac
+      ;;
+    --report) stage_report="${application[index+1]:-}" ;;
+    --report=*) stage_report="${application[index]#--report=}" ;;
+  esac
+done
+if [[ -n "$profile_stage" ]]; then
+  [[ "$stage_runner" == "true" ]] || \
+    fail "--profile-stage requires python -m models.dflash_v1.run_npu (or run_rollback)"
+  [[ "$msproftx" == "off" ]] || fail "dynamic stage capture does not use --msproftx"
+  [[ "$task_time" == "on" ]] || fail "dynamic stage capture requires --task-time on"
+  ((${#extra_msprof_args[@]} == 0)) || fail "dynamic stage capture does not accept --msprof-arg"
+  case "$aic_metrics" in
+    PipeUtilization|Memory|MemoryUB) ;;
+    *) fail "stage metrics must be PipeUtilization, Memory or MemoryUB" ;;
+  esac
+elif [[ "$profile_warmup_set" == "true" || "$profile_timeout_set" == "true" ]]; then
+  fail "--profile-warmup/--profile-timeout requires --profile-stage"
+fi
 expect_device_value="false"
 requested_device="npu:0"
 for argument in "${application[@]}"; do
@@ -163,13 +226,37 @@ profile_dir="$output_root/profile/msprof/$label"
 log_dir="$output_root/log"
 manifest_dir="$output_root/manifest"
 manifest_path="$manifest_dir/$label.json"
+control_report="$manifest_dir/$label-control.json"
+summary_report="$output_root/$label-stage-summary.csv"
 runtime_log="$log_dir/msprof-$label.log"
 preflight_log="$log_dir/preflight-$label.log"
 device_log="$log_dir/device-$label.log"
 
 [[ ! -e "$profile_dir" ]] || fail "profile output already exists: $profile_dir"
 [[ ! -e "$manifest_path" ]] || fail "manifest already exists: $manifest_path"
+[[ ! -e "$control_report" && ! -L "$control_report" ]] || fail "control report already exists: $control_report"
+if [[ -n "$profile_stage" ]]; then
+  [[ ! -e "$summary_report" && ! -L "$summary_report" ]] || fail "summary already exists: $summary_report"
+fi
 mkdir -p "$output_root/profile/msprof" "$log_dir" "$manifest_dir"
+
+collect_stages=("$profile_stage")
+if [[ "$profile_stage" == "all" ]]; then
+  collect_stages=(prefill feature-project draft verify-input verify target-top1 accept-commit draft-verify decode-round)
+fi
+if [[ -n "$profile_stage" ]]; then
+  unset DFLASH_MSPROF_PROCESS_CAPTURE || true
+  application+=(
+    --profile-stage "$profile_stage" --profile-output "$profile_dir"
+    --profile-warmup "$profile_warmup" --profile-aic-metrics "$aic_metrics"
+  )
+  if [[ -z "$stage_report" ]]; then
+    stage_report="$output_root/$label-stage-report.json"
+    application+=(--report "$stage_report")
+  fi
+else
+  export DFLASH_MSPROF_PROCESS_CAPTURE=1
+fi
 
 if [[ "$msproftx" == "on" ]]; then
   export DFLASH_BENCHMARK_MSTX=1
@@ -241,6 +328,10 @@ if [[ "$msproftx" == "on" ]]; then
   msprof_args+=("--msproftx=on")
 fi
 msprof_args+=("${extra_msprof_args[@]}")
+if [[ -n "$profile_stage" ]]; then
+  # The actual child PID and attach command are recorded by the controller.
+  msprof_args=("--dynamic=on" "${msprof_args[@]}")
+fi
 
 write_manifest() {
   local run_status="$1"
@@ -250,9 +341,10 @@ write_manifest() {
     "$manifest_path" "$run_status" "$exit_code" "$started_at" "$finished_at" \
     "$label" "$profile_dir" "$runtime_log" "$preflight_log" "$device_log" \
     "$msprof_bin" "$msprof_version" "$source_root" "$aic_metrics" "$task_time" \
-    "$msproftx" "$requested_device" \
+    "$msproftx" "$requested_device" "$profile_stage" "$profile_warmup" "$stage_report" \
+    "$profile_timeout" "$control_report" \
     "${#msprof_args[@]}" "${msprof_args[@]}" \
-    "${#application[@]}" "${application[@]}" <<'PY'
+    "${#application[@]}" "${application[@]}" "${collect_stages[@]}" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -263,9 +355,10 @@ values = sys.argv[1:]
     manifest_path, run_status, exit_code, started_at, finished_at, label,
     profile_dir, runtime_log, preflight_log, device_log, msprof_bin,
     msprof_version, source_root, aic_metrics, task_time, msproftx,
-    requested_device,
-) = values[:17]
-cursor = 17
+    requested_device, profile_stage, profile_warmup, stage_report,
+    profile_timeout, control_report,
+) = values[:22]
+cursor = 22
 msprof_count = int(values[cursor])
 cursor += 1
 msprof_args = values[cursor:cursor + msprof_count]
@@ -273,6 +366,7 @@ cursor += msprof_count
 application_count = int(values[cursor])
 cursor += 1
 application = values[cursor:cursor + application_count]
+stages = values[cursor + application_count:]
 
 redacted_application = list(application)
 for index, argument in enumerate(redacted_application[:-1]):
@@ -286,12 +380,14 @@ root = Path(source_root)
 source_hasher = hashlib.sha256()
 source_files = 0
 source_paths = [
+    root / "framework",
     root / "models" / "dflash_v1",
     root / "models" / "internal_dflash_bridge.py",
     root / "models" / "modeling_qwen3_5_hiai_nd_dflash_rollback.py",
     root / "models" / "export_model_wrapper_qwen3_5_dflash_rollback.py",
     root / "tools" / "run_msprof.sh",
     root / "docs" / "DFLASH_RUN_AND_VALIDATE.md",
+    root / "docs" / "QUANT_AIR_OM_FRAMEWORK.md",
     root / "config" / "npu_benchmark_v1.json",
 ]
 expanded = []
@@ -310,7 +406,7 @@ for path in sorted(set(expanded)):
     source_files += 1
 
 payload = {
-    "schema_version": 3,
+    "schema_version": 6,
     "status": run_status,
     "exit_code": int(exit_code),
     "label": label,
@@ -336,9 +432,25 @@ payload = {
         "aic_metrics": aic_metrics,
         "task_time": task_time,
         "msproftx": msproftx,
+        "collector": "msprof dynamic CLI" if profile_stage else "msprof process",
+        "profile_stage": profile_stage or None,
+        "stages": stages if profile_stage else None,
+        "profile_warmup": int(profile_warmup) if profile_stage else None,
+        "profile_timeout_seconds": float(profile_timeout) if profile_stage else None,
+        "actual_attach_arguments_in": control_report if profile_stage else None,
+        "export_arguments": (
+            [["--export=on", "--output=" + str(Path(profile_dir) / stage), "--summary-format=csv"]
+             for stage in stages] if profile_stage == "all" else
+            ["--export=on", "--output=" + profile_dir, "--summary-format=csv"] if profile_stage else None
+        ),
     },
     "application": redacted_application,
-    "artifacts": {"profile_dir": profile_dir, "runtime_log": runtime_log},
+    "artifacts": {
+        "profile_dir": profile_dir, "runtime_log": runtime_log,
+        "stage_report": stage_report if profile_stage else None,
+        "control_report": control_report if profile_stage else None,
+        "stage_summary": str(Path(manifest_path).parent.parent / (label + "-stage-summary.csv")) if profile_stage else None,
+    },
     "claim_boundary": (
         "msprof is diagnostic evidence, not the latency baseline; retain "
         "separate unprofiled 3-warmup/10-measurement ordinary and DFlash runs"
@@ -353,8 +465,121 @@ PY
 
 write_manifest "RUNNING" 0 ""
 set +e
-"$msprof_bin" "${msprof_args[@]}" "${application[@]}" 2>&1 | tee "$runtime_log"
-msprof_status=${PIPESTATUS[0]}
+if [[ -n "$profile_stage" ]]; then
+  "$python_bin" -B "$source_root/models/dflash_v1/msprof_cli.py" \
+    --msprof-bin "$msprof_bin" --output "$profile_dir" \
+    --stage "$profile_stage" --metrics "$aic_metrics" \
+    --timeout "$profile_timeout" --control-report "$control_report" \
+    -- "${application[@]}" 2>&1 | tee "$runtime_log"
+  msprof_status=${PIPESTATUS[0]}
+  if ((msprof_status == 0)); then
+    for collected_stage in "${collect_stages[@]}"; do
+      export_dir="$profile_dir"
+      if [[ "$profile_stage" == "all" ]]; then
+        export_dir="$profile_dir/$collected_stage"
+      fi
+      "$msprof_bin" --export=on "--output=$export_dir" --summary-format=csv 2>&1 | tee -a "$runtime_log"
+      msprof_status=${PIPESTATUS[0]}
+      ((msprof_status == 0)) || break
+    done
+  fi
+  if ((msprof_status == 0)); then
+    "$python_bin" -B - "$profile_dir" "$stage_report" "$profile_stage" "$control_report" \
+      "$summary_report" "${collect_stages[@]}" <<'PY' 2>&1 | tee -a "$runtime_log"
+import csv
+import json
+import math
+from pathlib import Path
+import sys
+
+root, report_path, stage, control_path, summary_path = sys.argv[1:6]
+stages = sys.argv[6:]
+report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+control = json.loads(Path(control_path).read_text(encoding="utf-8"))
+if (control.get("status") != "PASS_CONTROL"
+        or control.get("collector") != "msprof dynamic CLI"
+        or control.get("profile_stage") != stage
+        or Path(control.get("profile_output", "")).resolve() != Path(root).resolve()
+        or any(control.get(key) is not True for key in (
+            "start_acknowledged", "stop_acknowledged", "quit_acknowledged", "capture_completed"))
+        or any(control.get(key) != 0 for key in ("application_exit_code", "msprof_exit_code"))):
+    raise SystemExit("control report does not prove successful msprof start/stop/quit")
+if (report.get("status") != "PASS_CAPTURE"
+        or report.get("collector") != "msprof dynamic CLI"
+        or report.get("profile_stage") != stage
+        or report.get("capture_windows") != len(stages)
+        or report.get("operator_fallback_enabled") is not False
+        or Path(report.get("profile_output", "")).resolve() != Path(root).resolve()):
+    raise SystemExit("stage report does not prove the requested capture windows")
+reports = report.get("captures", []) if stage == "all" else [report]
+controls = control.get("captures", []) if stage == "all" else [control]
+if stage == "all" and (report.get("stages") != stages or control.get("stages") != stages):
+    raise SystemExit("all-stage order does not match the requested stages")
+if len(reports) != len(stages) or len(controls) != len(stages):
+    raise SystemExit("missing or extra stage reports")
+summary = []
+for selected, capture, handshake in zip(stages, reports, controls):
+    destination = Path(root) / selected if stage == "all" else Path(root)
+    expected = {
+        "prefill": int(selected == "prefill"),
+        "draft": int(selected in {"draft", "draft-verify", "decode-round"}),
+        "target_verify": int(selected in {"verify", "draft-verify", "decode-round"}),
+    }
+    if (capture.get("status") != "PASS_CAPTURE"
+            or capture.get("collector") != "msprof dynamic CLI"
+            or capture.get("profile_stage") != selected
+            or capture.get("capture_windows") != 1
+            or capture.get("captured_calls") != expected
+            or capture.get("gdr_backend") != "npu_chunk_gated_delta_rule_two_pass"
+            or capture.get("operator_rows_required") is not True
+            or Path(capture.get("profile_output", "")).resolve() != destination.resolve()):
+        raise SystemExit(f"{selected}: invalid stage capture report")
+    gdr_calls = capture.get("captured_gdr_layer_calls")
+    expected_gdr = {
+        "verify": selected in {"verify", "draft-verify", "decode-round"},
+        "commit": selected in {"accept-commit", "decode-round"},
+    }
+    if (not isinstance(gdr_calls, dict) or set(gdr_calls) != set(expected_gdr)
+            or any(isinstance(count, bool) or not isinstance(count, int)
+                   or count < 0 or (count > 0) != expected_gdr[key]
+                   for key, count in gdr_calls.items())):
+        raise SystemExit(f"{selected}: chunk-GDR verify/commit counts do not match the window")
+    if (handshake.get("profile_stage") != selected
+            or Path(handshake.get("profile_output", "")).resolve() != destination.resolve()
+            or handshake.get("msprof_exit_code") != 0
+            or any(handshake.get(key) is not True for key in (
+                "start_acknowledged", "stop_acknowledged", "quit_acknowledged", "capture_completed"))):
+        raise SystemExit(f"{selected}: incomplete control handshake")
+    rows = 0
+    for path in destination.rglob("op_summary*.csv"):
+        with path.open(encoding="utf-8-sig", newline="") as stream:
+            rows += sum(1 for row in csv.DictReader(stream) if any(row.values()))
+    if not rows:
+        raise SystemExit(f"{selected}: msprof export produced no operator rows; inspect the raw PROF_* data")
+    elapsed = capture.get("profiled_elapsed_ms")
+    if (isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
+            or not math.isfinite(elapsed) or elapsed < 0):
+        raise SystemExit(f"{selected}: missing or invalid synchronized stage time")
+    summary.append({
+        "stage": selected, "profiled_elapsed_ms": elapsed,
+        "operator_rows": rows,
+        "gdr_verify_layer_calls": gdr_calls["verify"],
+        "gdr_commit_layer_calls": gdr_calls["commit"],
+        "profile_output": str(destination),
+    })
+    print(f"PASS: one {selected} capture, {rows} exported operator rows")
+with Path(summary_path).open("x", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=list(summary[0]))
+    writer.writeheader()
+    writer.writerows(summary)
+print(f"Stage timing summary: {summary_path}")
+PY
+    msprof_status=${PIPESTATUS[0]}
+  fi
+else
+  "$msprof_bin" "${msprof_args[@]}" "${application[@]}" 2>&1 | tee "$runtime_log"
+  msprof_status=${PIPESTATUS[0]}
+fi
 set -e
 finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if ((msprof_status == 0)); then

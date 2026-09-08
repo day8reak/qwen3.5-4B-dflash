@@ -107,6 +107,20 @@ embedding_scale_path: /data/qwen35-w8a8/embedding_scale.bin
 正确性门禁通过后，可以把 `--execution-mode validate` 改为 `dflash`，只运行 DFlash 生产路径。
 该模式没有当次 ordinary 对照，因此报告不会伪造 exact-match PASS。
 
+只想用 msprof 查看一次 prefill、Draft、Target verify 或联合 Draft+verify 时，可给 `tools/run_msprof.sh`
+增加 `--profile-stage`（放在 `--` 之前，应用使用 `run_npu`）。选 `all` 可在一个应用进程中
+依次单独采集 prefill、特征投影、Draft、verify 输入准备、Target verify、Target Top1、
+接受/提交、联合 Draft+verify 和首轮 Draft→verify→提交；模型只加载一次，各阶段独立保存。
+也可选 `prefill`、`feature-project`、`draft`、`verify-input`、`verify`、
+`target-top1`、`accept-commit`、`draft-verify` 或 `decode-round` 单独采集。
+单独阶段的同步耗时见各自报告中的 `profiled_elapsed_ms`，算子明细见各自的 msprof CSV。
+`all` 的阶段报告放在 `<label>-stage-report.json` 的 `captures` 数组中，
+`<label>-stage-summary.csv` 汇总阶段耗时、算子行数和 GDR verify/commit 层调用次数。
+每阶段都会重新准备相同首轮状态并单独预热。本分支 `verify` 采第一次 chunk GDR，
+`accept-commit` 采 `accepted+1` 第二次 GDR 及状态提交；`decode-round` 包含两次 GDR。
+即使零接受，提交仍执行第二次 GDR。
+通过 msprof 原生动态采集 CLI 控制窗口，无需 pyACL；默认先在窗口外预热一次。完整命令和采集范围见[运行与验证 7.4 节](docs/DFLASH_RUN_AND_VALIDATE.md#74-只采一次-prefill-或-draft-生成--target-verify)。
+
 ## 文档
 
 | 文档 | 内容 |

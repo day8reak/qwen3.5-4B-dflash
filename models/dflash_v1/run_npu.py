@@ -21,6 +21,7 @@ from .internal_target_loader import (
     DECODE_CHUNK_SIZE_ENV,
     PREFILL_CHUNK_SIZE_ENV,
 )
+from .stage_profile import add_profile_arguments
 from .target_quant import (
     ORIGINAL_QUANTIZER_SPEC,
     QUANT_MODE_DISABLED,
@@ -137,6 +138,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--report")
+    add_profile_arguments(parser)
     parser.add_argument(
         "--progress",
         action=argparse.BooleanOptionalAction,
@@ -226,7 +228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("run_npu requires --device npu or npu:N")
     if args.reset_hook is not None:
         raise ValueError("--reset-hook is not part of the rollback transaction")
-    if args.max_new_tokens < 2:
+    if args.profile_stage is None and args.max_new_tokens < 2:
         raise ValueError("NPU DFlash smoke requires --max-new-tokens >= 2")
     if not DFLASH_MIN_BLOCK_SIZE <= args.block_size <= OFFICIAL_DFLASH_BLOCK_SIZE:
         raise ValueError(
@@ -297,6 +299,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.report is not None:
         adapter_args.extend(["--report", args.report])
+    if args.profile_stage is not None:
+        adapter_args.extend([
+            "--profile-stage", args.profile_stage,
+            "--profile-warmup", str(args.profile_warmup),
+            "--profile-aic-metrics", args.profile_aic_metrics,
+        ])
+    if args.profile_output is not None:
+        adapter_args.extend(["--profile-output", args.profile_output])
     adapter_args.append("--progress" if args.progress else "--no-progress")
     return _adapter_main(adapter_args)
 

@@ -1,7 +1,7 @@
 {
   "schema_version": 7,
   "purpose": "runtime identity contract for Qwen3.5-4B DFlash two-pass chunk-GDR rollback with the original GDR effective-length ABI and optional Target-only W8A8 dynamic quantization configured by the original inference YAML",
-  "package_revision": "r8",
+  "package_revision": "r9",
   "route_version": "dflash-rollback-original-quant-config-incremental-draft-kv-cache-two-pass-chunk-gdr",
   "package_layout": {
     "version": 7,
@@ -89,7 +89,7 @@
   },
   "npu_embedded_runtime": {
     "runner_file": "models/dflash_v1/run_npu.py",
-    "runner_sha256": "3ef4df377c22d8a3cd97c252c212ff9bcdbb88b760d2cedcbac1a8037ae785e5",
+    "runner_sha256": "359c290dc571b85e19515e3b1d3ecac665729e9bf89ddbfb5ed114dcb235e80e",
     "loader_file": "models/dflash_v1/internal_target_loader.py",
     "loader_sha256": "b6b586e24e0d48d30cc8011390f8eb73dde955f37f54df69a109494aa4698d83",
     "loader_contract_file": "models/dflash_v1/internal_target_loader_template.py",
@@ -111,11 +111,15 @@
     "w8a8_emulation_sha256": "fa604b2778f9e6a5e3c623f76ce714eb028713d5afdecbc52dae46514e070c37",
     "w8a8_cpu_validator_file": "models/dflash_v1/validate_w8a8_cpu.py",
     "w8a8_cpu_validator_sha256": "d86d60a8dc1c308a6a9047992313c3c1240e06cc249a55397ca211d2dc4bfdc6",
-    "target_quant_policy": "the CLI mirrors inference.py with --config and --quant_mode enable; the packaged original utils conversion is fail-closed and every pre-conversion nn.Linear path must become the original HIAI QLinear with exact K-by-N shape/device buffers; Draft-facing embedding and LM head remain FP16; every prompt chunk, decode row, and verify block indexes the YAML-declared INT8 embedding and FP32 scale artifacts"
+    "target_quant_policy": "the CLI mirrors inference.py with --config and --quant_mode enable; the packaged original utils conversion is fail-closed and every pre-conversion nn.Linear path must become the original HIAI QLinear with exact K-by-N shape/device buffers; Draft-facing embedding and LM head remain FP16; every prompt chunk, decode row, and verify block indexes the YAML-declared INT8 embedding and FP32 scale artifacts",
+    "stage_profiler_file": "models/dflash_v1/stage_profile.py",
+    "msprof_controller_file": "models/dflash_v1/msprof_cli.py",
+    "stage_profiler_sha256": "475e95deae11169d06e988568f894e3928143417651a7bc2acfa0b2e4cf7d3e0",
+    "msprof_controller_sha256": "c1808d4fcc42c7b987f50796bdccae35900b3442e4c23eb510c1fadc2cfb4da2"
   },
   "rollback_runtime": {
     "runner_file": "models/dflash_v1/run_rollback.py",
-    "runner_sha256": "76df2ea77c41c9cc83e5c156bbfc835dbfa0bd43be28e12a6b3076733a3fb2f4",
+    "runner_sha256": "d9b04ab5808884b72e87b413365c50af966a7975fe92b85ebe0655fd95b55ed9",
     "adapter_file": "models/dflash_v1/dflash_rollback_adapter.py",
     "adapter_sha256": "4cdb4489e9ed7345914ffc025804abfafe431326a1701e32540354de33069643",
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
@@ -132,11 +136,11 @@
     "runner_file": "models/dflash_v1/benchmark_npu.py",
     "runner_sha256": "f1832a595d5aaf4771b84d7f3e051ff6047a60ac3919735fc045312aba3c2077",
     "msprof_wrapper_file": "tools/run_msprof.sh",
-    "msprof_wrapper_sha256": "a6e8e9f82ecab0c7c9cadf7d0d5713e25d449feb6a6c49a60a71300881392a69",
+    "msprof_wrapper_sha256": "b3e88daaafa622c4c3a339d36001c0ba156b2f444322f75559940f513ef0be84",
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "b5fdd64b1eaea44b3f53452bc260cf62de53ca38b1fcd8699bf4f9e358d99c76",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "164828a55c204691a534184ec58d144b709df2bb2769ed42bb3979db85e6b197",
-    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks and rollback verify/accepted+1 commit uses two original-GDR chunk calls; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback"
+    "documentation_sha256": "18c32368d05e0ed33e1cf77913acccbf04e5d76655a1bdf0a0a7b26b2ae8969c",
+    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks and rollback verify/accepted+1 commit uses two original-GDR chunk calls; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback; native msprof dynamic CLI single-stage and all-stage diagnostics with one loaded application, independent fresh-state warmups and one acknowledged window per stage; verify collects the first original chunk GDR pass, accept-commit includes the mandatory accepted+1 second GDR pass even at zero acceptance, and decode-round collects both; per-window GDR verify/commit layer counters and nonempty operator exports are required; separate raw directories and synchronized timing CSV; no pyACL and no formal latency or strict-greedy accuracy claim from stage diagnostics"
   }
 }
