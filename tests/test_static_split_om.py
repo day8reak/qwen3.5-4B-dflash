@@ -20,6 +20,31 @@ from test_incremental_om_graphs import _FakeTarget, _FakeDraft
 from test_static_fused_om import _MaskReadingLayer, _compile_static_fixture
 
 
+def test_static_split_export_accepts_real_repository_source_lock():
+    # Exercise the production preflight without mocking it or loading weights.
+    # Documentation-only commits can also invalidate a locked *_file payload.
+    identity = quant_factory._verify_quant_source_lock()
+    lock = Path(__file__).resolve().parents[1] / "SOURCE_LOCK.json"
+    assert Path(identity["path"]) == lock
+    assert identity["sha256"] == quant_factory._sha256(lock)
+    assert identity["verified_file_count"] >= 10
+
+
+def test_static_split_export_rejects_changed_locked_document(monkeypatch):
+    document = Path(__file__).resolve().parents[1] / "docs/DFLASH_RUN_AND_VALIDATE.md"
+    original_sha256 = quant_factory._sha256
+
+    def changed_document_sha256(path):
+        return "0" * 64 if path == document else original_sha256(path)
+
+    monkeypatch.setattr(quant_factory, "_sha256", changed_document_sha256)
+    with pytest.raises(
+        ValueError,
+        match=r"quant source differs from SOURCE_LOCK: docs/DFLASH_RUN_AND_VALIDATE\.md",
+    ):
+        quant_factory._verify_quant_source_lock()
+
+
 def _specs(rows=64, capacity=256):
     draft = _FakeDraft().eval()
     draft.layers = nn.ModuleList([_MaskReadingLayer(0), _MaskReadingLayer(1)])

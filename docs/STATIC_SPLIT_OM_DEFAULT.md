@@ -183,6 +183,24 @@ stop reason 零差异，并完成 3 warmup + 10 次未 profiling 测量，才能
 若失败，回传新 manifest、model-query/分配诊断、第一条 GE/OP ERROR 上下文及完整 runner 日志；
 只看到末尾 ACL 500002 不能认定仍是同一个算子根因。
 
+## 导出前的源码锁错误
+
+`ValueError: quant source differs from SOURCE_LOCK: docs/DFLASH_RUN_AND_VALIDATE.md`
+发生在加载权重、实际 AIR 构图之前。`SOURCE_LOCK.json` 也锁定部分文档：`798e2c2`
+更新了上述文档，但漏同步 `npu_benchmark.documentation_sha256`，因此干净 Git 提交也会失败。
+后续修复仅同步这个已审阅文档的哈希，保留全部源码锁检查，不改变模型、runner 或 OM ABI。
+
+使用修复提交后，在本文配置的模块路径和模型环境中可以先执行不加载权重的真实门禁：
+
+```bash
+"$MODEL_PYTHON" -c 'from qwen35_dflash.ascend310p.quant_factory import _verify_quant_source_lock; print(_verify_quant_source_lock())'
+```
+
+门禁通过后，失败的导出从 `export-air` 重跑；已生成且有效的 v41 OM 不因文档哈希修复而失效。
+不要关闭检查、删除锁条目、批量重算未知脏工作树的哈希或清理无关本地文件。
+以后包括纯文档提交在内，也应运行 `tests/test_source_lock_benchmark.py` 与静态四图回归中的
+真实源码锁正例 / 文档变更拒绝用例；最终提交前跑完整测试。
+
 ## 显式回退
 
 - 旧静态 fused 四图：使用 `create_quant_fused_speculative_step_graphs` 和
