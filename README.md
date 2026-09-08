@@ -1,154 +1,71 @@
-# Qwen3.5-4B DFlash rollback
+# Qwen3.5-4B DFlash
 
-`feature/gdr-chunk-verify` 从 quant/AIR 框架分支演进，使用原 chunk GDR 实现
-Qwen3.5-4B persistent DFlash rollback，并支持同一套代码在两种 Target
-精度下运行：
+在 Ascend 310P 上运行 Qwen3.5-4B ordinary greedy 和 DFlash speculative decoding，
+支持 batch=1、strict greedy、FP16 Target 或 W8A8 Target。Draft 使用官方
+Qwen3.5-4B-DFlash checkpoint，以 FP16 执行。
 
-- 默认 FP16：不传量化参数；
-- Target W8A8 dynamic：追加 `--config ... --quant_mode enable`；
-- Draft 始终使用官方 Qwen3.5-4B-DFlash checkpoint 和 FP16 执行路径。
+## 1. 选择运行方式
 
-当前版本已经避免在每轮验证时重算不断增长的历史前缀。它是 strict-greedy、batch 1 的
-Qwen3.5 DFlash port，不是 z-lab/dflash 全部 generation API 的逐行复制，也尚未取得 Ascend
-310P 端到端加速结论。
+| 方式 | 适用场景 | 完整操作手册 |
+|---|---|---|
+| Python NPU | FP16/W8A8 验证、生成、benchmark、细分阶段 msprof | [Python NPU 从零运行](docs/DFLASH_RUN_AND_VALIDATE.md) |
+| AIR → OM → C++ | W8A8 模型导出、转换、AscendCL 执行、OM 阶段 msprof | [AIR/OM/C++ 从零部署](docs/GDR_CHUNK_AIR_OM.md) |
 
-本分支新增 [增量 AIR → OM → C++ 路径](docs/GDR_CHUNK_AIR_OM.md)：DFlash 使用 prefill、
-Draft、融合 verify/accept/commit 三个 OM，普通对照增加第四个一行 decode OM。
-Target prefill 共用，DFlash 不调用 decode OM。显式 KV/GDN 状态保留在 C++ device buffer。
-旧 [完整前缀重算框架](docs/QUANT_AIR_OM_FRAMEWORK.md) 继续作为对照。
-新增路径通过 host Tensor/export fixture 和真实 C++ + fake ACL 检查，实际 TorchAir/ATC、
-原生 ordinary 对照与 Ascend 310P 性能门禁仍待目标机验证。
+两份手册均从环境和模型准备开始，按顺序提供所需文件、命令、输出位置及检查方法。
+源码仓库不包含 checkpoint、量化权重、CANN、自定义算子包或 NPU receiver 加载器；
+这些依赖的路径和要求在各手册前置步骤中说明。
 
-普通模式在 **Python NPU 和 C++ OM 两个入口**均支持
-`--profile-mode ordinary --profile-stage prefill|decode|all`；`all` 分别只采一次 prefill
-和一次真实一行 decode。C++ 再加 `--profile-backend cpp`。完整可复制命令见
-[Python NPU 文档](docs/DFLASH_RUN_AND_VALIDATE.md#74-只采一次-prefill-或-draft-生成--target-verify)
-和 [C++ OM 文档](docs/GDR_CHUNK_AIR_OM.md#c-和-python-的单次-msprof)。
+## 2. 按顺序完成运行
 
-## 当前实现
+1. 准备 Linux/NPU 软件栈、源码和独立运行目录。
+2. 准备 Target、官方 Draft、外部 receiver 加载器；W8A8 模式再准备量化输入。
+3. 执行 Python NPU ordinary/DFlash token、EOS 和停止原因一致性检查。
+4. 使用 C++ 时，继续锁定输入、导出 AIR、编译 OM、构建 runner，并与 NPU ordinary 比较。
+5. 正确性通过后，执行不带 profiler 的时延测量，再用 msprof 定位阶段和算子耗时。
 
-| 环节 | 当前行为 |
-| --- | --- |
-| Prompt | Target 按最多 64 个真实 token 分块 prefill；原 GDR 接收本次真实行数 `effective_length` |
-| Draft | 官方 6 层、69 tensor；维护逐层 committed KV cache，只计算新增 feature 与当前 block |
-| `block_size` | 包含 1 个 anchor；`B=16` 表示最多 15 个 proposal，Target verify 总行数最多 16 |
-| Target verify | 一次输入 `[anchor, d1, ..., dK]`，不附带历史前缀 |
-| 接受 | 只提交最长连续匹配前缀；提交行数为 `1 + accepted` |
-| CPU/CUDA rollback | 恢复 round-start cache/state，再逐 token 重放 anchor 与已接受 proposal |
-| NPU rollback | 原 GDR chunk verify + `accepted+1` 二次 chunk state commit + conv golden + paged-KV logical cursor |
-| 量化 | 只量化 Target Linear 和 Target 输入 embedding；Draft embedding、LM head 和主体保持 FP16 |
-| 正确性 | `validate` 用独立 ordinary incremental session 做 token/EOS/stop-reason 零差异门禁 |
+## 3. OM 划分
 
-```mermaid
-flowchart LR
-    P[Target prompt prefill] --> A[clean anchor]
-    A --> D[Draft: anchor + K masks]
-    D --> Q[K proposals]
-    Q --> V[Target verify: K + 1 rows]
-    V --> M[longest contiguous match a]
-    M --> C[commit anchor + a proposals]
-    C --> A2[correction or bonus = next anchor]
-    A2 --> D
-```
+| OM | 功能 | 普通模式 | DFlash 模式 |
+|---|---|---|---|
+| `target_prefill.om` | 64 行物理 gear 的 prompt 分块，输出特征和状态 | 加载 | 加载 |
+| `target_decode.om` | 真正的一行 Target decode | 加载 | 不加载 |
+| `target_verify.om` | 16 行 verify、Top1、接受判断和第二次 GDR 状态提交 | 不加载 | 加载 |
+| `draft.om` | 特征投影、Draft KV 追加和一次并行 proposal | 不加载 | 加载 |
 
-每轮结束都保持同一个状态边界：
+DFlash 使用 3 个 OM，普通模式使用 2 个；对照部署共 4 个。
+两种模式共用 prefill，verify 内部完成 commit，无需独立 commit OM。
+显式 GDN、conv、KV 状态由 C++ 持续保存在设备 buffer 中。
 
-```text
-Target state/cache/feature 已处理到 current anchor 之前
-current anchor 已输出，但尚未作为 Target 输入处理
-```
+## 4. 单次 msprof
 
-因此 correction 或 all-match bonus 只能成为下一轮 anchor，不能在当前轮提前写入状态。
+统一使用 `tools/run_msprof.sh`，以下参数放在 `--` 之前。采集由 msprof 动态 PID CLI
+控制，无需 pyACL；窗口外完成预热和输入状态准备。
 
-## 快速运行
+| 后端和模式 | `--profile-stage` 可选值 | `all` 的行为 |
+|---|---|---|
+| `--profile-backend python --profile-mode ordinary` | `prefill`、`decode`、`all` | 同一进程分别采一次 prefill 和 decode |
+| `--profile-backend cpp --profile-mode ordinary` | `prefill`、`decode`、`all` | 同一进程分别采一次 prefill 和 decode |
+| `--profile-backend python --profile-mode dflash` | `prefill`、`feature-project`、`draft`、`verify-input`、`verify`、`target-top1`、`accept-commit`、`draft-verify`、`decode-round`、`all` | 9 个阶段分别采一次 |
+| `--profile-backend cpp --profile-mode dflash` | `prefill`、`draft`、`verify`、`all` | 3 个阶段分别采一次 |
 
-需要 Python 3.10、`transformers==5.14.1`、匹配设备的 PyTorch，以及本地 Target/Draft
-checkpoint。仓库不包含权重、cache、ONNX/OM、日志或性能报告。
+每个窗口保存独立算子数据、阶段报告和汇总 CSV。C++ 的 verify 已融合接受判断和提交；
+Python 的 verify、accept-commit 可以分别采集。完整命令和精确采集范围见对应操作手册。
 
-### FP16 NPU
+## 5. 检查结果
 
-不传 `--config` 和 `--quant_mode enable` 即为非量化模式：
+ordinary Target 是 strict-greedy 正确性对照；token IDs、EOS 和停止原因必须一致。
+性能比较使用相同 prompt token、精度、输出 token 和同步边界，保留 3 次预热与 10 次测量。
+msprof 算子累计时间用于定位热点，不能直接替代整段生成时延。
 
-```bash
-export PYTHONPATH=/path/to/copied-runtime
+AIR/OM/C++ 已有代码与主机模拟测试；真实 TorchAir/ATC、AscendCL 执行、token 精度和
+Ascend 310P 性能仍需目标机验证。主机测试不提供真实 OM 产物或设备加速结论。
 
-python -B -m models.dflash_v1.run_npu \
-  --target-dir /path/to/Qwen3.5-4B \
-  --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --kv-cache-max-len 2048 \
-  --prompt "请用一句话解释为什么天空是蓝色的。" \
-  --prompt-mode chat --enable-thinking \
-  --max-new-tokens 32 \
-  --execution-mode validate \
-  --block-size 16 \
-  --device npu:0 \
-  --report /path/to/run/dflash-fp16.json
-```
-
-NPU 进程只需要提供带 `INT16[B] effective_length` 输入的
-`npu_chunk_gated_delta_rule` ABI；本分支不调用 `npu_gated_delta_rule_mtp`。每轮第一次 chunk
-计算全部 verify rows，Target 得到接受数 `a` 后，第二次用同一个 round-start state 和
-`effective_length=a+1` 生成标量 committed state。`kv-cache-max-len` 需要覆盖 prompt 和输出，
-并能被 64 整除。
-
-### Target W8A8 dynamic
-
-在相同命令后追加：
-
-```bash
-  --config ./config/qwen3.5.yaml \
-  --quant_mode enable
-```
-
-YAML 沿用原 `inference.py` 的三个字段：
-
-```yaml
-quanted_pth: /data/qwen35-w8a8/linear
-embedding_weight_path: /data/qwen35-w8a8/embedding_weight.bin
-embedding_scale_path: /data/qwen35-w8a8/embedding_scale.bin
-```
-
-分支内置了原 `utils.quant_model` 的等价转换，不再需要填写 quantizer/provider 回调。关闭量化时
-省略上述参数，或显式传 `--quant_mode disable`。
-
-正确性门禁通过后，可以把 `--execution-mode validate` 改为 `dflash`，只运行 DFlash 生产路径。
-该模式没有当次 ordinary 对照，因此报告不会伪造 exact-match PASS。
-
-只想用 msprof 查看一次 prefill、Draft、Target verify 或联合 Draft+verify 时，可给 `tools/run_msprof.sh`
-增加 `--profile-stage`（放在 `--` 之前，应用使用 `run_npu`）。选 `all` 可在一个应用进程中
-依次单独采集 prefill、特征投影、Draft、verify 输入准备、Target verify、Target Top1、
-接受/提交、联合 Draft+verify 和首轮 Draft→verify→提交；模型只加载一次，各阶段独立保存。
-也可选 `prefill`、`feature-project`、`draft`、`verify-input`、`verify`、
-`target-top1`、`accept-commit`、`draft-verify` 或 `decode-round` 单独采集。
-单独阶段的同步耗时见各自报告中的 `profiled_elapsed_ms`，算子明细见各自的 msprof CSV。
-`all` 的阶段报告放在 `<label>-stage-report.json` 的 `captures` 数组中，
-`<label>-stage-summary.csv` 汇总阶段耗时、算子行数和 GDR verify/commit 层调用次数。
-每阶段都会重新准备相同首轮状态并单独预热。本分支 `verify` 采第一次 chunk GDR，
-`accept-commit` 采 `accepted+1` 第二次 GDR 及状态提交；`decode-round` 包含两次 GDR。
-即使零接受，提交仍执行第二次 GDR。
-通过 msprof 原生动态采集 CLI 控制窗口，无需 pyACL；默认先在窗口外预热一次。完整命令和采集范围见[运行与验证 7.4 节](docs/DFLASH_RUN_AND_VALIDATE.md#74-只采一次-prefill-或-draft-生成--target-verify)。
-
-## 文档
+## 6. 参考资料
 
 | 文档 | 内容 |
-| --- | --- |
-| [当前架构](docs/DFLASH_ARCHITECTURE.md) | token/feature/cache/state 流程，以及与锁定官方 DFlash 的差异 |
-| [自定义算子](docs/DFLASH_OPERATORS.md) | 已有、生产必需、条件新增和性能优化算子的功能与 I/O |
-| [运行与验证](docs/DFLASH_RUN_AND_VALIDATE.md) | CPU/CUDA/NPU、W8A8、benchmark、msprof 和报告门禁 |
-| [源码索引](models/dflash_v1/README.md) | 入口、scheduler、Target、Draft 和量化文件映射 |
-| [AIR/OM/C++ 框架](docs/QUANT_AIR_OM_FRAMEWORK.md) | 从 quant 权重到 AIR、OM、C++ token 推理和闭源时延 A/B |
-
-## 结果应怎样解释
-
-- CPU/reduced-shape 测试是模拟证据，不是 Ascend 310P 交付证据。
-- `benchmark_npu --mode ordinary` 是 rollback receiver 的内部控制组，不是原 main
-  `inference.py`。
-- 原非 DFlash 基线仍从原部署工程运行
-  `python3 inference.py --config ./config/qwen3.5.ymal --max_token 32`，且不传
-  `--quant_mode enable`。
-- 算子累计时间不能直接当成整网延迟；正式加速比必须使用相同 prompt token、输出 token、精度、
-  warmup、同步边界和输出 hash 的独立进程 3+10 测量。
-- 真实 NPU 结论必须禁用 fallback，并记录 runtime、device、源码内容身份和 kernel/profile 证据。
-
-当前完成度和后续工作以[当前架构的差异矩阵](docs/DFLASH_ARCHITECTURE.md#7-与完整-dflash-的差异)与
-[算子优先级表](docs/DFLASH_OPERATORS.md#2-总表)为准，其他文档不再重复维护第二套架构描述。
+|---|---|
+| [DFlash 架构](docs/DFLASH_ARCHITECTURE.md) | token、feature、cache、state 与接受/提交语义 |
+| [自定义算子](docs/DFLASH_OPERATORS.md) | 必需 ABI、Tensor 实现与性能候选 |
+| [AIR/OM/C++ 接口](docs/QUANT_AIR_OM_FRAMEWORK.md) | factory、manifest、tensor ABI、CLI 与计时范围 |
+| [DFlash 源码索引](models/dflash_v1/README.md) | 命令、调度、Target、Draft、量化与 profiling 文件 |
+| [框架目录](framework/README.md) | 导出、编译、C++ runtime 和合同文件 |

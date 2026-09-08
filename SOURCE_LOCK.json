@@ -140,7 +140,7 @@
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "b5fdd64b1eaea44b3f53452bc260cf62de53ca38b1fcd8699bf4f9e358d99c76",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "91fa7ffcce861a7256f264a9051a41d032c030c66f40fd79ec8d69801ccb763a",
+    "documentation_sha256": "01633bcc2e80e0604f468ba0a0cbfd048e2f0c4dc8e9d07ebd26f0181dac4ba6",
     "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks and rollback verify/accepted+1 commit uses two original-GDR chunk calls; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback; native msprof dynamic CLI single-stage and all-stage diagnostics with one loaded application, independent fresh-state warmups and one acknowledged window per stage; verify collects the first original chunk GDR pass, accept-commit includes the mandatory accepted+1 second GDR pass even at zero acceptance, and decode-round collects both; per-window GDR verify/commit layer counters and nonempty operator exports are required; separate raw directories and synchronized timing CSV; no pyACL and no formal latency or strict-greedy accuracy claim from stage diagnostics; ordinary Python and C++ prefill/decode/all windows; C++ DFlash prefill/draft/fused-verify/all windows; native C++ socket barriers and standard-library Python controller; actual graph-call counts checked; no device-performance claim from host fixtures"
   },
   "incremental_om_framework": {
@@ -149,7 +149,7 @@
     "files": [
       {
         "source_file": "README.md",
-        "source_sha256": "a3d34894e90003116aa05baea565646e5071c5d8d2d82fc19291405d379631bc"
+        "source_sha256": "6fceecd3e2bc5b0f4d4535050d04a98f8ca1b952a59e61c0fa6a42e66d9a20bb"
       },
       {
         "source_file": "config/gdr_chunk_air_om_factory.example.json",
@@ -157,11 +157,11 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "57de322f6d7ed2cfac796b60ee85f345b1fdca3086543226c0b08c45e1a245bf"
+        "source_sha256": "8ce034ae0a120dc5cdca8b891c4c7900ee038e3309f9a28a1ff47d2e8c81b064"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "1988a27f8e0715cf760743bd8247d390a3966330b9acda905d42848daa2943bf"
+        "source_sha256": "17f6863b308e19b8c92463741b1f94162e66b8663ada15d215ca527a0a119816"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
@@ -169,7 +169,7 @@
       },
       {
         "source_file": "framework/README.md",
-        "source_sha256": "d6e591c94431ea027555d10c5616287c188537f505678e3254761986559e8eb2"
+        "source_sha256": "4eddfb567f54c7167e1399650b0ff4dff2233748861d26f0e1e3537714d13b37"
       },
       {
         "source_file": "framework/abi/closed-runtime-baseline-v1.json",

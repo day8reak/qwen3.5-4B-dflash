@@ -1,49 +1,58 @@
-# Quant AIR/OM 推理框架
+# AIR/OM/C++ 推理框架
 
-`feature/gdr-chunk-verify` 增加了显式状态增量工厂：DFlash 使用 prefill、Draft、verify
-（含接受判断和第二次 GDR）三个 OM，普通对照可选第四个 decode OM。
-见 [增量 AIR/OM/C++ 文档](../docs/GDR_CHUNK_AIR_OM.md)。下文两输入/两输出针对旧重算基线；
-增量代码通过 host 检查，真实 TorchAir/ATC 和 Ascend 310P 门禁仍待实机执行。
+将 Qwen3.5-4B W8A8 Target 和 FP16 DFlash 导出为静态 AIR，经 ATC 编译成 OM，
+由 C++17/AscendCL 完成 ordinary greedy 或 strict-greedy DFlash 生成。
 
-这个目录是直接加在仓库 `quant` 分支之上的部署层，不替换现有量化、rollback 或 DFlash
-实现。基线提交固定为 `28f93e784a2beed87020a80bd93c8788754eab1c`。
+## 1. 准备环境和输入
 
-完整数据流是：
+打开 [AIR/OM/C++ 从零部署手册](../docs/GDR_CHUNK_AIR_OM.md)，从第 1 步开始准备：
+
+- 匹配设备的 CANN、PyTorch/NPU、TorchAir、ATC、AscendCL 和自定义算子包；
+- Target、官方 Draft、W8A8 Linear/embedding、外部 receiver 加载器；
+- 源码之外的运行目录、固定 prompt 和输入 manifest。
+
+## 2. 导出、转换并构建
+
+按手册继续执行 `export-air`、`compile-om` 和 `build-cpp`。增量 factory 为：
 
 ```text
-quant 分支 Target W8A8 + FP16 Draft
-        │ TorchAir dynamo_export
-        ▼
-      AIR + 外置权重
-        │ atc --framework=1 --mode=0
-        ▼
-      静态 OM
-        │ C++17 / AscendCL
-        ▼
-ordinary greedy 与 strict-greedy DFlash 逐 token 生成
+qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_graphs
 ```
 
-目录内容：
+| 图 | 功能 |
+|---|---|
+| `target_prefill` | 64 行物理 gear，处理 prompt 并输出特征和状态 |
+| `target_decode` | 可选的一行普通 decode |
+| `target_verify` | 16 行 verify，融合接受判断和第二次 GDR commit |
+| `draft` | 64 行特征 gear、16 行 Draft block，一次生成 15 个 proposal |
 
-- `python/qwen35_dflash/ascend310p/`：AIR 导出、ATC 编译、manifest/hash
-  门禁、tokenizer 控制面和 C++ runner 启动器；
-- `runtime/cpp/`：不经过 Python 热循环的 AscendCL OM runner；
-- `abi/`：OM、运行时、性能和闭源框架 A/B 合同；
-- `scripts/compare_cpp_closed_runtime.py`：同设备、同 token、同计时范围的性能对比；
-- `FRAMEWORK_LOCK.json`：本分支冻结的量化、图和运行时 ABI。
+DFlash 部署需要 3 个 OM；加入普通模式对照后共 4 个。C++ 按模式加载所需模型，
+持久保存状态 buffer，并核对 manifest、OM hash 和有序 tensor ABI。
 
-详细构建、运行与验证命令见
-[docs/QUANT_AIR_OM_FRAMEWORK.md](../docs/QUANT_AIR_OM_FRAMEWORK.md)。
+## 3. 验证并采集
 
-当前第一版 OM 使用固定 gear 的完整前缀重算，以先冻结可验证的两输入/两输出 ABI。它确实由
-C++ 调用 OM 完成 token 推理，但尚未把 `quant` 分支已有的 persistent rollback cache/state
-转成显式 OM I/O。因此它是功能基线，不应在真实测量前声称已达到闭源框架时延。
+1. 使用 `infer-cpp` 进行普通/DFlash 各 3 次预热和 10 次测量。
+2. 比较 NPU ordinary、OM ordinary、OM DFlash 的 token IDs、EOS 和停止原因。
+3. 使用 `prepare-chunk-plan` 生成所需模式的加载计划。
+4. 使用 `tools/run_msprof.sh --profile-backend cpp` 采集单个阶段或 `all`。
 
-当前 `quant` 基线要求原 GDR 算子接收 `INT16[B] effective_length`。框架不会为此增加第三个
-OM 输入，而是在 AIR 图内从 `attention_mask` 计算有效前缀长度；静态物理 gear 与逻辑有效
-行数因此可以分别为 64 和 37。
+普通模式支持 `prefill|decode|all`；DFlash 支持 `prefill|draft|verify|all`。
+`all` 在一个 C++ 进程中为各阶段分别创建一次采集窗口。全部命令、参数和报告路径均在
+[完整手册](../docs/GDR_CHUNK_AIR_OM.md)中。
 
-Target modeling 中的 `torch_npu.adn_rms_norm` 调用保持不变。AIR 导出前，框架只为
-`npu::adn_rms_norm` 注册接收方实测合同对应的 Fake/Meta 输出，并把该 FX 节点一对一转换成
-注册的 GE `RmsNorm` 节点；它不会执行或导出 Tensor 公式替代。导出成功后还必须在
-`dynamo.pbtxt` 中找到该 GE 节点，结果和 converter 命中次数会写入 `air-manifest.json`。
+代码已通过主机模拟检查；真实 TorchAir/ATC、自定义 GE 算子、AscendCL 和设备精度/性能
+需要在目标机验证。
+
+## 4. 查找实现和合同
+
+| 路径 | 内容 |
+|---|---|
+| `python/qwen35_dflash/ascend310p/` | 图工厂、AIR 导出、ATC 编译、manifest、tokenizer 和 runner 控制面 |
+| `runtime/cpp/` | AscendCL 执行、增量状态、生成调度和阶段采集 |
+| `abi/dflash-chunk-v1.json` | 增量图、状态与设备验证合同 |
+| `abi/performance-v1.json` | 性能计时和测量合同 |
+| `scripts/lock_quant_inputs.py` | 外部输入锁定 |
+| `scripts/compare_cpp_closed_runtime.py` | 相同设备、token 和计时范围的性能报告比较 |
+| `FRAMEWORK_LOCK.json` | 图、量化、运行时和 profiling 合同 |
+
+字段定义和调用边界见 [AIR/OM/C++ 接口参考](../docs/QUANT_AIR_OM_FRAMEWORK.md)。

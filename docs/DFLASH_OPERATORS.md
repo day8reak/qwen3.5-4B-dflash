@@ -1,12 +1,15 @@
 # DFlash 自定义算子清单
 
-本文区分三件事：当前 strict-greedy rollback 能否运行、去掉生产 golden 还缺什么、性能优化可能
+本文描述 Python NPU strict-greedy rollback 的算子依赖、Tensor 实现和性能候选。AIR/OM/C++
+的融合 verify/commit 与显式 I/O 见 [框架接口](QUANT_AIR_OM_FRAMEWORK.md)。
+
+下面区分当前 rollback 能否运行、去掉生产 golden 还缺什么、性能优化可能
 需要什么。只有实测热点才进入优化算子开发；sampling、streaming、batch 和 transaction 所有权
 首先是软件能力，不应被包装成一个巨型算子。
 
 ## 1. 当前结论
 
-- 已完成并接入：原 `ChunkGatedDeltaRule` 的 `effective_length` ABI；prompt、decode、verify 和
+- 必需接口：`ChunkGatedDeltaRule` 的 `effective_length` ABI；prompt、decode、verify 和
   accepted-prefix commit 都复用它，不调用 `GatedDeltaRuleMTP`。
 - 当前可运行：causal-conv 使用输入 NPU 上的 Tensor golden；KV 使用现有
   `npu_cache_update_` 逐 row 写；attention 使用现有 `adn_fused_infer_attention`；Draft 使用
@@ -27,7 +30,7 @@ golden”则明确需要 `CausalConv1dChunkCommit`。
 
 | 算子 | 当前状态 | 功能 | 主要输入 | 主要输出 | 需要程度 |
 | --- | --- | --- | --- | --- | --- |
-| `ChunkGatedDeltaRule` | 复用 receiver 新 ABI、已接线 | prompt/decode；verify `T` 行；从同一 S0 按 `a+1` 二次计算 committed state | Q/K/V、g、beta、`effective_length`、标量初始 state | attention output、最终 FP32 state | P0，已有 |
+| `ChunkGatedDeltaRule` | 使用含 effective_length 的 ABI | prompt/decode；verify `T` 行；从同一 S0 按 `a+1` 二次计算 committed state | Q/K/V、g、beta、`effective_length`、标量初始 state | attention output、最终 FP32 state | P0，已有 |
 | `GDRChunkStateCommit` | 未实现 | 消费第一次的 capsule，只计算接受前缀最终 state，跳过 query/output 路径 | K/V/g/beta 或紧凑中间量、S0、`commit_length` | 单个 FP32 state | 性能 P1，profile 后 |
 | `CausalConv1dChunkCommit` | Torch-NPU golden | 从标量 window 计算 T 行输出和 prefix windows，按 `a+1` 提交一个 window | mixed QKV、标量 conv state、weight/bias、`commit_length` | activated rows、单个 committed window | P1，去 golden 必需 |
 | `CacheUpdateMTP` | 现有 op 逐 row | 一次写入 T 行 paged K 或 V，支持跨 64-token block | cache、updates、positions、block table | 原位 cache | 条件 P1 |
@@ -60,7 +63,7 @@ golden”则明确需要 `CausalConv1dChunkCommit`。
 
 ## 4. 状态算子
 
-### 4.1 原 `ChunkGatedDeltaRule`：新增 `effective_length` ABI 已适配
+### 4.1 `ChunkGatedDeltaRule` 与 `effective_length`
 
 ```text
 npu_chunk_gated_delta_rule(
@@ -86,10 +89,10 @@ oracle 把真实 37 行右补齐到物理 S=64 时传 `[37]`；
 persistent prompt chunk 为 64+1 时两次分别传 `[64]` 和 `[1]`；decode 传 `[1]`。同一个
 `INT16[B]` Tensor 在一次 Target forward 的 24 个 GDN 层间复用，避免每层重复构造。
 
-普通 modeling 和 rollback modeling 的 ordinary 分支都调用这个新 ABI。部署侧若仍注册旧签名，
-必须先更新原 GDR 算子包；Python 侧不能通过删掉该参数兼容，否则 padding 会污染 final state。
+普通 modeling 和 rollback modeling 都要求这个 ABI。部署侧的算子包必须接收
+`effective_length`；缺少该参数会使 padding 污染 final state。
 
-### 4.2 Verify/commit：复用原 GDR
+### 4.2 Verify/commit：两遍 GDR
 
 ```text
 S0 = scalar committed recurrent state
@@ -109,8 +112,8 @@ windows。第二次调用的 `commit_length` 必须是 `a+1`，因为 anchor 也
 所有层成功后才发布 S1；失败则整轮/session fail-closed。正确性版不需要修改自定义算子。
 
 若 msprof 证明第二次调用的 output/query 路径是热点，可新增 `GDRChunkStateCommit`：输入 cached
-K/V/g/beta（或原 GDR 已生成的紧凑中间量）、S0 和 `INT16[B] commit_length`，只输出
-`[B,32,128,128]` FP32 state。该优化必须与上述第二次原 GDR 的 state 数值对齐，并重新执行整网
+K/V/g/beta（或GDR 已生成的紧凑中间量）、S0 和 `INT16[B] commit_length`，只输出
+`[B,32,128,128]` FP32 state。该优化必须与上述第二次GDR 的 state 数值对齐，并重新执行整网
 零 token-ID mismatch 门禁。
 
 ### 4.3 `CausalConv1dChunkCommit`：生产优先
@@ -212,7 +215,7 @@ cache commit 只包含 old+Δ，不包含 transient T。
 
 ### 6.3 W8A8 `FusedDynamicQuantLinear`
 
-原 QLinear 每次调用分别执行 `npu_dynamic_quant(x)` 和 `npu_quant_matmul(...)`：
+QLinear 每次调用分别执行 `npu_dynamic_quant(x)` 和 `npu_quant_matmul(...)`：
 
 ```text
 x            [B,T,K] FP16
@@ -233,7 +236,7 @@ QLinear 对齐。
 - `DraftKVAppendCrop`：减少 cache concat/allocator 峰值；异常时旧 committed cache 必须原样可用。
 - RMSNorm/RoPE/SwiGLU fusion：只在小算子 launch 成为热点时做，保持 FP32 reduction 和 FP16
   rounding boundary。
-- `GDRChunkStateCommit`：只有第二次原 GDR 的 query/output 计算成为实测热点时才开发。
+- `GDRChunkStateCommit`：只有第二次GDR 的 query/output 计算成为实测热点时才开发。
 
 ## 7. 不应做成自定义算子的内容
 
@@ -250,15 +253,15 @@ QLinear 对齐。
 
 ## 8. 开发顺序
 
-1. 用原 GDR 两次 chunk、conv golden、逐 row KV 和现有 attention 跑通 B=2，再扩到 B=16。
+1. 用 GDR 两次 chunk、conv golden、逐 row KV 和现有 attention 跑通 B=2，再扩到 B=16。
 2. 覆盖 accepted `0/1/K-1/K`、动态 T、cursor `62/63/64/65` 和 rejection 后下一 token。
 3. 开发 `CausalConv1dChunkCommit`，逐 commit length 对齐 golden，去掉 production conv golden。
 4. 在相同 token/hash/调用次数下采集无 profiler 3+10 latency，再用 msprof 定位热点。
 5. 按收益依次评估 Draft GQA/Top-1、Target Top-1、CacheUpdate、W8A8 fused linear。
 6. 每替换一个算子，重新跑完整 state 门禁和 ordinary/DFlash strict-greedy 零差异。
 
-当前不再持久化 `[B,T,32,128,128]` recurrent bank。原 GDR final state 是 FP32；bridge 在发布
-时复用 ordinary receiver 已有的 persistent cache dtype 边界（当前为 FP16），确保本分支测到的
+持久化 recurrent state 的 shape 为 `[B,32,128,128]`。GDR final state 是 FP32；bridge 在发布
+时复用 ordinary receiver 已有的 persistent cache dtype 边界（当前为 FP16），确保测到的
 chunk/recurrent 差异不混入新的状态存储口径。T=16 的 conv prefix windows 约 24 MiB/24 层，
 Q/K/V/g/beta capsule 约 9 MiB/24 层，另有 FP32 round-start state 快照。实际峰值必须用设备
 profile 统计；若要实验 FP32 persistent state，应作为单独精度分支并重跑 ordinary 对照。

@@ -1,678 +1,425 @@
-# DFlash rollback 运行与验证
+# Python NPU：从环境准备到运行、验证和 msprof
 
-本文只保留可执行命令、报告门禁和性能口径。算法见[当前架构](DFLASH_ARCHITECTURE.md)，算子
-见[自定义算子清单](DFLASH_OPERATORS.md)。
+本文按顺序运行 Qwen3.5-4B ordinary/DFlash，并采集单次 prefill、decode 或 Draft/verify。
+支持 batch=1、strict greedy，Target 可选 FP16/W8A8，Draft 运行时为 FP16。
+C++ OM 的完整部署步骤见 [AIR → OM → C++ 操作手册](GDR_CHUNK_AIR_OM.md)。
 
-## 1. 证据分级
+## 1. 准备源码和目录
 
-| 结论 | 最低证据 |
-| --- | --- |
-| scheduler 正确 | 同一 Target 下 ordinary/DFlash token ID、EOS、stop reason 完全一致 |
-| rollback 正确 | verify 不含历史前缀；state/KV/feature/position 同时提交 `1+a`；拒绝后下一 token 仍一致 |
-| NPU 路线通过 | 真实 Ascend 310P、无 fallback、记录 runtime/device/source/op 身份和 kernel trace |
-| 端到端加速 | 相同 workload、精度、输出、同步边界的独立进程 3+10 配对测量 |
-
-CPU reduced-shape 只能证明辅助逻辑；CUDA 只能证明 framework 路线。算子累计时间、单次 msprof
-结果和 correctness PASS 都不能替代端到端加速证据。
-
-## 2. 准备
-
-- Python 3.10、`transformers==5.14.1`、`safetensors`；
-- 匹配 CPU/CUDA/NPU 的 PyTorch；
-- 本地 Qwen3.5-4B Target 与完整 tokenizer；
-- 本地锁定的 `z-lab/Qwen3.5-4B-DFlash` checkpoint；
-- 报告、日志、profile 和 cache 放在源码仓库外。
+需要 Linux、可访问的 Ascend 310P、与驱动/固件匹配的 CANN 和 NPU Python 环境。
+先把下面的绝对路径改成实际路径。`AI_RUN_DIR` 使用源码和权重目录之外的全新目录；
+使用模型 workspace 时，由 `ws session start` 分配该目录，不要覆盖已有 session 的路径。
 
 ```bash
-python -m pip install "transformers==5.14.1" safetensors huggingface-hub
+export REPO_ROOT=/absolute/path/qwen3.5-4B-dflash
+export AI_RUN_DIR=/absolute/path/qwen35-run
+export MODEL_PYTHON=/absolute/path/npu-env/bin/python
+export CANN_ROOT=/absolute/path/ascend-toolkit
+export TARGET_DIR=/absolute/path/Qwen3.5-4B
+export DRAFT_DIR=/absolute/path/Qwen3.5-4B-DFlash
+export RECEIVER_ROOT=/absolute/path/qwen35-receiver
+export RECEIVER_MODELS_DIR="$RECEIVER_ROOT/models"
+
+# REPO_ROOT 必须是尚未创建的目录。
+git clone --single-branch --branch feature/gdr-chunk-verify \
+  https://github.com/day8reak/qwen3.5-4B-dflash.git "$REPO_ROOT"
+mkdir -p "$AI_RUN_DIR/log" "$AI_RUN_DIR/reports" "$AI_RUN_DIR/cache" "$AI_RUN_DIR/tmp"
+cd "$REPO_ROOT"
+
+source "$CANN_ROOT/set_env.sh"
 export PYTHONDONTWRITEBYTECODE=1
+export TMPDIR="$AI_RUN_DIR/tmp"
+export HF_HOME="$AI_RUN_DIR/cache/huggingface"
+export TORCH_HOME="$AI_RUN_DIR/cache/torch"
+export XDG_CACHE_HOME="$AI_RUN_DIR/cache"
+export PYTHONPATH="$REPO_ROOT/framework/python:$REPO_ROOT:$RECEIVER_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-入口会检查 Draft config、6 层/69 tensor、shape/dtype/hash，以及 Target/Draft 共享权重、device 和
-dtype。`block_size` 包含 anchor，范围 2..16；B=16 对应 K=15、T=16。
+权重、AIR、OM、编译目录、日志和报告均放在源码仓库外。后续命令在同一个 Bash 会话执行，
+使用这里定义的变量。源码已经位于 `REPO_ROOT` 时，从 `mkdir` 开始执行，无需再次 clone。
 
-## 3. CPU/CUDA
+## 2. 安装依赖并检查 NPU
+
+`MODEL_PYTHON` 使用 Python 3.10，并已安装与 CANN 配套的 PyTorch 和 `torch_npu`。
+CANN 驱动、固件、PyTorch/NPU 扩展及设备自定义算子包需要由设备软件栈提供；本仓库不包含
+这些安装包。不要用普通 CPU PyTorch 覆盖 NPU 环境中的 PyTorch。
+
+安装模型侧依赖：
 
 ```bash
-export PYTHONPATH="$PWD"
+"$MODEL_PYTHON" -m pip install numpy PyYAML safetensors huggingface-hub "transformers==5.14.1"
 
-python -B -m models.dflash_v1.run_rollback \
-  --target-dir /path/to/Qwen3.5-4B \
-  --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --prompt "请用一句话解释为什么天空是蓝色的。" \
-  --prompt-mode chat --enable-thinking \
-  --max-new-tokens 32 \
-  --execution-mode validate \
-  --block-size 16 \
-  --eos-token-id 248044 \
-  --dtype float16 \
-  --device cuda:0 \
-  --report /path/to/run/dflash-cuda.json
-```
-
-CPU 改为 `--device cpu`，并按环境选择 dtype。CPU/CUDA 使用
-`FrameworkDFlashRollbackTarget + TorchDFlashOps`：Target DynamicCache/GDN 在 verify 前保存，
-commit 时只重放 anchor 与 accepted proposal，不重放 prompt 或更早历史。
-
-CUDA 不可用时必须直接失败，不能用 CPU 结果伪装。不要传 HIAI factory、source、reset hook 或
-NPU ops backend。
-
-## 4. HIAI/NPU 部署
-
-保留原 ordinary 文件，新增 rollback 文件：
-
-```text
-models/
-├── modeling_qwen3_5_hiai_nd.py                         # ordinary；适配新 GDR effective_length ABI
-├── export_model_wrapper_qwen3_5.py                     # 原文件，不覆盖
-├── modeling_qwen3_5_hiai_nd_dflash_rollback.py
-├── export_model_wrapper_qwen3_5_dflash_rollback.py
-├── internal_dflash_bridge.py
-└── dflash_v1/
-```
-
-复制源码后使用部署环境声明的 Python：
-
-```bash
-export DEPLOY_ROOT=/path/to/copied-runtime
-export MODEL_PYTHON=/path/to/deployment/python
-export PYTHONPATH="$DEPLOY_ROOT:$PYTHONPATH"
-export PYTHONDONTWRITEBYTECODE=1
-
-"$MODEL_PYTHON" -B -m py_compile \
-  "$DEPLOY_ROOT/models/modeling_qwen3_5_hiai_nd_dflash_rollback.py" \
-  "$DEPLOY_ROOT/models/export_model_wrapper_qwen3_5_dflash_rollback.py" \
-  "$DEPLOY_ROOT/models/internal_dflash_bridge.py" \
-  "$DEPLOY_ROOT/models/dflash_v1/run_npu.py"
-```
-
-先确认部署的原 GDR 算子包已经升级到带 `effective_length` 的新 ABI：
-
-```text
-npu_chunk_gated_delta_rule(
-  query, key, value, g, beta, effective_length,
-  chunk_size=64, initial_state=None,
-  output_final_state=False, use_qk_l2norm_in_kernel=False
-)
-```
-
-其中 `effective_length` 必须接受 `[B] INT16`。普通 modeling、rollback ordinary、verify 和
-accepted-prefix commit 都会传这个输入；旧注册包会在第一次 Target 调用时直接接口不匹配。
-只检查原 GDR 注册：
-
-```bash
+npu-smi info | tee "$AI_RUN_DIR/log/npu-smi.txt"
 "$MODEL_PYTHON" -B - <<'PY'
 import torch
 import torch_npu
-
-op = getattr(torch_npu, "npu_chunk_gated_delta_rule", None)
-if not callable(op):
-    op = getattr(getattr(torch.ops, "npu", None), "npu_chunk_gated_delta_rule", None)
-assert callable(op), "npu_chunk_gated_delta_rule is not registered"
-print("CHUNK_GDR_REGISTERED")
+assert torch.npu.is_available(), "没有可用 NPU"
+torch.npu.set_device("npu:0")
+print("torch:", torch.__version__)
+print("torch_npu:", getattr(torch_npu, "__version__", "unknown"))
+print("device:", torch.npu.get_device_name(0))
 PY
 ```
 
-语法和符号可见不证明 shape、数值或整网通过。
-
-## 5. NPU FP16
-
-先用 B=2 跑至少一轮 Draft/verify：
+按自定义算子包的安装说明完成注册后，检查 Target 所需接口：
 
 ```bash
-export RUN_DIR=/path/to/dflash-run
-mkdir -p "$RUN_DIR"
-
-"$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
-  --target-dir /path/to/Qwen3.5-4B \
-  --draft-dir /path/to/Qwen3.5-4B-DFlash \
-  --kv-cache-max-len 2048 \
-  --prompt "请用一句话解释为什么天空是蓝色的。" \
-  --prompt-mode chat --enable-thinking \
-  --max-new-tokens 2 \
-  --execution-mode validate \
-  --block-size 2 \
-  --device npu:0 \
-  --report "$RUN_DIR/dflash-fp16-smoke.json"
+"$MODEL_PYTHON" -B - <<'PY'
+import torch_npu
+required = (
+    "npu_chunk_gated_delta_rule", "adn_fused_infer_attention",
+    "adn_rms_norm", "npu_cache_update_",
+)
+missing = [name for name in required if not callable(getattr(torch_npu, name, None))]
+assert not missing, f"缺少 NPU 算子: {missing}"
+print("Target operator symbols: PASS")
+PY
 ```
 
-`run_npu` 固定 FP16、EOS 248044、prefill chunk 64、decode chunk 1 和 package-local NPU Draft
-backend。`kv-cache-max-len` 必须覆盖 prompt+output，并能被 64 整除。Prompt、verify 和 commit
-都使用原 GDR chunk 路线：verify 传当前 `T`，commit 从同一个 round-start state 出发传
-`a+1`。本分支不要求注册 GDR-MTP。
+`npu_chunk_gated_delta_rule` 必须接受 `effective_length: INT16[B]`，含义是本次调用的有效行数。
+接口形式为：
 
-如果 anchor 立即 EOS，报告会是 `INCONCLUSIVE_NO_DRAFT_ROUND`；换固定非立即结束 prompt。B=2
-通过后再跑 `--max-new-tokens 32 --block-size 16`。
-
-离线 validate 通过后，日常单跑改为：
-
-```bash
-  --execution-mode dflash
+```text
+npu_chunk_gated_delta_rule(query, key, value, g, beta, effective_length,
+                         chunk_size=64, initial_state=None,
+                         output_final_state=False, use_qk_l2norm_in_kernel=False)
 ```
 
-`dflash` 模式不额外跑 ordinary；它仍检查 checkpoint/source/device，但
-`strict_greedy_exact_match=null`，正确性证据必须来自同 revision 的 validate 报告。
+符号检查通过后，仍需通过后面的真实模型执行验证 shape、dtype 和数值。
 
-默认就是非量化模式。可以省略量化参数，也可显式传 `--quant_mode disable`。
+## 3. 准备模型和外部加载器
 
-## 6. Target W8A8 dynamic
-
-量化 artifact 由原部署工程提供。分支不重新量化，也不复制权重。
-
-先跑不加载 Draft 的预检：
+需要完整的 Target checkpoint、tokenizer，以及官方 Draft checkpoint。已有匹配文件时，直接
+设置好 `TARGET_DIR` 和 `DRAFT_DIR`；需要下载时，以下命令从 `SOURCE_LOCK.json` 读取锁定版本：
 
 ```bash
+"$MODEL_PYTHON" -B - <<'PY'
+import json, os
+from pathlib import Path
+from huggingface_hub import snapshot_download
+lock = json.loads((Path(os.environ["REPO_ROOT"]) / "SOURCE_LOCK.json").read_text())
+for section, directory in (("target_checkpoint", "TARGET_DIR"), ("dflash_checkpoint", "DRAFT_DIR")):
+    item = lock[section]
+    snapshot_download(repo_id=item["repository"], revision=item["revision"],
+                      local_dir=os.environ[directory])
+PY
+```
+
+Draft 文件保留 checkpoint 中的 BF16 数据，运行时加载为 FP16；不要预先改写 checkpoint。
+加载器会检查 Draft 的配置、6 层/69 tensor、shape、dtype 和文件 hash。
+
+还需要外部文件 `$RECEIVER_MODELS_DIR/export_model_wrapper_qwen3_5.py` 及其依赖。
+该文件由 Qwen3.5 NPU receiver 软件包提供，本仓库不附带。它必须导出
+`Qwen3_5ForCausalLMWrapper` 类和模块级 `Qwen3_5ForCausalLM`，负责权重加载及设备初始化。
+将完整 receiver 软件包放到 `RECEIVER_ROOT`，然后建立本次运行专用的模块搜索配置：
+
+```bash
+mkdir -p "$AI_RUN_DIR/python-bootstrap"
+cat > "$AI_RUN_DIR/python-bootstrap/sitecustomize.py" <<'PY'
+import os
+import models
+receiver_models = os.environ.get("RECEIVER_MODELS_DIR")
+if receiver_models and receiver_models not in models.__path__:
+    models.__path__.append(receiver_models)
+PY
+export PYTHONPATH="$AI_RUN_DIR/python-bootstrap:$REPO_ROOT/framework/python:$REPO_ROOT:$RECEIVER_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+"$MODEL_PYTHON" -B - <<'PY'
+import importlib.util, os
+from pathlib import Path
+expected = Path(os.environ["RECEIVER_MODELS_DIR"]) / "export_model_wrapper_qwen3_5.py"
+assert expected.is_file(), f"缺少外部加载器: {expected}"
+spec = importlib.util.find_spec("models.export_model_wrapper_qwen3_5")
+assert spec is not None and Path(spec.origin).resolve() == expected.resolve()
+print("receiver wrapper:", spec.origin)
+PY
+```
+
+配置放在运行目录中，不修改模型源码。模型文件优先从本仓库查找，外部目录提供缺少的加载器
+及辅助模块。若 wrapper 的依赖无法导入，补齐 receiver 软件包和对应 Python 依赖后再执行。
+
+## 4. 选择精度并固定运行参数
+
+FP16 不需要量化文件，在当前 Bash 会话设置：
+
+```bash
+QUANT_ARGS=()
+export KV_CAPACITY=2048
+export MAX_NEW_TOKENS=32
+cat > "$AI_RUN_DIR/prompt.txt" <<'TEXT'
+请用一句话解释为什么天空是蓝色的。
+TEXT
+
+NPU_ARGS=(
+  --target-dir "$TARGET_DIR" --draft-dir "$DRAFT_DIR"
+  --kv-cache-max-len "$KV_CAPACITY" --device npu:0
+  --prompt-file "$AI_RUN_DIR/prompt.txt" --prompt-mode chat --enable-thinking
+)
+```
+
+`KV_CAPACITY` 必须是 64 的倍数，覆盖 prompt 和输出 token。
+`--block-size` 包含一个 anchor，取值 2..16；16 表示最多 15 个 proposal。
+NPU prefill 每块最多 64 个真实 token，ordinary decode 每次一行。
+
+要使用 W8A8，先完成下面的量化输入准备，然后设置 `QUANT_ARGS`。只运行 FP16 可直接进入第 5 步。
+
+需要以下三个量化输入；仓库消费这些文件，不提供 W8A8 权重生成工具：
+
+| 输入 | 内容 |
+|---|---|
+| `QUANT_LINEAR_DIR` | 含 `data*.safetensors` 的 Target W8A8 Linear 权重目录 |
+| `QUANT_EMBED_WEIGHT` | Target embedding 的 INT8 raw binary |
+| `QUANT_EMBED_SCALE` | 每词表行的 FP32 scale raw binary |
+
+量化数据必须与 `TARGET_DIR` 的结构和权重匹配。设置路径并生成 YAML：
+
+```bash
+export QUANT_LINEAR_DIR=/absolute/path/qwen35-w8a8/linear
+export QUANT_EMBED_WEIGHT=/absolute/path/qwen35-w8a8/embedding_weight.bin
+export QUANT_EMBED_SCALE=/absolute/path/qwen35-w8a8/embedding_scale.bin
+export QUANT_CONFIG="$AI_RUN_DIR/qwen35-w8a8.yaml"
+
+"$MODEL_PYTHON" -B - <<'PY'
+import os, yaml
+from pathlib import Path
+values = {
+    "quanted_pth": os.environ["QUANT_LINEAR_DIR"],
+    "embedding_weight_path": os.environ["QUANT_EMBED_WEIGHT"],
+    "embedding_scale_path": os.environ["QUANT_EMBED_SCALE"],
+}
+Path(os.environ["QUANT_CONFIG"]).write_text(yaml.safe_dump(values, sort_keys=False))
+PY
+```
+
+YAML 中就是这三个绝对路径字段。Target Linear 和输入 embedding 使用量化数据，
+Draft embedding、Draft 主体和 LM head 使用 FP16。
+
+```bash
+QUANT_ARGS=(--config "$QUANT_CONFIG" --quant_mode enable)
+
 "$MODEL_PYTHON" -B -m models.dflash_v1.preflight_target_quant \
-  --target-dir /path/to/Qwen3.5-4B \
-  --prompt-ids 1,2,3,4 \
-  --device npu:0 \
-  --kv-cache-max-len 2048 \
-  --config ./config/qwen3.5.yaml \
-  --compare-first-qlinear \
-  --report "$RUN_DIR/target-quant-preflight.json"
+  --target-dir "$TARGET_DIR" --prompt-ids 1,2,3,4 \
+  --kv-cache-max-len "$KV_CAPACITY" --device npu:0 \
+  --config "$QUANT_CONFIG" --compare-first-qlinear \
+  --report "$AI_RUN_DIR/reports/quant-preflight.json"
 ```
 
-YAML：
+量化预检验证装配、部分公式和状态调用，随后仍须完成整网 ordinary/DFlash 对照。
+FP16 和 W8A8 的输出精度比较需要独立数据，不能由 W8A8 内部的 ordinary/DFlash 一致性推出。
 
-```yaml
-quanted_pth: /data/qwen35-w8a8/linear
-embedding_weight_path: /data/qwen35-w8a8/embedding_weight.bin
-embedding_scale_path: /data/qwen35-w8a8/embedding_scale.bin
-```
+## 5. 执行一次正确性验证
 
-`quanted_pth` 是包含 `data*.safetensors` 的目录；两个 embedding 文件是原 `numpy.tofile` raw
-artifact。预检覆盖 Linear->QLinear 拓扑、同 activation 公式诊断、真实 multi-token prefill、
-ordinary S=1、rollback S=1 和 embedding lookup，但不替代整网 DFlash 门禁。
-
-预检通过后，在第 5 节命令追加：
+先用小 block 和两个输出 token 检查基本调用：
 
 ```bash
-  --config ./config/qwen3.5.yaml \
-  --quant_mode enable
+"$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+  "${NPU_ARGS[@]}" "${QUANT_ARGS[@]}" \
+  --execution-mode validate --block-size 2 --max-new-tokens 2 \
+  --report "$AI_RUN_DIR/reports/smoke.json"
 ```
 
-Target Linear/输入 embedding 走 W8A8，Draft embedding、LM head 和 6 层主体保持 FP16。整网
-validate 比较的是“同一个 W8A8 Target 的 ordinary 与 DFlash”；若还要求 W8A8 与 FP16 token
-一致，需要另做 ordinary 精度对照。
-
-## 7. NPU 性能基准与 msprof
-
-先区分三条路径：
-
-| 对象 | 入口 | 用途 |
-| --- | --- | --- |
-| 原 main 非 DFlash | 原工程 `inference.py` | 旧部署权威基线 |
-| rollback ordinary | `benchmark_npu --mode ordinary` | 同 receiver、同门禁的 scheduler 内部控制组 |
-| rollback DFlash | `benchmark_npu --mode dflash` | 当前 Draft/verify/commit 路线 |
-
-未 profiling 的正式基线使用独立进程、3 次 warmup、10 次 measurement。每次 measurement 包含
-一轮完整 generation 和末尾设备同步，不包含 checkpoint hash、模型加载、tokenizer 或前置
-correctness gate。
+随后执行完整 block：
 
 ```bash
-export BENCH_DIR=/path/to/dflash-benchmark
-mkdir -p "$BENCH_DIR"
-
-for MODE in ordinary dflash; do
-  "$MODEL_PYTHON" -B -m models.dflash_v1.benchmark_npu \
-    --mode "$MODE" \
-    --target-dir /path/to/Qwen3.5-4B \
-    --draft-dir /path/to/Qwen3.5-4B-DFlash \
-    --kv-cache-max-len 2048 \
-    --prompt "请用一句话解释为什么天空是蓝色的。" \
-    --prompt-mode chat --enable-thinking \
-    --max-new-tokens 32 --block-size 16 \
-    --warmup 3 --repetitions 10 \
-    --device npu:0 \
-    --report "$BENCH_DIR/$MODE.json"
-done
+"$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+  "${NPU_ARGS[@]}" "${QUANT_ARGS[@]}" \
+  --execution-mode validate --block-size 16 --max-new-tokens "$MAX_NEW_TOKENS" \
+  --report "$AI_RUN_DIR/reports/validate.json"
 ```
 
-W8A8 对比时两个进程必须追加完全相同的参数：
+`validate` 分别创建 ordinary 和 DFlash 的独立状态，比较 token IDs、EOS 和停止原因。
+读取报告检查：
 
 ```bash
-QUANT_ARGS=(--config ./config/qwen3.5.yaml --quant_mode enable)
-```
-
-再把 `"${QUANT_ARGS[@]}"` 放到 ordinary 和 dflash 两条命令中。不能用 W8A8 DFlash 与 FP16
-ordinary 计算 scheduler speedup。
-
-正式比较前检查：
-
-- copied source-tree hash、Target/Draft checkpoint、device/runtime 相同；
-- prompt token hash、chat template、thinking、max tokens、实际输出 token 和输出 hash 相同；
-- `block_size`、KV 长度、chunk、quant mode 相同；
-- acceptance、Draft/verify calls、Target rows、fallback rounds 工作量可解释。
-
-量化或低接受率场景不应假设 B=16 最快；保持上述身份不变，追加 B=`2/4/6/8/16` sweep。
-
-### 7.1 原 main 非 DFlash 模型
-
-原模型从原部署工程根目录运行 `inference.py` 和 main 的
-`models/modeling_qwen3_5_hiai_nd.py`。`inference.py` 与配置不在本仓库中。下面命令故意保持
-非量化：
-
-~~~bash
-cd /path/to/qwen3.5-main-runtime
-export DFLASH_SOURCE=/path/to/copied-qwen3.5-4B-dflash
-export BENCH_DIR=/path/to/dflash-benchmark
-mkdir -p "$BENCH_DIR"
-
-"$DFLASH_SOURCE/tools/run_msprof.sh" \
-  --label main-original-unquantized \
-  --output-dir "$BENCH_DIR/msprof-main-original-unquantized" \
-  --python python3 \
-  --aic-metrics PipeUtilization \
-  --no-msproftx \
-  -- \
-  python3 inference.py \
-    --config ./config/qwen3.5.ymal \
-    --max_token 32
-~~~
-
-这条命令与下面的 rollback ordinary 并不是同一入口。若要计算“整体方案相对旧部署”的
-speedup，还要对齐 prompt/input IDs、thinking、实际输出 token、cache 初始化和计时同步边界；
-参数名字相似不自动代表边界相同。
-
-### 7.2 rollback 内部 ordinary 控制组
-
-`--mode ordinary` 并不是原 main 非 DFlash 模型。msprof 建议 1+1，只用于诊断：
-
-```bash
-tools/run_msprof.sh \
-  --label rollback-ordinary-pipe \
-  --output-dir "$BENCH_DIR/msprof-rollback-ordinary-pipe" \
-  --python "$MODEL_PYTHON" \
-  --aic-metrics PipeUtilization \
-  --no-msproftx \
-  -- \
-  "$MODEL_PYTHON" -B -m models.dflash_v1.benchmark_npu \
-    --mode ordinary \
-    --target-dir /path/to/Qwen3.5-4B \
-    --draft-dir /path/to/Qwen3.5-4B-DFlash \
-    --kv-cache-max-len 2048 \
-    --prompt "请用一句话解释为什么天空是蓝色的。" \
-    --prompt-mode chat --enable-thinking \
-    --max-new-tokens 32 --block-size 16 \
-    --warmup 1 --repetitions 1 --device npu:0 \
-    --report "$BENCH_DIR/msprof-rollback-ordinary-pipe/ordinary.json"
-```
-
-### 7.3 rollback DFlash
-
-```bash
-tools/run_msprof.sh \
-  --label dflash-pipe \
-  --output-dir "$BENCH_DIR/msprof-dflash-pipe" \
-  --python "$MODEL_PYTHON" \
-  --aic-metrics PipeUtilization \
-  --no-msproftx \
-  -- \
-  "$MODEL_PYTHON" -B -m models.dflash_v1.benchmark_npu \
-    --mode dflash \
-    --target-dir /path/to/Qwen3.5-4B \
-    --draft-dir /path/to/Qwen3.5-4B-DFlash \
-    --kv-cache-max-len 2048 \
-    --prompt "请用一句话解释为什么天空是蓝色的。" \
-    --prompt-mode chat --enable-thinking \
-    --max-new-tokens 32 --block-size 16 \
-    --warmup 1 --repetitions 1 --device npu:0 \
-    --report "$BENCH_DIR/msprof-dflash-pipe/dflash.json"
-```
-
-`run_msprof.sh` 不读取 Git/branch/dirty 信息，复制代码到目标机后可直接使用；manifest 通过源码
-内容 hash 标识运行。wrapper 默认关闭 MSTX，并采 AI Core、task-time、runtime-api 和 AscendCL。
-只有目标环境确认支持时才显式传 `--msproftx`；若出现 `mstx.range_start failed`，移除该选项后
-重采。默认进程级 profile 还包含模型加载、correctness gate 和 warmup，不能把算子累计值或整个
-profile 时长当作单次 measurement latency。
-
-### 7.4 只采一次 prefill 或 Draft 生成 + Target verify
-
-**普通模式也支持单次采集**，Python NPU 和新增 C++ OM 入口均可使用。
-保留下面默认 DFlash 命令不变；普通模式在 wrapper 的 `--` 前加
-`--profile-mode ordinary --profile-stage prefill|decode|all`（实际填写其中一个阶段名）。
-`all` 在普通模式下只有两个窗口：完整 prefill 一次、一行 decode 一次。
-
-```bash
-tools/run_msprof.sh \
-  --label ordinary-all --output-dir "$BENCH_DIR/ordinary-all" \
-  --python "$MODEL_PYTHON" \
-  --profile-mode ordinary --profile-stage all --profile-warmup 1 \
-  --aic-metrics PipeUtilization \
-  -- "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
-    --target-dir /path/to/Qwen3.5-4B \
-    --draft-dir /path/to/Qwen3.5-4B-DFlash \
-    --kv-cache-max-len 2048 --device npu:0 \
-    --prompt "请用一句话解释为什么天空是蓝色的。" \
-    --prompt-mode chat --enable-thinking
-```
-
-只采一次 prefill 或 decode，替换上面的 `all` 并换新输出路径即可。
-W8A8 在应用参数中照常加 `--config /path/to/qwen3.5.ymal --quant_mode enable`。
-此 ordinary 调用本分支 Target 的 `begin_ordinary` / `advance_ordinary`，与 rollback
-benchmark ordinary 对照一致；不运行原 main `inference.py`。沿用现有 `--draft-dir` 配置和
-checkpoint 审计，但不加载 Draft 模型，也不调用 Draft 投影/生成或 Target verify/commit。
-
-- `prefill` 窗口包含 cache reset、完整 prompt 的分块 Target forward 和最后一行 LM head；
-  不采集 prompt tensor 上传、anchor Top1、Draft 特征收集/投影。
-- `decode` 先在窗口外执行真实 ordinary prefill，取首 token 并上传 `[1,1]` 输入；只采一次
-  `advance_ordinary` 的 Target forward、LM head 和状态更新。下一 token 的 Top1 在窗口外。
-- 所有 warmup 都从相同 prompt 新建状态，采集前也重新准备；`--max-new-tokens` 不控制窗口。
-  KV 要容纳 prompt 加一行；anchor 为 EOS 时明确退出，不生成空 decode 采集。
-
-`all` 的两份算子数据在 `profile/msprof/ordinary-all/prefill/` 和 `decode/`，
-同步耗时见 `ordinary-all-stage-summary.csv`。`ordinary-all-stage-report.json` 记录
-`captured_ordinary_calls`，其中 decode 窗口必须是 prefill=0、decode=1，Draft/verify/commit=0。
-prefill 的 `ordinary_prefill_token_calls` 历史字段名实际计数 64 行分块，不能当作 token 数。
-
-C++ 同样用此 wrapper，新增 `--profile-backend cpp`，应用换成
-`qwen35_dflash_acl_runner --model-kind chunk`，模型输入是 hash-locked 加载计划。
-完整命令、四图/三图准备、融合 verify 的范围与输出说明见
-[增量 OM 文档的单次 msprof 部分](GDR_CHUNK_AIR_OM.md#c-和-python-的单次-msprof)。
-C++ 采集控制只需要 Python 标准库，不依赖 torch_npu 或 pyACL；普通只加载 prefill/decode
-两个 OM。C++ 的 Top1 融合在 OM 内，计时范围与 Python 有差异，不能直接比较窗口时长。
-
-以下继续说明默认 `--profile-mode dflash` 的 Python 9 阶段诊断。
-
-本分支的 verify/commit 使用两次原 chunk GDR：第一次生成全部 verify rows 的输出，
-第二次按 `accepted + 1` 重算 committed GDN state。单独测第一次使用 `verify`，
-单独测第二次及提交使用 `accept-commit`；测 Draft 到提交的首轮事务使用 `decode-round`。
-`draft-verify` 的窗口在第一次 verify 后结束，第二次 GDR 在该窗口之外。
-
-Python NPU 路线可以传 `--profile-stage STAGE`。参数放在 wrapper 的 `--` **之前**，
-应用使用 `models.dflash_v1.run_npu`，不经过 `benchmark_npu` 的 correctness/warmup/measurement 循环。
-例如只采一次完整 prefill：
-
-```bash
-tools/run_msprof.sh \
-  --label single-prefill \
-  --output-dir "$BENCH_DIR/single-prefill" \
-  --python "$MODEL_PYTHON" \
-  --profile-stage prefill --profile-warmup 1 \
-  --aic-metrics PipeUtilization \
-  -- \
-  "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
-    --target-dir /path/to/Qwen3.5-4B \
-    --draft-dir /path/to/Qwen3.5-4B-DFlash \
-    --kv-cache-max-len 2048 --block-size 16 --device npu:0 \
-    --prompt "请用一句话解释为什么天空是蓝色的。" \
-    --prompt-mode chat --enable-thinking
-```
-
-只采一次 Draft 生成和紧接着的 Target verify：
-
-```bash
-tools/run_msprof.sh \
-  --label single-draft-verify \
-  --output-dir "$BENCH_DIR/single-draft-verify" \
-  --python "$MODEL_PYTHON" \
-  --profile-stage draft-verify --profile-warmup 1 \
-  --aic-metrics PipeUtilization \
-  -- \
-  "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
-    --target-dir /path/to/Qwen3.5-4B \
-    --draft-dir /path/to/Qwen3.5-4B-DFlash \
-    --kv-cache-max-len 2048 --block-size 16 --device npu:0 \
-    --prompt "请用一句话解释为什么天空是蓝色的。" \
-    --prompt-mode chat --enable-thinking
-```
-
-单独测一次 Draft 和一次 Target verify，可以分别运行下面两种模式（每种模式一个进程、一个采集窗口）：
-
-```bash
-for stage in draft verify; do
-  tools/run_msprof.sh \
-    --label "single-$stage" \
-    --output-dir "$BENCH_DIR/single-$stage" \
-    --python "$MODEL_PYTHON" \
-    --profile-stage "$stage" --profile-warmup 1 \
-    --aic-metrics PipeUtilization \
-    -- \
-    "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
-      --target-dir /path/to/Qwen3.5-4B \
-      --draft-dir /path/to/Qwen3.5-4B-DFlash \
-      --kv-cache-max-len 2048 --block-size 16 --device npu:0 \
-      --prompt "请用一句话解释为什么天空是蓝色的。" \
-      --prompt-mode chat --enable-thinking
-done
-```
-
-读取各自 `single-draft-stage-report.json` / `single-verify-stage-report.json` 中的
-`profiled_elapsed_ms`，即对应阶段的同步耗时（毫秒）。该值排除模型加载、前置阶段和
-msprof 控制握手时间，包含 profiling 开销；具体算子时间读取各自输出目录的 `op_summary*.csv`。
-`verify` 会先在窗口外执行真实 prefill 和 Draft，使用其状态与 token 构建完整 verify 输入。
-`draft` 完成后清理请求，不执行 verify。两次运行应保持 prompt、B、预热次数和量化配置一致。
-单独测出的两段耗时不能视为联合窗口的精确拆分：`draft-verify` 还包含 proposal 整理和
-block 创建，且单独采集引入了各自的边界同步与 profiling 开销。联合窗口仍不在 Draft 与 verify
-之间额外插入同步。
-
-一条命令依次单独采集所有阶段，使用 `--profile-stage all`：
-
-```bash
-tools/run_msprof.sh \
-  --label all-stages \
-  --output-dir "$BENCH_DIR/all-stages" \
-  --python "$MODEL_PYTHON" \
-  --profile-stage all --profile-warmup 1 \
-  --aic-metrics PipeUtilization \
-  -- \
-  "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
-    --target-dir /path/to/Qwen3.5-4B \
-    --draft-dir /path/to/Qwen3.5-4B-DFlash \
-    --kv-cache-max-len 2048 --block-size 16 --device npu:0 \
-    --prompt "请用一句话解释为什么天空是蓝色的。" \
-    --prompt-mode chat --enable-thinking
-```
-
-`all` 只启动一个应用进程、加载一份 Target/Draft，按下表所列阶段各采一次。
-每个阶段先从相同 prompt 重建首轮状态并执行指定次数的预热，准备和预热都不采集；
-这些重复准备会计入命令的总运行时间。控制器为每个阶段重新 attach 同一个应用 PID，
-分别执行 start/stop/quit，退出前一个 msprof 后再进入下一阶段，无需 pyACL。
-每次 start/stop/quit 都须有成功回执，各阶段的独立输出目录直接传给 msprof，
-不会依靠 PROF 目录生成时间猜测阶段归属。
-
-`all` 的输出路径：
-
-- `profile/msprof/<label>/<stage>/`：该阶段独立的原始数据和算子 CSV。
-- `<label>-stage-report.json`：共同运行身份，以及 `captures` 中逐阶段的范围、同步耗时和结果。
-- `<label>-stage-summary.csv`：每阶段 `profiled_elapsed_ms`、算子行数、GDR verify/commit 层调用次数和数据路径。
-- `manifest/<label>-control.json`：共同应用 PID，以及每阶段的 msprof PID、命令、回执、退出状态。
-
-日志中的 `preparing stage=...` / `captured stage=...` 标明当前阶段。
-任一阶段的执行、握手、导出或结果检查失败，整体返回 FAIL；已有原始数据和控制日志保留。
-所有阶段都成功后才输出最终汇总 CSV。已有输出目录/报告不会被覆盖。
-在原命令中切换单个阶段或 `all` 时，其余模型、量化和 prompt 参数保持一致。
-
-W8A8 沿用应用参数 `--config /path/to/qwen3.5.ymal --quant_mode enable`。每次使用新的输出目录；
-需分别查看 Memory/MemoryUB 时，保持 prompt、B、量化配置一致，换 `--aic-metrics` 单独采集。
-
-| 选项 | 窗口内执行 | 窗口外执行 |
-| --- | --- | --- |
-| `prefill` | 一次 Target `begin_rollback`：新建 cache、所有真实 prompt 分块、feature 收集、最后真实行 LM head | 模型加载、预热、anchor Top1；本模式不执行 Draft feature projection 或 Draft/verify |
-| `feature-project` | 一次真实 prompt features 的 Target→Draft `fc + hidden_norm` 投影 | Target prefill、shape 检查、投影结果指纹回传；本模式不执行 Draft/verify |
-| `draft` | 一次首轮 Draft proposal：首次 Draft KV 构建、Draft 计算及 Top1 | 模型加载、预热、prefill、prompt feature projection、anchor Top1、proposal 整理和请求清理；不执行 Target verify |
-| `verify-input` | 一次 Draft token ID 回传、EOS 截断及 proposal 整理、verify block tensor 创建/上传 | Draft、Target verify 及后处理 |
-| `verify` | 一次首轮 Target verify，含标量 GDN state 克隆、第一次原 chunk GDR（`effective_length=T`）、Target LM head | 模型加载、预热、prefill、Draft、proposal 整理、verify 输入 tensor 创建，以及 Target Top1/accept/第二次 GDR commit |
-| `target-top1` | 一次 verify logits 的有限值检查、argmax 和 token ID 回传 | Target LM head 已包含在 verify 中；prefill anchor Top1 在本窗口外 |
-| `accept-commit` | 接受判断、零接受时关闭推测、从保留的 round-start state 执行第二次原 chunk GDR（`effective_length=accepted+1`）、conv state 选择、持久状态 dtype 转换、逻辑 KV 游标提交；继续推测时包含下一轮 feature projection | Target Top1、第一次 verify 的 Target 前向 |
-| `draft-verify` | 首轮 Draft proposal（含首次 Draft KV 构建和 Draft Top1）、proposal 整理与 block 构建、一次 Target verify（含状态克隆及第一次 GDR） | 模型加载、预热、prefill、prompt feature projection、anchor Top1、Target verify 后的 Top1/accept/第二次 GDR commit |
-| `decode-round` | 首轮事务：prefix tensor、Draft、verify 输入准备、Target verify、Target Top1、接受判断与提交，包含两次 GDR；内部没有额外采集同步 | prefill、prompt feature projection、anchor Top1、外层生成循环的 token 输出/EOS 终止判断、回调和文本解码 |
-
-上述九项也都可以作为单独的 `--profile-stage` 值。`draft-verify` 和 `decode-round`
-是有重叠范围的联合窗口，因此不要把九项耗时相加当作请求耗时。`all` 中各窗口同样各自带有
-边界同步和 profiling 开销，不是同一轮时间线的无扰动拆分。
-`accept-commit` 若真实接受数量为 0，会按生产规则关闭推测、跳过下一轮 feature projection；
-此时仍须用 `effective_length=1` 执行第二次 GDR 并提交 anchor state，不能作为纯主机阶段。
-本分支所有阶段均要求导出非空算子 CSV，包括零接受时的 `accept-commit`。
-阶段 JSON 的 `captured_gdr_layer_calls.verify/commit` 和汇总 CSV 的
-`gdr_verify_layer_calls/gdr_commit_layer_calls` 来自窗口前后累计计数器的差值，排除准备、
-预热和窗口外提交。单独 `verify` 应只有 verify 层调用，单独 `accept-commit` 应只有 commit
-层调用，`decode-round` 应有两者；任一不符均报 FAIL。这些是代码执行计数，具体 kernel
-耗时仍取自 msprof 算子明细。
-预处理/tokenizer、模型加载、prefill anchor Top1、文本输出及后续 decode 轮次不属于 `all` 的独立阶段。
-
-`--profile-warmup` 默认 1，预热不启动采集。每次预热和正式采集都从同一个 prompt 重建请求状态，
-不会沿用预热后推进的 KV/cursor。设为 0 可观察当前进程中未做该阶段显式预热的调用；
-`all` 中前面的阶段仍可能已经触发相同内核，不能把后面的窗口当作进程冷启动。
-Draft/verify 相关模式仍须先完成 prefill，`verify` 还须先完成 Draft。
-这里采的是 **prefill 后的首轮**，不代表后续已有 Draft KV 的稳定 decode 轮次。
-
-一个 prefill 可以包含多个 64-token 分块，不等于只执行一个模型 chunk。Draft/verify 相关模式都按完整 B
-请求 proposal：B=16 请求 15 个 draft token，通常 verify T=16；遇到 proposal EOS 会按生产规则
-缩短 T，实际值见报告 `result.verify_rows`；`draft` 不执行 verify，该值为 0，proposal 结果仍按 EOS
-规则截断。若 prefill anchor 已是 EOS，则报错退出而不生成空采集。
-此诊断分支忽略 `max-new-tokens` 的生成预算，也不运行 `execution-mode=validate` 的 ordinary 对照。
-
-内部使用 **msprof 原生动态采集 CLI**，无需 Python `acl` 模块，也不调用 profiling API。
-wrapper 在启动应用前自动设置 `PROFILING_MODE=dynamic`；模型加载和预热完成后，应用同步 NPU，
-通过本地 socket 等待。控制程序执行以下命令并接管其交互输入：
-
-```bash
-msprof --dynamic=on --pid=<应用PID> --output=<raw目录> \
-  --ascendcl=on --runtime-api=on --task-time=on --aicpu=on \
-  --ai-core=on --aic-mode=task-based --aic-metrics=PipeUtilization
-# 自动发送：start → 指定阶段执行完毕并同步 NPU → stop → quit
-```
-
-只有收到明确的 start 成功回执才放行指定阶段。兼容 `dynamic profiling start success......`
-和目标机返回的 `dynamic profiling for pid <应用PID> start success`，带 PID 时必须与当前应用
-一致；stop、quit 使用相同规则。实际匹配的回执保存在控制报告的 `acknowledgements` 字段。
-执行完毕、同步 NPU 后，
-等待 stop、quit 的成功回执及 msprof 正常退出，才继续应用的后处理。Draft 与 verify 之间不额外
-插入同步。流程使用回执握手控制边界，不使用固定 delay/duration，也不暂停整个应用进程。
-`--profile-timeout 600` 是默认的每步控制超时，覆盖等候模型加载/预热、阶段执行及 CLI 命令完成；
-较慢机器可增大该值。超时、未识别的成功回执或进程异常退出均报 FAIL，并清理本次创建的进程。
-如果停在 `msprof_start_sent`，工具已打印带 PID 的 `start success`，但没有
-`msprof_start_acknowledged` / `application_started`，这是旧版 wrapper 未识别回执的现象。
-按 Ctrl+C 结束该次运行，更新到包含此兼容修复的代码后，用原命令和新的输出目录重跑；
-增大超时不能解决回执格式不匹配。正常执行结束还应看到 `msprof_stop_acknowledged` 和
-`msprof_quit_acknowledged`，最终以 wrapper 的完整报告与导出检查为准。
-目标环境需要支持 `--dynamic=on --pid` 的 msprof 和配套 CANN runtime；仅看到提示符或
-“Start profiling” 日志不算采集已启动。如果安装版本的交互协议不同，请保留日志核对。
-
-本模式通过 wrapper 启动；直接给 `run_npu` 传阶段参数会提示使用 wrapper。不要再外套进程级
-msprof；不接受 `--msproftx` 或额外 `--msprof-arg`。动态采集方式见
-[CANN msprof 交互式采集文档](https://www.hiascend.com/document/detail/zh/canncommercial/800/devaids/devtools/profiling/atlasprofiling_16_0016.html)，
-回执语义见 [CANN runtime 的 DynProfClient 实现](https://gitcode.com/cann/runtime/blob/68752f679cfb68365e472eec38855ec4fd4721f6/src/dfx/msprof/collector/dvvp/msprof/dynamic_profiling/src/dyn_prof_client.cpp)。
-同一应用允许退出交互模式后再次执行 msprof 连接，见
-[CANN 动态采集的 quit 说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/devaids/Profiling/atlasprofiling_16_0016.html)。
-关闭采集后 wrapper 对每个阶段目录执行 `msprof --export=on --output=... --summary-format=csv`，参数见
-[msprof 离线导出文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/devaids/Profiling/atlasprofiling_16_0021.html)。
-
-输出位于 `--output-dir` 下：
-
-- `profile/msprof/<label>/`：raw 数据及导出的 `op_summary*.csv`。
-- `<label>-stage-report.json`：阶段次数/范围和 token 结果。
-- `<label>-stage-summary.csv`：阶段同步耗时和算子行数。
-- `manifest/<label>-control.json`：应用 PID、实际 attach 命令、start/stop/quit 回执及进程退出状态。
-- `manifest/<label>.json`：运行身份和最终状态；`log/msprof-<label>.log` 保留完整交互输出。
-
-wrapper 仅在控制握手、应用、导出、窗口内 GDR 调用次数和各阶段非空算子 CSV 检查
-都成功后返回 PASS。阶段报告的
-`PASS_CAPTURE` 只表示阶段流程完成，预热对照仅检查该阶段 token 结果稳定，不替代
-strict-greedy 正确性门禁。`profiled_elapsed_ms` 是带 profiling 开销的同步窗口时间，排除了
-attach/start/stop/quit 及等待控制回执的时间；具体算子时长看 CSV，正式时延仍按 3+10 测量。
-该 CLI 集成已通过主机上的交互协议与异常路径测试；真实算子采集效果须在目标 NPU/CANN 上验证。
-
-当前参数适用于 Python NPU 的 two-pass chunk-GDR rollback 路线。
-OM/C++ runner 的现有流程见 [AIR/OM 框架](QUANT_AIR_OM_FRAMEWORK.md)。
-
-## 8. 报告门禁
-
-`validate`：
-
-```python
-assert report["route"] == "qwen3.5-dflash-incremental-rollback"
+"$MODEL_PYTHON" -B - <<'PY'
+import json, os
+from pathlib import Path
+report = json.loads((Path(os.environ["AI_RUN_DIR"]) / "reports/validate.json").read_text())
 assert report["execution_mode"] == "validate"
 assert report["correctness_gate"]["status"] == "PASS"
 assert report["strict_greedy_exact_match"] is True
-assert report["historical_prefix_replay_during_verify"] is False
+assert report["operator_fallback_enabled"] is False
 assert report["ordinary"]["generated_token_ids"] == report["dflash"]["generated_token_ids"]
+assert report["ordinary"]["stop_reason"] == report["dflash"]["stop_reason"]
 assert report["dflash_execution_gate"]["target_verify_calls"] > 0
-assert report["draft_kv_cache_audit"]["mode"] == "upstream_equivalent_append_then_crop"
-assert report["operator_fallback_enabled"] is False
+print(report["dflash"]["generated_text"])
+PY
 ```
 
-`dflash` 单跑：
+出现 `INCONCLUSIVE_NO_DRAFT_ROUND` 时，prompt 的 anchor 已结束生成，应换一条能进入
+Draft/verify 的固定 prompt。完成短文本后，还应覆盖长 prompt、EOS、零/部分/全接受及重复请求。
 
-```python
-assert report["execution_mode"] == "dflash"
-assert report["ordinary"] is None
-assert report["strict_greedy_exact_match"] is None
-assert report["correctness_gate"]["status"] == "NOT_RUN_DFLASH_ONLY"
-```
-
-NPU rollback：
-
-```python
-audit = report["target_rollback_audit"]
-assert audit["gdr_backend"] == "npu_chunk_gated_delta_rule_two_pass"
-assert audit["custom_gdr_mtp_required"] is False
-assert audit["conv_bank_backend"] == "torch_tensor_golden_on_input_device"
-assert audit["kv_policy"] == "physical_provisional_writes_logical_cursor_commit"
-assert audit["prefill_execution_mode"] == "block_aligned_real_token_chunks_original_gdr"
-assert audit["prefill_chunk_size"] == 64
-assert audit["session_invalid"] is False
-```
-
-W8A8：
-
-```python
-quant = report["target_quantization"]
-assert quant["status"] == "PASS_ASSEMBLY_CONTRACT_NO_NUMERICAL_CLAIM"
-assert quant["scheme"] == "w8a8_dynamic"
-assert quant["route"] == "rollback"
-assert quant["linear_topology_validation"] == "PASS_EXACT_PATH_SHAPE_BIAS"
-assert quant["qlinear_count"] > 0
-assert quant["embedding_lookup_failures"] == 0
-```
-
-assembly PASS 只证明装配成功；数值结论仍来自同 activation 对照、整网 token/state 门禁和真实
-NPU trace。
-
-benchmark：
-
-```python
-assert report["benchmark"]["status"] == "PASS"
-assert report["benchmark"]["summary"]["count"] == 10
-assert report["strict_greedy_exact_match"] is True
-assert report["operator_fallback_enabled"] is False
-```
-
-同时比较 `latency_ms`、aggregate tokens/s、peak memory、全部 10 条 measurement、acceptance、
-Draft/verify calls 和 Target rows。`persistent_cursor` 等是 session state，不是累计 counter。
-
-## 9. 自动化检查
+## 6. 单独运行 DFlash 生成
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_rollback_scheduler.py
-PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_framework_rollback.py
-PYTHONDONTWRITEBYTECODE=1 python tests/test_internal_dflash_bridge_rollback.py
-PYTHONDONTWRITEBYTECODE=1 python tests/test_dflash_rollback_helpers.py
-PYTHONDONTWRITEBYTECODE=1 python -m pytest -q \
-  tests/test_run_npu_modes.py \
-  tests/test_dflash_runtime_optimizations.py \
-  tests/test_benchmark_npu.py \
-  tests/test_msprof_script.py \
-  tests/test_msprof_stage_script.py \
-  tests/test_msprof_acknowledgements.py \
-  tests/test_stage_profile.py \
-  tests/test_source_lock_benchmark.py \
-  tests/test_rollback_target_quant.py
+"$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+  "${NPU_ARGS[@]}" "${QUANT_ARGS[@]}" \
+  --execution-mode dflash --block-size 16 --max-new-tokens "$MAX_NEW_TOKENS" \
+  --report "$AI_RUN_DIR/reports/dflash.json"
 ```
 
-这些仍是 CPU/reduced-shape 证据。
+该模式只执行 DFlash；`ordinary=null`，`strict_greedy_exact_match=null`，
+`correctness_gate.status=NOT_RUN_DFLASH_ONLY`。生成文本在报告的 `dflash.generated_text`。
 
-## 10. 真机门禁顺序
+## 7. 测量不带 msprof 的普通/DFlash 时延
 
-1. B=2，连续多轮，accepted 0/1，ordinary token 零差异。
-2. B=`2/4/6/8/16`，accepted `0/1/K-1/K`，最后一轮动态 T。
-3. cursor `62/63/64/65`，rejected KV tail 不可见并被覆写。
-4. 24 层 GDR/conv、8 层 KV、feature、position 共用同一个 `a`。
-5. rejection 后继续至少一个 token，比较完整 state tuple。
-6. 多 prompt、多进程重复，无状态泄漏、越界或持续内存增长。
-7. 无 CPU fallback；记录 device/runtime/source/op/kernel identity。
-8. 正确性闭合后再做 unprofiled 3+10 和单独 msprof 归因。
+使用独立进程分别测量普通和 DFlash，每种模式 3 次预热、10 次测量：
 
-若发布 W8A8，还需分别通过 Target quant preflight、W8A8 ordinary/DFlash、W8A8 与要求的 FP16
-ordinary 精度门禁。FP16 rollback PASS 不能替代量化 rollback PASS。
+```bash
+for GENERATION_MODE in ordinary dflash; do
+  "$MODEL_PYTHON" -B -m models.dflash_v1.benchmark_npu \
+    "${NPU_ARGS[@]}" "${QUANT_ARGS[@]}" \
+    --mode "$GENERATION_MODE" --block-size 16 --max-new-tokens "$MAX_NEW_TOKENS" \
+    --warmup 3 --repetitions 10 \
+    --report "$AI_RUN_DIR/reports/benchmark-$GENERATION_MODE.json"
+done
+```
+
+两次运行使用同一份权重、精度、prompt、thinking、KV 容量和 token 预算。
+普通模式调用 Target 的 `begin_ordinary`/`advance_ordinary`；DFlash 调用 Draft/verify/commit。
+测量包含完整 generation 及末尾设备同步，排除加载、tokenizer 和前置正确性检查。
+读取原始 10 个值、median、p90，并确认实际输出 token 一致后再计算加速比。
+
+## 8. 普通模式：分别只采一次 prefill 和 decode
+
+设置 msprof 路径，运行下面的一条采集命令：
+
+```bash
+export MSPROF_BIN=/absolute/path/msprof
+"$MSPROF_BIN" --version
+
+"$REPO_ROOT/tools/run_msprof.sh" \
+  --label python-ordinary-all --output-dir "$AI_RUN_DIR/msprof/ordinary-all" \
+  --python "$MODEL_PYTHON" --msprof-bin "$MSPROF_BIN" \
+  --profile-backend python --profile-mode ordinary \
+  --profile-stage all --profile-warmup 1 --aic-metrics PipeUtilization \
+  -- "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+    "${NPU_ARGS[@]}" "${QUANT_ARGS[@]}"
+```
+
+`all` 依次创建 prefill 和 decode 两个窗口，每个只采一次。
+普通阶段仍检查 `--draft-dir` 的 checkpoint 配置，但不加载 Draft 模型，不执行特征投影、
+Draft 生成、Target verify 或 commit。
+
+| 阶段 | 窗口内 | 窗口外 |
+|---|---|---|
+| `prefill` | cache reset、全部 prompt 分块的 Target forward、末行 LM head | prompt 上传、anchor Top1；不收集 Draft 特征 |
+| `decode` | 一次 `[1,1]` 的 Target forward、LM head 和状态更新 | prefill/KV 准备、首 token Top1、decode 输入上传、下一 token Top1 |
+
+只测一段时执行：
+
+```bash
+PROFILE_STAGE=decode
+"$REPO_ROOT/tools/run_msprof.sh" \
+  --label "python-ordinary-$PROFILE_STAGE" --output-dir "$AI_RUN_DIR/msprof/ordinary-$PROFILE_STAGE" \
+  --python "$MODEL_PYTHON" --msprof-bin "$MSPROF_BIN" \
+  --profile-backend python --profile-mode ordinary \
+  --profile-stage "$PROFILE_STAGE" --profile-warmup 1 --aic-metrics PipeUtilization \
+  -- "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+    "${NPU_ARGS[@]}" "${QUANT_ARGS[@]}"
+```
+
+`PROFILE_STAGE` 填 `prefill` 或 `decode`。decode 需要 prompt 后留一行 KV；
+anchor 已是 EOS 时不会产生 decode 窗口。
+
+## 9. DFlash 模式：单阶段或 all 采集
+
+```bash
+PROFILE_STAGE=all
+"$REPO_ROOT/tools/run_msprof.sh" \
+  --label "python-dflash-$PROFILE_STAGE" --output-dir "$AI_RUN_DIR/msprof/dflash-$PROFILE_STAGE" \
+  --python "$MODEL_PYTHON" --msprof-bin "$MSPROF_BIN" \
+  --profile-backend python --profile-mode dflash \
+  --profile-stage "$PROFILE_STAGE" --profile-warmup 1 --aic-metrics PipeUtilization \
+  -- "$MODEL_PYTHON" -B -m models.dflash_v1.run_npu \
+    "${NPU_ARGS[@]}" "${QUANT_ARGS[@]}" --block-size 16
+```
+
+`PROFILE_STAGE` 可以选下表任意一个阶段。`all` 在同一个应用进程中按表的顺序各采一次，
+每个窗口使用相同 prompt 重建状态。每次命令使用新 label/输出路径。
+
+| 阶段 | 窗口内 |
+|---|---|
+| `prefill` | 完整 Target prefill、特征收集、末行 LM head；不含 Draft 投影和 anchor Top1 |
+| `feature-project` | prompt 特征的 Draft `fc + hidden_norm` |
+| `draft` | 一次 Draft 生成，含首轮 Draft KV 构建和 Draft Top1 |
+| `verify-input` | proposal token 回读、EOS 截断、verify block 创建与上传 |
+| `verify` | 一次 Target verify，含第一遍 chunk GDR；不含 Target Top1 和第二遍 GDR |
+| `target-top1` | Target 有限值检查、argmax 和 token 回读；LM head 已在 verify 中 |
+| `accept-commit` | 接受判断、第二遍 GDR、conv state 选择、KV/cursor 提交；继续推测时含下一轮特征投影 |
+| `draft-verify` | 一次 Draft、输入整理和 Target verify；不含 Target Top1 及状态提交 |
+| `decode-round` | 一次 Draft → verify → Top1 → 接受/提交事务，含两遍 GDR |
+
+verify 使用窗口外真实 prefill 和 Draft 产生的输入。commit 的第二遍 GDR 从本轮初始状态
+执行 `effective_length=accepted+1`，零接受时也会执行，不能当作没有算子的纯主机阶段。
+`draft-verify` 和 `decode-round` 的内部不添加采集边界同步；单独阶段的时长不能直接相加
+当作联合窗口时长。
+
+## 10. 查看采集结果
+
+普通 `all` 示例对应的输出：
+
+```text
+msprof/ordinary-all/
+  profile/msprof/python-ordinary-all/prefill/
+  profile/msprof/python-ordinary-all/decode/
+  python-ordinary-all-stage-report.json
+  python-ordinary-all-stage-summary.csv
+  manifest/python-ordinary-all.json
+  manifest/python-ordinary-all-control.json
+  log/msprof-python-ordinary-all.log
+```
+
+每个阶段目录包含原始 `PROF_*` 数据及导出的 `op_summary*.csv`。
+单阶段 raw 目录直接是 `profile/msprof/<label>/`。
+
+| 文件/字段 | 用途 |
+|---|---|
+| `op_summary*.csv` | 具体算子的执行时间 |
+| `<label>-stage-summary.csv` | 每阶段同步时长、算子行数、数据目录 |
+| `profiled_elapsed_ms` | 带 profiling 开销的同步窗口时间，排除控制器等待 |
+| `captured_ordinary_calls` | decode 窗口中 `ordinary_prefill_token_calls=0`、`ordinary_decode_calls=1`；prefill 字段按最多 64 行的块计数 |
+| `captured_gdr_layer_calls` | 检查 verify/commit 的 GDR 调用是否属于所选窗口 |
+| `<label>-control.json` | 应用/采集 PID、start/stop/quit 回执、退出状态 |
+
+`--profile-warmup 1` 表示先在窗口外预热一次，测量时再次从相同 prompt 准备状态。
+阶段诊断忽略 `--max-new-tokens` 的生成预算，block 不按剩余输出预算截短。
+`PASS_CAPTURE` 证明窗口流程完成，不能代替整段 token 正确性和第 7 步的时延测量。
+
+采集使用 msprof 动态 PID CLI，无需 pyACL。阶段参数放在 wrapper 的 `--` 前；
+不要直接给应用添加这些参数，也不要再套一层进程级 msprof。
+支持 `PipeUtilization`、`Memory`、`MemoryUB`，每组指标单独运行并使用新输出路径。
+不带 `--profile-stage` 的 wrapper 会采集整个应用进程，包含加载和预热。
+
+## 11. 处理失败
+
+| 现象 | 检查方法 |
+|---|---|
+| NPU 不可见或 import 失败 | 第 2 步的软件栈、设备权限、自定义算子注册 |
+| 找不到 receiver wrapper | 第 3 步路径、模块搜索配置和 receiver 依赖 |
+| 量化装配失败 | 三个 YAML 路径、checkpoint、QLinear 结构和 embedding dtype |
+| anchor 为 EOS | 选择可以进入 decode/verify 的固定 prompt |
+| KV 容量不足 | prompt＋输出预算、完整 verify block 与 64 行对齐要求 |
+| token 不一致 | 保存报告和首个差异轮次，定位状态/接受判断后再测性能 |
+| 停在 `msprof_start_sent` | 查看 controller 日志是否收到匹配应用 PID 的完整 start 成功回执 |
+| 等待超时 | `--profile-timeout` 默认为 600 秒；根据加载、预热和阶段耗时设置 |
+| 没有算子 CSV | 检查 start/stop/quit 回执、导出退出码及原始 PROF 数据 |
+
+控制器要求启停回执、应用成功退出及每窗口非空算子数据；任一失败都返回 FAIL，保留日志。
+CPU/fake ACL 测试只验证控制流程，真实 NPU 采集以设备导出结果为准。
+
+## 12. CPU/CUDA 功能检查
+
+CPU/CUDA 使用对应的模型 Python、PyTorch 和第 3 步准备的 checkpoint，不加载 NPU receiver。
+在源码目录执行：
+
+```bash
+"$MODEL_PYTHON" -B -m models.dflash_v1.run_rollback \
+  --target-dir "$TARGET_DIR" --draft-dir "$DRAFT_DIR" \
+  --prompt-file "$AI_RUN_DIR/prompt.txt" --prompt-mode chat --enable-thinking \
+  --execution-mode validate --block-size 16 --max-new-tokens "$MAX_NEW_TOKENS" \
+  --device cuda:0 --dtype float16 --eos-token-id 248044 \
+  --report "$AI_RUN_DIR/reports/cuda-validate.json"
+```
+
+CPU 使用 `--device cpu` 并选择其支持的 dtype。这里检查调度和模型功能，不生成 NPU 性能证据。
