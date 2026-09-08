@@ -1,9 +1,12 @@
 # 基于 `quant` 分支的 AIR → OM → C++ token 推理框架
 
-针对当前 fused 动态运行故障，先按
-[静态 fused OM 基线](STATIC_FUSED_OM_BASELINE.md) 使用固定 N=64；
-静态真机通过后再恢复本文的原动态候选。静态开关是
-`fused_static_feature_rows`，不是 `example_sequence_length`。
+**v41 新默认部署与重跑命令以 [静态四图指南](STATIC_SPLIT_OM_DEFAULT.md) 为准**：
+合并 Prefill、保留 Decode1、独立静态 Draft N=64 和 Verify16，Draft/Verify 联合常驻。
+切换需要重建 runner 1.25.0 并重新导出 AIR、编译 OM。静态真机通过后再尝试动态。
+本文保留通用框架、历史排错和显式 fused/split-head/recompute 对照命令；这些显式
+factory/config 不会自动变成新默认。旧 [静态 fused 基线](STATIC_FUSED_OM_BASELINE.md)
+使用 `fused_static_feature_rows`，新默认使用 `draft_static_feature_rows`，两者均不是
+`example_sequence_length`。
 v39 同时修复 Draft FP16 KV 头复制的 BroadcastTo auto-tiling 路径，
 见静态基线文档中的 KV 复制门禁和 manifest 核验。它与 v37 的 INT64 Scatter 索引修复不同，
 需要新源码导出 AIR，再编译 OM；不能仅按同名 `BroadcastTo_1` 判断故障是否相同。
@@ -35,38 +38,38 @@ AIR graph + 外置权重文件 + air-manifest.json
         │
         │ atc --mode=0 --framework=1 --soc_version=<精确型号>
         ▼
-target-prefill.om + target-prefill-head.om + target-decode1.om
-                 + fused-speculative-step.om + deployment-manifest.json
+target-prefill.om（含 head）+ target-decode1.om
+    + draft-propose.om + target-verify-commit.om + deployment-manifest.json
         │
         │ C++17 / AscendCL
         ▼
-四个 OM 各加载一次 → device-resident 状态机 → 生成 token → EOS/长度停止
+按阶段换组，Draft/Verify 联合常驻 → device-resident 状态机 → token → EOS/长度停止
 ```
 
-当前 C++ 主部署路线是四物理 OM 的精确融合投机拓扑：prefill body/head 分离、ordinary decode
-独立，Draft proposal 与固定 `T=16` Target verify 合并为一个物理 OM。Target/Draft KV、GDR、
+当前 C++ 默认路线是四个静态 OM：prefill body/head 合并，ordinary decode1 保留，
+Draft proposal 与固定 `T=16` Target verify 各自独立、联合常驻。Target/Draft KV、GDR、
 conv state 和 compact carrier 都是显式、常驻 device 的状态。静态完整前缀重算图仍保留，但只用作
 最小 correctness/单图诊断基线，不再是 `run-e2e-cpp` 的默认产物。因此：
 
 - “是否真的调用 OM 生成完整 token 序列”可以验证；
 - “是否达到闭源增量推理框架时延”必须在真实设备测量，当前不能预先声称；
-- fused 4-OM 必须先通过 ordinary greedy 的 token/EOS 零差异、完整常驻集合显存以及未开启
+- 新静态四图及旧 fused 候选都必须先通过 ordinary greedy 的 token/EOS 零差异、实际驻留组显存以及未开启
   profiling 的同机 3+10 时延门禁，才能从候选提升为正式性能结论。
 
 这里必须区分“当前分支实际产物”和“最终低时延拓扑”：
 
 | 阶段 | 逻辑图 | 物理 OM 数 | 当前状态 |
 | --- | --- | ---: | --- |
-| C++ 主部署候选 | prefill body/head、ordinary decode、Draft+固定 T16 verify supergraph | 4 个 | 默认生成；代码/Fake-ACL 已验证，真机门禁待执行 |
-| 可选对照候选 | prefill body/head、decode、draft、verify 分离 | 5 个 | 显式 factory 可生成，用于定位融合边界收益 |
+| C++ 默认静态候选 | 合并 Prefill、Decode1、Draft N=64、Verify16 | 4 个 | 默认生成、分组驻留；主机测试，真机门禁待执行 |
+| 显式 fused 回退 | prefill body/head、ordinary decode、Draft+T16 verify supergraph | 4 个 | 使用旧 fused factory/config |
+| 显式 split-head 对照 | prefill body/head、decode、动态 Draft、verify 分离 | 5 个 | incremental factory 设置 merged_prefill=false、draft_static_feature_rows=0 |
 | 单图诊断基线 | Target 全前缀 + Draft proposal 整图 | 1 个 | 显式 factory 可生成，不用于最终低时延结论 |
 
 `verify` 不能与 ordinary `decode` 共用一个含糊的状态合同：前者一次计算最多 16 个 provisional
-row，并只按接受数提交一个 GDN/conv state-bank 槽；后者固定提交单个 row。用户口头所说的
-“prefill、decode、draft 三类”在逻辑上因此落为上述四个角色。为满足“非末 prompt chunk
-不执行完整 LM head”的热路径约束，`target-prefill` body 输出 device-resident `last_hidden`，只在
-最后一个 chunk 调用 `target-prefill-head`；再把 Draft 与固定 T16 verify 合并后，主路线最终是
-四个物理 OM。
+row，并只按接受数提交一个 GDN/conv state-bank 槽；后者固定提交单个 row。
+新默认按用户选择保留四个角色、合并 Prefill head，以减少阶段换模。
+多块 prompt 会在每块计算一次 head，但只消费末块结果；旧 split-head 候选才保证非末块
+不执行词表投影。新默认保留 decode1 处理 DFlash 预算尾部和可选的 target-only 回退。
 
 ## 2. 冻结 ABI
 
@@ -951,8 +954,9 @@ Target/Draft 推理。`qwen35_dflash_acl_runner` 只认识 `--model` 单图 ABI�
 它依次执行真实设备 preflight、AIR、ATC、OM hash gate、C++ paired generation 和最终
 summary。任何阶段失败都不会伪造后续 PASS。
 
-当前代码中 `run-e2e-cpp` 即使省略 `--factory` 也默认选择上述 fused 4-OM factory；文档仍显式写出
-该参数，便于从日志直接确认拓扑。Python `run-e2e` 的默认值仍是单图重算 factory，两者不要混淆。
+上面显式 fused 命令是回退示例。v41 的 `run-e2e-cpp`、`export-air`、`build-om` 省略
+`--factory` 时选择 incremental factory 的合并 Prefill 静态四图；请配套使用新指南的
+factory/runner JSON，不能继续带旧 fused 选择器。Python `run-e2e` 仍默认单图重算。
 
 ## 11. 如何判定框架“能用”
 
@@ -1069,14 +1073,16 @@ jq '{
 
 ### 11.4 用 msprof 单独分析当前 OM
 
-主路线必须 profile 同一次 fused bundle 中的四个常驻 OM：`target-prefill`、
+下面是旧 fused all-resident 对照的 profiling 方法；v41 默认 phase 模式的加载周期归因
+尚未接入汇总器，见新指南的限制。旧对照必须 profile 同一次 fused bundle 中的四个常驻 OM：`target-prefill`、
 `target-prefill-head`、`target-decode1`、`fused-speculative-step`。使用
 [增量 OM 与 C++ 高性能路线](INCREMENTAL_OM_PERFORMANCE.md) 第 5.7 节的完整命令；它以
 `qwen35_dflash_incremental_acl_runner --measurement-protocol profile` 运行真实状态机，并把运行时
 model ID、每次物理执行 role/gear、AscendCL API 次数与 msprof CSV 关联。不能分别用随机 state
 直接调用四个 OM 后把结果当作端到端性能。
 
-分支还提供五图基线 `create_quant_incremental_state_graphs`、四物理 OM 动态候选
+分支还提供五图基线（`create_quant_incremental_state_graphs` 显式设置 `merged_prefill=false`、
+`draft_static_feature_rows=0`）、四物理 OM 动态候选
 `create_quant_unified_target_step_graphs`、四物理 OM Draft+verify 精确融合候选
 `create_quant_fused_speculative_step_graphs` 和同一个常驻 OM C++ runner。生成后，应使用
 `docs/INCREMENTAL_OM_PERFORMANCE.md` 第 5.7 节对应拓扑的完整状态机 msprof 命令，并按
@@ -1458,10 +1464,10 @@ INT32 count 和有界 dynamic Shape 的既有检查全部保留。
 
 ## 13. 性能验证与后续候选
 
-当前 C++ 已消除 Python token 热循环、重复 OM load、重复 host/device buffer 分配和多余 stream
-同步，并实现了五图基线、四物理 OM 统一 Target-step 候选和作为 C++ 默认 factory 的 fused
-四物理 OM 候选。若真实 profile 显示 OM 计算主导，
-应基于 `quant` 已有 rollback 语义比较这些**逻辑角色**：
+当前 C++ 消除了 Python token 热循环和每轮 buffer 分配。v41 默认为合并 Prefill 的静态四图，
+按阶段重载并将切换成本计入时延，Draft/Verify 热循环内不重载。旧五图、统一 Target-step、
+fused 四图保留作对照。若真实 profile 显示 OM 计算主导，可基于 `quant` rollback 语义比较。
+下面列出的是**旧 split-head/统一候选**的角色拆分，新默认 Prefill 已包含第 2 项：
 
 1. `target-prefill.om`：分块 prompt body，不含 LM head；
 2. `target-prefill-head.om`：只在最后一个 prompt chunk 后运行量化 LM head/Top1/EOS；
@@ -1512,7 +1518,7 @@ NPU，后续调用只处理新增 token：
 msprof、候选集合内存/load 和状态搬运审计，再做未 profiling 的端到端 3+10，最后与同身份闭源
 基线比较。
 
-代码默认选择 fused factory 只代表交付拓扑已明确，不代表性能候选已经通过真机提升门禁。在没有
+代码默认选择合并 Prefill 的静态四图只代表用户选定部署拓扑，不代表性能候选通过真机提升门禁。在没有
 真实 baseline、state-branch、完整显存和零差异证据前，报告中的候选状态仍必须保持
 `APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE`。
 

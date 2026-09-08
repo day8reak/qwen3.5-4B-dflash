@@ -54,7 +54,7 @@ def test_infer_cpp_progress_is_on_by_default_and_can_be_disabled() -> None:
     assert parser.parse_args(_infer_cpp_args("--no-progress")).progress is False
 
 
-def test_run_e2e_cpp_defaults_to_fused_four_om_factory() -> None:
+def test_run_e2e_cpp_defaults_to_static_split_four_om_factory() -> None:
     args = build_parser().parse_args(
         [
             "run-e2e-cpp",
@@ -78,7 +78,15 @@ def test_run_e2e_cpp_defaults_to_fused_four_om_factory() -> None:
     )
 
     assert args.factory == DEFAULT_CPP_GRAPH_FACTORY
-    assert args.factory.endswith("create_quant_fused_speculative_step_graphs")
+    assert args.factory.endswith("create_quant_incremental_state_graphs")
+
+
+@pytest.mark.parametrize("command", ["export-air", "build-om"])
+def test_export_cli_defaults_to_static_split_factory(command: str) -> None:
+    arguments = [command, "--factory-config", "/tmp/factory.json", "--bundle-dir", "/tmp/bundle"]
+    if command == "build-om":
+        arguments += ["--soc-version", "Ascend310P3"]
+    assert build_parser().parse_args(arguments).factory == DEFAULT_CPP_GRAPH_FACTORY
 
 
 def test_runner_preflight_rejects_the_wrong_binary_family(

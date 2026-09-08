@@ -1,9 +1,15 @@
 # v40：静态 OM 按阶段常驻，先解决权重同时分配的峰值
 
+本页记录 **v40 旧静态 fused 四图**的运行时修复，供显式回退。
+v41 默认已改为 [合并 Prefill + Decode1 + 静态 Draft + Verify16](STATIC_SPLIT_OM_DEFAULT.md)，
+默认 phase-resident，Draft/Verify 联合常驻，权重预算为
+`max(Prefill, Decode1, ALIGN_UP(Draft,512)+Verify)`，而非最大单 OM。
+新默认需要重新导出 AIR/OM；下面“不用重新导出”的说明只适用于旧 fused 拓扑。
+
 本候选只改 C++ 运行时生命周期与控制面，不改已有静态 AIR/OM、量化精度、
 KV capacity、prompt 或生成长度。必须显式配置 `model_residency_policy: "phase-resident"`；
 缺省仍为 `all-resident`，旧的性能基线和动态路线不被静默替换。
-当前只支持经过 manifest 和物理 ABI 双重检查的四个静态 OM。
+v40 只支持经过 manifest 和物理 ABI 双重检查的四个静态 fused 路线 OM。
 
 ## 这次日志说明什么
 
@@ -87,9 +93,10 @@ models[].model_id 在该策略下仅是启动 metadata 检查的 ID，已经卸�
 额外 switch synchronization 单独记录并计入总同步数，不能当成 DFlash 多窗口的节省。
 phase-resident 不应被当成原 all-resident 稳态延迟直接比较；大 OM 每次请求重载有成本。
 
-短 prompt 的静态基线可以进一步把 prefill body+head 合并；目前拆分是为多块 prompt
+以下是 v40 的后续候选分析；其中合并 Prefill 和 Draft/Verify 联合驻留现已由 v41 实现，
+设备收益仍待验证。v40 的短 prompt 静态基线可进一步把 prefill body+head 合并；原拆分是为多块 prompt
 只在最终块运行一次 head，且 body 已明确排除 head 权重。合并可减少换模，但不保证降低
-max(weight/work)；需要新的图 ABI、AIR/OM 与精度门禁，本提交不混入这项图变更。
+max(weight/work)；需要新的图 ABI、AIR/OM 与精度门禁，v40 运行时修复不包含这项图变更。
 另一合理后续是 prefill、Draft、Verify 三图：prefill 用后卸载，Draft/Verify 热循环常驻。
 若删除 decode1，Verify 还需经过严格验证的 target-only 路径，覆盖预算尾部、零接受回退、
 EOS、recurrent state 选择与 KV 边界。静态 T=16 跑逻辑 K=0 也会付出多行计算成本。

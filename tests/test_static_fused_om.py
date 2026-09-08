@@ -165,13 +165,13 @@ def test_static_request_does_not_truncate_or_allow_clamped_padding_to_hit_live_k
         validate_static_request(shape, 64, 129)
 
 
-def _compile_static_fixture(tmp_path, monkeypatch):
+def _compile_static_fixture(tmp_path, monkeypatch, specs=None):
     """Control-plane fixture only: no actual AIR graph or ATC/device execution."""
     monkeypatch.setenv("AI_RUN_DIR", str(tmp_path))
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     graphs = []
-    for spec in _specs():
+    for spec in _specs() if specs is None else specs:
         path = bundle / (spec.role + ".air")
         path.write_bytes(b"static control-plane fixture: " + spec.role.encode())
         graph = {
@@ -195,6 +195,8 @@ def _compile_static_fixture(tmp_path, monkeypatch):
         }
         if spec.role == "fused-speculative-step":
             graph["metadata"] = {"fused_static_shape": spec.metadata["fused_static_shape"]}
+        if spec.role == "draft-propose":
+            graph["metadata"] = {"draft_static_shape": spec.metadata["draft_static_shape"]}
         graphs.append(graph)
     air_manifest = bundle / "air-manifest.json"
     air_manifest.write_text(json.dumps({

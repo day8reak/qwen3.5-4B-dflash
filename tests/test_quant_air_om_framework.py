@@ -2137,8 +2137,9 @@ def test_draft_index_audit_is_required_at_export_and_before_atc(
 
     def factory(config):
         return (AirGraphSpec(
-            name="draft-propose", role="draft-propose", model=nn.Identity(),
+            name="draft-propose", role="operator-audit", model=nn.Identity(),
             example_args=(torch.ones(1),),
+            # Isolated operator audit, not the eight-input Draft ABI.
             metadata={"draft_cache_index_policy": "static-repeat-tile-v1",
                       "draft_cache_index_layers": 1},
             custom_ops=(CustomOpExportSpec(
@@ -2372,7 +2373,7 @@ def test_compile_rejects_skipped_dynamic_mapping_before_atc_resolution(
 def test_default_factory_is_quant_branch_factory() -> None:
     assert DEFAULT_GRAPH_FACTORY.endswith("quant_factory:create_quant_recompute_graph")
     assert DEFAULT_CPP_GRAPH_FACTORY.endswith(
-        "quant_factory:create_quant_fused_speculative_step_graphs"
+        "quant_factory:create_quant_incremental_state_graphs"
     )
     assert QUANT_BASE_REVISION == "28f93e784a2beed87020a80bd93c8788754eab1c"
 

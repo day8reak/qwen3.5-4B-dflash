@@ -1,7 +1,25 @@
 {
-  "schema_version": 8,
+  "schema_version": 9,
   "abi_id": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
   "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
+  "default_static_split": {
+    "source_default_since": "framework v41 / runner 1.25.0",
+    "physical_topology": "merged-prefill-four-static-split-v1",
+    "roles": ["target-prefill", "target-decode1", "draft-propose", "target-verify-commit"],
+    "public_input_output_counts": [[9, 11], [8, 8], [8, 4], [9, 13]],
+    "draft_static_feature_rows": 64,
+    "physical_verify_rows": 16,
+    "prefill": "64 physical rows per chunk; body plus exact Top1/EOS; only final chunk result observed",
+    "feature_policy": "fixed-16/committed-prefix describe source rows only; every static Draft binds N rows with same-stream zero padding",
+    "request_gate": "tokenized prompt<=N; prompt+max_new_tokens+N<=KV capacity; no truncation",
+    "model_residency_policy": "phase-resident",
+    "resident_groups": [["target-prefill"], ["target-decode1"], ["draft-propose", "target-verify-commit"]],
+    "weight_budget": "max(Prefill,Decode1,ALIGN_UP(Draft,512)+Verify); non-overlapping live weights",
+    "timing_scope": "generation includes group switching; no Draft/Verify reload between transactions",
+    "migration": "regenerate AIR/OM and runner; legacy split-head tensor/topology contracts below remain explicit rollback",
+    "documentation": "docs/STATIC_SPLIT_OM_DEFAULT.md",
+    "claim_boundary": "user-selected static source default; not target-device accuracy or performance promotion"
+  },
   "approval": {
     "record": "approvals/incremental-performance-v2.json",
     "approved_proposal_sha256": "597d342e8bcd8b8ca3c76ee951f6cacad9b464257bbdfe8880c6f7a0d7a4d2ed",

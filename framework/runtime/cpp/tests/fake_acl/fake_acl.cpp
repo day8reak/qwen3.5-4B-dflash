@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <new>
 #include <string>
@@ -61,7 +62,13 @@ bool DynamicShapeMode(Role role) {
        role == Role::kFusedSpeculativeStep);
 }
 
+bool StaticSplitMode() {
+  const char* enabled = std::getenv("QWEN35_DFLASH_FAKE_STATIC_SPLIT");
+  return enabled != nullptr && std::string(enabled) == "1";
+}
+
 bool StaticFusedMode(Role role) {
+  if (role == Role::kDraftPropose && StaticSplitMode()) return true;
   const char* enabled = std::getenv("QWEN35_DFLASH_FAKE_STATIC_FUSED");
   return role == Role::kFusedSpeculativeStep && enabled != nullptr &&
       std::string(enabled) == "1";
@@ -97,7 +104,7 @@ const Spec kDraftCursor{ACL_INT64, {1}, "logical_draft_cursor"};
 std::map<std::uint32_t, Role> g_models;
 std::uint32_t g_next_model_id = 1;
 void* g_incremental_shared_work = nullptr;
-std::vector<void*> g_incremental_weights;
+std::map<std::uint32_t, std::pair<std::uintptr_t, std::size_t>> g_incremental_weights;
 std::vector<const void*> g_pending_h2d_sources;
 std::map<void*, std::size_t> g_device_allocations;
 bool g_model_work_pending = false;
@@ -274,6 +281,17 @@ const std::vector<Spec>& Inputs(Role role) {
     result[0].shape[1] = 64;
     return result;
   }();
+  static const std::vector<Spec> static_draft = [&]() {
+    auto result = shape_draft;
+    result[0].shape[1] = 64;
+    return result;
+  }();
+  static const std::vector<Spec> merged_prefill = [&]() {
+    auto result = prefill;
+    result.push_back(prefill_head[1]);
+    result.push_back(prefill_head[2]);
+    return result;
+  }();
   // Reduced-width version of the receiver's 48-input AIR ABI. The 33 FP64
   // placeholders and reordered public tensors must fail before inference.
   static const std::vector<Spec> lifted_fused = [&]() {
@@ -289,13 +307,13 @@ const std::vector<Spec>& Inputs(Role role) {
   }();
   switch (role) {
     case Role::kTargetPrefill:
-      return prefill;
+      return StaticSplitMode() ? merged_prefill : prefill;
     case Role::kTargetPrefillHead:
       return prefill_head;
     case Role::kTargetDecode:
       return decode;
     case Role::kDraftPropose:
-      return DynamicShapeMode(role) ? shape_draft : draft;
+      return StaticSplitMode() ? static_draft : DynamicShapeMode(role) ? shape_draft : draft;
     case Role::kTargetVerify:
       return verify;
     case Role::kTargetStep:
@@ -383,9 +401,14 @@ const std::vector<Spec>& Outputs(Role role) {
       kDraftValue,
       kDraftCursor,
   };
+  static const std::vector<Spec> merged_prefill = [&]() {
+    auto result = prefill;
+    result.insert(result.end(), prefill_head.begin(), prefill_head.end());
+    return result;
+  }();
   switch (role) {
     case Role::kTargetPrefill:
-      return prefill;
+      return StaticSplitMode() ? merged_prefill : prefill;
     case Role::kTargetPrefillHead:
       return prefill_head;
     case Role::kTargetDecode:
@@ -489,6 +512,12 @@ aclError ExecutePrefill(const aclmdlDataset* input, aclmdlDataset* output) {
   SetScalar<std::int64_t>(
       output->buffers[7],
       Scalar<std::int64_t>(input->buffers[6]) + length);
+  if (StaticSplitMode()) {
+    const std::int64_t token = ids[length - 1] + 1;
+    FillCommitted(output->buffers[8], {token});
+    SetScalar<std::int32_t>(output->buffers[9], 1);
+    SetScalar<std::uint8_t>(output->buffers[10], IsEos(token, input->buffers[7], input->buffers[8]));
+  }
   return ACL_SUCCESS;
 }
 
@@ -518,10 +547,19 @@ aclError ExecuteDecode(const aclmdlDataset* input, aclmdlDataset* output) {
 }
 
 aclError ExecuteDraft(const aclmdlDataset* input, aclmdlDataset* output) {
-  if (input->dynamic_dims.dimCount < 3) {
+  if (StaticSplitMode()) {
+    if (input->dynamic_dims.dimCount != 0 || input->uses_tensor_descriptor ||
+        input->buffers[0]->size != 64 * 8 * sizeof(std::uint16_t)) return 1;
+    const auto cursor = Scalar<std::int64_t>(input->buffers[7]);
+    const auto source = cursor == 0 ? Scalar<std::int32_t>(input->buffers[1]) : 16;
+    const auto* features = static_cast<const std::uint16_t*>(input->buffers[0]->data);
+    for (std::size_t index = source * 8; index < 64 * 8; ++index) {
+      if (features[index] != 0) return 1;
+    }
+  } else if (input->dynamic_dims.dimCount < 3) {
     return 1;
   }
-  const auto feature_rows = input->dynamic_dims.dims[1];
+  const auto feature_rows = StaticSplitMode() ? 64 : input->dynamic_dims.dims[1];
   const auto committed_input_count = Scalar<std::int32_t>(input->buffers[1]);
   if (!((feature_rows >= 1 && feature_rows <= 16) ||
         feature_rows == 64 || feature_rows == 128) ||
@@ -559,6 +597,10 @@ aclError ExecuteDraft(const aclmdlDataset* input, aclmdlDataset* output) {
       output->buffers[3],
       Scalar<std::int64_t>(input->buffers[7]) +
           Scalar<std::int32_t>(input->buffers[1]));
+  if (StaticSplitMode()) {
+    auto* features = static_cast<std::uint16_t*>(input->buffers[0]->data);
+    std::fill(features + 16 * 8, features + 64 * 8, 0x7e00);
+  }
   return ACL_SUCCESS;
 }
 
@@ -836,8 +878,10 @@ aclError aclmdlLoadFromFileWithMem(
   const std::size_t required_weight = ModelWeightBytes(path);
   if (g_model_work_pending || !g_pending_h2d_sources.empty()) return 9001;
   if (EnvSize("QWEN35_DFLASH_FAKE_FAIL_RELOAD", 0) && g_model_execution_count) return 9002;
+  if (EnvSize("QWEN35_DFLASH_FAKE_FAIL_VERIFY_GROUP_LOAD", 0) &&
+      g_model_execution_count && RoleFromPath(path) == Role::kTargetVerify) return 9005;
   if (work_ptr == nullptr || work_size < kModelWorkBytes ||
-      weight_ptr == nullptr || weight_size < required_weight) {
+      weight_ptr == nullptr || weight_size < required_weight || model_id == nullptr) {
     return 1;
   }
   if (g_incremental_shared_work == nullptr) {
@@ -845,17 +889,17 @@ aclError aclmdlLoadFromFileWithMem(
   } else if (g_incremental_shared_work != work_ptr) {
     return 1;
   }
-  if (std::find(
-          g_incremental_weights.begin(),
-          g_incremental_weights.end(),
-          weight_ptr) != g_incremental_weights.end()) {
-    return 1;
-  }
-  g_incremental_weights.push_back(weight_ptr);
-  if (model_id == nullptr) {
-    return 1;
+  const auto begin = reinterpret_cast<std::uintptr_t>(weight_ptr);
+  if (weight_size > std::numeric_limits<std::uintptr_t>::max() - begin) return 1;
+  for (const auto& item : g_incremental_weights) {
+    const auto other_begin = item.second.first;
+    const auto other_size = item.second.second;
+    // Distinct pointers are insufficient: simultaneously loaded models must
+    // not overlap anywhere in their declared weight ranges.
+    if (begin < other_begin + other_size && other_begin < begin + weight_size) return 1;
   }
   *model_id = g_next_model_id++;
+  g_incremental_weights[*model_id] = {begin, weight_size};
   g_models[*model_id] = RoleFromPath(path);
   return ACL_SUCCESS;
 }
@@ -878,6 +922,7 @@ aclError aclmdlUnload(std::uint32_t model_id) {
     return 9004;
   }
   g_models.erase(model_id);
+  g_incremental_weights.erase(model_id);
   if (g_models.empty()) {
     g_incremental_shared_work = nullptr;
     g_incremental_weights.clear();
@@ -920,9 +965,14 @@ aclError aclmdlGetInputDims(
   const aclError status = SetDims(dimensions, spec);
   if (status == ACL_SUCCESS && g_model_execution_count &&
       EnvSize("QWEN35_DFLASH_FAKE_RELOAD_ABI_DRIFT", 0) &&
-      description->role == Role::kTargetPrefillHead && index == 0) {
+      (description->role == Role::kTargetPrefillHead ||
+       (StaticSplitMode() && description->role == Role::kTargetPrefill)) && index == 0) {
     // Same byte count, different shape: stale datasets must still be rejected.
-    std::swap(dimensions->dims[1], dimensions->dims[2]);
+    if (description->role == Role::kTargetPrefill) {
+      std::swap(dimensions->dims[0], dimensions->dims[1]);
+    } else {
+      std::swap(dimensions->dims[1], dimensions->dims[2]);
+    }
   }
   const char* force_zero_rank_public =
       std::getenv("QWEN35_DFLASH_FAKE_ZERO_RANK_PUBLIC_INPUT");

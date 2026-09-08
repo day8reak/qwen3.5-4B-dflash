@@ -10,7 +10,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .draft_cache_export import validated_draft_cache_index_audit
 from .draft_kv_repeat_export import validated_draft_kv_repeat_audit
-from .static_shape import validated_fused_static_shape
+from .static_shape import validated_static_feature_shape
 from .utils import (
     atomic_write_json,
     contained_path,
@@ -333,7 +333,7 @@ def compile_air_bundle(
         )
         draft_index_audit = validated_draft_cache_index_audit(graph)
         kv_repeat_audit = validated_draft_kv_repeat_audit(graph)
-        static_shape = validated_fused_static_shape(
+        static_shape = validated_static_feature_shape(
             graph, air=True, allow_test_double=runner is not None,
         )
         validated_graphs.append((graph, weight_mapping, input_abi, draft_index_audit, static_shape, kv_repeat_audit))
@@ -417,7 +417,9 @@ def compile_air_bundle(
         if kv_repeat_audit is not None:
             compiled_graph["draft_kv_repeat_audit"] = kv_repeat_audit
         if static_shape is not None:
-            compiled_graph["fused_static_shape"] = static_shape
+            compiled_graph[
+                "draft_static_shape" if graph["role"] == "draft-propose" else "fused_static_shape"
+            ] = static_shape
         compiled.append(compiled_graph)
 
     deployment = {

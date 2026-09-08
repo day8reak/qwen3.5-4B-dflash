@@ -13,7 +13,7 @@ import sys
 import time
 from typing import Any, Callable, Mapping, Sequence
 
-from .static_shape import validated_fused_static_shape, validate_static_request
+from .static_shape import validated_static_feature_shape, validate_static_request
 from .utils import (
     atomic_write_json,
     contained_path,
@@ -159,6 +159,15 @@ _FUSED_SPECULATIVE_STEP_GRAPH_ABI["fused-speculative-step"] = (
     ],
 )
 _BASELINE_INCREMENTAL_TOPOLOGY = "split-prefill-head-five-resident-v1"
+_MERGED_STATIC_GRAPH_ABI = {
+    role: binding for role, binding in _INCREMENTAL_GRAPH_ABI.items()
+    if role != "target-prefill-head"
+}
+_MERGED_STATIC_GRAPH_ABI["target-prefill"] = (
+    _INCREMENTAL_GRAPH_ABI["target-prefill"][0] + ["eos_token_ids", "eos_token_count"],
+    _INCREMENTAL_GRAPH_ABI["target-prefill"][1] + ["committed_token_ids", "commit_count", "finished"],
+)
+_MERGED_STATIC_TOPOLOGY = "merged-prefill-four-static-split-v1"
 _UNIFIED_TARGET_STEP_TOPOLOGY = (
     "split-prefill-head-four-resident-unified-target-step-v1"
 )
@@ -617,6 +626,8 @@ def _resolve_incremental_oms(
         selected_abi = _INCREMENTAL_GRAPH_ABI
     elif set(_UNIFIED_TARGET_STEP_GRAPH_ABI).issubset(graph_roles):
         selected_abi = _UNIFIED_TARGET_STEP_GRAPH_ABI
+    elif graph_roles == set(_MERGED_STATIC_GRAPH_ABI) and len(graphs) == 4:
+        selected_abi = _MERGED_STATIC_GRAPH_ABI
     else:
         raise ValueError(
             "deployment manifest matches none of the baseline, unified "
@@ -655,7 +666,11 @@ def _resolve_incremental_oms(
         else "draft-propose"
     )
     draft_graph = resolved[draft_role][1]
-    static_shape = validated_fused_static_shape(draft_graph)
+    static_shape = validated_static_feature_shape(draft_graph)
+    if selected_abi is _MERGED_STATIC_GRAPH_ABI and static_shape is None:
+        raise ValueError("merged prefill topology requires a static Draft contract")
+    if selected_abi is not _MERGED_STATIC_GRAPH_ABI and draft_graph.get("draft_static_shape") is not None:
+        raise ValueError("static Draft requires the merged prefill four-OM topology")
     if static_shape is not None:
         if any(
             item[1].get("dynamic") is not False or item[1].get("input_dim_gears", {})
@@ -874,6 +889,7 @@ def validate_incremental_cpp_runner_report(
     prefill_completion_policy: str = SEPARATE_PREFILL_COMPLETION_POLICY,
     zero_accept_fallback_policy: str = DISABLED_ZERO_ACCEPT_FALLBACK_POLICY,
     fused_static_feature_rows: int = 0,
+    draft_static_feature_rows: int = 0,
     model_residency_policy: str = "all-resident",
 ) -> None:
     """Validate the resident graph set, device state routing and paired parity."""
@@ -881,7 +897,7 @@ def validate_incremental_cpp_runner_report(
     if model_residency_policy not in {"all-resident", "phase-resident"}:
         raise RuntimeError("unknown model residency policy")
     phase_resident = model_residency_policy == "phase-resident"
-    if phase_resident and not fused_static_feature_rows:
+    if phase_resident and not (fused_static_feature_rows or draft_static_feature_rows):
         raise RuntimeError("phase-resident requires static fused OM evidence")
 
     if report.get("schema_version") != 12:
@@ -898,6 +914,13 @@ def validate_incremental_cpp_runner_report(
     if int(report.get("device_id", -1)) != int(device_id):
         raise RuntimeError("incremental C++ runner used a different device ID")
     supplied_roles = list(om_sha256_by_role)
+    merged_prefill = supplied_roles == list(_MERGED_STATIC_GRAPH_ABI)
+    static_prefix = "draft_static_" if merged_prefill else "fused_static_"
+    expected_static_rows = draft_static_feature_rows if merged_prefill else fused_static_feature_rows
+    if (merged_prefill and (not draft_static_feature_rows or fused_static_feature_rows)) or (
+        not merged_prefill and draft_static_feature_rows
+    ):
+        raise RuntimeError("static Draft shape/topology differs")
     if supplied_roles == list(_INCREMENTAL_GRAPH_ABI):
         expected_roles = list(_INCREMENTAL_GRAPH_ABI)
         unified_target_step = False
@@ -910,6 +933,9 @@ def validate_incremental_cpp_runner_report(
         expected_roles = list(_FUSED_SPECULATIVE_STEP_GRAPH_ABI)
         unified_target_step = False
         fused_speculative_step = True
+    elif merged_prefill:
+        expected_roles = list(_MERGED_STATIC_GRAPH_ABI)
+        unified_target_step = fused_speculative_step = False
     else:
         raise RuntimeError("incremental expected OM role set differs")
     models = report.get("models")
@@ -943,7 +969,7 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental model IDs are invalid or duplicated")
     model_by_role = {str(item["role"]): item for item in models}
-    if int(model_by_role["target-prefill-head"]["weight_bytes"]) >= int(
+    if not merged_prefill and int(model_by_role["target-prefill-head"]["weight_bytes"]) >= int(
         model_by_role["target-prefill"]["weight_bytes"]
     ):
         raise RuntimeError(
@@ -991,6 +1017,8 @@ def validate_incremental_cpp_runner_report(
     if protocol.get("draft_feature_policy") != draft_feature_policy:
         raise RuntimeError("incremental runner Draft feature policy differs")
     expected_draft_feature_description = (
+        "static Draft always binds fixed N; the feature policy selects the valid source carrier extent before zero padding, not the OM shape"
+        if merged_prefill else
         "static fused always binds fixed N; the feature policy selects "
         "the valid source carrier extent before zero padding, not the OM shape"
         if fused_static_feature_rows else
@@ -1080,6 +1108,8 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental prefill control policy differs")
     expected_prefill_draft_policy = (
+        "Target feature slabs stay device-resident; final prompt completion executes one static Draft with zero-padded feature carrier"
+        if merged_prefill else
         "Target feature slabs stay device-resident; a fixed-shape fused "
         "transaction consumes the zero-padded prompt feature carrier"
         if fused_static_feature_rows else
@@ -1099,6 +1129,8 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental prefill feature arena policy differs")
     if protocol.get("prefill_target_lm_head_policy") != (
+        "target-prefill includes exact Top1/EOS per physical chunk; only final compact result is observed; no separate head OM"
+        if merged_prefill else
         "target-prefill body contains no LM head; target-prefill-head "
         "executes exactly once after the final physical prompt chunk"
     ):
@@ -1141,6 +1173,8 @@ def validate_incremental_cpp_runner_report(
     )
     if phase_resident:
         expected_topology = "split-prefill-head-four-artifact-phase-resident-fused-v1"
+    if merged_prefill:
+        expected_topology = _MERGED_STATIC_TOPOLOGY
     if abi.get("physical_topology") != expected_topology:
         raise RuntimeError("incremental runner physical topology differs")
     if abi.get("state_policy") != "explicit device-resident ping-pong":
@@ -1172,13 +1206,13 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental sequence/prefill capacity differs")
     memory = report.get("model_memory_query", {})
-    static_rows = memory.get("fused_static_feature_rows", 0)
+    static_rows = memory.get(static_prefix + "feature_rows", 0)
     if (
         isinstance(static_rows, bool) or not isinstance(static_rows, int)
-        or static_rows != fused_static_feature_rows
+        or static_rows != expected_static_rows
         or static_rows < 0 or static_rows % 64
         or static_rows > sequence_capacity
-        or (static_rows and not fused_speculative_step)
+        or (static_rows and not (fused_speculative_step or merged_prefill))
     ):
         raise RuntimeError("static fused OM shape differs from the manifest")
     if static_rows:
@@ -1189,7 +1223,7 @@ def validate_incremental_cpp_runner_report(
     if memory.get("source") != "aclmdlQuerySize":
         raise RuntimeError("incremental runner omitted model memory queries")
     expected_load_policy = (
-        f"{'four' if unified_target_step or fused_speculative_step else 'five'} "
+        f"{'four' if unified_target_step or fused_speculative_step or merged_prefill else 'five'} "
         "aclmdlLoadFromFileWithMem sessions; one max-sized serial "
         "workspace; separate per-artifact weights; no cross-OM weight sharing "
         "assumed"
@@ -1199,6 +1233,11 @@ def validate_incremental_cpp_runner_report(
             "phase-resident static fused; one live OM; synchronized unload before "
             "reusing max-sized workspace and weight arena; hot decode stays loaded"
         )
+        if merged_prefill:
+            expected_load_policy = (
+                "phase-resident static split; groups {prefill}, {decode1}, {Draft,Verify}; "
+                "synchronized unload before reusing weight arena; Draft and Verify stay hot"
+            )
     if memory.get("load_policy") != expected_load_policy:
         raise RuntimeError("incremental runner did not share the serial workspace")
     expected_sum_work = sum(int(item["work_bytes"]) for item in models)
@@ -1207,6 +1246,12 @@ def validate_incremental_cpp_runner_report(
     allocated_weights = (
         max(int(item["weight_bytes"]) for item in models) if phase_resident else expected_sum_weight
     )
+    if phase_resident and merged_prefill:
+        allocated_weights = max(
+            allocated_weights,
+            ((int(model_by_role["draft-propose"]["weight_bytes"]) + 511) // 512) * 512
+            + int(model_by_role["target-verify-commit"]["weight_bytes"]),
+        )
     residency = report.get("model_residency")
     switch_syncs = 0
     if residency is not None or phase_resident:
@@ -1241,14 +1286,29 @@ def validate_incremental_cpp_runner_report(
                 "target_decode1_executions", "fused_speculative_step_executions",
             )]
             # Two modes per repetition; each request enters prefill and head.
-            minimum_switches = 4 * (protocol["warmup"] + protocol["repetitions"])
+            minimum_switches = (2 if merged_prefill else 4) * (protocol["warmup"] + protocol["repetitions"])
+            group_loads = residency.get("split_group_loads", 0)
+            current = residency.get("current_resident_models", 1)
+            if merged_prefill:
+                calls.extend([actual.get("draft_propose_executions"), actual.get("target_verify_commit_executions")])
+                if (type(group_loads) is not int or group_loads < 0 or
+                    group_loads != actual.get("prefill_draft_propose_executions") or
+                    type(current) is not int or current not in (1, 2)):
+                    raise RuntimeError("static Draft/Verify hot-group residency differs")
+                # A one-token request only executes prefill; it can stay hot
+                # across all repetitions without any further group switch.
+                minimum_switches = max(1, 2 * group_loads)
             if (any(type(v) is not int or v < 0 for v in calls)
-                    or peak != 1 or loads != len(models) + switches
-                    or unloads != loads - 1 or not minimum_switches <= switches <= sum(calls)
+                    or peak != (2 if merged_prefill and group_loads else 1)
+                    or loads != len(models) + switches + (group_loads if merged_prefill else 0)
+                    or unloads != loads - (current if merged_prefill else 1)
+                    or not minimum_switches <= switches <= sum(calls)
                     or switch_syncs > switches):
                 raise RuntimeError("phase-resident load/unload accounting does not close")
         elif (peak != len(models) or loads != len(models)
-              or unloads or switches or switch_syncs or switch_ms):
+              or unloads or switches or switch_syncs or switch_ms
+              or residency.get("split_group_loads", 0) != 0
+              or residency.get("current_resident_models", len(models)) != len(models)):
             raise RuntimeError("all-resident report unexpectedly switched models")
         if (type(memory.get("allocated_weight_bytes")) is not int
                 or memory["allocated_weight_bytes"] != allocated_weights
@@ -1391,7 +1451,7 @@ def validate_incremental_cpp_runner_report(
     ):
         raise RuntimeError("incremental explicit device allocation does not close")
     execution = report.get("execution_io_counters", {})
-    if execution.get("fused_static_feature_rows", 0) != static_rows:
+    if execution.get(static_prefix + "feature_rows", 0) != static_rows:
         raise RuntimeError("static fused execution shape evidence differs")
     if static_rows and (
         memory.get("draft_dynamic_shape") is not False
@@ -1430,16 +1490,17 @@ def validate_incremental_cpp_runner_report(
     )
     fused_execution = execution.get("fused_speculative_step_executions")
     if static_rows:
-        physical = execution.get("fused_static_physical_feature_rows")
-        source = execution.get("fused_static_source_feature_rows")
-        padding = execution.get("fused_static_padding_rows")
-        memsets = execution.get("fused_static_padding_operations")
+        physical = execution.get(static_prefix + "physical_feature_rows")
+        source = execution.get(static_prefix + "source_feature_rows")
+        padding = execution.get(static_prefix + "padding_rows")
+        memsets = execution.get(static_prefix + "padding_operations")
+        static_calls = draft if merged_prefill else fused_execution
         if (
             any(isinstance(v, bool) or not isinstance(v, int) or v < 0
-                for v in (physical, source, padding, memsets, fused_execution))
-            or physical != static_rows * fused_execution
-            or physical != source + padding or source < fused_execution
-            or memsets > fused_execution or memsets > padding
+                for v in (physical, source, padding, memsets, static_calls))
+            or physical != static_rows * static_calls
+            or physical != source + padding or source < static_calls
+            or memsets > static_calls or memsets > padding
             or (padding > 0 and memsets == 0)
         ):
             raise RuntimeError("static fused physical feature/padding counters do not close")
@@ -1523,9 +1584,9 @@ def validate_incremental_cpp_runner_report(
     deferred_prefill = execution.get("deferred_prefill_chunks")
     if (
         prefill != expected_prefill
-        or prefill_head != request_count
+        or prefill_head != (0 if merged_prefill else request_count)
         or execution.get("target_prefill_head_executions_elided")
-        != expected_deferred
+        != (expected_prefill if merged_prefill else expected_deferred)
         or prefill_completions != request_count
         or deferred_prefill != expected_deferred
         or execution.get("prefill_synchronizations_elided")
@@ -2099,23 +2160,25 @@ def run_cpp_pair(
     graph: dict[str, Any] | None = None
     om_record: dict[str, Any] | None = None
     om_path: Path | None = None
-    fused_static_shape = None
+    static_shape = None
+    merged_prefill = False
     if incremental:
         resolved_incremental, deployment = _resolve_incremental_oms(
             deployment_manifest
         )
-        if "fused-speculative-step" in resolved_incremental:
-            fused_static_shape = validated_fused_static_shape(
-                resolved_incremental["fused-speculative-step"][1]
-            )
-        if fused_static_shape is not None:
-            validate_static_request(fused_static_shape, len(tokens), max_new_tokens)
-        if identity["model_residency_policy"] == "phase-resident" and fused_static_shape is None:
+        merged_prefill = "target-prefill-head" not in resolved_incremental
+        draft_role = "fused-speculative-step" if "fused-speculative-step" in resolved_incremental else "draft-propose"
+        static_shape = validated_static_feature_shape(resolved_incremental[draft_role][1])
+        if merged_prefill and "model_residency_policy" not in runner_options:
+            identity["model_residency_policy"] = "phase-resident"
+        if static_shape is not None:
+            validate_static_request(static_shape, len(tokens), max_new_tokens)
+        if identity["model_residency_policy"] == "phase-resident" and static_shape is None:
             raise ValueError("phase-resident requires a validated static fused manifest")
         if "fused-speculative-step" in resolved_incremental:
             fused_path, _, fused_record = resolved_incremental["fused-speculative-step"]
-            mode = "static" if fused_static_shape is not None else "dynamic"
-            rows = fused_static_shape["feature_rows"] if fused_static_shape is not None else "dynamic"
+            mode = "static" if static_shape is not None else "dynamic"
+            rows = static_shape["feature_rows"] if static_shape is not None else "dynamic"
             _progress(
                 progress,
                 f"stage=fused-manifest mode={mode} feature_rows={rows} "
@@ -2143,9 +2206,10 @@ def run_cpp_pair(
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     command = [str(executable)]
-    if fused_static_shape is not None:
+    if static_shape is not None:
         command.extend([
-            "--fused-static-feature-rows", str(fused_static_shape["feature_rows"]),
+            "--draft-static-feature-rows" if merged_prefill else "--fused-static-feature-rows",
+            str(static_shape["feature_rows"]),
         ])
     if incremental:
         for role, (role_path, _, record) in resolved_incremental.items():
@@ -2188,7 +2252,7 @@ def run_cpp_pair(
         str(int(device_id)),
     ])
     if incremental:
-        if identity["model_residency_policy"] != "all-resident":
+        if merged_prefill or identity["model_residency_policy"] != "all-resident":
             command.extend(["--model-residency-policy", identity["model_residency_policy"]])
         command.extend(
             [
@@ -2262,8 +2326,9 @@ def run_cpp_pair(
                 "zero_accept_fallback_policy"
             ],
             fused_static_feature_rows=(
-                0 if fused_static_shape is None else fused_static_shape["feature_rows"]
+                0 if static_shape is None or merged_prefill else static_shape["feature_rows"]
             ),
+            draft_static_feature_rows=(static_shape["feature_rows"] if merged_prefill else 0),
             model_residency_policy=identity["model_residency_policy"],
         )
     else:

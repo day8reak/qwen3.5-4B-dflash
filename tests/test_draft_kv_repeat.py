@@ -272,8 +272,9 @@ def test_export_compile_propagates_gate_before_atc(tmp_path, monkeypatch, kind):
             path.write_text(path.read_text(encoding="utf-8") + _pbtxt(kind=kind), encoding="utf-8")
 
     def factory(config):
-        return (AirGraphSpec(name="draft-propose", role="draft-propose",
+        return (AirGraphSpec(name="draft-propose", role="operator-audit",
                              model=nn.Identity(), example_args=(torch.ones(1),),
+                             # Isolated operator audit, not the eight-input Draft ABI.
                              metadata=METADATA,
                              custom_ops=(CustomOpExportSpec(
                                  torch_op=ADN_RMS_NORM_TORCH_OP,

@@ -29,22 +29,25 @@ ordinary greedy 与 strict-greedy DFlash 逐 token 生成
 - `scripts/compare_cpp_closed_runtime.py`：同设备、同 token、同计时范围的性能对比；
 - `FRAMEWORK_LOCK.json`：本分支冻结的量化、图和运行时 ABI。
 
-详细构建、运行与验证命令见
-[docs/QUANT_AIR_OM_FRAMEWORK.md](../docs/QUANT_AIR_OM_FRAMEWORK.md)。
-当前排查优先走 [固定 64 行静态 fused 基线](../docs/STATIC_FUSED_OM_BASELINE.md)，
-真机跑通并完成严格 greedy 对齐后再恢复动态；v39 使用同一四图拓扑和 runner 1.23.0，
-并将 Draft K/V 头复制改为带逐路导出审计的 Tile。此修复须从新 AIR 开始重跑，不能复用旧 AIR/OM。
-v40 / runner 1.24.0 增加 [按阶段常驻的显存候选](../docs/STATIC_OM_MEMORY.md)：
-prefill/head 用后卸载，当前 decode 热循环常驻，权重由总和改为最大单 OM 大小的复用区。
-此运行时改动可复用已正确生成的 v39 静态 OM；原 all-resident 默认策略保留。
+v41 / runner 1.25.0 的默认构图、迁移命令和验证边界见
+[静态四图默认部署指南](../docs/STATIC_SPLIT_OM_DEFAULT.md)：合并 Prefill body/head，
+保留 Decode1，独立静态 Draft N=64 和 Verify16。默认 phase-resident，
+Draft/Verify 联合常驻、两份权重不重叠；Prefill/Decode1 按阶段替换。
+必须重新导出 AIR、编译四个 OM 并重建 runner，不能复用旧 Prefill ABI。
+静态真机严格 greedy 对齐后再验证动态。已有 Scatter/GQA Tile 审计继续保留。
+
+[旧静态 fused 基线](../docs/STATIC_FUSED_OM_BASELINE.md) 和
+[v40 静态 fused 显存候选](../docs/STATIC_OM_MEMORY.md) 保留为显式回退。
+只有 v40 的旧拓扑生命周期改动可复用原正确静态 OM；它的“不用重新导出”不适用于 v41。
+通用框架与历史排错参考见 [AIR/OM/C++ 框架](../docs/QUANT_AIR_OM_FRAMEWORK.md)。
 增量状态 ABI、2/3/4 OM 选择门禁和内存检查命令见
 [docs/INCREMENTAL_OM_PERFORMANCE.md](../docs/INCREMENTAL_OM_PERFORMANCE.md)。
 
-当前第一版 OM 使用固定 gear 的完整前缀重算，以先冻结可验证的两输入/两输出 ABI。它确实由
+保留的第一版诊断 OM 使用固定 gear 的完整前缀重算，以先冻结可验证的两输入/两输出 ABI。它确实由
 C++ 调用 OM 完成 token 推理，但尚未把 `quant` 分支已有的 persistent rollback cache/state
 转成显式 OM I/O。因此它是功能基线，不应在真实测量前声称已达到闭源框架时延。
 
-当前 C++ 基线在第一次完整输入上传后只发送变化区间，并只从 Target 输出下载 scheduler 需要的
+该单图 C++ 诊断基线在第一次完整输入上传后只发送变化区间，并只从 Target 输出下载 scheduler 需要的
 尾部 `K+1` 行；JSON 保留实际与“每次完整传输”等价字节计数。这个 exact I/O 优化不改变 OM
 数学，也不能替代后续 incremental state OM。
 

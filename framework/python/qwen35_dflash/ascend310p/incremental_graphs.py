@@ -331,6 +331,31 @@ class TargetPrefillHeadGraph(nn.Module):
         return committed, commit_count, finished
 
 
+class TargetPrefillWithHeadGraph(nn.Module):
+    """One static prefill OM: unchanged body followed by exact Top1/EOS.
+
+    Each physical 64-row chunk computes a head. Only the final chunk's compact
+    result is observed; intermediate heads never advance the logical cursor.
+    """
+
+    def __init__(self, target: nn.Module, *, kv_cache_max_len: int) -> None:
+        super().__init__()
+        self.body = TargetPrefillStateGraph(target, kv_cache_max_len=kv_cache_max_len)
+        self.head = TargetPrefillHeadGraph(target)
+
+    def forward(
+        self, input_ids: Tensor, effective_length: Tensor,
+        conv_state: Tensor, recurrent_state: Tensor,
+        key_cache: Tensor, value_cache: Tensor, logical_target_cursor: Tensor,
+        eos_token_ids: Tensor, eos_token_count: Tensor,
+    ) -> tuple[Tensor, ...]:
+        body = self.body(
+            input_ids, effective_length, conv_state, recurrent_state,
+            key_cache, value_cache, logical_target_cursor,
+        )
+        return (*body, *self.head(body[0], eos_token_ids, eos_token_count))
+
+
 class TargetDecodeOneStateGraph(_ExplicitTargetGraph):
     """Consume one ordinary input row without executing the Draft."""
 
@@ -815,6 +840,8 @@ def incremental_state_graph_specs(
     unified_target_step: bool = False,
     fused_speculative_step: bool = False,
     fused_static_feature_rows: int = 0,
+    merged_prefill: bool = False,
+    draft_static_feature_rows: int = 0,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[AirGraphSpec, ...]:
     """Create one approved exact incremental physical-topology candidate."""
@@ -833,6 +860,17 @@ def incremental_state_graph_specs(
         raise ValueError(
             "unified_target_step and fused_speculative_step are mutually exclusive"
         )
+    if not isinstance(merged_prefill, bool):
+        raise TypeError("merged_prefill must be a boolean")
+    if merged_prefill and (unified_target_step or fused_speculative_step):
+        raise ValueError("merged_prefill requires separate static Draft/Verify and decode1")
+    if isinstance(draft_static_feature_rows, bool) or not isinstance(draft_static_feature_rows, int):
+        raise TypeError("draft_static_feature_rows must be an integer")
+    if (merged_prefill != bool(draft_static_feature_rows) or
+        draft_static_feature_rows < 0 or
+        draft_static_feature_rows % PREFILL_ROWS or
+        draft_static_feature_rows > kv_cache_max_len):
+        raise ValueError("merged_prefill requires positive static Draft rows divisible by 64 within KV capacity")
     if isinstance(fused_static_feature_rows, bool) or not isinstance(
         fused_static_feature_rows, int
     ):
@@ -907,6 +945,10 @@ def incremental_state_graph_specs(
 
     shared_metadata = {
         **dict(metadata or {}),
+        **({
+            "physical_topology": "merged-prefill-four-static-split-v1",
+            "default_static_split": True,
+        } if merged_prefill else {}),
         "incremental_abi": "qwen35-4b-dflash-ascend310p-incremental-performance-v2",
         "status": "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE",
         "state_owner": "C++ request context device buffers",
@@ -971,6 +1013,8 @@ def incremental_state_graph_specs(
     prefill = TargetPrefillStateGraph(
         target, kv_cache_max_len=kv_cache_max_len
     ).eval()
+    if merged_prefill:
+        prefill = TargetPrefillWithHeadGraph(target, kv_cache_max_len=kv_cache_max_len).eval()
     prefill_head = TargetPrefillHeadGraph(target).eval()
     decode = TargetDecodeOneStateGraph(
         target, kv_cache_max_len=kv_cache_max_len
@@ -1015,18 +1059,18 @@ def incremental_state_graph_specs(
             torch.zeros((1, PREFILL_ROWS), dtype=torch.long, device=target_device),
             torch.full((1,), PREFILL_ROWS, dtype=torch.int16, device=target_device),
             *state_inputs,
-        ),
+        ) + ((eos_ids, eos_count) if merged_prefill else ()),
         input_names=(
             "input_ids", "effective_length", "target_conv_state",
             "target_recurrent_state", "target_key_cache",
             "target_value_cache", "logical_target_cursor",
-        ),
+        ) + (("eos_token_ids", "eos_token_count") if merged_prefill else ()),
         output_names=(
             "last_hidden", "target_feature_tail", "committed_input_count",
             "target_conv_state", "target_recurrent_state",
             "target_key_cache", "target_value_cache",
             "logical_target_cursor",
-        ),
+        ) + (("committed_token_ids", "commit_count", "finished") if merged_prefill else ()),
         metadata=graph_metadata(
             "target-prefill",
             ordinary_custom_ops,
@@ -1102,7 +1146,7 @@ def incremental_state_graph_specs(
         role="draft-propose",
         model=propose,
         example_args=(
-            torch.zeros((1, VERIFY_ROWS, feature_width), dtype=dtype, device=target_device),
+            torch.zeros((1, draft_static_feature_rows or VERIFY_ROWS, feature_width), dtype=dtype, device=target_device),
             torch.ones((1,), dtype=torch.int32, device=target_device),
             torch.zeros((1, VERIFY_ROWS), dtype=torch.long, device=target_device),
             torch.ones((1,), dtype=torch.int32, device=target_device),
@@ -1121,13 +1165,28 @@ def incremental_state_graph_specs(
             "verify_input_ids", "draft_key_cache", "draft_value_cache",
             "logical_draft_cursor",
         ),
-        dynamic=True,
-        input_dim_gears={0: {1: draft_feature_gears}},
-        metadata=graph_metadata(
-            "draft-propose",
-            (),
-            ["draft_key_cache", "draft_value_cache", "logical_draft_cursor"],
-        ),
+        dynamic=not bool(draft_static_feature_rows),
+        input_dim_gears={} if draft_static_feature_rows else {0: {1: draft_feature_gears}},
+        metadata={
+            **graph_metadata(
+                "draft-propose", (),
+                ["draft_key_cache", "draft_value_cache", "logical_draft_cursor"],
+            ),
+            **({
+                "draft_static_shape": {
+                    "feature_rows": draft_static_feature_rows,
+                    "feature_width": feature_width,
+                    "verify_rows": VERIFY_ROWS,
+                    "kv_capacity": kv_cache_max_len,
+                    "padding_policy": "zero-tail-on-stream-v1",
+                    "capacity_policy": "reserve-full-static-write-v1",
+                },
+                "draft_feature_tail": (
+                    f"FP16[1,{draft_static_feature_rows},{feature_width}]; "
+                    "fixed carrier, live committed_input_count"
+                ),
+            } if draft_static_feature_rows else {}),
+        },
     )
     verify_metadata = graph_metadata(
         "target-verify-commit",
@@ -1293,6 +1352,8 @@ def incremental_state_graph_specs(
         return prefill_spec, prefill_head_spec, decode_spec, fused_spec
     if unified_target_step:
         return prefill_spec, prefill_head_spec, draft_spec, verify_spec
+    if merged_prefill:
+        return prefill_spec, decode_spec, draft_spec, verify_spec
     return prefill_spec, prefill_head_spec, decode_spec, draft_spec, verify_spec
 
 
@@ -1305,6 +1366,7 @@ __all__ = [
     "TargetDecodeOneStateGraph",
     "TargetPrefillHeadGraph",
     "TargetPrefillStateGraph",
+    "TargetPrefillWithHeadGraph",
     "TargetStepStateGraph",
     "TargetVerifyCommitStateGraph",
     "VERIFY_ROWS",

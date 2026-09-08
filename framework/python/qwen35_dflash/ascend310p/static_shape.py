@@ -1,4 +1,4 @@
-"""The opt-in, fixed-carrier fused OM contract (not dynamic shape gears)."""
+"""Fixed-carrier Draft and legacy fused OM contracts (no dynamic shape APIs)."""
 
 from __future__ import annotations
 
@@ -6,28 +6,31 @@ from collections.abc import Mapping
 from typing import Any
 
 
-def validated_fused_static_shape(
+def _validated_static_shape(
     graph: Mapping[str, Any], *, air: bool = False,
     allow_test_double: bool = False,
+    role: str = "fused-speculative-step", key: str = "fused_static_shape",
+    binding_count: int = 15, kv_index: int = 12,
 ) -> dict[str, Any] | None:
     source = graph.get("metadata", {}) if air else graph
-    raw = source.get("fused_static_shape") if isinstance(source, Mapping) else None
+    label = "static fused" if role == "fused-speculative-step" else "static Draft"
+    raw = source.get(key) if isinstance(source, Mapping) else None
     if raw is None:
-        if graph.get("role") == "fused-speculative-step" and graph.get("dynamic") is False:
-            raise ValueError("static fused OM requires a fused_static_shape contract")
+        if graph.get("role") == role and graph.get("dynamic") is False:
+            raise ValueError(f"static {role} OM requires a {key} contract")
         return None
     if (
-        graph.get("role") != "fused-speculative-step"
+        graph.get("role") != role
         or graph.get("dynamic") is not False
         or graph.get("input_dim_gears") != {}
         or not isinstance(raw, Mapping)
     ):
-        raise ValueError("static fused shape contract conflicts with role/dynamic/gears")
+        raise ValueError(f"{label} shape contract conflicts with role/dynamic/gears")
     result = dict(raw)
-    for key in ("feature_rows", "feature_width", "verify_rows", "kv_capacity"):
-        value = result.get(key)
+    for field in ("feature_rows", "feature_width", "verify_rows", "kv_capacity"):
+        value = result.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"static fused {key} must be a positive integer")
+            raise ValueError(f"{label} {field} must be a positive integer")
     if (
         result["feature_rows"] % 64 or result["kv_capacity"] % 64
         or result["feature_rows"] > result["kv_capacity"]
@@ -35,19 +38,19 @@ def validated_fused_static_shape(
         or result.get("padding_policy") != "zero-tail-on-stream-v1"
         or result.get("capacity_policy") != "reserve-full-static-write-v1"
     ):
-        raise ValueError("static fused shape/padding/capacity policy differs")
+        raise ValueError(f"{label} shape/padding/capacity policy differs")
     if air:
         audit = graph.get("runtime_input_abi", {})
         if not isinstance(audit, Mapping):
-            raise ValueError("static fused AIR input audit must be an object")
+            raise ValueError(f"{label} AIR input audit must be an object")
         if allow_test_double and audit.get("status") == "NOT_APPLICABLE_EXPLICIT_TEST_DOUBLE":
             return result
         bindings = audit.get("bindings", [])
-        if audit.get("status") != "PASS" or not isinstance(bindings, list) or len(bindings) != 15:
-            raise ValueError("static fused AIR requires 15 audited static tensor bindings")
+        if audit.get("status") != "PASS" or not isinstance(bindings, list) or len(bindings) != binding_count:
+            raise ValueError(f"static {role} AIR requires {binding_count} audited static tensor bindings")
         for index, binding in enumerate(bindings):
             if not isinstance(binding, Mapping):
-                raise ValueError("static fused AIR input binding must be an object")
+                raise ValueError(f"{label} AIR input binding must be an object")
             shape = binding.get("serialized_shape")
             if (
                 binding.get("index") != index or not isinstance(shape, list)
@@ -56,14 +59,31 @@ def validated_fused_static_shape(
                 )
                 or shape != binding.get("example_shape")
             ):
-                raise ValueError("static fused AIR input has an unaudited/dynamic shape")
+                raise ValueError(f"{label} AIR input has an unaudited/dynamic shape")
         if bindings[0]["serialized_shape"] != [
             1, result["feature_rows"], result["feature_width"]
         ] or bindings[0].get("dtype") != "float16":
-            raise ValueError("static fused AIR feature binding differs from contract")
-        if bindings[12]["serialized_shape"][3:4] != [result["kv_capacity"]]:
-            raise ValueError("static fused AIR KV capacity differs from contract")
+            raise ValueError(f"{label} AIR feature binding differs from contract")
+        if bindings[kv_index]["serialized_shape"][3:4] != [result["kv_capacity"]]:
+            raise ValueError(f"{label} AIR KV capacity differs from contract")
     return result
+
+
+def validated_fused_static_shape(
+    graph: Mapping[str, Any], *, air: bool = False, allow_test_double: bool = False,
+) -> dict[str, Any] | None:
+    return _validated_static_shape(graph, air=air, allow_test_double=allow_test_double)
+
+
+def validated_static_feature_shape(
+    graph: Mapping[str, Any], *, air: bool = False, allow_test_double: bool = False,
+) -> dict[str, Any] | None:
+    fused = validated_fused_static_shape(graph, air=air, allow_test_double=allow_test_double)
+    draft = _validated_static_shape(
+        graph, air=air, allow_test_double=allow_test_double,
+        role="draft-propose", key="draft_static_shape", binding_count=8, kv_index=5,
+    )
+    return fused if fused is not None else draft
 
 
 def validate_static_request(
@@ -72,8 +92,8 @@ def validate_static_request(
     rows = shape["feature_rows"]
     if prompt_rows > rows:
         raise ValueError(
-            f"static fused OM accepts at most {rows} prompt tokens; got {prompt_rows}. "
-            "Export a larger fused_static_feature_rows carrier; no truncation is allowed."
+            f"static fused/Draft OM accepts at most {rows} prompt tokens; got {prompt_rows}. "
+            "Export a larger static feature carrier; no truncation is allowed."
         )
     # The current cache scatter writes the entire physical carrier. Reserving
     # N rows keeps all indices unique and prevents padding from clamping onto

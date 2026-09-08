@@ -48,6 +48,8 @@ const char* IncrementalModelResidencyPolicyName(
     IncrementalModelResidencyPolicy policy) noexcept;
 
 struct IncrementalModelResidencyStats {
+  std::size_t split_group_loads = 0;
+  std::size_t current_resident_models = 0;
   std::size_t allocated_weight_bytes = 0;
   std::size_t peak_resident_models = 0;
   std::size_t model_loads = 0;
@@ -185,11 +187,11 @@ struct IncrementalAclExecutionStats {
   bool draft_dynamic_shape = false;
   // Nonzero only for the opt-in fixed-carrier fused OM. The legacy feature
   // counters describe source rows; these counters expose actual padded work.
-  std::size_t fused_static_feature_rows = 0;
-  std::size_t fused_static_physical_feature_rows = 0;
-  std::size_t fused_static_source_feature_rows = 0;
-  std::size_t fused_static_padding_rows = 0;
-  std::size_t fused_static_padding_operations = 0;
+  std::size_t static_feature_rows = 0;
+  std::size_t static_physical_feature_rows = 0;
+  std::size_t static_source_feature_rows = 0;
+  std::size_t static_padding_rows = 0;
+  std::size_t static_padding_operations = 0;
   bool target_step_dynamic_shape = false;
   std::size_t draft_om_dynamic_gear_count = 0;
   std::size_t target_step_om_dynamic_gear_count = 0;
@@ -288,6 +290,7 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
   IncrementalDraftFeaturePolicy draft_feature_policy() const noexcept;
   bool unified_target_step() const noexcept;
   bool fused_speculative_step() const noexcept;
+  bool merged_prefill() const noexcept;
 
  private:
   class Impl;

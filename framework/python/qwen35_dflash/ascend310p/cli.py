@@ -372,7 +372,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     export = subparsers.add_parser("export-air", help="export factory graphs to AIR")
-    export.add_argument("--factory", required=True, help="module:function graph factory")
+    export.add_argument("--factory", default=DEFAULT_CPP_GRAPH_FACTORY,
+                        help="module:function (default: four static split OMs)")
     export.add_argument("--factory-config", type=Path)
     export.add_argument("--bundle-dir", type=Path, required=True)
     export.set_defaults(handler=command_export)
@@ -385,7 +386,8 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.set_defaults(handler=command_compile)
 
     build = subparsers.add_parser("build-om", help="export AIR and compile every graph")
-    build.add_argument("--factory", required=True, help="module:function graph factory")
+    build.add_argument("--factory", default=DEFAULT_CPP_GRAPH_FACTORY,
+                       help="module:function (default: four static split OMs)")
     build.add_argument("--factory-config", type=Path)
     build.add_argument("--bundle-dir", type=Path, required=True)
     _add_atc_arguments(build)
@@ -523,7 +525,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_e2e_cpp.add_argument(
         "--factory",
         default=DEFAULT_CPP_GRAPH_FACTORY,
-        help="module:function graph factory (default: fused four-OM topology)",
+        help="module:function graph factory (default: merged prefill, static Draft, Verify16, decode1)",
     )
     run_e2e_cpp.add_argument("--factory-config", type=Path, required=True)
     run_e2e_cpp.add_argument("--bundle-dir", type=Path, required=True)

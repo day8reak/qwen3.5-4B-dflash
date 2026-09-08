@@ -1,5 +1,9 @@
 # 先跑通静态 fused OM，再恢复动态
 
+本页保留旧 fused 四图的显式回退方法。**v41 默认已改为合并 Prefill、Decode1、
+静态 Draft、Verify16**，新默认请按 [静态四图部署指南](STATIC_SPLIT_OM_DEFAULT.md)
+重建 runner 并重新导出 AIR/OM，不要混用本页 fused factory/config。
+
 如果已生成正确的 v39 静态 OM，但启动时报显存不足，先看
 [v40 按阶段常驻修复](STATIC_OM_MEMORY.md)。它只需重建 runner / 改配置，
 不要求再导出同一份 OM；下文的重新导出步骤适用于尚未生成正确静态图的情况。

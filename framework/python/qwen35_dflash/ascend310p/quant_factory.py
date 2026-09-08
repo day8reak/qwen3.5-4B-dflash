@@ -10,8 +10,8 @@ second target implementation:
 * ``models.dflash_v1.modeling_dflash.DFlashDraftModel`` remains FP16.
 
 The fixed-gear full-prefix recompute graph remains the simplest diagnostic
-baseline.  The production C++ workflow selects the four-resident-OM fused
-speculative topology, while all routes reuse the same quant branch model and
+baseline. The default C++ workflow selects merged prefill, static Draft,
+Verify16 and decode1 with phase-group residency. All routes reuse the same model and
 custom-operator export contracts.
 """
 
@@ -60,6 +60,7 @@ QUANT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-recompute-v4"
 QUANT_INCREMENTAL_GRAPH_FACTORY_ID = (
     "qwen3.5-4b-quant-w8a8-dflash-incremental-state-v3"
 )
+QUANT_STATIC_SPLIT_GRAPH_FACTORY_ID = "qwen3.5-4b-quant-w8a8-dflash-static-split-v1"
 QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY_ID = (
     "qwen3.5-4b-quant-w8a8-dflash-unified-target-step-v1"
 )
@@ -716,11 +717,10 @@ def create_quant_recompute_graph(
 def create_quant_incremental_state_graphs(
     config: Mapping[str, Any],
 ) -> tuple[AirGraphSpec, ...]:
-    """Build the approved state ABI as the baseline or unified AIR topology.
+    """Default: merged prefill + static Draft + Verify16 + decode1.
 
-    This is an implementation candidate, not the default factory.  Export,
-    ATC, real-model parity, complete resident-set memory and latency all remain
-    promotion gates.
+    Legacy split-head and fused/unified routes remain explicit options.
+    Construction is not evidence of AIR/ATC/device parity or performance.
     """
 
     unified_target_step = config.get("unified_target_step", False)
@@ -733,6 +733,13 @@ def create_quant_incremental_state_graphs(
         raise ValueError(
             "unified_target_step and fused_speculative_step are mutually exclusive"
         )
+    merged_prefill = config.get(
+        "merged_prefill", not (unified_target_step or fused_speculative_step)
+    )
+    if not isinstance(merged_prefill, bool):
+        raise TypeError("merged_prefill must be a boolean")
+    if merged_prefill and (unified_target_step or fused_speculative_step):
+        raise ValueError("merged_prefill requires separate Draft/Verify and decode1")
     max_sequence_length = int(config.get("max_sequence_length", 0))
     if max_sequence_length <= 0 or max_sequence_length % _TARGET_GDN_CHUNK:
         raise ValueError(
@@ -743,6 +750,13 @@ def create_quant_incremental_state_graphs(
             "max_sequence_length exceeds the GDR INT16 effective-length ABI"
         )
     fused_static_feature_rows = config.get("fused_static_feature_rows", 0)
+    draft_static_feature_rows = config.get("draft_static_feature_rows", 64 if merged_prefill else 0)
+    if isinstance(draft_static_feature_rows, bool) or not isinstance(draft_static_feature_rows, int):
+        raise TypeError("draft_static_feature_rows must be an integer")
+    if (merged_prefill != bool(draft_static_feature_rows) or
+        draft_static_feature_rows < 0 or draft_static_feature_rows % 64 or
+        draft_static_feature_rows > max_sequence_length):
+        raise ValueError("merged_prefill requires positive static Draft rows divisible by 64 within capacity")
     if isinstance(fused_static_feature_rows, bool) or not isinstance(
         fused_static_feature_rows, int
     ):
@@ -791,6 +805,7 @@ def create_quant_incremental_state_graphs(
     locked_inputs = identity["locked_inputs"]
     metadata = {
         "factory_id": (
+            QUANT_STATIC_SPLIT_GRAPH_FACTORY_ID if merged_prefill else
             QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY_ID
             if unified_target_step
             else (
@@ -834,6 +849,8 @@ def create_quant_incremental_state_graphs(
         "approval_status": "APPROVED",
         "activation_status": "NOT_ACTIVE",
         "physical_topology": (
+            "merged-prefill-four-static-split-v1"
+            if merged_prefill else
             "split-prefill-head-four-resident-unified-target-step-v1"
             if unified_target_step
             else (
@@ -868,6 +885,8 @@ def create_quant_incremental_state_graphs(
         unified_target_step=unified_target_step,
         fused_speculative_step=fused_speculative_step,
         fused_static_feature_rows=fused_static_feature_rows,
+        merged_prefill=merged_prefill,
+        draft_static_feature_rows=draft_static_feature_rows,
         metadata=metadata,
     )
 
@@ -897,6 +916,7 @@ __all__ = [
     "QUANT_BASE_REVISION",
     "QUANT_GRAPH_FACTORY_ID",
     "QUANT_INCREMENTAL_GRAPH_FACTORY_ID",
+    "QUANT_STATIC_SPLIT_GRAPH_FACTORY_ID",
     "QUANT_FUSED_SPECULATIVE_STEP_GRAPH_FACTORY_ID",
     "QUANT_UNIFIED_TARGET_STEP_GRAPH_FACTORY_ID",
     "QuantFullPrefixExportTarget",

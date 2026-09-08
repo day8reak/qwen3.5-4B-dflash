@@ -33,7 +33,7 @@ def _batched_cache_update_proposal() -> dict[str, object]:
 def test_incremental_contract_has_exact_approval_but_is_not_active() -> None:
     contract = _contract()
     approval = json.loads(APPROVAL_PATH.read_text(encoding="utf-8"))
-    assert contract["schema_version"] == 8
+    assert contract["schema_version"] == 9
     assert contract["status"] == "APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE"
     assert approval["status"] == "APPROVED"
     assert approval["approval_statement"] == "批准多OM状态图"
@@ -335,13 +335,22 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 40
+    assert framework_lock["schema_version"] == 41
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v40"
+        "qwen3.5-4b-quant-air-om-ascendcl-v41"
     )
     residency = framework_lock["runtime"]["incremental_model_residency"]
-    assert residency["default"] == "all-resident"
-    assert residency["candidate"] == "phase-resident"
+    assert residency["default"] == "phase-resident for merged static split; all-resident for legacy topologies"
+    assert "all-resident rollback" in residency["candidate"]
+    default = framework_lock["default_cpp_graph"]
+    split = _contract()["default_static_split"]
+    assert split["physical_topology"] == default["physical_topology"]
+    assert split["roles"] == default["roles"]
+    assert split["public_input_output_counts"] == default["public_input_output_counts"]
+    assert split["draft_static_feature_rows"] == 64
+    assert split["resident_groups"][-1] == ["draft-propose", "target-verify-commit"]
+    assert default["roles"] == ["target-prefill", "target-decode1", "draft-propose", "target-verify-commit"]
+    assert default["public_input_output_counts"] == [[9, 11], [8, 8], [8, 4], [9, 13]]
     assert "successfully unload" in residency["ownership"]
     assert "included in generation latency" in residency["evidence"]
     assert deployment["schema_version"] == 2

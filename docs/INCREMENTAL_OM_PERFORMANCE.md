@@ -1,5 +1,11 @@
 # 增量 OM 与 C++ 高性能路线
 
+v41 当前默认请先看 [合并 Prefill 的静态四图指南](STATIC_SPLIT_OM_DEFAULT.md)：
+Prefill + Decode1 + Draft N=64 + Verify16，默认按阶段驻留，Draft/Verify 联合常驻。
+本页主要保留旧 split-head 五图、动态 unified、fused 候选的性能合同和对照方法；
+下文动态 feature gear、head 只运行一次、启动后不再 load 的描述不适用于新默认。
+新默认的额外换组同步/重载必须计入 wall time，不能只按事务同步数声称性能改善。
+
 当前 `quant_dflash_recompute.om` 是 correctness 基线，不是最终性能形态。它的每次调用都重算完整
 前缀，而且一个图同时运行 Target 和 Draft。C++ speculative round 又会调用这个大图两次：先取
 proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成也会无条件支付 Draft 成本。
@@ -9,7 +15,7 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
 - prompt 只 prefill 一次；
 - ordinary decode 每次只处理 1 行且不运行 Draft；
 - Draft 复用自己的 KV 和 Target 新增 feature，只生成最多 15 个 proposal；
-- 五图基线的 Target verify 固定处理 16 个因果行；四图候选只处理 `T=K+1` 个真实行。两者都只
+- 五图基线和新静态四图的 Target verify 固定处理 16 个因果行；旧 unified 四图候选处理 `T=K+1` 个真实行。两者都只
   提交 `logical_proposal_count` 指定的前缀，不再重算历史前缀；
 - proposal、KV、GDR/conv state 和 feature 全部留在 device；
 - 默认每个 speculative round 只在 accept/commit 后同步一次；同一 OM ABI 的双轮候选可把两个
@@ -21,11 +27,11 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
 `APPROVED_IN_IMPLEMENTATION_NOT_ACTIVE`：可以实现，但还不能冒充已经生成、真机验证或达到性能
 目标的 OM。
 
-当前 `run-e2e-cpp` 的默认 graph factory 已明确为 fused 四物理 OM；这是为了避免遗漏 `--factory`
-时又生成单个 `quant_dflash_recompute.om`，不等于性能候选已经激活。Python `run-e2e` 和显式
+当前 `run-e2e-cpp` 的默认 graph factory 为 incremental factory 的合并 Prefill 静态四图；
+不会因遗漏 `--factory` 生成单个 `quant_dflash_recompute.om`，也不等于性能候选已经激活。Python `run-e2e` 和显式
 `create_quant_recompute_graph` 仍保留单图诊断语义。
 
-## 1. 五 OM 基线与两种四物理 OM 候选
+## 1. 历史 split-head 五 OM 基线与四物理 OM 对照候选
 
 四个逻辑角色是：
 
@@ -38,7 +44,7 @@ proposal，再把 `prefix + proposals` 重算一次进行 verify。普通生成�
 
 物理文件不一定恰好是四个：
 
-- 当前实现把逻辑 `target-prefill` 物理拆成 `target-prefill` body 和
+- 显式旧 split-head 路线（`merged_prefill=false`）把逻辑 `target-prefill` 物理拆成 `target-prefill` body 和
   `target-prefill-head`。body 导出签名不引用 `lm_head`，head 只保留量化
   `QLinear + argmax + EOS`；因此非末 chunk 真正不做词表投影，末 chunk 才执行一次 head；
 - 源码现在还提供统一 `target-verify-commit`：Target body 使用动态 `T=1..16`，`T=1`
@@ -445,13 +451,15 @@ load，才能把“总权重基本持平”作为真机结论。
 沿用量化 factory 配置，但生产 context 容量应按真实 workload 设置，例如 2048；必须是 64 的
 倍数。`eos_table_width` 必须能容纳 tokenizer 的全部 EOS ID：
 
-若只执行当前主路线，可直接复制
+新默认请使用 [静态四图指南](STATIC_SPLIT_OM_DEFAULT.md)。若只执行旧 fused 对照，可直接复制
 `config/quant_air_om_fused_factory.example.json`，填写外部路径后跳到 5.2.2。下面先保留五 OM
 对照命令，便于判断 Draft→verify 物理边界是否确实是瓶颈。
 
 ```json
 {
   "max_sequence_length": 2048,
+  "merged_prefill": false,
+  "draft_static_feature_rows": 0,
   "eos_table_width": 4,
   "dtype": "float16",
   "device": "npu:0"

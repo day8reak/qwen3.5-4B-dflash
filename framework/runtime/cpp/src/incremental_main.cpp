@@ -66,7 +66,7 @@ struct Arguments {
   std::int64_t pad_token_id = 0;
   std::size_t max_new_tokens = 32;
   std::size_t max_draft_tokens = 15;
-  std::size_t fused_static_feature_rows = 0;
+  std::size_t static_feature_rows = 0;
   IncrementalModelResidencyPolicy model_residency_policy =
       IncrementalModelResidencyPolicy::kAllResident;
   std::size_t dflash_sync_window = 1;
@@ -91,7 +91,7 @@ void Usage(std::ostream& stream) {
       << "Usage: qwen35_dflash_incremental_acl_runner [options]\n"
       << "  --target-prefill PATH                    hash-locked prefill OM\n"
       << "  --target-prefill-sha256 HEX              expected prefill SHA-256\n"
-      << "  --target-prefill-head PATH               final-chunk QLinear head OM\n"
+      << "  --target-prefill-head PATH               legacy split head only; omit for merged prefill\n"
       << "  --target-prefill-head-sha256 HEX         expected head SHA-256\n"
       << "  --target-decode1 PATH                    optional decode-one OM; omit for unified Target step\n"
       << "  --target-decode1-sha256 HEX              required only with target-decode1\n"
@@ -102,7 +102,8 @@ void Usage(std::ostream& stream) {
       << "  --fused-speculative-step PATH            exact Draft+verify supergraph; replaces separate pair\n"
       << "  --fused-speculative-step-sha256 HEX      expected fused OM SHA-256\n"
       << "  --fused-static-feature-rows N            opt in to a fixed fused carrier (multiple of 64)\n"
-      << "  --model-residency-policy POLICY          all-resident (default) or phase-resident (static fused)\n"
+      << "  --draft-static-feature-rows N            fixed split Draft carrier (default 64 for merged prefill)\n"
+      << "  --model-residency-policy POLICY          phase-resident by default for merged split; all-resident for legacy\n"
       << "  --output PATH                            paired JSON report\n"
       << "  --prompt-token-ids CSV                   non-empty prompt\n"
       << "  --eos-token-ids CSV                      optional EOS token IDs\n"
@@ -274,7 +275,7 @@ Arguments ParseArguments(int argc, char** argv) {
   Arguments result;
   for (std::size_t index = 0; index < result.models.size(); ++index) {
     auto& model = result.models[index];
-    if (index >= 2) {
+    if (index >= 1) {
       const std::string path = TakeOptional(&values, model.role, "");
       const std::string hash = TakeOptional(
           &values, std::string(model.role) + "-sha256", "");
@@ -299,6 +300,10 @@ Arguments ParseArguments(int argc, char** argv) {
   const bool has_decode = !result.models[2].path.empty();
   const bool has_draft = !result.models[3].path.empty();
   const bool has_verify = !result.models[4].path.empty();
+  const bool merged = result.models[1].path.empty();
+  if (merged && (fused || !has_decode || !has_draft || !has_verify)) {
+    throw std::invalid_argument("merged prefill requires prefill, decode1, Draft and Verify");
+  }
   if (fused) {
     if (!has_decode || has_draft || has_verify) {
       throw std::invalid_argument(
@@ -321,26 +326,26 @@ Arguments ParseArguments(int argc, char** argv) {
   result.max_draft_tokens = ParseSize(
       TakeOptional(&values, "max-draft-tokens", "15"), "max-draft-tokens");
   const std::int64_t static_feature_rows = ParseInt64(
-      TakeOptional(&values, "fused-static-feature-rows", "0"),
-      "fused-static-feature-rows");
+      TakeOptional(&values, merged ? "draft-static-feature-rows" : "fused-static-feature-rows", merged ? "64" : "0"),
+      "static-feature-rows");
   if (static_feature_rows < 0) {
-    throw std::invalid_argument("static fused carrier rows must be non-negative");
+    throw std::invalid_argument("static feature carrier rows must be non-negative");
   }
-  result.fused_static_feature_rows = static_cast<std::size_t>(static_feature_rows);
-  const auto residency = TakeOptional(&values, "model-residency-policy", "all-resident");
+  result.static_feature_rows = static_cast<std::size_t>(static_feature_rows);
+  const auto residency = TakeOptional(&values, "model-residency-policy", merged ? "phase-resident" : "all-resident");
   if (residency == "phase-resident") {
-    if (!fused || result.fused_static_feature_rows == 0) {
-      throw std::invalid_argument("phase-resident requires a static fused carrier");
+    if ((!fused && !merged) || result.static_feature_rows == 0) {
+      throw std::invalid_argument("phase-resident requires a static fused or split Draft carrier");
     }
     result.model_residency_policy = IncrementalModelResidencyPolicy::kPhaseResident;
   } else if (residency != "all-resident") {
     throw std::invalid_argument("model-residency-policy must be all-resident or phase-resident");
   }
-  if (result.fused_static_feature_rows != 0 &&
-      (!fused || result.fused_static_feature_rows % 64 != 0 ||
-       result.prompt_token_ids.size() > result.fused_static_feature_rows)) {
+  if (result.static_feature_rows != 0 &&
+      ((!fused && !merged) || result.static_feature_rows % 64 != 0 ||
+       result.prompt_token_ids.size() > result.static_feature_rows)) {
     throw std::invalid_argument(
-        "static fused carrier requires fused topology, N a multiple of 64, "
+        "static feature carrier requires fused or merged split topology, N a multiple of 64, "
         "and prompt_tokens <= N; re-export a larger carrier, do not truncate");
   }
   result.dflash_sync_window = ParseSize(
@@ -625,11 +630,15 @@ void WriteReport(
   const bool phase_resident =
       arguments.model_residency_policy == IncrementalModelResidencyPolicy::kPhaseResident;
   const bool fused_speculative_step = executor.fused_speculative_step();
+  const bool merged_prefill = executor.merged_prefill();
+  const char* static_prefix = merged_prefill ? "draft_static_" : "fused_static_";
   const char* resident_model_count =
-      (executor.unified_target_step() || fused_speculative_step)
+      (executor.unified_target_step() || fused_speculative_step || merged_prefill)
       ? "four"
       : "five";
-  const char* physical_topology = phase_resident
+  const char* physical_topology = merged_prefill
+      ? "merged-prefill-four-static-split-v1"
+      : phase_resident
       ? "split-prefill-head-four-artifact-phase-resident-fused-v1"
       : fused_speculative_step
       ? "split-prefill-head-four-resident-fused-speculative-step-v1"
@@ -766,9 +775,9 @@ void WriteReport(
               execution.draft_verify_feature_rows_elided !=
           execution.draft_verify_full_width_equivalent_rows ||
       execution.draft_verify_dynamic_gear_count !=
-          (execution.fused_static_feature_rows ? 0 : executor.proposal_width() + 1) ||
+          (execution.static_feature_rows ? 0 : executor.proposal_width() + 1) ||
       execution.draft_prefill_dynamic_gear_count !=
-          (execution.fused_static_feature_rows ? 0 : execution.prefill_staging_slots) ||
+          (execution.static_feature_rows ? 0 : execution.prefill_staging_slots) ||
       execution.draft_dynamic_gear_count !=
           execution.draft_verify_dynamic_gear_count +
               execution.draft_prefill_dynamic_gear_count) {
@@ -876,7 +885,7 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
-         << ",\"fused_static_feature_rows\":" << execution.fused_static_feature_rows
+         << ",\"" << static_prefix << "feature_rows\":" << execution.static_feature_rows
          << ",\"draft_dynamic_shape\":" << (execution.draft_dynamic_shape ? "true" : "false")
          << ",\"draft_om_dynamic_gear_count\":" << execution.draft_om_dynamic_gear_count
          << ",\"target_step_dynamic_shape\":" << (execution.target_step_dynamic_shape ? "true" : "false")
@@ -894,7 +903,9 @@ void WriteReport(
                 execution.carrier_device_bytes
          << ",\"load_policy\":\"";
   if (phase_resident) {
-    output << "phase-resident static fused; one live OM; synchronized unload before "
+    if (merged_prefill) output << "phase-resident static split; groups {prefill}, {decode1}, {Draft,Verify}; "
+                                 "synchronized unload before reusing weight arena; Draft and Verify stay hot";
+    else output << "phase-resident static fused; one live OM; synchronized unload before "
               "reusing max-sized workspace and weight arena; hot decode stays loaded";
   } else {
     output << resident_model_count << " aclmdlLoadFromFileWithMem sessions; "
@@ -909,6 +920,8 @@ void WriteReport(
          << ",\"model_loads\":" << residency.model_loads
          << ",\"model_unloads\":" << residency.model_unloads
          << ",\"model_switches\":" << residency.model_switches
+         << ",\"split_group_loads\":" << residency.split_group_loads
+         << ",\"current_resident_models\":" << residency.current_resident_models
          << ",\"model_switch_synchronizations\":" << residency.model_switch_synchronizations
          << ",\"model_switch_wall_ms\":" << residency.model_switch_wall_ms
          << ",\"timing_scope\":\"model switch synchronization/unload/load/ABI validation is included in generation and benchmark wall times; startup inspection is separate\"}"
@@ -965,7 +978,9 @@ void WriteReport(
             "table/count; all device subsegments start at 64-byte "
             "boundaries\","
          << "\"prefill_draft_policy\":\""
-         << (execution.fused_static_feature_rows
+         << (merged_prefill
+                 ? "Target feature slabs stay device-resident; final prompt completion executes one static Draft with zero-padded feature carrier"
+                 : execution.static_feature_rows
                  ? "Target feature slabs stay device-resident; a fixed-shape fused "
                    "transaction consumes the zero-padded prompt feature carrier"
                  : fused_speculative_step
@@ -980,9 +995,11 @@ void WriteReport(
          << "\"prefill_feature_arena_policy\":\"contiguous 64-row FP16 slabs "
             "with 64-byte-aligned starts and one terminal guard; no D2D "
             "compaction\","
-         << "\"prefill_target_lm_head_policy\":\"target-prefill body contains "
-            "no LM head; target-prefill-head executes exactly once after the "
-            "final physical prompt chunk\","
+         << "\"prefill_target_lm_head_policy\":\""
+         << (merged_prefill
+                 ? "target-prefill includes exact Top1/EOS per physical chunk; only final compact result is observed; no separate head OM"
+                 : "target-prefill body contains no LM head; target-prefill-head executes exactly once after the final physical prompt chunk")
+         << "\","
          << "\"device_suballocation_policy\":\"64-byte segment starts; "
             "ALIGN_UP(payload,32)+32 reserved span\","
          << "\"decode_carrier_policy\":\""
@@ -1002,7 +1019,9 @@ void WriteReport(
          << qwen35::dflash::IncrementalDraftFeaturePolicyName(
                 executor.draft_feature_policy())
          << "\",\"draft_feature_policy_description\":\""
-         << (execution.fused_static_feature_rows
+         << (merged_prefill
+                 ? "static Draft always binds fixed N; the feature policy selects the valid source carrier extent before zero padding, not the OM shape"
+                 : execution.static_feature_rows
                  ? "static fused always binds fixed N; the feature policy selects "
                    "the valid source carrier extent before zero padding, not the OM shape"
                  : executor.draft_feature_policy() ==
@@ -1235,7 +1254,7 @@ void WriteReport(
          << execution.prefill_feature_arena_bytes
          << ",\"draft_dynamic_gear_count\":"
          << execution.draft_dynamic_gear_count
-         << ",\"fused_static_feature_rows\":" << execution.fused_static_feature_rows
+         << ",\"" << static_prefix << "feature_rows\":" << execution.static_feature_rows
          << ",\"draft_dynamic_shape\":" << (execution.draft_dynamic_shape ? "true" : "false")
          << ",\"draft_om_dynamic_gear_count\":" << execution.draft_om_dynamic_gear_count
          << ",\"target_step_dynamic_shape\":" << (execution.target_step_dynamic_shape ? "true" : "false")
@@ -1250,10 +1269,10 @@ void WriteReport(
          << execution.target_step_zero_count_device_bytes
          << ",\"target_step_zero_count_bindings\":"
          << execution.target_step_zero_count_bindings
-         << ",\"fused_static_physical_feature_rows\":" << execution.fused_static_physical_feature_rows
-         << ",\"fused_static_source_feature_rows\":" << execution.fused_static_source_feature_rows
-         << ",\"fused_static_padding_rows\":" << execution.fused_static_padding_rows
-         << ",\"fused_static_padding_operations\":" << execution.fused_static_padding_operations
+         << ",\"" << static_prefix << "physical_feature_rows\":" << execution.static_physical_feature_rows
+         << ",\"" << static_prefix << "source_feature_rows\":" << execution.static_source_feature_rows
+         << ",\"" << static_prefix << "padding_rows\":" << execution.static_padding_rows
+         << ",\"" << static_prefix << "padding_operations\":" << execution.static_padding_operations
          << "},\"profile_model_execution_trace\":[";
   for (std::size_t index = 0; index < model_execution_trace.size(); ++index) {
     if (index != 0) output << ',';
@@ -1329,6 +1348,7 @@ int main(int argc, char** argv) {
         !fused_speculative_step && arguments.models[2].path.empty();
     const char* topology_count =
         fused_speculative_step ? "four-fused"
+                               : arguments.models[1].path.empty() ? "four-static-split"
                                : (unified_target_step ? "four" : "five");
     PrintProgress(
         arguments.progress,
@@ -1379,11 +1399,12 @@ int main(int argc, char** argv) {
         arguments.draft_feature_policy,
         arguments.model_residency_policy);
     const auto load_end = std::chrono::steady_clock::now();
-    const std::size_t static_rows = executor.execution_stats().fused_static_feature_rows;
-    if (static_rows != arguments.fused_static_feature_rows) {
+    const std::size_t static_rows = executor.execution_stats().static_feature_rows;
+    if (static_rows != arguments.static_feature_rows) {
       throw std::runtime_error(
-          "loaded fused OM shape differs from --fused-static-feature-rows; "
-          "static export/manifest/runner must agree");
+          std::string("loaded static OM shape differs from ") +
+          (executor.merged_prefill() ? "--draft-static-feature-rows" : "--fused-static-feature-rows") +
+          "; static export/manifest/runner must agree");
     }
     executor.ValidateRequest(arguments.prompt_token_ids.size(), arguments.max_new_tokens);
     const double load_ms = std::chrono::duration<double, std::milli>(
