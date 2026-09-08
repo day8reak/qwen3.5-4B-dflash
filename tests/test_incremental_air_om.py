@@ -547,6 +547,46 @@ def test_undefined_gdr_padding_cannot_pollute_later_kv():
     assert all(torch.isfinite(t).all() for t in outputs)
 
 
+@pytest.mark.parametrize("rows,start,valid", [
+    (64, 0, 1), (64, 63, 64), (64, 2049, 7), (64, 4083, 13),
+    (16, 63, 1), (16, 2049, 16), (16, 4091, 5),
+    (1, 2049, 1), (1, 4095, 1),
+])
+def test_attention_lengths_and_mask_preserve_runtime_prefix(rows, start, valid):
+    # Positions beyond 2048 include integers FP16 cannot represent exactly.
+    # Lengths stay in integer inputs; FP16 carries only the exact 0/-inf mask.
+    capacity = 4160
+    target = TinyTarget().eval()
+    target.kv_cache_max_len = capacity
+    base = target.dflash_execution_model.language_model.layers[1].self_attn
+    base.kv_max_len = capacity
+    base.block_table = torch.arange(capacity // 64, dtype=torch.int32)[None]
+    calls = []
+    def attention(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros_like(kwargs["query"])
+    graph = TargetRowsGraph(target, rows=rows, verify=rows == 16,
+                            feature_layers=(), gdr=gdr, attention=attention, rotary=rotary)
+    conv, recurrent = target._fresh_hybrid_cache(1)[0]
+    key, value = (torch.zeros(capacity // 64, 1, 64, 16).half() for _ in range(2))
+    with torch.inference_mode():
+        graph(torch.zeros(1, rows, dtype=torch.long), torch.tensor([start]),
+              torch.tensor([valid], dtype=torch.int16), conv, recurrent, key, value)
+    assert len(calls) == 1
+    call = calls[0]
+    assert call.get("pse_shift") is None
+    assert call["all_seq_lengths_q"] == [capacity]
+    assert call["actual_seq_lengths_q"] == [rows]
+    assert call["actual_seq_lengths_kv"] == [capacity]
+    mask = call["atten_mask"]
+    assert mask.dtype == torch.float16 and mask.shape == (1, 1, rows, capacity)
+    for row in range(rows):
+        visible_end = start + min(row + 1, valid)
+        assert torch.equal(mask[0, 0, row, :visible_end], torch.zeros(visible_end).half())
+        assert torch.isneginf(mask[0, 0, row, visible_end:]).all()
+    assert call["block_table"].dtype == torch.int32
+
+
 def test_draft_graph_exports_with_dynamic_context_length():
     spec = next(s for s in specs() if s.name == "draft")
     with torch.inference_mode():
@@ -624,7 +664,7 @@ def test_fake_conversion_preserves_tensor_abi_and_hashes(chunk_bundle, tmp_path)
         write_incremental_plan(chunk_bundle, tmp_path / "bad-plan.txt")
 
 
-@pytest.mark.parametrize("failure", ["empty", "duplicate", "invalid-name"])
+@pytest.mark.parametrize("failure", ["empty", "duplicate", "invalid-name", "attention-abi", "missing-attention-abi"])
 def test_compiler_rejects_invalid_graph_sets_before_atc(chunk_bundle, failure):
     from qwen35_dflash.ascend310p.compiler import compile_air_bundle
 
@@ -635,8 +675,15 @@ def test_compiler_rejects_invalid_graph_sets_before_atc(chunk_bundle, failure):
         air["graphs"] = []
     elif failure == "duplicate":
         air["graphs"].append(air["graphs"][0])
-    else:
+    elif failure == "invalid-name":
         air["graphs"][0]["name"] = "../escape"
+    else:
+        for graph in air["graphs"]:
+            contract = graph["metadata"]["incremental_contract"]
+            if failure == "attention-abi":
+                contract["attention_export"] = "receiver_adn_fused_infer_attention_pse_shift_int64_logical_end"
+            else:
+                contract.pop("attention_export", None)
     air_path.write_text(json.dumps(air))
     calls = []
     with pytest.raises(ValueError):

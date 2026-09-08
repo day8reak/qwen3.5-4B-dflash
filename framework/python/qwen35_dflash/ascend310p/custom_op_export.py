@@ -437,6 +437,18 @@ def _first_tensor(values: Sequence[torch.Tensor], name: str) -> torch.Tensor:
     return values[0]
 
 
+def _validate_adn_pse_dtype(pse_shift: Any, ge_float16: Any = None) -> None:
+    if pse_shift is None:
+        return
+    dtype = getattr(pse_shift, "dtype", None)
+    if dtype != torch.float16 and (ge_float16 is None or dtype != ge_float16):
+        raise TypeError(
+            "AdnFusedInferAttention pse_shift is an optional FP16 bias, not a "
+            "sequence length; pass lengths via all_seq_lengths_q and leave "
+            f"pse_shift absent for Qwen3.5 (got {dtype})"
+        )
+
+
 def _fake_adn_fused_infer_attention(
     query: torch.Tensor,
     key: Sequence[torch.Tensor],
@@ -465,6 +477,7 @@ def _fake_adn_fused_infer_attention(
 ) -> torch.Tensor:
     """Mirror the receiver AdnFusedInferAttention output metadata."""
 
+    _validate_adn_pse_dtype(pse_shift)
     del (
         pse_shift,
         atten_mask,
@@ -1438,6 +1451,9 @@ def _register_framework_converter(
             meta_outputs: Any = None,
         ) -> Any:
             del meta_outputs
+            _validate_adn_pse_dtype(
+                pse_shift, getattr(getattr(ge_api, "DataType", None), "DT_FLOAT16", None)
+            )
             all_q = _ge_int64_tensor(ge_api, all_seq_lengths_q)
             actual_q = _ge_int64_tensor(ge_api, actual_seq_lengths_q)
             actual_kv = _ge_int64_tensor(ge_api, actual_seq_lengths_kv)

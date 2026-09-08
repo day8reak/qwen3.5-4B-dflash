@@ -314,6 +314,10 @@ manifest 保存有序输入/输出的 dtype、shape、文件 hash、算子预检
 verify 接受长度使用 INT32 `Cumsum → Equal → ReduceSum`，最后输出 INT64 接受数；
 短块的 padding 不参与接受判断，第二次 GDR 提交 `accepted_count+1` 行。
 缓存写入索引与 Draft 的 KV head 复制使用静态 `repeat/Tile`。
+Target attention 使用 `all_seq_lengths_q=[C+64]`、
+`actual_seq_lengths_q=[当前物理行数]` 和 `actual_seq_lengths_kv=[C+64]`；
+这三个前端长度列表分别映射为 INT64 GE 输入。运行时因果 mask 同时排除
+`start_position+valid_rows` 以后的缓存位置，`pse_shift` 留空。
 这些路径不调用 `unfold`、`index_copy`、`amin`、`min(dim=...)` 或 `cumprod`。
 若日志以 `ERR03007 GRAPH feature not supported` 结束，
 查看完整日志中第一条 `NotImplementedError` 或 converter 异常及其对应的 `Original traceback`，
@@ -322,6 +326,8 @@ verify 接受长度使用 INT32 `Cumsum → Equal → ReduceSum`，最后输出 
 导出失败后，使用新的空 bundle 目录重试，例如将 `--bundle-dir` 改为
 `"$AI_RUN_DIR/artifacts-custom-ops"`；后续 `--air-manifest` 和
 `--deployment-manifest` 的路径也须指向该目录。导出器不会覆盖非空目录。
+如果 ATC 报 `pse_shift DT_INT64`，需要更新源码并重新导出 AIR；只重新编译已有
+AIR 无法改变错误的输入映射。编译器会提前拒绝使用整数 PSE 策略的增量 bundle。
 
 ## 9. 将 AIR 转为 OM
 
@@ -577,7 +583,7 @@ verify 的 `valid_rows=1` 继续生成。这个 fallback 仍是 16 行物理图�
 | wrapper 导入 | receiver 文件、依赖及第 3 步的模块搜索配置 |
 | SOURCE_LOCK/input manifest | 源码、模型和量化数据是否与锁定内容一致 |
 | TorchAir graph break/unsupported op | 首个失败算子的 schema、Fake/Meta、converter 和 GE 注册 |
-| fused attention 导出 | `pse_shift=INT64[1] logical_end` 的接收方导出支持 |
+| fused attention 导出 | 长度专用 INT64 输入、空 `pse_shift`、运行时因果及有效前缀 mask |
 | ATC 编译 | `log/compile-om.log`、具体不支持节点及算子包 |
 | C++ I/O 不匹配 | OM 和计划是否配套，实际 dtype/shape/字节数是否匹配 |
 | token 不一致 | 保留首个差异轮次、接受数、有效行数、GDN/conv/KV 状态；停止性能比较 |

@@ -154,8 +154,25 @@ matmul 输出为 FP16。专用前端仅在工厂启用的 AIR 捕获期间生效
 调用不变。RMSNorm 的两个输出分别为同 input shape/dtype 的 Tensor，以及
 `[*input.shape[:-1],1] FP32` 的 rstd。
 
-GDR 的 `effective_length: INT16[1]` 表示本次有效行数；
-attention 的 `pse_shift: INT64[1]` 表示 logical end。GDR GE 输入中
+GDR 的 `effective_length: INT16[1]` 表示本次有效行数。
+Target attention 的三个长度专用输入分别是：
+
+| 前端参数（SymInt[]） | GE Tensor（INT64[1]）内容 |
+| --- | --- |
+| `all_seq_lengths_q` | 增量静态图为物理缓存容量 `C+64` |
+| `actual_seq_lengths_q` | 当前物理行数：prefill 64、decode 1、verify 16 |
+| `actual_seq_lengths_kv` | 物理缓存容量 `C+64` |
+
+运行时 mask 只允许 `key_position <= query_position` 且
+`key_position < start_position+valid_rows` 的位置参与 attention。
+位置和长度保持整数，FP16 mask 只表示精确的 0 和负无穷；有效前缀由 mask 限定，
+不能从固定物理长度推断真实已提交长度。该策略仍需通过目标机普通生成和 DFlash
+严格 token 对齐检查。
+
+`pse_shift` 是可选的 FP16 attention bias，本模型不传该输入；不可用它携带整数长度，
+也不可把长度转成 FP16 后传入。Fake/GE converter 会拒绝非 FP16 的 PSE。
+完整前缀工厂同样通过 `all_seq_lengths_q` 传递其固定序列长度。
+GDR GE 输入中
 `initial_state` 位于 `effective_length` 前；converter 显式按 GE 名称映射，
 不把 PyTorch 的参数顺序直接传给 GE。已配置的 vendor 环境需要通过 GDR/attention
 prototype 检查。
@@ -165,6 +182,8 @@ prototype 检查。
 内置 converter 以 GE 节点审计为准；框架 converter 同时检查调用次数。
 解析同时支持 GE dump 的 `op:` 和 `type:` 字段，避免重复计数。
 编译前检查整个图集合的审计，缺少任意声明的算子或 SoftplusV2 记录都会拒绝进入 ATC。
+增量 bundle 还会检查 attention 导出策略；缺少该策略或使用整数 PSE 的 bundle
+需要重新导出 AIR，不能只重新运行 ATC。
 
 CPU、fixture 或 fake ACL 检查不证明目标环境的导出和算子数值正确。目标机需完成真实
 TorchAir/ATC、自定义算子、AscendCL 和 token 精度检查。

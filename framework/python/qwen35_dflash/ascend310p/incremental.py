@@ -14,6 +14,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .contracts import AirGraphSpec, CustomOpExportSpec
+from .incremental_plan import ATTENTION_EXPORT_POLICY
 
 CHUNK_ABI = "qwen35-dflash-chunk-v1"
 
@@ -100,7 +101,7 @@ class AirTargetAttention(nn.Module):
         super().__init__()
         self.base, self.operation, self.apply_rotary = base, operation, rotary
 
-    def forward(self, x, key_cache, value_cache, positions, logical_end, mask):
+    def forward(self, x, key_cache, value_cache, positions, mask):
         base = self.base
         shape = x.shape[:-1]
         view = (*shape, -1, base.head_dim)
@@ -125,6 +126,11 @@ class AirTargetAttention(nn.Module):
             query=query_nz,
             key=[key_cache],
             value=[value_cache],
+            # The receiver frontend exposes lengths as SymInt[], and GE puts
+            # them in INT64 all_seq_lengths_q. Follow the quant AIR static
+            # route: use physical capacity and the runtime causal/prefix mask.
+            # pse_shift is an optional FP16 bias, never a sequence-length slot.
+            all_seq_lengths_q=[base.kv_max_len],
             actual_seq_lengths_q=[shape[1]],
             actual_seq_lengths_kv=[base.kv_max_len],
             block_table=base.block_table,
@@ -135,7 +141,6 @@ class AirTargetAttention(nn.Module):
             scale_value=base.scaling,
             inner_precise=2,
             atten_mask=mask.to(torch.float16),
-            pse_shift=logical_end,
         )
         output = (
             base.transform_nz_2_nd(output.reshape(query_shape))
@@ -247,7 +252,9 @@ class TargetRowsGraph(nn.Module):
         )
         logical_end = start_position + valid_rows.to(torch.long)
         columns = torch.arange(self.cache_capacity, device=input_ids.device)
-        visible = columns[None, :] <= positions[:, None]
+        visible = (columns[None, :] <= positions[:, None]) & (
+            columns[None, :] < logical_end
+        )
         mask = torch.where(visible, 0.0, float("-inf"))[None, None]
         hidden = self.embedding(input_ids).to(torch.float16)
         row_valid = (
@@ -269,7 +276,6 @@ class TargetRowsGraph(nn.Module):
                     state[2 * index],
                     state[2 * index + 1],
                     positions,
-                    logical_end,
                     mask,
                 )
                 next_state.extend((key, value))
@@ -567,7 +573,7 @@ def incremental_graph_specs(
         "vocab_size": draft.config.vocab_size,
         "feature_width": draft.config.feature_size,
         "state_policy": "in-graph-acceptance-two-pass-gdr-atomic-fp16-state-output",
-        "attention_export": "receiver_adn_fused_infer_attention_pse_shift_int64_logical_end",
+        "attention_export": ATTENTION_EXPORT_POLICY,
         "single_row_policy": "ordinary_decode1_chunk1; speculative_fallback_verify16_valid1",
         "commit_capsules": "internal_to_target_verify_not_external_OM_IO",
     }

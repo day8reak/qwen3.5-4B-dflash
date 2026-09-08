@@ -186,7 +186,11 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
             assert graph["standard_op_overrides"][0]["ge_node_occurrences"] == 1
             attention = next(node for node in nodes
                              if str(node.target) == "npu.adn_fused_infer_attention.default")
-            assert attention.kwargs["pse_shift"].meta["val"].dtype == torch.int64
+            assert attention.kwargs.get("pse_shift") is None
+            capacity = graph["metadata"]["incremental_contract"]["cache_capacity"]
+            assert attention.kwargs["all_seq_lengths_q"] == [capacity]
+            assert attention.kwargs["actual_seq_lengths_q"] == [rows]
+            assert attention.kwargs["actual_seq_lengths_kv"] == [capacity]
             quant_nodes = [node for node in nodes if str(node.target) ==
                            "qwen35_dflash.npu_quant_matmul_v4444.default"]
             assert len(quant_nodes) == 13
@@ -1423,13 +1427,12 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         pertoken_scale=pertoken_scale,
         output_dtype=torch.float16,
     )
-    attention_mask, block_table, logical_end = object(), object(), object()
+    attention_mask, block_table = object(), object()
     torchair.converters[operations["adn_fused_infer_attention"]](
         placeholder,
         [placeholder],
         [placeholder],
         atten_mask=attention_mask,
-        pse_shift=logical_end,
         all_seq_lengths_q=[5],
         actual_seq_lengths_q=[3],
         actual_seq_lengths_kv=[64],
@@ -1539,7 +1542,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
             "query": placeholder,
             "key": [placeholder],
             "value": [placeholder],
-            "pse_shift": logical_end,
+            "pse_shift": None,
             "atten_mask": attention_mask,
             "actual_seq_lengths_q": ("const", [3], "DT_INT64"),
             "actual_seq_lengths_kv": ("const", [64], "DT_INT64"),
@@ -1566,3 +1569,69 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
         },
     }
     assert attention_session.converter_mode == "named-adn-attention-v1"
+
+
+@pytest.mark.parametrize("dtype", [torch.int16, torch.int32, torch.int64, torch.float32])
+def test_attention_rejects_non_fp16_pse_before_ge(dtype):
+    from qwen35_dflash.ascend310p.custom_op_export import _fake_adn_fused_infer_attention
+
+    operation = _ensure_target_test_schema("adn_fused_infer_attention")
+    ta = _FakeTorchAir()
+    session = prepare_custom_op_export(CustomOpExportSpec(
+        ADN_FUSED_INFER_ATTENTION_TORCH_OP, ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE), ta)
+    query = torch.empty(1, 1, 3, 16, device="meta", dtype=torch.float16)
+    pse = torch.empty(1, device="meta", dtype=dtype)
+    with pytest.raises(TypeError, match="pass lengths via all_seq_lengths_q"):
+        _fake_adn_fused_infer_attention(query, [query], [query], pse_shift=pse)
+    with pytest.raises(TypeError, match="pass lengths via all_seq_lengths_q"):
+        ta.converters[operation](query, [query], [query], pse_shift=pse)
+    assert session.converter_calls == 0 and not ta.ge.calls
+
+
+def test_attention_converter_preserves_optional_fp16_bias_and_ge_dtype_guard():
+    from types import SimpleNamespace
+
+    operation = _ensure_target_test_schema("adn_fused_infer_attention")
+    ta = _FakeTorchAir()
+    prepare_custom_op_export(CustomOpExportSpec(
+        ADN_FUSED_INFER_ATTENTION_TORCH_OP, ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE), ta)
+    query, bias = object(), SimpleNamespace(dtype=ta.ge.DataType.DT_FLOAT16)
+    ta.converters[operation](query, [query], [query], pse_shift=bias, all_seq_lengths_q=[192])
+    assert ta.ge.calls[-1][2]["inputs"]["pse_shift"] is bias
+    assert ta.ge.calls[-1][2]["inputs"]["all_seq_lengths_q"] == ("const", [192], "DT_INT64")
+    with pytest.raises(TypeError, match="pass lengths via all_seq_lengths_q"):
+        ta.converters[operation](query, [query], [query],
+                                 pse_shift=SimpleNamespace(dtype=ta.ge.DataType.DT_INT64))
+    assert len(ta.ge.calls) == 1
+
+
+@pytest.mark.parametrize("module_name", ["modeling_qwen3_5_hiai_nd", "modeling_qwen3_5_hiai_nd_dflash_rollback"])
+@pytest.mark.parametrize("method", ["forward", "forward1"])
+@pytest.mark.parametrize("export_flag", [False, True])
+def test_receiver_attention_call_uses_sequence_length_input(monkeypatch, module_name, method, export_flag):
+    from test_incremental_air_om import Attention
+
+    calls = []
+    module = ModuleType("torch_npu")
+    module.__spec__ = importlib.machinery.ModuleSpec("torch_npu", loader=None)
+    def attention(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros_like(kwargs["query"])
+    module.adn_fused_infer_attention = attention
+    monkeypatch.setitem(sys.modules, "torch_npu", module)
+    modeling = importlib.import_module("models." + module_name)
+    monkeypatch.setattr(modeling, "torch_npu", module)
+    monkeypatch.setattr(modeling, "apply_rotary_pos_emb", lambda q, k, *args: (q, k))
+    base = Attention().half().eval()
+    base.update = lambda new, positions, cache: cache
+    base.kv_block_table = [[0]]
+    cache = (torch.zeros(3, 1, 64, 16).half(),) * 2 if method == "forward" else None
+    with torch.inference_mode():
+        getattr(modeling.Qwen3_5Attention, method)(
+            base, torch.zeros(1, 64, 32).half(),
+            attention_mask=torch.zeros(1, 1, 64, 192).half(),
+            position_ids=torch.arange(64)[None], past_key_values=cache,
+            cache_position=torch.arange(64), allQLen=[192], export_flag=export_flag)
+    assert len(calls) == 1
+    assert calls[0].get("pse_shift") is None
+    assert calls[0]["all_seq_lengths_q"] == [192]

@@ -8,7 +8,7 @@
     "canonical_package": "models.dflash_v1",
     "canonical_source_directory": "models/dflash_v1",
     "hiai_source_file": "models/modeling_qwen3_5_hiai_nd.py",
-    "hiai_source_sha256": "f9aa906f08132dfd956c4de7f8e6ee353dfa78a483e994264657476a0dc8bf8d",
+    "hiai_source_sha256": "042b11bb162114aa77ced36b2d178349fc90c3307b373230bd9e6a9106f3cc2d",
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
@@ -125,11 +125,11 @@
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
     "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
     "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
-    "hiai_modeling_sha256": "19cfde2e03297b6e882efc3b4acda94abe0b2f34dc3a6c03fd65387993bcaa31",
+    "hiai_modeling_sha256": "0f12ab5efc6635fbaf8c718f664cca5dd116d57507bc9130d3c36ce56f77201e",
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
     "wrapper_sha256": "fb634dbf46880820df462dfa728d18aab0cc56be690ba6de0ad186083a57c53c",
     "shared_qlinear_source_file": "models/modeling_qwen3_5_hiai_nd.py",
-    "shared_qlinear_source_sha256": "f9aa906f08132dfd956c4de7f8e6ee353dfa78a483e994264657476a0dc8bf8d",
+    "shared_qlinear_source_sha256": "042b11bb162114aa77ced36b2d178349fc90c3307b373230bd9e6a9106f3cc2d",
     "policy": "persistent ordinary and DFlash sessions; prefill uses the original multi-token GDR route with 64-row real-token chunks, INT16[B] call-local effective length, and no padding commit; only the final real prompt row executes the LM head; T=K+1 verification and accepted+1 scalar state commit both reuse the original chunk GDR from the same round-start state and do not require GDR-MTP; optional Target W8A8 reuses the original QLinear while the Draft stays FP16; incremental Draft KV cache; no historical-prefix replay during verify; strict-greedy zero token mismatch"
   },
   "npu_benchmark": {
@@ -157,15 +157,15 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "3570845a16cc4f0df8fed35fd8497b7076724dd8fc3d0ea129cb66ba518bfaf3"
+        "source_sha256": "d04e0e1038bd4de54120bbebdd0924cdb2f00fc387636dc40fd8622ed464d3c2"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "b18fc13ef8afe03588155d6ed1174a066b1707cec140ca824f19fcba5dbfb013"
+        "source_sha256": "c0ed48fb4c670b8210f7fc9359331e54c30952e9e235933faa75dff19e1149e1"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
-        "source_sha256": "7e97b19cadeca96e6aa44fcd9c6c18e2e53f27b5ad9ec1c19bf57ea2cf3a3831"
+        "source_sha256": "f81a90f3c1c7dd1b643ab632ca61b802896a33ae06953478ee5df33f94c44ed0"
       },
       {
         "source_file": "framework/README.md",
@@ -177,7 +177,7 @@
       },
       {
         "source_file": "framework/abi/dflash-chunk-v1.json",
-        "source_sha256": "4c2462763426dbe41e276711185e7a2ce84f8010ff6fca869aad8bd1fd701ed6"
+        "source_sha256": "0c4884eda09cda8feda9f167dd43416aaad6d9a1b3502eda7c92a9a445eeae51"
       },
       {
         "source_file": "framework/abi/dflash-deployment-v1.json",
@@ -221,7 +221,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/custom_op_export.py",
-        "source_sha256": "988663c43260dc5937710014f13d42f9ea22bbccae13746646534add871c78a0"
+        "source_sha256": "913d49885bb3fac921a2a7ce854bbafbb7ca9b1d2d66a839967f9632e6eab8c1"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/exporter.py",
@@ -233,11 +233,11 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/incremental.py",
-        "source_sha256": "ad3fb9dc3419d00c68350cfa62fb31c7b73d16a2799ce53ff53d642d9b42446a"
+        "source_sha256": "753f5b563f0c802bd683aa805ebf9794a33ca2ea5541509d0ccdbe9d8e27d13b"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/incremental_plan.py",
-        "source_sha256": "3466af953bf63541a75290b8e8146dfc975d667b51ebc7ae53c46b4a01dd1750"
+        "source_sha256": "9ab4b74931215aafd68e9bd6200618e95c7bff0bc89950309e7aa9645a277df8"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/input_manifest.py",
@@ -349,11 +349,11 @@
       },
       {
         "source_file": "tests/test_custom_op_export.py",
-        "source_sha256": "260310df99365a9ad5372a84ac9f2496dfd86b05a6d4fe999ac08481eb6e2f72"
+        "source_sha256": "1fbdb056bb767153e1a6bf12e0096bd30190b08647d7d0ec3a91791c7dfd4778"
       },
       {
         "source_file": "tests/test_incremental_air_om.py",
-        "source_sha256": "17d607843ed0a5717af5bd4d2f5cb05eacf4d9fbafc54fbde2316c88f5280b02"
+        "source_sha256": "b6a17f118fc7771b869bca9f4c70b2918afbc197ebc77046f69566e45ee58e76"
       },
       {
         "source_file": "tests/test_msprof_stage_script.py",

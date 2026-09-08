@@ -105,7 +105,9 @@
         {
           "torch_target": "npu.adn_fused_infer_attention.default",
           "ge_op_type": "AdnFusedInferAttention",
-          "pse_shift": "INT64[1] logical_end"
+          "pse_shift": "absent; reserved for optional FP16 bias",
+          "all_seq_lengths_q": "SymInt[] frontend -> INT64 GE length input; static cache capacity for incremental graphs",
+          "logical_prefix": "runtime causal mask and key_position < start_position + valid_rows"
         },
         {
           "torch_target": "qwen35_dflash.npu_cache_update.default",
@@ -197,7 +199,9 @@
       {
         "torch_target": "npu.adn_fused_infer_attention.default",
         "ge_op_type": "AdnFusedInferAttention",
-        "pse_shift": "INT64[1] logical_end"
+        "pse_shift": "absent; reserved for optional FP16 bias",
+        "all_seq_lengths_q": "SymInt[] frontend -> INT64 GE length input; static cache capacity for incremental graphs",
+        "logical_prefix": "runtime causal mask and key_position < start_position + valid_rows"
       }
     ],
     "draft_custom_operators": []

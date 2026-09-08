@@ -8,6 +8,7 @@ from pathlib import Path
 from .utils import contained_path, load_json_object, require_run_output, sha256_file
 
 ABI = "qwen35-dflash-chunk-v1"
+ATTENTION_EXPORT_POLICY = "receiver_adn_all_seq_lengths_q_static_capacity_causal_mask"
 ROLES = ("target_prefill", "target_decode", "target_verify", "draft")
 DTYPES = {"int64": 8, "int16": 2, "float16": 2, "float32": 4}
 
@@ -100,6 +101,11 @@ def validate_incremental_bundle(graphs):
     c = candidates[0]["metadata"]["incremental_contract"]
     if c.get("abi") != ABI or c.get("block_size") != 16 or c.get("prefill_rows") != 64:
         raise ValueError("unsupported incremental ABI")
+    if c.get("attention_export") != ATTENTION_EXPORT_POLICY:
+        raise ValueError(
+            "unsupported attention export ABI: regenerate AIR with "
+            "all_seq_lengths_q and no integer pse_shift in a new bundle directory"
+        )
     capacity = c.get("capacity")
     if (
         type(capacity) is not int
