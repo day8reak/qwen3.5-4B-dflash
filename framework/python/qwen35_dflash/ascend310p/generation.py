@@ -57,6 +57,11 @@ def tokenize_prompt(tokenizer: Any, prompt: str, *, chat: bool) -> list[int]:
         )
     else:
         values = tokenizer.encode(prompt, add_special_tokens=True)
+    # Chat templates may return BatchEncoding, a Mapping rather than a dict.
+    if isinstance(values, Mapping):
+        if "input_ids" not in values:
+            raise ValueError("tokenizer output is missing input_ids")
+        values = values["input_ids"]
     if hasattr(values, "tolist"):
         values = values.tolist()
     if values and isinstance(values[0], list):

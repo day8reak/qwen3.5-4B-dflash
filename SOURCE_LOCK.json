@@ -229,7 +229,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/generation.py",
-        "source_sha256": "298df196d4faac1c5b40f2653775b658c49a483b97dfa6bd985c66b0f35325ab"
+        "source_sha256": "fcffbf273c9b693ce42c1e5e9f3c5c8ac1557d50e7a8e63e10cd0b454dd6ea3d"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/incremental.py",
@@ -350,6 +350,10 @@
       {
         "source_file": "tests/test_msprof_stage_script.py",
         "source_sha256": "7dc9ecf9925fe5a6040059a1b35c37825e6f4e5b97917b400724ec2dcb0cfc3a"
+      },
+      {
+        "source_file": "tests/test_prompt_tokenization.py",
+        "source_sha256": "1c29c34bf219d5cf8fac5939195ed06fef0517b39e7580b1fe3d39e85310548e"
       },
       {
         "source_file": "tests/test_quant_air_om_framework.py",
