@@ -4,6 +4,9 @@
 [静态 fused OM 基线](STATIC_FUSED_OM_BASELINE.md) 使用固定 N=64；
 静态真机通过后再恢复本文的原动态候选。静态开关是
 `fused_static_feature_rows`，不是 `example_sequence_length`。
+v39 同时修复 Draft FP16 KV 头复制的 BroadcastTo auto-tiling 路径，
+见静态基线文档中的 KV 复制门禁和 manifest 核验。它与 v37 的 INT64 Scatter 索引修复不同，
+需要新源码导出 AIR，再编译 OM；不能仅按同名 `BroadcastTo_1` 判断故障是否相同。
 
 ## 1. 目标和边界
 

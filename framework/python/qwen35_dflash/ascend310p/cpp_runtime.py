@@ -2035,6 +2035,15 @@ def run_cpp_pair(
             )
         if fused_static_shape is not None:
             validate_static_request(fused_static_shape, len(tokens), max_new_tokens)
+        if "fused-speculative-step" in resolved_incremental:
+            fused_path, _, fused_record = resolved_incremental["fused-speculative-step"]
+            mode = "static" if fused_static_shape is not None else "dynamic"
+            rows = fused_static_shape["feature_rows"] if fused_static_shape is not None else "dynamic"
+            _progress(
+                progress,
+                f"stage=fused-manifest mode={mode} feature_rows={rows} "
+                f"om={fused_path} sha256={fused_record['sha256']}",
+            )
         artifacts = {
             role: str(record["sha256"])
             for role, (_, _, record) in resolved_incremental.items()

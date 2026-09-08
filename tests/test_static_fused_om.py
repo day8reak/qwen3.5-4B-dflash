@@ -235,7 +235,7 @@ def test_static_contract_survives_compile_to_runtime_manifest(tmp_path, monkeypa
     (17, 32, "exit 96"), (65, 1, "prompt tokens"), (64, 129, "free KV slots"),
 ])
 def test_static_control_plane_forwards_explicit_carrier_and_rejects_before_launch(
-    tmp_path, monkeypatch, prompt_rows, max_tokens, error,
+    tmp_path, monkeypatch, capsys, prompt_rows, max_tokens, error,
 ):
     deployment, _ = _compile_static_fixture(tmp_path, monkeypatch)
     commands = []
@@ -261,9 +261,12 @@ def test_static_control_plane_forwards_explicit_carrier_and_rejects_before_launc
             prompt_token_ids=[10] * prompt_rows, eos_token_ids=[], device_id=0,
             max_new_tokens=max_tokens, max_draft_tokens=15,
             raw_output=tmp_path / "raw.json", log_output=tmp_path / "runner.log",
-            execute=execute, progress=False,
+            execute=execute, progress=True,
         )
     if prompt_rows == 17:
+        stderr = capsys.readouterr().err
+        assert "stage=fused-manifest mode=static feature_rows=64" in stderr
+        assert "sha256=" in stderr
         command, = commands
         assert command[command.index("--fused-static-feature-rows") + 1] == "64"
         for role in _FUSED_SPECULATIVE_STEP_GRAPH_ABI:

@@ -405,6 +405,7 @@ class _FakeDraft(nn.Module):
             block_size=16,
             mask_token_id=99,
             num_key_value_heads=1,
+            num_key_value_groups=1,
             head_dim=2,
             feature_size=4,
         )
@@ -687,6 +688,11 @@ def test_five_physical_specs_freeze_binding_order_and_reuse_state_examples() -> 
     assert specs[3].dynamic is True
     assert specs[3].metadata["draft_cache_index_policy"] == "static-repeat-tile-v1"
     assert specs[3].metadata["draft_cache_index_layers"] == len(draft.layers)
+    assert specs[3].metadata["draft_kv_repeat_policy"] == "gqa-head-repeat-tile-v1"
+    assert specs[3].metadata["draft_kv_repeat_layers"] == len(draft.layers)
+    assert specs[3].metadata["draft_kv_repeat_groups"] == 1
+    assert all("draft_kv_repeat_policy" not in item.metadata
+               for item in specs if item.role != "draft-propose")
     assert all("draft_cache_index_policy" not in item.metadata
                for item in specs if item.role != "draft-propose")
     assert specs[3].input_dim_gears == {
@@ -789,6 +795,9 @@ def test_four_physical_specs_fuse_draft_and_verify_without_external_carrier() ->
     fused = specs[-1]
     assert fused.metadata["draft_cache_index_policy"] == "static-repeat-tile-v1"
     assert fused.metadata["draft_cache_index_layers"] == 2
+    assert fused.metadata["draft_kv_repeat_policy"] == "gqa-head-repeat-tile-v1"
+    assert fused.metadata["draft_kv_repeat_layers"] == 2
+    assert all("draft_kv_repeat_policy" not in item.metadata for item in specs[:-1])
     assert isinstance(fused.model, FusedSpeculativeStepStateGraph)
     assert fused.dynamic is True
     assert fused.input_dim_gears == {

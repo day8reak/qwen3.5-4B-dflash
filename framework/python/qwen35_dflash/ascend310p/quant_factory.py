@@ -250,9 +250,12 @@ def _repeat_kv(states: Tensor, repetitions: int) -> Tensor:
     if repetitions == 1:
         return states
     batch, heads, sequence, head_dim = states.shape
-    expanded = states[:, :, None, :, :].expand(
-        batch, heads, repetitions, sequence, head_dim
-    )
+    # Keep each KV head's copies adjacent (GQA), but materialize the singleton
+    # group axis with Tile rather than BroadcastTo. The receiver's FP16
+    # [1,8,1,2064,128] -> [1,8,4,2064,128] BroadcastTo failed constant-shape
+    # auto-tiling even though these shapes satisfy broadcasting rules.
+    # Repeating the original head axis would produce the wrong head order.
+    expanded = states.unsqueeze(2).repeat(1, 1, repetitions, 1, 1)
     return expanded.reshape(batch, heads * repetitions, sequence, head_dim)
 
 

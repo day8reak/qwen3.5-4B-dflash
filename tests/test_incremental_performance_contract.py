@@ -335,9 +335,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 38
+    assert framework_lock["schema_version"] == 39
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v38"
+        "qwen3.5-4b-quant-air-om-ascendcl-v39"
     )
     assert deployment["schema_version"] == 2
     assert performance["schema_version"] == 6
@@ -369,6 +369,10 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert "independent of logical counts" in draft_index["physical_rows"]
     assert "no index_copy substitution" in draft_index["semantics"]
     assert "before ATC" in framework_lock["compiler"]["draft_cache_index_gate"]
+    kv_repeat = framework_lock["graph"]["draft_kv_head_repeat"]
+    assert kv_repeat["policy"] == "gqa-head-repeat-tile-v1"
+    assert "adjacent copies" in kv_repeat["semantics"]
+    assert "before ATC" in framework_lock["compiler"]["draft_kv_repeat_gate"]
     assert "Data.index == runtime input index" in framework_lock["compiler"][
         "dynamic_external_weight_mapping_gate"
     ]

@@ -62,7 +62,10 @@ def _nodes(text: str) -> dict[str, dict[str, Any]]:
         name = names[0]
         if name in nodes:
             raise ValueError(f"Draft cache index audit found duplicate node {name!r}")
-        nodes[name] = {"type": kinds[0], "inputs": fields.get("input", [])}
+        nodes[name] = {
+            "type": kinds[0], "inputs": fields.get("input", []),
+            "text": text[start.start():match.end()],
+        }
     return nodes
 
 

@@ -16,6 +16,7 @@ from torch import Tensor, nn
 from .incremental import ExactAcceptCommitStateGraph, _valid_eos_matches
 from .contracts import AirGraphSpec, CustomOpExportSpec
 from .draft_cache_export import DRAFT_CACHE_INDEX_POLICY
+from .draft_kv_repeat_export import DRAFT_KV_REPEAT_POLICY
 
 
 VERIFY_ROWS = 16
@@ -948,6 +949,9 @@ def incremental_state_graph_specs(
                 {
                     "draft_cache_index_policy": DRAFT_CACHE_INDEX_POLICY,
                     "draft_cache_index_layers": draft_layers,
+                    "draft_kv_repeat_policy": DRAFT_KV_REPEAT_POLICY,
+                    "draft_kv_repeat_layers": draft_layers,
+                    "draft_kv_repeat_groups": int(draft.config.num_key_value_groups),
                 }
                 if role in {"draft-propose", "fused-speculative-step"}
                 else {}

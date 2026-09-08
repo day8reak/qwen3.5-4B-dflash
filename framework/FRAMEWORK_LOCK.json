@@ -1,6 +1,6 @@
 {
-  "schema_version": 38,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v38",
+  "schema_version": 39,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v39",
   "repository_base": {
     "branch": "quant",
     "revision": "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -208,9 +208,18 @@
       "reason": "receiver BroadcastTo_1 inferred positive [1,8,64,128] then failed host auto-tiling before ACL 500002",
       "claim_boundary": "exact source/CPU and serialized AIR lowering checks; receiver ATC and Ascend310P correctness remain required"
     },
+    "draft_kv_head_repeat": {
+      "policy": "gqa-head-repeat-tile-v1",
+      "source": "quant_factory._repeat_kv, shared by AirDFlashOps.attention K and V",
+      "replacement": "states[B,H,S,D].unsqueeze(2).repeat(1,1,G,1,1).reshape(B,H*G,S,D); singleton group axis 2 and Const [1,1,4,1,1] for the locked Draft",
+      "semantics": "adjacent copies of each KV head; groups=1 returns the original tensor; FP16/FP32 values, FP32 attention/softmax, masks, weights, token/EOS/state and external OM ABI unchanged",
+      "reason": "receiver FP16 BroadcastTo inferred [1,8,1,2064,128] -> [1,8,4,2064,128], then MatchConstShape/auto-tiling failed before ACL 500002; distinct from the INT64 scatter-index incident",
+      "claim_boundary": "CPU/FX and serialized AIR lowering checks only; static receiver AIR/ATC and strict greedy NPU validation required"
+    },
     "state_policy": "recompute committed prefix"
   },
   "compiler": {
+    "draft_kv_repeat_gate": "new cached Draft graphs declare gqa-head-repeat-tile-v1; trace each K/V ScatterElements through Concat and singleton-axis Unsqueeze to Tile with exact binary Const repeats and a Reshape consumer; require one distinct head replica per cache write before ATC and retain the audit in deployment; unrelated BroadcastTo and legacy rollback bundles are not relabeled as fixed",
     "draft_cache_index_gate": "new Draft-bearing graphs declare static-repeat-tile-v1; audit every ScatterElements indices edge in dynamo.pbtxt for Tile with Const repeats, require two scatter nodes per layer, reject missing/failed evidence before ATC and retain it in deployment; unrelated BroadcastTo operations are allowed and legacy bundles do not claim this fix",
     "runtime_input_abi_gate": "AIR schema 4 requires public-tensor-storage-identity-v1 normalization: Dynamo specialize_float=True preserves model Python float constants without freezing tensor dimensions; resolve Data.index against concrete serialization inputs before weights are externalized, canonicalize Data/RefData order to public tensor arguments, and reject every unknown scalar, duplicate, alias, or missing public input before serialization; compile-om validates and retains the passing audit",
     "exporter": "TorchAir dynamo_export",

@@ -9,6 +9,7 @@ import subprocess
 from typing import Any, Callable, Mapping, Sequence
 
 from .draft_cache_export import validated_draft_cache_index_audit
+from .draft_kv_repeat_export import validated_draft_kv_repeat_audit
 from .static_shape import validated_fused_static_shape
 from .utils import (
     atomic_write_json,
@@ -331,10 +332,11 @@ def compile_air_bundle(
             allow_test_double=runner is not None,
         )
         draft_index_audit = validated_draft_cache_index_audit(graph)
+        kv_repeat_audit = validated_draft_kv_repeat_audit(graph)
         static_shape = validated_fused_static_shape(
             graph, air=True, allow_test_double=runner is not None,
         )
-        validated_graphs.append((graph, weight_mapping, input_abi, draft_index_audit, static_shape))
+        validated_graphs.append((graph, weight_mapping, input_abi, draft_index_audit, static_shape, kv_repeat_audit))
     exact_soc_version = validate_soc_version(soc_version)
     atc_path = resolve_atc_executable(atc_bin)
 
@@ -349,7 +351,7 @@ def compile_air_bundle(
     log_root.mkdir(parents=True, exist_ok=True)
 
     compiled: list[dict[str, Any]] = []
-    for graph, external_weight_mapping, input_abi, draft_index_audit, static_shape in validated_graphs:
+    for graph, external_weight_mapping, input_abi, draft_index_audit, static_shape, kv_repeat_audit in validated_graphs:
         name = str(graph["name"])
         custom_op_audit = _validated_custom_op_audit(graph)
         air_record = graph["air"]
@@ -412,6 +414,8 @@ def compile_air_bundle(
             compiled_graph["runtime_input_abi"] = input_abi
         if draft_index_audit is not None:
             compiled_graph["draft_cache_index_audit"] = draft_index_audit
+        if kv_repeat_audit is not None:
+            compiled_graph["draft_kv_repeat_audit"] = kv_repeat_audit
         if static_shape is not None:
             compiled_graph["fused_static_shape"] = static_shape
         compiled.append(compiled_graph)

@@ -1,8 +1,35 @@
 # 先跑通静态 fused OM，再恢复动态
 
-v38 / C++ runner 1.23.0 提供显式静态候选。原动态配置保留供回滚；
+v39 / C++ runner 1.23.0 提供显式静态候选和 Draft KV 头复制修复。原动态配置保留供回滚；
 **本轮先使用固定 N=64。** Host/Fake 测试不是 CANN/310P 数值证据，
 必须在设备上重新导出、编译、运行。
+
+## v39：静态输入不会自动移除 KV 头复制的 BroadcastTo
+
+2026-09-08 接收端日志中的 FP16
+`[1,8,1,2064,128] -> [1,8,4,2064,128]` 在 `MatchConstShape` 报
+`input shape and const shape not match`，随后 auto-tiling 失败并返回 ACL 500002。
+这组尺寸符合广播规则；仅凭日志不能断言常量错误或 CANN 不支持五维广播。
+它与 v37 的 **INT64 Scatter 索引**不是同一节点语义，不能仅按 `BroadcastTo_1` 名称定位。
+2064 是 KV capacity 2048 加 block 16，不是 feature 行数 N，也不能证明整图已切静态。
+
+v39 把 `AirDFlashOps.attention` 的 K、V 共用 `_repeat_kv` 改为
+`unsqueeze(2) -> repeat(1,1,G,1,1) -> reshape`，保持每个 KV 头相邻复制的顺序。
+不能直接在原 head 轴上 `repeat(1,G,1,1)`，那会改变 GQA 的头对应关系。
+FP32 attention/softmax、mask、原量化权重和计数/state ABI 均不改变。
+
+新 cached Draft 图声明 `draft_kv_repeat_policy: gqa-head-repeat-tile-v1`。
+导出沿每个 K/V cache write 的 `ScatterElements -> Concat -> Unsqueeze -> Tile -> Reshape`
+检查连接（允许中间 Identity），要求 group 轴为 2，并从 Const **实际二进制数据**核对
+`[1,1,4,1,1]`，不靠可读字符串或 Tile 总数断言通过。
+锁定的六层 Draft 必须得到 12 条不同的 K/V 绑定；group=1 不需要复制。
+缺少 pbtxt、仍走相关 BroadcastTo、错误 repeats/连接或缺失绑定时停止并保留 AIR 诊断。
+无关的 mask/state BroadcastTo 不在本门禁禁止范围内。
+`compile-om` 在调用 ATC 前验证 `draft_kv_repeat_audit`，并将其保留到 deployment manifest。
+旧 bundle 可回滚，但不自动声明含有本修复。
+
+本修复的 CPU/FX/模拟 GE 审计不是实际 TorchAir、ATC 或 Ascend 310P 推理证据。
+还需要新静态 AIR/OM 的真实导出检查，以及下文的严格 greedy 和重复运行门槛。
 
 ## 固定什么，不固定什么
 
@@ -41,6 +68,11 @@ Target verify 只输出 16 行，不能假定 64 行输入缓冲区的其余部�
 复用已锁定的 checkpoint、量化输入、环境和 runner 身份配置；无需重新量化。
 **从 export-air 开始重跑 AIR → OM，并重建 C++ runner**。重新编译旧动态 AIR、
 只改 manifest 的 dynamic 字段或只重编 C++ 都不能得到静态模型。
+v39 的 KV 修复同样需要从新源码导出 AIR，不能只重编 v38 的 AIR。
+C++ ABI 仍是 1.23.0；如果已确认用上该 runner，可复用它，新 Python 控制面会打印
+`stage=fused-manifest mode=static feature_rows=64 om=... sha256=...`，便于核对实际运行产物。
+这一行在 `infer-cpp` 控制面的 stderr，而非 C++ 子进程日志中；它说明 manifest 选择，
+实际 OM 的输入 shape 仍由 C++ 校验。
 所有新产物使用活动 run 下的新路径；保留旧 bundle。
 
 1. 将已成功导出的 `factory-fused.json` 另存为
@@ -79,12 +111,19 @@ jq -e '
   (.graphs | length == 4) and
   ([.graphs[] | (.dynamic == false and .input_dim_gears == {})] | all) and
   ([.graphs[] | select(.role == "fused-speculative-step") |
-    .fused_static_shape.feature_rows] == [64])
+    .fused_static_shape.feature_rows] == [64]) and
+  ([.graphs[] | select(.role == "fused-speculative-step") |
+    (.draft_kv_repeat_audit.status == "PASS" and
+     .draft_kv_repeat_audit.policy == "gqa-head-repeat-tile-v1" and
+     .draft_kv_repeat_audit.layers == 6 and .draft_kv_repeat_audit.groups == 4 and
+     .draft_kv_repeat_audit.repeats == [1,1,4,1,1] and
+     (.draft_kv_repeat_audit.files | length > 0) and
+     ([.draft_kv_repeat_audit.files[] | (.bindings | length == 12)] | all))] == [true])
 ' "$STATIC_FUSED_BUNDLE/deployment-manifest.json"
 ```
 
 导出还会核查 GE Data 的 15 个输入均为正整数 shape，与静态 example 一致，
-并保留已有 public-input、custom-op 和 ScatterElements/Tile 审计。
+并保留已有 public-input、custom-op、ScatterElements/Tile 及新的 KV 头复制审计。
 不要手改 pbtxt、删审计或给 ATC 追加动态参数绕过门禁。
 
 4. 先用 `draft_feature_policy: "fixed-16"`、`dflash_sync_window: 1`、
