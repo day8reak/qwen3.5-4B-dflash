@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import importlib
 import os
 from pathlib import Path
@@ -14,6 +14,7 @@ import torch
 from .contracts import AirGraphSpec
 from .custom_op_export import audit_custom_op_export, prepare_custom_op_export
 from .standard_op_export import prepare_aten_softplus_export, audit_aten_softplus_export
+from .runtime_input_export import canonical_runtime_input_abi
 from .utils import atomic_write_json, file_record, require_run_output, resolve_callable
 
 
@@ -123,7 +124,19 @@ def export_air_bundle(
         if spec.compiler_config is not None:
             call_kwargs["config"] = spec.compiler_config
         call_kwargs.update(dict(spec.example_kwargs))
-        with torch.inference_mode(), _working_directory(graph_dir):
+        input_abi_context = (
+            canonical_runtime_input_abi(
+                torchair, public_inputs=spec.example_args,
+                public_names=spec.input_names,
+                explicit_test_double=torchair_module is not None,
+                require_static_shapes=True,
+            )
+            if spec.metadata.get("incremental_contract") else nullcontext(None)
+        )
+        with (
+            torch.inference_mode(), _working_directory(graph_dir),
+            input_abi_context as runtime_input_abi,
+        ):
             torchair.dynamo_export(*spec.example_args, **call_kwargs)
 
         custom_op_audit = audit_custom_op_export(
@@ -161,6 +174,8 @@ def export_air_bundle(
                     for name, item in spec.example_kwargs.items()
                 },
                 "metadata": dict(spec.metadata),
+                **({"runtime_input_abi": runtime_input_abi}
+                   if runtime_input_abi is not None else {}),
                 "custom_op_audit": custom_op_audit,
                 "standard_op_overrides": standard_op_audit,
                 "air": air_record,

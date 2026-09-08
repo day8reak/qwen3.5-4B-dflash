@@ -96,6 +96,7 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
 aclError FixtureDims(const FixtureTensor& tensor, aclmdlIODims* dimensions) {
   if (!dimensions) return 1;
   std::memset(dimensions, 0, sizeof(*dimensions));
+  std::strncpy(dimensions->name, tensor.name.c_str(), sizeof(dimensions->name) - 1);
   dimensions->dimCount = tensor.shape.size();
   std::copy(tensor.shape.begin(), tensor.shape.end(), dimensions->dims);
   return ACL_SUCCESS;
@@ -222,6 +223,21 @@ aclError aclmdlLoadFromFile(const char* path, std::uint32_t* model_id) {
       (word == "I" ? model.inputs : model.outputs).push_back(tensor);
     }
   }
+  if (model.role == "draft") {
+    const char* fault = std::getenv("QWEN35_FAKE_CHUNK_IO_FAULT");
+    const std::string kind = fault ? fault : "";
+    auto& tensors = kind.find("output-") == 0 ? model.outputs : model.inputs;
+    if (kind == "input-order") {
+      std::swap(tensors.at(1), tensors.at(2));
+    } else if (!kind.empty()) {
+      auto& tensor = tensors.at(0);
+      if (kind.find("-dtype") != std::string::npos) tensor.dtype = ACL_INT32;
+      if (kind.find("-bytes") != std::string::npos) tensor.bytes += 32;
+      if (kind.find("-rank") != std::string::npos) tensor.shape.insert(tensor.shape.begin(), 1);
+      if (kind.find("-shape") != std::string::npos) tensor.shape.back() += 1;
+      if (kind.find("-count") != std::string::npos) tensors.pop_back();
+    }
+  }
   fixtures[*model_id] = std::move(model);
   return ACL_SUCCESS;
 }
@@ -263,12 +279,12 @@ aclDataType aclmdlGetOutputDataType(const aclmdlDesc* desc, std::size_t index) {
   return index < 2 ? ACL_INT64 : ACL_DT_UNDEFINED;
 }
 
-std::size_t aclmdlGetInputSizeByIndex(const aclmdlDesc* desc, std::size_t index) {
+std::size_t aclmdlGetInputSizeByIndex(aclmdlDesc* desc, std::size_t index) {
   if (!fixtures.at(desc->id).role.empty()) return fixtures.at(desc->id).inputs.at(index).bytes;
   return index < 2 ? kSequenceLength * sizeof(std::int64_t) : 0;
 }
 
-std::size_t aclmdlGetOutputSizeByIndex(const aclmdlDesc* desc, std::size_t index) {
+std::size_t aclmdlGetOutputSizeByIndex(aclmdlDesc* desc, std::size_t index) {
   if (!fixtures.at(desc->id).role.empty()) return fixtures.at(desc->id).outputs.at(index).bytes;
   if (index == 0) {
     return kSequenceLength * sizeof(std::int64_t);

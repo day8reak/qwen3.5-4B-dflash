@@ -125,6 +125,7 @@
   },
   "compiler": {
     "exporter": "TorchAir dynamo_export",
+    "runtime_input_abi_gate": "incremental graphs normalize GE Data.index and physical Data order by public tensor storage identity before serialization; specialize_float=True; verify static shapes; require one PASS audit per graph before ATC",
     "custom_op_gate": "validate all declared custom-op contracts and SoftplusV2 audits for the entire graph suite before ATC; preserve builtin converters and audit their GE nodes",
     "atc_mode": 0,
     "atc_framework": 1,
@@ -147,7 +148,8 @@
     "execute": "aclmdlExecuteAsync",
     "memory": "persistent pinned host and device buffers",
     "synchronization": "one stream synchronization per OM invocation",
-    "generation": "ordinary greedy and strict-greedy DFlash"
+    "generation": "ordinary greedy and strict-greedy DFlash",
+    "om_io_validation": "exact per-index dtype, bytes, rank and shape before execution; errors include graph/path, expected and actual tensor descriptors, and full failing-model I/O dump"
   },
   "correctness_gate": {
     "token_id_mismatches": 0,

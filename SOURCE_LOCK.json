@@ -157,7 +157,7 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "d04e0e1038bd4de54120bbebdd0924cdb2f00fc387636dc40fd8622ed464d3c2"
+        "source_sha256": "b60d0ddacf6a7d7e2d4a49dcdb7b274cd3257901bcfd8de6deec36750c7f99b2"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -165,7 +165,7 @@
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
-        "source_sha256": "f81a90f3c1c7dd1b643ab632ca61b802896a33ae06953478ee5df33f94c44ed0"
+        "source_sha256": "5c340f39c19645f60eabf28a4feba3b704e4ca1c3751c27f774f5e3d000e2aa1"
       },
       {
         "source_file": "framework/README.md",
@@ -177,7 +177,7 @@
       },
       {
         "source_file": "framework/abi/dflash-chunk-v1.json",
-        "source_sha256": "0c4884eda09cda8feda9f167dd43416aaad6d9a1b3502eda7c92a9a445eeae51"
+        "source_sha256": "04176671cf1fb06b53e0858913ffe5b97f43b7ccbfa5306dac8fef369b40265a"
       },
       {
         "source_file": "framework/abi/dflash-deployment-v1.json",
@@ -209,7 +209,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/compiler.py",
-        "source_sha256": "60c1e752bf33fff42df44b505df6d854322f7f936e37ee67d92eb656a4ce38f6"
+        "source_sha256": "8599d09ce6d93478c277e8d0eda3d6c0978da8d3b3eb6869f4628a57e6ccc5d8"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/contracts.py",
@@ -217,7 +217,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/cpp_runtime.py",
-        "source_sha256": "fc9b71835a530dffd114da0014b5c77c07f0101775cda4928ff6b37ff55ff9de"
+        "source_sha256": "5028bac049a250fec0a12ec05d7aa2005723917d5c0939de91b344f2e8436063"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/custom_op_export.py",
@@ -225,7 +225,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/exporter.py",
-        "source_sha256": "51ba51506b4538c5dc95e06e3f8518dd97a2e39ac975214f856a036df3bfec55"
+        "source_sha256": "a7c2320efde92337958d3dccd3c363d9a899f827517a129877185254311313e1"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/generation.py",
@@ -254,6 +254,10 @@
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/recompute_backend.py",
         "source_sha256": "071349a9557916409a0f1631fd97f9741e70812fd0f97099bf528b6951bb18e3"
+      },
+      {
+        "source_file": "framework/python/qwen35_dflash/ascend310p/runtime_input_export.py",
+        "source_sha256": "9d94fe9a23cf98155a8c4116b0a7a03bf024c92633589c01014382b14a09ede0"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/standard_op_export.py",
@@ -293,7 +297,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_chunk.cpp",
-        "source_sha256": "1fe0e5ab3b137a28f1a6e4543257f3ae0954686a60878f5621303413fd44096d"
+        "source_sha256": "4bf64a6141696bed5eef0cb2009507e02ec63196e450f097865ea19cad4735f7"
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_executor.cpp",
@@ -321,11 +325,11 @@
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/acl/acl.h",
-        "source_sha256": "84a5fd8473cc947353c1539b10265cbabb3c988006c494590d8203e56383cd04"
+        "source_sha256": "145af3c6b43afe84c3e179ed6afc6e4b3e688f07a1438aa3440c9869808abdfd"
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/fake_acl.cpp",
-        "source_sha256": "0c11e9b70d9fd3e1a3f71e43136d1fe8b7e477fae004abe4b9723b1883d23ba9"
+        "source_sha256": "f712361b836b04e68f173e2ec8aa0b8206bc9c3ad3922eb1d458a0b6c6b8473d"
       },
       {
         "source_file": "framework/runtime/cpp/tests/run_fake_runner.cmake",
@@ -353,7 +357,7 @@
       },
       {
         "source_file": "tests/test_incremental_air_om.py",
-        "source_sha256": "b6a17f118fc7771b869bca9f4c70b2918afbc197ebc77046f69566e45ee58e76"
+        "source_sha256": "05f16ef99ccb478cdb8978631a6eda6c0a180bf041b57f42991b5ad68bc81958"
       },
       {
         "source_file": "tests/test_msprof_stage_script.py",
@@ -366,6 +370,10 @@
       {
         "source_file": "tests/test_quant_air_om_framework.py",
         "source_sha256": "564ac347c0ed77ee90daebace44887617452392dc57a3a8a79959705f535d3c0"
+      },
+      {
+        "source_file": "tests/test_runtime_input_export.py",
+        "source_sha256": "2edaf029c0c274441e9e61a63ca46891d95386676d873ce055a697034cbd97d0"
       },
       {
         "source_file": "tests/test_source_lock_benchmark.py",

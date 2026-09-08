@@ -303,6 +303,12 @@ set -o pipefail
 成功后得到 `artifacts/air-manifest.json`，以及 `artifacts/air/<graph>/` 下的 AIR、
 `dynamo.pbtxt` 和外置权重。四个 graph 名称与本文开头的 OM 名称一致。
 manifest 保存有序输入/输出的 dtype、shape、文件 hash、算子预检和每张图的节点审计。
+导出器按原始输入张量的存储身份确定 GE `Data.index` 和 Data 节点顺序，并记录
+`runtime_input_abi` 审计。不能仅靠 Python 参数名或 manifest 的 `input_names` 控制
+TorchDynamo 的捕获顺序；形状相同的多个 KV 状态也必须按张量身份区分。
+Draft 的公开输入顺序固定为 `features, start_position, valid_rows, anchor, ...KV states`。
+每个图必须只完成一次输入规范化，并保持公开输入的静态 shape；未知的运行时输入或
+捕获中丢失的公开输入会使导出失败。
 三个 Target 图均检查 `RmsNorm/AdnRmsNorm`、`DynamicQuant`、
 `QuantBatchMatmulV4444`、`ChunkGatedDeltaRule`、`AdnFusedInferAttention`，
 以及 `SoftplusV2`。Draft 使用 Tensor 算子，不要求出现 Target 自定义节点。
@@ -339,6 +345,9 @@ AIR 无法改变错误的输入映射。编译器会提前拒绝使用整数 PSE
 ```
 
 编译流程使用 `atc --mode=0 --framework=1`，验证 AIR payload 后逐图编译。
+启动 ATC 前还会检查整组图的 `runtime_input_abi`：要求 `status=PASS`，实际 Data 绑定
+与公开输入的顺序、dtype、静态 shape 一致。缺少或不通过这项审计时，须重新导出到空的
+bundle 目录；只编辑 manifest 无法修正 AIR 中的输入顺序。
 成功后得到：
 
 ```text
@@ -367,6 +376,9 @@ assert {g["name"] for g in report["graphs"]} == {"target_prefill", "target_decod
 for graph in report["graphs"]:
     om = root / graph["om"]["path"]
     assert om.is_file() and om.stat().st_size > 0
+    audit = graph["runtime_input_abi"]
+    assert audit["status"] == "PASS" and audit["calls"] == 1
+    assert [b["logical_name"] for b in audit["bindings"]] == graph["input_names"]
 print("OM files: PASS")
 PY
 ```
@@ -386,6 +398,8 @@ export CPP_RUNNER="$AI_RUN_DIR/build/cpp/qwen35_dflash_acl_runner"
 需要生成 `qwen35_dflash_acl_runner`；名字带 `_fake` 的程序只用于主机测试。
 构建日志在 `$AI_RUN_DIR/log/dflash-cpp-build/`，编译身份及 runner hash 在 `cpp-build.json`。
 C++ 加载模型一次，持久保存 device buffer，循环使用 AscendCL 执行 OM。
+更新 C++ 源码后再次执行 `build-cpp`，使用新的 `--build-dir` 和 `--output` 路径，
+并将 `CPP_RUNNER` 指向本次生成的可执行文件。构建器不覆盖非空目录或已有报告。
 
 ## 11. 运行 C++ 普通/DFlash 对照
 
@@ -419,6 +433,20 @@ PY
 这里 Python 负责 tokenizer 和文本解码；生成循环、OM 执行、接受判断复核、EOS 处理在 C++。
 同一进程交错运行普通/DFlash，各 3 次 warmup＋10 次测量。
 报告的 `output.text` 是生成文本，`ordinary`、`dflash` 保存完整 token 和时延分布。
+
+C++ 会在执行推理前逐项比较 OM 描述与 chunk plan。若失败，Python 异常会附带第一项
+差异，例如 `graph=draft input[1] expected={...} actual={...}`；其中显示张量名、dtype、
+字节数、rank 和 shape。完整日志还包含该 OM 的全部输入/输出描述：
+
+```bash
+cat "$AI_RUN_DIR/log/cpp-paired-cpp-runner.log"
+```
+
+若 `start_position INT64[1]` 对应到实际的 `valid_rows INT16[1]`，说明输入顺序不一致，
+应使用带 `runtime_input_abi` 审计的源码重新导出 AIR、转换 OM，再运行 C++。
+不要更改控制张量 dtype 或取消校验来绕过错误。新 bundle 路径要同时用于
+`compile-om --air-manifest` 和 `infer-cpp --deployment-manifest`；重试报告使用新的
+`--output` 文件名，例如 `cpp-paired-io.json`，避免覆盖失败日志。
 
 ## 12. 检查 token 一致性和时延范围
 

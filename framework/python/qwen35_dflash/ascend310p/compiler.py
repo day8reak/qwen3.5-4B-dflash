@@ -8,6 +8,8 @@ import re
 import subprocess
 from typing import Any, Callable, Mapping, Sequence
 
+from .runtime_input_export import validated_runtime_input_abi
+
 from .utils import (
     atomic_write_json,
     contained_path,
@@ -244,6 +246,10 @@ def compile_air_bundle(
     for graph in graphs:
         _validated_custom_op_audit(graph)
         _validated_standard_op_overrides(graph)
+        validated_runtime_input_abi(
+            graph, required=bool(graph.get("metadata", {}).get("incremental_contract")),
+            allow_test_double=runner is not None,
+        )
 
     arguments = _validate_extra_args(extra_args)
     execute = runner or _default_runner
@@ -311,6 +317,8 @@ def compile_air_bundle(
                 "output_names": list(graph.get("output_names", [])),
                 "custom_op_audit": custom_op_audit,
                 "standard_op_overrides": _validated_standard_op_overrides(graph),
+                **({"runtime_input_abi": graph["runtime_input_abi"]}
+                   if "runtime_input_abi" in graph else {}),
                 "air": dict(air_record),
                 "om": file_record(om_path, relative_to=root),
                 "atc_command": command,

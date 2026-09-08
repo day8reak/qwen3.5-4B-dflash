@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 #include "qwen35_dflash/chunk.hpp"
@@ -28,6 +30,108 @@ aclDataType Dtype(const std::string& name) {
   if (name == "float32") return ACL_FLOAT;
   if (name == "float16") return ACL_FLOAT16;
   throw std::runtime_error("unsupported chunk tensor dtype");
+}
+std::string DtypeName(aclDataType dtype) {
+  const char* name = "unknown";
+  switch (dtype) {
+    case ACL_FLOAT: name = "float32"; break;
+    case ACL_FLOAT16: name = "float16"; break;
+    case ACL_INT16: name = "int16"; break;
+    case ACL_INT32: name = "int32"; break;
+    case ACL_INT64: name = "int64"; break;
+    default: break;
+  }
+  return std::string(name) + "(" + std::to_string(static_cast<int>(dtype)) + ")";
+}
+struct OmTensor {
+  aclmdlIODims dims{};
+  aclError dims_status = ACL_SUCCESS;
+  aclDataType dtype = ACL_DT_UNDEFINED;
+  std::size_t bytes = 0;
+
+  bool Matches(const TensorSpec& spec) const {
+    const auto limit = sizeof(dims.dims) / sizeof(dims.dims[0]);
+    return dims_status == ACL_SUCCESS && dtype == Dtype(spec.dtype) &&
+           bytes == spec.bytes() && dims.dimCount == spec.shape.size() &&
+           dims.dimCount <= limit &&
+           std::equal(spec.shape.begin(), spec.shape.end(), dims.dims);
+  }
+  std::string Describe() const {
+    std::ostringstream out;
+    const std::string name(dims.name,
+        std::find(dims.name, dims.name + sizeof(dims.name), '\0'));
+    out << "name=" << std::quoted(name) << " dtype=" << DtypeName(dtype)
+        << " bytes=" << bytes << " rank=" << dims.dimCount << " shape=[";
+    const auto limit = sizeof(dims.dims) / sizeof(dims.dims[0]);
+    for (std::size_t i = 0; i < std::min(dims.dimCount, limit); ++i) {
+      if (i) out << ',';
+      out << dims.dims[i];
+    }
+    if (dims.dimCount > limit) out << ",...invalid-rank";
+    out << "] dims_status=" << dims_status;
+    return out.str();
+  }
+};
+OmTensor ReadOmTensor(aclmdlDesc* desc, bool output, std::size_t index) {
+  OmTensor tensor;
+  tensor.dims_status = output ? aclmdlGetOutputDims(desc, index, &tensor.dims)
+                             : aclmdlGetInputDims(desc, index, &tensor.dims);
+  tensor.dtype = output ? aclmdlGetOutputDataType(desc, index)
+                        : aclmdlGetInputDataType(desc, index);
+  tensor.bytes = output ? aclmdlGetOutputSizeByIndex(desc, index)
+                        : aclmdlGetInputSizeByIndex(desc, index);
+  return tensor;
+}
+std::string DescribePlanTensor(const TensorSpec& spec) {
+  std::ostringstream out;
+  out << "name=" << std::quoted(spec.name) << " dtype=" << DtypeName(Dtype(spec.dtype))
+      << " bytes=" << spec.bytes() << " rank=" << spec.shape.size() << " shape=[";
+  for (std::size_t i = 0; i < spec.shape.size(); ++i) {
+    if (i) out << ',';
+    out << spec.shape[i];
+  }
+  out << ']';
+  return out.str();
+}
+std::string DescribeModelIo(aclmdlDesc* desc, const ChunkGraph& graph) {
+  std::ostringstream out;
+  out << "\n[chunk-runtime] OM I/O descriptors graph=" << graph.name
+      << " model=" << std::quoted(graph.model.string());
+  for (bool output : {false, true}) {
+    const auto count = output ? aclmdlGetNumOutputs(desc) : aclmdlGetNumInputs(desc);
+    const auto& specs = output ? graph.outputs : graph.inputs;
+    out << '\n' << (output ? "outputs" : "inputs") << ": plan=" << specs.size()
+        << " om=" << count;
+    for (std::size_t i = 0; i < std::max(count, specs.size()); ++i) {
+      out << '\n' << (output ? "output[" : "input[") << i << "] expected={"
+          << (i < specs.size() ? DescribePlanTensor(specs[i]) : "absent") << "} actual={"
+          << (i < count ? ReadOmTensor(desc, output, i).Describe() : "absent") << '}';
+    }
+  }
+  return out.str();
+}
+void ValidateModelIo(aclmdlDesc* desc, const ChunkGraph& graph) {
+  const auto inputs = aclmdlGetNumInputs(desc), outputs = aclmdlGetNumOutputs(desc);
+  if (inputs != graph.inputs.size() || outputs != graph.outputs.size()) {
+    throw std::runtime_error(
+        "OM tensor count differs from chunk plan: graph=" + graph.name +
+        " inputs(plan=" + std::to_string(graph.inputs.size()) + ",om=" + std::to_string(inputs) +
+        ") outputs(plan=" + std::to_string(graph.outputs.size()) + ",om=" + std::to_string(outputs) + ")" +
+        DescribeModelIo(desc, graph));
+  }
+  for (bool output : {false, true}) {
+    const auto& specs = output ? graph.outputs : graph.inputs;
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+      const auto actual = ReadOmTensor(desc, output, i);
+      if (!actual.Matches(specs[i])) {
+        throw std::runtime_error(
+            "OM tensor ABI differs from chunk plan: graph=" + graph.name +
+            (output ? " output[" : " input[") + std::to_string(i) + "] expected={" +
+            DescribePlanTensor(specs[i]) + "} actual={" + actual.Describe() + "}" +
+            DescribeModelIo(desc, graph));
+      }
+    }
+  }
 }
 struct Memory {
   void* device = nullptr;
@@ -147,15 +251,15 @@ class AclChunkExecutor::Impl {
   void Load(const ChunkGraph& graph) {
     auto owner = std::make_unique<Loaded>();
     auto& model = *owner;
+    std::cerr << "[chunk-runtime] load graph=" << graph.name
+              << " model=" << std::quoted(graph.model.string()) << '\n';
     Check(aclmdlLoadFromFile(graph.model.c_str(), &model.id),
           "aclmdlLoadFromFile");
     model.loaded = true;
     model.desc = aclmdlCreateDesc();
     Require(model.desc != nullptr, "aclmdlCreateDesc returned null");
     Check(aclmdlGetDesc(model.desc, model.id), "aclmdlGetDesc");
-    Require(aclmdlGetNumInputs(model.desc) == graph.inputs.size() &&
-                aclmdlGetNumOutputs(model.desc) == graph.outputs.size(),
-            "OM tensor count differs from chunk plan");
+    ValidateModelIo(model.desc, graph);
     model.inputs = aclmdlCreateDataset();
     model.outputs = aclmdlCreateDataset();
     Require(model.inputs && model.outputs, "aclmdlCreateDataset returned null");
@@ -164,21 +268,6 @@ class AclChunkExecutor::Impl {
       auto& buffers = output ? model.output_buffers : model.input_buffers;
       for (std::size_t index = 0; index < specs.size(); ++index) {
         const auto& spec = specs[index];
-        aclmdlIODims dims{};
-        Check(output ? aclmdlGetOutputDims(model.desc, index, &dims)
-                     : aclmdlGetInputDims(model.desc, index, &dims),
-              "aclmdlGetIODims");
-        const auto dtype = output ? aclmdlGetOutputDataType(model.desc, index)
-                                  : aclmdlGetInputDataType(model.desc, index);
-        const auto bytes = output
-                               ? aclmdlGetOutputSizeByIndex(model.desc, index)
-                               : aclmdlGetInputSizeByIndex(model.desc, index);
-        Require(dtype == Dtype(spec.dtype) && bytes == spec.bytes() &&
-                    dims.dimCount == spec.shape.size(),
-                "OM dtype/bytes/rank differs from chunk plan");
-        for (std::size_t d = 0; d < dims.dimCount; ++d)
-          Require(dims.dims[d] == spec.shape[d],
-                  "OM shape differs from chunk plan");
         auto& mem = Get(spec, graph.name, output);
         auto* data = aclCreateDataBuffer(mem.device, mem.bytes);
         Require(data != nullptr, "aclCreateDataBuffer returned null");

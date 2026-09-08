@@ -657,6 +657,10 @@ def test_fake_conversion_preserves_tensor_abi_and_hashes(chunk_bundle, tmp_path)
     )
     assert plan.read_text().count("\ngraph ") == 4
     assert len(deployment["graphs"]) == 4
+    air = json.loads((chunk_bundle.parent / deployment["air_manifest"]["path"]).read_text())
+    assert [g["runtime_input_abi"] for g in deployment["graphs"]] == [
+        g["runtime_input_abi"] for g in air["graphs"]
+    ]
     assert contract["commit_capsules"] == "internal_to_target_verify_not_external_OM_IO"
     om = chunk_bundle.parent / deployment["graphs"][0]["om"]["path"]
     om.write_bytes(b"corrupt")
@@ -664,7 +668,8 @@ def test_fake_conversion_preserves_tensor_abi_and_hashes(chunk_bundle, tmp_path)
         write_incremental_plan(chunk_bundle, tmp_path / "bad-plan.txt")
 
 
-@pytest.mark.parametrize("failure", ["empty", "duplicate", "invalid-name", "attention-abi", "missing-attention-abi"])
+@pytest.mark.parametrize("failure", ["empty", "duplicate", "invalid-name", "attention-abi", "missing-attention-abi",
+                                      "missing-input-abi", "failed-input-abi"])
 def test_compiler_rejects_invalid_graph_sets_before_atc(chunk_bundle, failure):
     from qwen35_dflash.ascend310p.compiler import compile_air_bundle
 
@@ -677,6 +682,10 @@ def test_compiler_rejects_invalid_graph_sets_before_atc(chunk_bundle, failure):
         air["graphs"].append(air["graphs"][0])
     elif failure == "invalid-name":
         air["graphs"][0]["name"] = "../escape"
+    elif failure == "missing-input-abi":
+        air["graphs"][-1].pop("runtime_input_abi")
+    elif failure == "failed-input-abi":
+        air["graphs"][-1]["runtime_input_abi"]["status"] = "FAIL"
     else:
         for graph in air["graphs"]:
             contract = graph["metadata"]["incremental_contract"]
@@ -695,6 +704,45 @@ def test_compiler_rejects_invalid_graph_sets_before_atc(chunk_bundle, failure):
             atc_identity="host-test",
         )
     assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["input-order", *[
+    f"{direction}-{field}" for direction in ("input", "output")
+    for field in ("dtype", "bytes", "rank", "shape", "count")
+]])
+def test_cpp_reports_actual_om_descriptors_before_execute(
+    chunk_bundle, tmp_path, monkeypatch, failure,
+):
+    from qwen35_dflash.ascend310p.cpp_runtime import run_cpp_pair
+
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER to the CMake fake ACL executable")
+    monkeypatch.setenv("QWEN35_FAKE_CHUNK_IO_FAULT", failure)
+    events = tmp_path / "events.jsonl"
+    monkeypatch.setenv("QWEN35_FAKE_EVENT_LOG", str(events))
+    output, log = tmp_path / "cpp.json", tmp_path / "cpp.log"
+    with pytest.raises(RuntimeError, match="graph=draft") as caught:
+        run_cpp_pair(
+            deployment_manifest=chunk_bundle, runner=runner,
+            runner_options={"device_model": "host-fixture", "cann": "fake",
+                            "driver": "fake", "firmware": "fake", "runtime": "fake-acl"},
+            prompt_token_ids=[4], eos_token_ids=[], device_id=0,
+            max_new_tokens=16, max_draft_tokens=15, raw_output=output, log_output=log,
+        )
+    text = log.read_text()
+    assert "OM I/O descriptors graph=draft" in text
+    assert "inputs: plan=8 om=" in text and "outputs: plan=5 om=" in text
+    assert not output.exists() and not events.exists()
+    detail = str(caught.value)
+    if failure == "input-order":
+        assert 'input[1] expected={name="start_position" dtype=int64(9) bytes=8 rank=1 shape=[1]}' in detail
+        assert 'actual={name="valid_rows" dtype=int16(6) bytes=2 rank=1 shape=[1]' in detail
+    elif failure.endswith("count"):
+        assert "OM tensor count differs" in detail
+    else:
+        assert f'{failure.split("-")[0]}[0] expected={{' in detail
+        assert all(word in detail for word in ("dtype=", "bytes=", "rank=", "shape=", "actual={"))
 
 
 @pytest.mark.parametrize("accepted,eos", [(0, []), (3, []), (15, []), (15, [7])])

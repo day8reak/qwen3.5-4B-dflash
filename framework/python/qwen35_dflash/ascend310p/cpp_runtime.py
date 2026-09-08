@@ -431,8 +431,11 @@ def run_cpp_pair(
     end_ns = time.perf_counter_ns()
     log_path.write_text(result.stdout or "", encoding="utf-8")
     if result.returncode != 0:
+        detail = next((line for line in reversed((result.stdout or "").splitlines())
+                       if line.startswith("qwen35_dflash_acl_runner:")), "")
         raise RuntimeError(
             f"C++ ACL runner failed with exit {result.returncode}; log={log_path}"
+            + (f"\n{detail}" if detail else "")
         )
     if not raw_path.is_file():
         raise RuntimeError("C++ ACL runner returned success without a JSON report")
