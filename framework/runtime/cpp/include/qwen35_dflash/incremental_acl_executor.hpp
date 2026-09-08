@@ -12,6 +12,14 @@
 
 namespace qwen35::dflash {
 
+// Diagnostic-only host payloads. Never allocated/downloaded by normal generation.
+struct TargetTensorSnapshot {
+  std::string dtype;
+  std::vector<std::int64_t> shape;
+  std::vector<std::uint8_t> data;
+};
+using TargetStateSnapshot = std::vector<TargetTensorSnapshot>;
+
 struct IncrementalOmPaths {
   std::filesystem::path target_prefill;
   std::filesystem::path target_prefill_head;
@@ -295,6 +303,13 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
   bool unified_target_step() const noexcept;
   bool fused_speculative_step() const noexcept;
   bool merged_prefill() const noexcept;
+
+  // These synchronized probes are for a separate diagnostic invocation only.
+  // Restore discards proposal/carrier metadata: resume only teacher-forced
+  // DecodeOne, never the original speculative request after a restore.
+  TargetStateSnapshot CaptureTargetState();
+  void RestoreTargetStateForDiagnostic(const TargetStateSnapshot& snapshot);
+  std::vector<std::int64_t> CaptureVerifyInputIds();
 
  private:
   class Impl;

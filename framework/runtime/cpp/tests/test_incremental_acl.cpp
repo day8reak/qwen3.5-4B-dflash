@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -825,6 +826,48 @@ void TestExtendedSpeculativeWindow(
       "cross-window direct compact carrier accounting differs");
 }
 
+void TestDiagnosticSnapshots(const std::array<std::filesystem::path, 5>& model_paths) {
+  qwen35::dflash::AclIncrementalExecutor executor({
+      model_paths[0], model_paths[1], model_paths[2], model_paths[3], model_paths[4], {}});
+  executor.Reset(0, {});
+  const auto prefill = executor.PrefillChunk({10}, false, 0);
+  const auto snapshot = executor.CaptureTargetState();
+  const auto bytes_before = executor.execution_stats().state_device_bytes;
+  auto changed = snapshot;
+  changed[0].data[0] ^= 1;
+  executor.RestoreTargetStateForDiagnostic(changed);
+  const auto after_restore = executor.CaptureTargetState();
+  Require(after_restore[0].data == changed[0].data, "snapshot restore did not copy exact bytes");
+  Require(snapshot[0].data != changed[0].data, "host snapshot aliases live device state");
+  // Complete validation must precede any write (last tensor invalid).
+  auto invalid = snapshot;
+  invalid.back().shape = {2};
+  bool rejected = false;
+  try { executor.RestoreTargetStateForDiagnostic(invalid); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  Require(rejected && executor.CaptureTargetState()[0].data == changed[0].data,
+          "invalid snapshot partially overwrote Target state");
+  invalid = snapshot;
+  const std::int64_t bad_cursor = 129;
+  std::memcpy(invalid.back().data.data(), &bad_cursor, sizeof(bad_cursor));
+  rejected = false;
+  try { executor.RestoreTargetStateForDiagnostic(invalid); }
+  catch (const std::invalid_argument&) { rejected = true; }
+  Require(rejected, "out-of-range diagnostic cursor admitted");
+  executor.RestoreTargetStateForDiagnostic(snapshot);
+  const auto first = executor.DecodeOne(prefill.token_ids.at(0));
+  const auto first_state = executor.CaptureTargetState();
+  executor.RestoreTargetStateForDiagnostic(snapshot);
+  const auto repeat = executor.DecodeOne(prefill.token_ids.at(0));
+  const auto repeat_state = executor.CaptureTargetState();
+  Require(first.token_ids == repeat.token_ids, "same-state replay changed fake tokens");
+  for (std::size_t i = 0; i < first_state.size(); ++i) {
+    Require(first_state[i].data == repeat_state[i].data, "same-state replay changed fake state");
+  }
+  Require(executor.execution_stats().state_device_bytes == bytes_before,
+          "diagnostic allocated an extra device state arena");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -861,6 +904,7 @@ int main(int argc, char** argv) {
         qwen35::dflash::IncrementalDecodeCarrierPolicy::
             kOneTokenHostFallback);
     TestExplicitDecodeOverride(paths);
+    TestDiagnosticSnapshots(paths);
     TestCommittedDraftFeaturePrefix(paths, 1);
     TestCommittedDraftFeaturePrefix(paths, 2);
     TestCommittedDraftFeaturePrefix(paths, 8);

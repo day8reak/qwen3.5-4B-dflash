@@ -1,5 +1,8 @@
 # v44：OM 首对即停与失败诊断
 
+v45 / runner 1.28.0 新增默认关闭的 [Target 定点状态重放](OM_TARGET_PARITY_DIAGNOSTICS.md)。
+若已有本页的事务轨迹仍不能判断状态/计算分歧，可单独开启；本页的默认失败诊断继续有效。
+
 适用于 incremental C++ runner 1.27.0。用户报告的
 `stateful DFlash output differs from ordinary greedy authority` 是正确性失败，
 不是接受率阈值，也不是之前的 ACL 500002。本次改善定位能力，不修改 OM 数学、

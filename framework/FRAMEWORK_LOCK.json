@@ -1,6 +1,25 @@
 {
-  "schema_version": 44,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v44",
+  "schema_version": 45,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v45",
+  "target_parity_diagnostics": {
+    "runner_version": "1.28.0",
+    "default_enabled": false,
+    "python_flags": ["--diagnose-target-parity", "--diagnostic-max-transactions"],
+    "default_max_transactions": 2,
+    "max_transactions_range": [1, 4],
+    "scope": "four static split OMs, sync-window=1, separate prefill; capture existing DFlash schedule then teacher-forced Decode1 replays",
+    "capture": "host Target snapshots before/after captured transactions, Verify input IDs and compact returned tokens; no raw logits",
+    "comparison": "chained Decode1 and same-input-state Decode1; per-layer conv/GDR and logically live paged KV; observed differences do not establish a kernel root cause",
+    "extra_device_state_bytes": 0,
+    "host_snapshot_budget_bytes": 2147483648,
+    "report_kind": "cpp-ascendcl-target-parity-diagnostic",
+    "report_schema": 1,
+    "timing": "DIAGNOSTIC only; no paired benchmark or formal latency evidence",
+    "failure_policy": "token/cursor mismatch retains raw diagnostic and nonzero exit; never changes ordinary authority or mismatch thresholds",
+    "regeneration": "runner and Python control plane only; existing v43+ AIR/OM unchanged",
+    "device_accuracy_status": "FAIL_REPORTED_AWAITING_TARGET_REPLAY",
+    "documentation": "docs/OM_TARGET_PARITY_DIAGNOSTICS.md"
+  },
   "failure_diagnostics": {
     "runner_version": "1.27.0",
     "pass_report_schema": 13,
@@ -15,7 +34,8 @@
     "latest_user_observation": {
       "status": "FAIL",
       "error": "stateful DFlash output differs from ordinary greedy authority",
-      "failing_artifact_identity": "not provided for the reported invocation",
+      "failing_artifact_identity": "user runner 1.27.0 failure: prefill=45edf00eccb3e2af7b68d0da20230d9d7da34d177d17a99a50cc5d7d0387634a, decode1=aa0f7d698a6b63c8a01fff159b723c69f83a356b7373bc4f99837bdd445988ea, draft=8b791aac5af7b8694183b939ad34b062d0970ceb990988c56c8afcc85c1e3446, verify=58ab37c690ddb78a90941eaf3b6c45fce88a466ed7bf1e3b49caa4e35f0926c9",
+      "first_mismatch": "warmup 1, generated index 8 / absolute index 25, ordinary 27382 vs DFlash 2014; transaction 2 correction after 5 accepted proposals",
       "claim_boundary": "diagnostic-only change; no device parity fix or acceptance improvement claimed"
     },
     "documentation": "docs/OM_FAILURE_DIAGNOSTICS.md"

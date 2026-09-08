@@ -1538,6 +1538,96 @@ class AclIncrementalExecutor::Impl {
         true, pending.model_executions, pending.compact_state_index);
   }
 
+  static std::string DiagnosticDtype(aclDataType dtype) {
+    if (dtype == ACL_FLOAT16) return "float16";
+    if (dtype == ACL_FLOAT) return "float32";
+    if (dtype == ACL_INT64) return "int64";
+    throw std::runtime_error("unsupported Target diagnostic state dtype");
+  }
+
+  // Use pinned memory on both directions; never release a queued H2D source
+  // before completion, including the error path. No additional device arena.
+  void DiagnosticCopy(const BufferView& device, void* host, bool upload) {
+    HostAllocation staging;
+    staging.Allocate(device.bytes);
+    try {
+      if (upload) std::memcpy(staging.data, host, device.bytes);
+      stream_work_pending_ = true;
+      Check(aclrtMemcpyAsync(
+          upload ? device.data : staging.data, device.bytes,
+          upload ? staging.data : device.data, device.bytes,
+          upload ? ACL_MEMCPY_HOST_TO_DEVICE : ACL_MEMCPY_DEVICE_TO_HOST,
+          stream_), "aclrtMemcpyAsync(target parity diagnostic)");
+      Synchronize();
+      if (!upload) std::memcpy(host, staging.data, device.bytes);
+    } catch (...) {
+      static_cast<void>(aclrtSynchronizeStream(stream_));
+      staging.Release();
+      throw;
+    }
+    staging.Release();
+  }
+
+  TargetStateSnapshot CaptureTargetState() {
+    RequireReset();
+    RequirePrefilled();
+    RequireCompletedPrefill();
+    TargetStateSnapshot snapshot;
+    for (std::size_t i = 0; i < target_state_specs_.size(); ++i) {
+      const auto& spec = target_state_specs_[i];
+      snapshot.push_back({DiagnosticDtype(spec.dtype), spec.shape,
+                          std::vector<std::uint8_t>(spec.bytes)});
+      DiagnosticCopy(target_states_[target_state_index_].tensors[i],
+                     snapshot.back().data.data(), false);
+    }
+    return snapshot;
+  }
+
+  void RestoreTargetStateForDiagnostic(const TargetStateSnapshot& snapshot) {
+    RequireReset();
+    RequirePrefilled();
+    RequireCompletedPrefill();
+    if (snapshot.size() != target_state_specs_.size()) {
+      throw std::invalid_argument("diagnostic Target state tensor count differs");
+    }
+    // Validate the complete snapshot before writing any part of device state.
+    for (std::size_t i = 0; i < snapshot.size(); ++i) {
+      const auto& spec = target_state_specs_[i];
+      if (snapshot[i].dtype != DiagnosticDtype(spec.dtype) ||
+          snapshot[i].shape != spec.shape || snapshot[i].data.size() != spec.bytes) {
+        throw std::invalid_argument("diagnostic Target state ABI differs");
+      }
+    }
+    std::int64_t cursor = 0;
+    if (snapshot.at(4).data.size() < sizeof(cursor)) {
+      throw std::invalid_argument("diagnostic Target cursor payload is too short");
+    }
+    std::memcpy(&cursor, snapshot.at(4).data.data(), sizeof(cursor));
+    if (cursor < 0 || static_cast<std::size_t>(cursor) > sequence_length_) {
+      throw std::invalid_argument("diagnostic Target cursor is out of range");
+    }
+    target_state_index_ = 0;
+    for (std::size_t i = 0; i < snapshot.size(); ++i) {
+      DiagnosticCopy(target_states_[0].tensors[i],
+                     const_cast<std::uint8_t*>(snapshot[i].data.data()), true);
+    }
+    decode_carrier_valid_ = false;
+    compact_carrier_is_staged_ = false;
+    proposal_ready_ = false;
+    feature_source_ = FeatureSource::kNone;
+    committed_feature_rows_valid_ = false;
+  }
+
+  std::vector<std::int64_t> CaptureVerifyInputIds() {
+    RequireCompletedPrefill();
+    if (unified_target_step_ || fused_speculative_step_) {
+      throw std::invalid_argument("Target diagnostic requires separate static Verify");
+    }
+    std::vector<std::int64_t> ids(verify_width_);
+    DiagnosticCopy(verify_ids_.View(ids.size() * sizeof(ids[0])), ids.data(), false);
+    return ids;
+  }
+
   std::size_t max_speculative_sync_window() const noexcept {
     return kMaxSpeculativeSyncWindow;
   }
@@ -4337,6 +4427,19 @@ std::size_t AclIncrementalExecutor::sequence_length() const noexcept {
 
 StatefulStep AclIncrementalExecutor::VerifyOne(std::int64_t input_token_id) {
   return impl_->VerifyOne(input_token_id);
+}
+
+TargetStateSnapshot AclIncrementalExecutor::CaptureTargetState() {
+  return impl_->CaptureTargetState();
+}
+
+void AclIncrementalExecutor::RestoreTargetStateForDiagnostic(
+    const TargetStateSnapshot& snapshot) {
+  impl_->RestoreTargetStateForDiagnostic(snapshot);
+}
+
+std::vector<std::int64_t> AclIncrementalExecutor::CaptureVerifyInputIds() {
+  return impl_->CaptureVerifyInputIds();
 }
 
 void AclIncrementalExecutor::ValidateRequest(

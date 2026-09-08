@@ -180,6 +180,10 @@ std::size_t TypeBytes(aclDataType dtype) {
 }
 
 std::size_t Bytes(const Spec& spec) {
+  if (const char* fault = std::getenv("QWEN35_DFLASH_FAKE_DIAGNOSTIC_FAULT")) {
+    if (std::string(fault) == "padded-cursor" &&
+        std::string(spec.name) == "logical_target_cursor") return 32;
+  }
   std::size_t result = TypeBytes(spec.dtype);
   for (const std::int64_t raw : spec.shape) {
     const std::size_t value = raw == -1
@@ -533,7 +537,10 @@ aclError ExecutePrefillHead(
 }
 
 aclError ExecuteDecode(const aclmdlDataset* input, aclmdlDataset* output) {
-  const std::int64_t token = Scalar<std::int64_t>(input->buffers[0]) + 1;
+  std::int64_t token = Scalar<std::int64_t>(input->buffers[0]) + 1;
+  if (const char* fault = std::getenv("QWEN35_DFLASH_FAKE_DIAGNOSTIC_FAULT")) {
+    if (std::string(fault) == "gdr" && Scalar<float>(input->buffers[4]) != 0) ++token;
+  }
   FillCommitted(output->buffers[0], {token});
   SetScalar<std::int32_t>(output->buffers[1], 1);
   SetScalar<std::uint8_t>(
@@ -581,6 +588,9 @@ aclError ExecuteDraft(const aclmdlDataset* input, aclmdlDataset* output) {
   verify[0] = anchor;
   for (std::size_t index = 1; index < kVerifyRows; ++index) {
     verify[index] = anchor + static_cast<std::int64_t>(index);
+  }
+  if (const char* fault = std::getenv("QWEN35_DFLASH_FAKE_DIAGNOSTIC_FAULT")) {
+    if (std::string(fault) == "correction") verify[proposal_count] += 50;
   }
   const char* force_zero_accept =
       std::getenv("QWEN35_DFLASH_FAKE_ZERO_ACCEPT");
@@ -641,6 +651,10 @@ aclError ExecuteVerify(const aclmdlDataset* input, aclmdlDataset* output) {
   if (!accepted_eos) {
     committed.push_back(verify[accepted] + 1);
   }
+  if (const char* fault = std::getenv("QWEN35_DFLASH_FAKE_DIAGNOSTIC_FAULT")) {
+    if ((std::string(fault) == "correction" || std::string(fault) == "bonus") &&
+        !accepted_eos) committed.back() += 100;
+  }
   // Test-only fault injection: exercise real runner failure reporting, not
   // the arithmetic validity of any NPU model.
   if (const char* fault = std::getenv("QWEN35_DFLASH_FAKE_PARITY_FAULT")) {
@@ -668,6 +682,22 @@ aclError ExecuteVerify(const aclmdlDataset* input, aclmdlDataset* output) {
       IsEos(committed.back(), input->buffers[2], input->buffers[3]));
   Copy(output->buffers[11], input->buffers[6]);
   Copy(output->buffers[12], input->buffers[7]);
+  if (const char* fault = std::getenv("QWEN35_DFLASH_FAKE_DIAGNOSTIC_FAULT")) {
+    const std::string kind(fault);
+    if (kind == "gdr") {
+      auto* state = static_cast<float*>(output->buffers[6]->data);
+      state[0] += 1.0F;
+    }
+    if (kind == "nan") SetScalar<float>(output->buffers[6], std::numeric_limits<float>::quiet_NaN());
+    if (kind == "fp16") SetScalar<std::uint16_t>(output->buffers[5], 0x8000); // negative zero
+    if (kind == "cursor") {
+      SetScalar<std::int64_t>(output->buffers[9], Scalar<std::int64_t>(output->buffers[9]) + 1);
+    }
+    if (kind == "kv-tail" || kind == "kv-live") {
+      auto* key = static_cast<std::uint16_t*>(output->buffers[11]->data);
+      key[kind == "kv-tail" ? 127 * 16 : 0] = 0x3c00; // FP16 1 at token 127/0
+    }
+  }
   return ACL_SUCCESS;
 }
 

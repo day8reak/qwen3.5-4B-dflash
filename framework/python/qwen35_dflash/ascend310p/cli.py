@@ -223,7 +223,7 @@ def _cpp_eos_token_ids(args: argparse.Namespace) -> tuple[int, ...]:
 
 
 def command_infer_cpp(args: argparse.Namespace) -> int:
-    """Tokenize once, then run paired 3+10 generation in one C++ process."""
+    """Tokenize once, then run paired generation or opt-in Target diagnosis."""
 
     output = require_run_output(args.output)
     if output.exists():
@@ -263,10 +263,18 @@ def command_infer_cpp(args: argparse.Namespace) -> int:
         raw_output=raw_output,
         log_output=log_output,
         progress=args.progress,
+        diagnose_target_parity=args.diagnose_target_parity,
+        diagnostic_max_transactions=args.diagnostic_max_transactions,
     )
     payload["control_plane"]["target_preflight"] = file_record(
         preflight_log, relative_to=run_root
     )
+    if args.diagnose_target_parity:
+        payload.update(prompt=args.prompt, chat=args.chat, tokenizer_source=tokenizer_source)
+        atomic_write_json(output, payload)
+        _progress(args.progress, f"stage=final-report-done status=DIAGNOSTIC output={output}")
+        _print(payload)
+        return 0
     generated = [int(item) for item in payload["dflash"]["stable_generated_token_ids"]]
     _progress(args.progress, "stage=detokenize-start")
     detokenize_start = time.perf_counter_ns()
@@ -477,6 +485,14 @@ def build_parser() -> argparse.ArgumentParser:
     infer_cpp.add_argument("--device-id", type=int, default=0)
     infer_cpp.add_argument("--max-new-tokens", type=int, default=32)
     infer_cpp.add_argument("--max-draft-tokens", type=int, default=15)
+    infer_cpp.add_argument(
+        "--diagnose-target-parity", action="store_true",
+        help="opt-in bounded Target state/Decode1 replay; replaces benchmark, no OM re-export",
+    )
+    infer_cpp.add_argument(
+        "--diagnostic-max-transactions", type=int, choices=range(1, 5), default=2,
+        help="capture first N decode transactions in diagnostic mode (default 2)",
+    )
     infer_cpp.add_argument(
         "--eos-token-id", type=int, action="append", default=None,
         help="repeatable EOS override; default 248044 matches the locked torch_npu route",

@@ -4,7 +4,10 @@
 greedy 对齐，再另建动态候选；本次不缩减模型、量化精度、KV 容量或请求长度。
 这是用户选择的源码默认值，不代表已经取得 Ascend310P 真机正确性或性能结论。
 
-**当前为 v44 / runner 1.27.0 / PASS report schema 13，四图拓扑保持 v41。**
+**当前为 v45 / runner 1.28.0 / PASS report schema 13，四图拓扑保持 v41。**
+v45 可选开启 [Target 定点状态重放](OM_TARGET_PARITY_DIAGNOSTICS.md)，
+对比 Verify 与 Decode1 的相同输入状态/连续前缀重放；默认关闭，不改变正常调度和计时。
+该诊断只需重建 runner、更新 Python 控制面，不改现有 OM。
 v44 只增加[首对即停与失败诊断](OM_FAILURE_DIAGNOSTICS.md)：已有 v43 bundle 时只重建
 runner、更新 Python 控制面，不需要重新导出 AIR/OM。以下 v42/v43 图内修复的重建要求仍有效。
 v43 保留 [v42 Draft mask 修复](DRAFT_OM_ATTENTION_PARITY.md)，进一步修正部分 Prefill 的
@@ -22,6 +25,7 @@ conv state 提交，并对齐当前分支 torch_npu 的 K、零接受回退和 E
 | 需要做什么 | 使用的文档 | 适用范围 |
 | --- | --- | --- |
 | 新默认构图、重跑、静态尺寸与分组显存 | 本页及所链接的 static-split factory/runner 模板 | v41 / runner 1.25.0 起 |
+| 首个 Verify/Decode1 分歧的状态快照和重放 | [Target 定点诊断](OM_TARGET_PARITY_DIAGNOSTICS.md) | v45 / runner 1.28.0，默认关闭，不重导已有 v43+ OM |
 | 环境、自定义算子 ABI、历史 AIR/ATC 排错 | [框架参考](QUANT_AIR_OM_FRAMEWORK.md) | 第 4–11 节保留旧 fused 对照；不是默认运行命令 |
 | 复用旧正确静态 fused OM，仅修改生命周期 | [v40 显存说明](STATIC_OM_MEMORY.md) | 仅旧静态 fused，不适用新 Prefill ABI / Draft shape |
 | 旧 fused 静态导出或动态排错 | [静态 fused 基线](STATIC_FUSED_OM_BASELINE.md)、[性能候选参考](INCREMENTAL_OM_PERFORMANCE.md) | 显式回退 / 独立候选 |

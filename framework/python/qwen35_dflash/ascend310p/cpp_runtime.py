@@ -2166,6 +2166,49 @@ def validate_incremental_cpp_runner_report(
         raise RuntimeError("incremental runner ordinary parity gate failed")
 
 
+def validate_target_parity_diagnostic(
+    report: Mapping[str, Any], *, prompt_token_ids: Sequence[int],
+    artifacts: Mapping[str, str], device_id: int, max_new_tokens: int,
+    max_draft_tokens: int, max_transactions: int,
+) -> None:
+    """Admit diagnostic output only; never substitute for paired accuracy/timing."""
+    if (report.get("schema_version") != 1
+            or report.get("report_kind") != "cpp-ascendcl-target-parity-diagnostic"
+            or report.get("status") != "DIAGNOSTIC"
+            or report.get("formal_latency_evidence") is not False
+            or report.get("model_hashes_verified") is not True):
+        raise RuntimeError("invalid Target parity diagnostic envelope")
+    for key, expected in {
+        "prompt_token_ids": list(prompt_token_ids), "artifacts": dict(artifacts),
+        "device_id": device_id, "max_new_tokens": max_new_tokens,
+        "max_draft_tokens": max_draft_tokens,
+    }.items():
+        if report.get(key) != expected:
+            raise RuntimeError(f"Target parity diagnostic identity differs: {key}")
+    detail = report.get("diagnostic")
+    if not isinstance(detail, Mapping):
+        raise RuntimeError("missing Target parity diagnostic detail")
+    count = detail.get("captured_transactions")
+    transactions = detail.get("transactions")
+    if (type(count) is not int or not 0 <= count <= max_transactions
+            or not isinstance(transactions, list) or len(transactions) != count
+            or detail.get("max_transactions") != max_transactions
+            or detail.get("raw_logits_available") is not False):
+        raise RuntimeError("invalid Target parity diagnostic capture scope")
+    expected_status = "NOT_CHECKED" if count == 0 else "PASS"
+    if (detail.get("token_parity") != expected_status
+            or detail.get("cursor_parity") != expected_status):
+        raise RuntimeError("Target parity diagnostic mismatch returned a success exit code")
+    for transaction in transactions:
+        if (not isinstance(transaction, Mapping)
+                or transaction.get("verify_cursor_transition_consistent") is not True):
+            raise RuntimeError("invalid Target parity transaction")
+        for key in ("chained_decode1_tokens", "same_input_state_decode1_tokens"):
+            check = transaction.get(key)
+            if not isinstance(check, Mapping) or check.get("equal") is not True or check.get("mismatches") != []:
+                raise RuntimeError("Target parity diagnostic contains a token mismatch")
+
+
 def run_cpp_pair(
     *,
     deployment_manifest: str | Path,
@@ -2179,12 +2222,20 @@ def run_cpp_pair(
     raw_output: str | Path,
     log_output: str | Path,
     progress: bool = True,
+    diagnose_target_parity: bool = False,
+    diagnostic_max_transactions: int = 2,
     execute: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> dict[str, Any]:
-    """Run paired ordinary/DFlash generation entirely inside one C++ process."""
+    """Run paired generation, or opt-in bounded diagnosis, in one C++ process."""
 
     if max_new_tokens <= 0 or max_draft_tokens <= 0:
         raise ValueError("C++ generation limits must be positive")
+    if not isinstance(diagnose_target_parity, bool):
+        raise ValueError("diagnose_target_parity must be boolean")
+    if (type(diagnostic_max_transactions) is not int
+            or not 1 <= diagnostic_max_transactions <= 4
+            or (not diagnose_target_parity and diagnostic_max_transactions != 2)):
+        raise ValueError("diagnostic_max_transactions requires diagnosis and must be in 1..4")
     tokens = [int(item) for item in prompt_token_ids]
     if not tokens:
         raise ValueError("C++ runner prompt tokens must not be empty")
@@ -2234,6 +2285,17 @@ def run_cpp_pair(
         om_record = dict(graph["om"])
         artifacts = {str(graph["name"]): str(om_record["sha256"])}
     _progress(progress, "stage=validate-manifest-and-om-done")
+    if diagnose_target_parity and (
+        not incremental or not merged_prefill or static_shape is None
+        or set(resolved_incremental) != {
+            "target-prefill", "target-decode1", "draft-propose", "target-verify-commit",
+        }
+        or identity["dflash_sync_window"] != 1
+        or identity["prefill_completion_policy"] != "separate"
+    ):
+        raise ValueError(
+            "Target diagnosis requires four static split OMs, sync-window=1 and separate prefill"
+        )
     executable = preflight_cpp_runner(
         runner, state_policy=identity["state_policy"]
     )
@@ -2286,9 +2348,9 @@ def run_cpp_pair(
         "--max-draft-tokens",
         str(int(max_draft_tokens)),
         "--warmup",
-        "3",
+        "1" if diagnose_target_parity else "3",
         "--repetitions",
-        "10",
+        "1" if diagnose_target_parity else "10",
         "--device-id",
         str(int(device_id)),
     ])
@@ -2298,7 +2360,7 @@ def run_cpp_pair(
         command.extend(
             [
                 "--measurement-protocol",
-                "evidence",
+                "profile" if diagnose_target_parity else "evidence",
                 "--state-reset-policy",
                 identity["state_reset_policy"],
                 "--decode-carrier-policy",
@@ -2313,6 +2375,11 @@ def run_cpp_pair(
                 identity["zero_accept_fallback_policy"],
             ]
         )
+    if diagnose_target_parity:
+        command.extend([
+            "--diagnose-target-parity", "true",
+            "--diagnostic-max-transactions", str(diagnostic_max_transactions),
+        ])
     command.extend(["--progress", "true" if progress else "false"])
     deployment_path = Path(deployment_manifest).expanduser().resolve()
     # Persist before launch: even a signal or failure before JSON output must
@@ -2366,13 +2433,20 @@ def run_cpp_pair(
         raise RuntimeError(
             f"C++ ACL runner failed with exit {result.returncode}; log={log_path}"
             f"; invocation={invocation_path}"
+            + (f"; target_parity_report={raw_path}" if diagnose_target_parity and raw_path.is_file() else "")
             + _runner_failure_details(result.stdout, failure_path)
         )
     if not raw_path.is_file():
         raise RuntimeError("C++ ACL runner returned success without a JSON report")
     _progress(progress, "stage=validate-runner-report-start")
     report = load_json_object(raw_path)
-    if incremental:
+    if diagnose_target_parity:
+        validate_target_parity_diagnostic(
+            report, prompt_token_ids=tokens, artifacts=artifacts,
+            device_id=device_id, max_new_tokens=max_new_tokens,
+            max_draft_tokens=max_draft_tokens, max_transactions=diagnostic_max_transactions,
+        )
+    elif incremental:
         validate_incremental_cpp_runner_report(
             report,
             prompt_token_ids=tokens,
@@ -2447,7 +2521,8 @@ def run_cpp_pair(
         "compiler": dict(deployment.get("compiler", {})),
         "target": dict(deployment.get("target", {})),
     }
-    _progress(progress, "stage=cpp-pair-done status=PASS")
+    _progress(progress, "stage=target-parity-done status=DIAGNOSTIC" if diagnose_target_parity
+              else "stage=cpp-pair-done status=PASS")
     return report
 
 

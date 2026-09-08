@@ -1,6 +1,7 @@
 #include "qwen35_dflash/generation.hpp"
 #include "qwen35_dflash/incremental_acl_executor.hpp"
 #include "qwen35_dflash/sha256.hpp"
+#include "qwen35_dflash/target_parity_diagnostic.hpp"
 
 #include "acl_memory_policy.hpp"
 
@@ -78,6 +79,8 @@ struct Arguments {
   std::size_t repetitions = 10;
   int device_id = 0;
   bool progress = true;
+  bool diagnose_target_parity = false;
+  std::size_t diagnostic_max_transactions = 2;
   IncrementalStateResetPolicy state_reset_policy =
       IncrementalStateResetPolicy::kAsyncMemset;
   IncrementalDecodeCarrierPolicy decode_carrier_policy =
@@ -125,6 +128,8 @@ void Usage(std::ostream& stream) {
       << "  --draft-feature-policy POLICY          fixed-16 (default) or "
          "committed-prefix\n"
       << "  --progress true|false                    live stderr progress\n";
+  stream << "  --diagnose-target-parity true|false      opt-in bounded Target state/token replay; no benchmark\n"
+         << "  --diagnostic-max-transactions N          capture first 1..4 decode transactions (default 2)\n";
 }
 
 std::string Trim(std::string value) {
@@ -377,13 +382,27 @@ Arguments ParseArguments(int argc, char** argv) {
     throw std::invalid_argument(
         "zero-accept-fallback-policy must be disabled or request-target-only");
   }
-  result.warmup = ParseSize(TakeOptional(&values, "warmup", "3"), "warmup");
+  result.diagnose_target_parity = ParseBool(
+      TakeOptional(&values, "diagnose-target-parity", "false"), "diagnose-target-parity");
+  const bool has_diagnostic_limit = values.count("diagnostic-max-transactions") != 0;
+  result.diagnostic_max_transactions = ParseSize(
+      TakeOptional(&values, "diagnostic-max-transactions", "2"), "diagnostic-max-transactions");
+  if ((has_diagnostic_limit && !result.diagnose_target_parity) ||
+      result.diagnostic_max_transactions > 4) {
+    throw std::invalid_argument("diagnostic-max-transactions requires diagnosis and must be in 1..4");
+  }
+  if (result.diagnose_target_parity &&
+      (!merged || fused || !has_decode || result.dflash_sync_window != 1 ||
+       result.coalesce_prefill_with_first_verify)) {
+    throw std::invalid_argument("Target diagnosis requires four static split OMs, sync-window=1 and separate prefill");
+  }
+  result.warmup = ParseSize(TakeOptional(&values, "warmup", result.diagnose_target_parity ? "1" : "3"), "warmup");
   result.repetitions = ParseSize(
-      TakeOptional(&values, "repetitions", "10"), "repetitions");
+      TakeOptional(&values, "repetitions", result.diagnose_target_parity ? "1" : "10"), "repetitions");
   result.progress = ParseBool(
       TakeOptional(&values, "progress", "true"), "progress");
   const std::string measurement_protocol = TakeOptional(
-      &values, "measurement-protocol", "evidence");
+      &values, "measurement-protocol", result.diagnose_target_parity ? "profile" : "evidence");
   if (measurement_protocol == "evidence") {
     result.measurement_protocol = MeasurementProtocol::kEvidence;
   } else if (measurement_protocol == "profile") {
@@ -434,6 +453,9 @@ Arguments ParseArguments(int argc, char** argv) {
   result.device_id = static_cast<int>(device_id);
   if (!values.empty()) {
     throw std::invalid_argument("unknown option --" + values.begin()->first);
+  }
+  if (result.diagnose_target_parity && result.measurement_protocol != MeasurementProtocol::kProfile) {
+    throw std::invalid_argument("Target diagnosis is not formal latency evidence; use measurement-protocol=profile");
   }
   if (result.measurement_protocol == MeasurementProtocol::kEvidence &&
       (result.warmup != 3 || result.repetitions != 10)) {
@@ -1427,8 +1449,11 @@ void WriteFailureReport(
       << "\",\"target_only_execution_policy\":\""
       << (!args.models[5].path.empty() ? "ordinary-decode1-legacy"
               : args.models[2].path.empty() ? "verify-t1" : "static-verify16-k0")
-      << "\",\"state_capture\":\"host compact results and logical prefix only; "
-         "KV/conv/GDR tensors not downloaded\",\"last_progress\":";
+      << "\",\"state_capture\":\""
+      << (args.diagnose_target_parity
+              ? "opt-in Target snapshots/replay; see target-parity diagnostic raw report if completed"
+              : "host compact results and logical prefix only; KV/conv/GDR tensors not downloaded")
+      << "\",\"last_progress\":";
   if (progress) {
     const auto& p = *progress;
     out << "{\"phase\":\"" << p.phase << "\",\"run_index\":" << p.run_index
@@ -1586,6 +1611,50 @@ int main(int argc, char** argv) {
         arguments.zero_accept_fallback_policy;
     options.eos_token_ids = arguments.eos_token_ids;
     options.collect_transaction_trace = true;
+    if (arguments.diagnose_target_parity) {
+      failure_stage = "target-parity-diagnostic";
+      PrintProgress(arguments.progress, "stage=target-parity-start formal_latency_evidence=false");
+      const auto diagnostic = qwen35::dflash::DiagnoseTargetParity(
+          executor, arguments.prompt_token_ids, options,
+          arguments.diagnostic_max_transactions,
+          [&](const std::string& message) { PrintProgress(arguments.progress, message); });
+      std::ostringstream report;
+      report << "{\"schema_version\":1,\"report_kind\":\"cpp-ascendcl-target-parity-diagnostic\","
+             << "\"status\":\"DIAGNOSTIC\",\"formal_latency_evidence\":false,\"runner_version\":\""
+             << JsonEscape(QWEN35_DFLASH_RUNNER_VERSION) << "\",\"device_id\":" << arguments.device_id
+             << ",\"model_hashes_verified\":true,\"prompt_token_ids\":";
+      WriteTokenIds(report, arguments.prompt_token_ids);
+      report << ",\"eos_token_ids\":";
+      WriteTokenIds(report, arguments.eos_token_ids);
+      report << ",\"max_new_tokens\":" << arguments.max_new_tokens
+             << ",\"max_draft_tokens\":" << arguments.max_draft_tokens
+             << ",\"command\":[";
+      for (int index = 0; index < argc; ++index) {
+        if (index) report << ',';
+        report << '"' << JsonEscape(argv[index]) << '"';
+      }
+      report << "],\"artifacts\":{";
+      bool first_model = true;
+      for (const auto& model : arguments.models) {
+        if (model.path.empty()) continue;
+        if (!first_model) report << ',';
+        first_model = false;
+        report << '"' << JsonEscape(model.role) << "\":\"" << model.sha256 << '"';
+      }
+      report << "},\"diagnostic\":" << diagnostic.detail_json << '}';
+      AtomicWrite(arguments.output, report.str());
+      PrintProgress(arguments.progress,
+          "stage=target-parity-done status=DIAGNOSTIC report=" +
+          std::filesystem::absolute(arguments.output).string());
+      // Preserve a nonzero exit and the full diagnostic, never emit a paired PASS.
+      if (!diagnostic.token_parity || !diagnostic.cursor_parity) {
+        throw std::runtime_error("Target parity diagnostic found token/cursor mismatch; first_token_mismatch=" +
+                                 diagnostic.first_token_mismatch_json + "; report=" +
+                                 std::filesystem::absolute(arguments.output).string());
+      }
+      std::cout << report.str() << '\n';
+      return 0;
+    }
     PrintProgress(
         arguments.progress,
         arguments.measurement_protocol == MeasurementProtocol::kEvidence
