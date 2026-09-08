@@ -13,6 +13,7 @@ import torch
 
 from .contracts import AirGraphSpec
 from .custom_op_export import audit_custom_op_export, prepare_custom_op_export
+from .standard_op_export import prepare_aten_softplus_export, audit_aten_softplus_export
 from .utils import atomic_write_json, file_record, require_run_output, resolve_callable
 
 
@@ -89,6 +90,8 @@ def export_air_bundle(
     # both 4B checkpoints, so a missing export runtime must fail before that
     # expensive and memory-heavy operation starts.
     factory_callable = resolve_callable(factory)
+    prepare = getattr(factory_callable, "prepare_export", None)
+    preflight = prepare(dict(factory_config), torchair) if callable(prepare) else None
     specs = _normalize_specs(factory_callable(dict(factory_config)))
     from .incremental_plan import validate_incremental_bundle
     validate_incremental_bundle([
@@ -107,6 +110,10 @@ def export_air_bundle(
         custom_op_sessions = [
             prepare_custom_op_export(item, torchair) for item in spec.custom_ops
         ]
+        softplus_session = (
+            prepare_aten_softplus_export(torchair)
+            if spec.metadata.get("standard_op_export_contracts") else None
+        )
         call_kwargs = {
             "model": spec.model.eval(),
             "export_path": str(graph_dir),
@@ -124,6 +131,11 @@ def export_air_bundle(
             graph_dir,
             relative_to=root,
         )
+
+        standard_op_audit = [] if softplus_session is None else [
+            audit_aten_softplus_export(softplus_session, graph_dir,
+                                      calls_before=0, relative_to=root)
+        ]
 
         air_files = sorted(graph_dir.glob("*.air"))
         if len(air_files) != 1:
@@ -150,6 +162,7 @@ def export_air_bundle(
                 },
                 "metadata": dict(spec.metadata),
                 "custom_op_audit": custom_op_audit,
+                "standard_op_overrides": standard_op_audit,
                 "air": air_record,
                 "payload_files": records,
             }
@@ -172,6 +185,7 @@ def export_air_bundle(
             "torch_npu": _module_version("torch_npu"),
             "torchair": str(getattr(torchair, "__version__", "unknown")),
         },
+        "operator_preflight": preflight,
         "graphs": graphs,
     }
     manifest_path = atomic_write_json(root / "air-manifest.json", manifest)

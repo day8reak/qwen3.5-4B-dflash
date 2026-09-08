@@ -81,7 +81,7 @@ PY
 import torch_npu
 required = (
     "npu_chunk_gated_delta_rule", "adn_fused_infer_attention",
-    "adn_rms_norm", "npu_cache_update_",
+    "adn_rms_norm", "npu_dynamic_quant", "npu_quant_matmul",
 )
 missing = [name for name in required if not callable(getattr(torch_npu, name, None))]
 assert not missing, f"缺少 NPU 算子: {missing}"
@@ -98,7 +98,13 @@ npu_chunk_gated_delta_rule(query, key, value, g, beta, effective_length,
                          output_final_state=False, use_qk_l2norm_in_kernel=False)
 ```
 
+这里检查增量 AIR 图实际使用的五类接口。导出器会在加载权重前进一步检查 dispatcher schema、
+Fake/Meta 和 GE converter；Fake/Meta 只描述输出 shape/dtype，不执行算子或提供 CPU 数值替代。
 符号检查通过后，仍需通过后面的真实模型执行验证 shape、dtype 和数值。
+
+自定义算子包的环境脚本需要正确设置 `ASCEND_CUSTOM_OPP_PATH` 和对应动态库路径。
+导出器检查已配置的 GDR/attention GE prototype，拒绝重复的 GDR 注册、不含
+`effective_length` 的 GDR ABI，以及缺少 310P attention kernel 的已配置包。
 
 ## 3. 准备模型和外部加载器
 
@@ -276,7 +282,9 @@ PY
 ```
 
 导出前会再次检查外部输入和 `SOURCE_LOCK.json`。冻结输入后不要增加、删除或修改文件。
-`RmsNorm` 必须是目标环境注册的 GE type；自定义包使用其他 type 时，在配置里填写对应名称。
+`RmsNorm` 必须是目标环境注册的 GE type；自定义包注册的是 `AdnRmsNorm` 时，填写
+`"adn_rms_norm_ge_op_type": "AdnRmsNorm"`。两者的 GE 输入名分别为 `x` 和 `self`，
+导出器按所选类型处理，不接受任意 GE 名称。
 
 ## 8. 导出 AIR
 
@@ -294,8 +302,17 @@ set -o pipefail
 
 成功后得到 `artifacts/air-manifest.json`，以及 `artifacts/air/<graph>/` 下的 AIR、
 `dynamo.pbtxt` 和外置权重。四个 graph 名称与本文开头的 OM 名称一致。
-manifest 保存有序输入/输出的 dtype、shape、文件 hash 和自定义 RMSNorm 节点审计。
+manifest 保存有序输入/输出的 dtype、shape、文件 hash、算子预检和每张图的节点审计。
+三个 Target 图均检查 `RmsNorm/AdnRmsNorm`、`DynamicQuant`、
+`QuantBatchMatmulV4444`、`ChunkGatedDeltaRule`、`AdnFusedInferAttention`，
+以及 `SoftplusV2`。Draft 使用 Tensor 算子，不要求出现 Target 自定义节点。
+量化 matmul 在 AIR 捕获时使用专用前端，保留 FP32 weight/per-token scale 和 FP16 输出；
+普通 NPU 推理仍调用同一套 receiver 量化接口。
 保留整个 AIR 目录，不要只复制 `.air` 文件。
+
+导出失败后，使用新的空 bundle 目录重试，例如将 `--bundle-dir` 改为
+`"$AI_RUN_DIR/artifacts-custom-ops"`；后续 `--air-manifest` 和
+`--deployment-manifest` 的路径也须指向该目录。导出器不会覆盖非空目录。
 
 ## 9. 将 AIR 转为 OM
 

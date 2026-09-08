@@ -306,7 +306,7 @@ def test_custom_op_audit_rejects_missing_ge_node(tmp_path: Path) -> None:
         'op {\n  name: "wrong"\n  type: "Mul"\n}\n',
         encoding="utf-8",
     )
-    with pytest.raises(RuntimeError, match="converter calls"):
+    with pytest.raises(RuntimeError, match="TorchAir IR contains"):
         audit_custom_op_export((session,), graph_dir, relative_to=tmp_path)
 
 
@@ -722,9 +722,15 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
     )
     assert spec.metadata["quant_source_lock"]["verified_file_count"] >= 10
     assert spec.metadata["target_checkpoint_manifest_sha256"]
-    assert len(spec.custom_ops) == 1
+    assert len(spec.custom_ops) == 7
     assert spec.custom_ops[0].torch_target == "npu.adn_rms_norm.default"
     assert spec.custom_ops[0].ge_op_type == "RmsNorm"
+    assert {item.torch_target for item in spec.custom_ops} == {
+        "npu.adn_rms_norm.default", "npu.npu_dynamic_quant.default",
+        "qwen35_dflash.npu_quant_matmul_v4444.default",
+        "npu.npu_chunk_gated_delta_rule.default", "npu.adn_fused_infer_attention.default",
+        "qwen35_dflash.npu_cache_update.default", "npu.npu_scatter_nd_update_.default",
+    }
     assert spec.input_names == ("input_ids", "attention_mask")
     assert spec.output_names == ("target_top1", "draft_top1")
 

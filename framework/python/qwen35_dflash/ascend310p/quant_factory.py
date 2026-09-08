@@ -33,6 +33,21 @@ from .contracts import AirGraphSpec, CustomOpExportSpec
 from .custom_op_export import (
     ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
     ADN_RMS_NORM_TORCH_OP,
+    ADN_FUSED_INFER_ATTENTION_TORCH_OP,
+    ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE,
+    FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP,
+    FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
+    NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE,
+    NPU_DYNAMIC_QUANT_TORCH_OP,
+    NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE,
+    NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
+    NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
+    NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+    NPU_SCATTER_ND_UPDATE_TORCH_OP,
+    NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
+    prepare_custom_op_export,
+    validate_gdr_ge_prototype_environment,
+    validate_adn_attention_ge_prototype_environment,
 )
 from .integrated import (
     enable_padded_draft_context,
@@ -358,6 +373,70 @@ class QuantFullPrefixExportTarget(nn.Module):
         return logits, features
 
 
+def _enable_target_quant_matmul_export_mode(target: nn.Module) -> int:
+    """Make every receiver QLinear select the private AIR-only frontend."""
+
+    execution_model = getattr(target, "dflash_execution_model", target)
+    if not isinstance(execution_model, nn.Module):
+        raise TypeError("quant Target execution model must be an nn.Module")
+    enabled = 0
+    for module in execution_model.modules():
+        setter = getattr(module, "set_quant_matmul_export_mode", None)
+        if not callable(setter):
+            continue
+        setter(True)
+        enabled += 1
+    audit = dict(getattr(target, "dflash_target_quantization_audit", {}))
+    expected = int(audit.get("qlinear_count", 0))
+    if expected and enabled != expected:
+        raise RuntimeError(
+            "AIR quant-matmul frontend coverage differs from the Target "
+            f"quantization audit: enabled={enabled}, expected={expected}"
+        )
+    return enabled
+
+def _target_custom_op_exports(
+    config: Mapping[str, Any], *, incremental: bool,
+) -> tuple[CustomOpExportSpec, ...]:
+    """Declare operators actually retained by each Target graph."""
+    rms_type = str(config.get("adn_rms_norm_ge_op_type", ADN_RMS_NORM_DEFAULT_GE_OP_TYPE))
+    if rms_type not in {"RmsNorm", "AdnRmsNorm"}:
+        raise ValueError("adn_rms_norm_ge_op_type must be RmsNorm or AdnRmsNorm")
+    operators = [
+        CustomOpExportSpec(ADN_RMS_NORM_TORCH_OP, rms_type),
+        CustomOpExportSpec(NPU_DYNAMIC_QUANT_TORCH_OP, NPU_DYNAMIC_QUANT_DEFAULT_GE_OP_TYPE),
+        CustomOpExportSpec(FUNCTIONAL_NPU_QUANT_MATMUL_TORCH_OP, NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE),
+        CustomOpExportSpec(NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP, NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE),
+        CustomOpExportSpec(ADN_FUSED_INFER_ATTENTION_TORCH_OP, ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE),
+    ]
+    if not incremental:
+        operators.extend((
+            CustomOpExportSpec(FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP, NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE),
+            CustomOpExportSpec(NPU_SCATTER_ND_UPDATE_TORCH_OP, NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
+                               minimum_occurrences=0),
+        ))
+    return tuple(operators)
+
+
+def _prepare_quant_export(config: Mapping[str, Any], torchair_module: Any,
+                          *, incremental: bool) -> dict[str, Any]:
+    """Fail on dispatcher/Meta/GE contract gaps before loading 4B weights."""
+    importlib.import_module("torch_npu")
+    sessions = [
+        prepare_custom_op_export(spec, torchair_module)
+        for spec in _target_custom_op_exports(config, incremental=incremental)
+    ]
+    return {
+        "operators": [{"torch_target": s.spec.torch_target, "torch_schema": s.schema,
+                       "fake_kernel": s.fake_kernel, "converter_policy": s.converter_policy}
+                      for s in sessions],
+        "ge_prototypes": [
+            validate_gdr_ge_prototype_environment(),
+            validate_adn_attention_ge_prototype_environment(),
+        ],
+    }
+
+
 def create_quant_recompute_graph(
     config: Mapping[str, Any],
     *,
@@ -389,15 +468,7 @@ def create_quant_recompute_graph(
     device = str(config.get("device", "npu:0"))
     if not device.startswith("npu"):
         raise ValueError("formal quant AIR export requires an explicit NPU device")
-    adn_rms_norm_export = CustomOpExportSpec(
-        torch_op=ADN_RMS_NORM_TORCH_OP,
-        ge_op_type=str(
-            config.get(
-                "adn_rms_norm_ge_op_type",
-                ADN_RMS_NORM_DEFAULT_GE_OP_TYPE,
-            )
-        ),
-    )
+    custom_op_exports = _target_custom_op_exports(config, incremental=_incremental)
     target_dir = _required_directory(config, "target_dir")
     draft_dir = _required_directory(config, "draft_dir")
     quant_config = _required_file(config, "quant_config")
@@ -479,6 +550,13 @@ def create_quant_recompute_graph(
             device=torch.device(device),
             dtype=dtype,
         )
+    enabled_qlinear = _enable_target_quant_matmul_export_mode(target)
+    if not _incremental:
+        execution_model = getattr(target, "dflash_execution_model", target)
+        for module in execution_model.modules():
+            setter = getattr(module, "set_cache_update_export_mode", None)
+            if callable(setter):
+                setter(True)
     draft = DFlashDraftModel.from_pretrained(
         draft_dir,
         ops=AirDFlashOps(),
@@ -521,11 +599,17 @@ def create_quant_recompute_graph(
         "gdr_effective_length_contract": (
             "INT16[B] call-local valid rows derived from attention_mask"
         ),
-        "custom_op_export_contract": {
-            "torch_target": adn_rms_norm_export.torch_target,
-            "ge_op_type": adn_rms_norm_export.ge_op_type,
-            "preservation": "one registered GE operator; no Tensor decomposition",
-        },
+        "custom_op_export_contracts": [
+            {"torch_target": spec.torch_target, "ge_op_type": spec.ge_op_type,
+             "minimum_occurrences": spec.minimum_occurrences,
+             "preservation": "one registered GE operator; no Tensor decomposition"}
+            for spec in custom_op_exports
+        ],
+        "standard_op_export_contracts": [
+            {"torch_target": "aten.softplus.default", "ge_op_type": "SoftplusV2",
+             "minimum_occurrences": 1}
+        ],
+        "qlinear_export_frontend_count": enabled_qlinear,
         "claim_boundary": (
             "fixed-gear recompute ABI; persistent rollback OM state is a "
             "separate later optimization"
@@ -545,7 +629,7 @@ def create_quant_recompute_graph(
         return incremental_graph_specs(target, draft, capacity=max_sequence_length,
             metadata=metadata, gdr=torch_npu.npu_chunk_gated_delta_rule,
             attention=torch_npu.adn_fused_infer_attention, rotary=apply_rotary_pos_emb,
-            custom_ops=(adn_rms_norm_export,), include_ordinary_decode=include_ordinary_decode)
+            custom_ops=custom_op_exports, include_ordinary_decode=include_ordinary_decode)
     enable_padded_draft_context(draft)
     target_adapter = QuantFullPrefixExportTarget(target).eval()
     return (
@@ -558,7 +642,7 @@ def create_quant_recompute_graph(
             device=device,
             name=str(config.get("name", "quant_dflash_recompute")),
             metadata=metadata,
-            custom_ops=(adn_rms_norm_export,),
+            custom_ops=custom_op_exports,
         ),
     )
 
@@ -566,6 +650,19 @@ def create_quant_recompute_graph(
 def create_quant_incremental_graphs(config: Mapping[str, Any]) -> tuple[AirGraphSpec, ...]:
     """Load the same locked weights with the branch's rollback target class."""
     return create_quant_recompute_graph(config, _incremental=True)
+
+
+# Optional exporter hook; plain factory calls still return graph specifications.
+def _prepare_incremental_export(config, torchair_module):
+    return _prepare_quant_export(config, torchair_module, incremental=True)
+
+
+def _prepare_recompute_export(config, torchair_module):
+    return _prepare_quant_export(config, torchair_module, incremental=False)
+
+
+create_quant_incremental_graphs.prepare_export = _prepare_incremental_export
+create_quant_recompute_graph.prepare_export = _prepare_recompute_export
 
 
 __all__ = [

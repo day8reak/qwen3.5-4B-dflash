@@ -95,22 +95,121 @@ def _normalize_gdr_effective_length(
     return effective_length
 
 
+def _npu_quant_matmul_with_export_frontend(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    pertoken_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    use_v4444_frontend: bool,
+) -> torch.Tensor:
+    """Keep the quant eager ABI and AIR V4444 frontend separated.
+
+    The private export frontend must retain the checkpoint's FP32 scale so its
+    TorchAir converter can lower the V4444 contract.  Ordinary eager execution
+    must preserve the authoritative ``quant`` branch call ABI as well: INT8
+    activation, INT8 weight, FP32 weight scale, and FP32 per-token scale.  Do
+    not pre-encode the weight scale with ``npu_trans_quant_param`` here; that
+    produces an INT64 carrier which has no INT8-weight V4444 kernel row on the
+    receiver.
+    """
+
+    if use_v4444_frontend:
+        namespace = getattr(torch.ops, "qwen35_dflash", None)
+        packet = (
+            None
+            if namespace is None
+            else getattr(namespace, "npu_quant_matmul_v4444", None)
+        )
+        operation = None if packet is None else getattr(packet, "default", None)
+        if operation is None:
+            raise RuntimeError(
+                "AIR QLinear requires the registered "
+                "qwen35_dflash::npu_quant_matmul_v4444 frontend"
+            )
+        return operation(
+            x1,
+            x2,
+            scale,
+            pertoken_scale=pertoken_scale,
+            output_dtype=output_dtype,
+        )
+    return torch_npu.npu_quant_matmul(
+        x1,
+        x2,
+        scale,
+        pertoken_scale=pertoken_scale,
+        output_dtype=output_dtype,
+    )
+
+
+def _npu_cache_update(
+    input: torch.Tensor,
+    updates: torch.Tensor,
+    target_block: torch.Tensor,
+    offset_in_block: torch.Tensor,
+    *, use_export_frontend: bool = False,
+) -> torch.Tensor:
+    """Keep eager mutation while capturing one copy-free AIR dataflow."""
+
+    if use_export_frontend and torch.compiler.is_compiling():
+        namespace = getattr(torch.ops, "qwen35_dflash", None)
+        packet = (
+            None
+            if namespace is None
+            else getattr(namespace, "npu_cache_update", None)
+        )
+        operation = None if packet is None else getattr(packet, "default", None)
+        if operation is None:
+            raise RuntimeError(
+                "AIR CacheUpdate requires the registered "
+                "qwen35_dflash::npu_cache_update frontend"
+            )
+        return operation(input, updates, target_block, offset_in_block)
+    torch_npu.npu_cache_update_(
+        input,
+        updates,
+        target_block,
+        offset_in_block,
+    )
+    return input
+
+
 class QLinear(nn.Module):
     def __init__(self, W_q, scale, idx):
         super().__init__()
         self.register_buffer("W_q", W_q)
         self.register_buffer("scale", scale)
+        self._quant_matmul_export_mode = False
         self.idx = idx
+
+    def set_quant_matmul_export_mode(self, enabled: bool = True):
+        """Select the private float-scale frontend only for AIR capture."""
+
+        if not isinstance(enabled, bool):
+            raise TypeError("quant matmul export mode must be a bool")
+        self._quant_matmul_export_mode = enabled
+        return self
+
+    def _use_quant_matmul_export_frontend(self) -> bool:
+        """Limit the mutable factory flag to an active Dynamo capture."""
+
+        return bool(
+            self._quant_matmul_export_mode and torch.compiler.is_compiling()
+        )
 
     def forward(self, x):
         x_quant, pertoken_scale = torch_npu.npu_dynamic_quant(x)
         pertoken_scale = pertoken_scale.reshape(-1).to(torch.float32)
-        npu_out = torch_npu.npu_quant_matmul(
+        export_frontend = self._use_quant_matmul_export_frontend()
+        npu_out = _npu_quant_matmul_with_export_frontend(
             x_quant,
             self.W_q.to(x.device),
             self.scale.to(x.device),
             pertoken_scale=pertoken_scale,
             output_dtype=torch.float16,
+            use_v4444_frontend=export_frontend,
         )
         return npu_out.to(torch.float16)
 
@@ -463,18 +562,27 @@ class Qwen3_5Attention(nn.Module):
         )
         return output_matrix.reshape(b, n, s, d)
 
+    def set_cache_update_export_mode(self, enabled: bool = True):
+        if not isinstance(enabled, bool):
+            raise TypeError("cache update export mode must be a bool")
+        self._cache_update_export_mode = enabled
+        return self
+
     def update(self, new_k, cache_position, past_key_value):
         b, s, n, d = new_k.shape
         block_idx = cache_position[0] // self.block_size
         offset_in_block = (cache_position[0] % self.block_size).to(torch.int32)
         target_blocks = block_idx.reshape(1).to(torch.int32)
         k_flattened = new_k.reshape(b, s, -1, 16)
-        torch_npu.npu_cache_update_(
+        updated = _npu_cache_update(
             past_key_value.to(new_k.device),
             k_flattened[0, :, :, :].to(torch.float16),
             target_blocks,
             offset_in_block,
+            use_export_frontend=getattr(self, "_cache_update_export_mode", False),
         )
+        if getattr(self, "_cache_update_export_mode", False) and torch.compiler.is_compiling():
+            return updated
         return past_key_value
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")

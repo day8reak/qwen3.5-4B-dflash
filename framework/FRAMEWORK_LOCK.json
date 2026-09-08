@@ -75,16 +75,68 @@
       ],
       "default_ge_op_type": "RmsNorm",
       "lowering": "one registered GE operator; no Tensor decomposition",
-      "preservation_gate": "converter call count must be positive and dynamo.pbtxt GE-node count must cover every converter call"
+      "preservation_gate": "converter call count must be positive and dynamo.pbtxt GE-node count must cover every converter call",
+      "required_operators": [
+        {
+          "torch_target": "npu.adn_rms_norm.default",
+          "ge_op_type": "RmsNorm",
+          "alternative_ge_op_type": "AdnRmsNorm"
+        },
+        {
+          "torch_target": "npu.npu_dynamic_quant.default",
+          "ge_op_type": "DynamicQuant",
+          "converter_policy": "torchair-builtin"
+        },
+        {
+          "torch_target": "qwen35_dflash.npu_quant_matmul_v4444.default",
+          "ge_op_type": "QuantBatchMatmulV4444",
+          "scale_dtype": "float32",
+          "output_dtype": "float16"
+        },
+        {
+          "torch_target": "npu.npu_chunk_gated_delta_rule.default",
+          "ge_op_type": "ChunkGatedDeltaRule",
+          "meta_rows": [
+            1,
+            16,
+            64
+          ]
+        },
+        {
+          "torch_target": "npu.adn_fused_infer_attention.default",
+          "ge_op_type": "AdnFusedInferAttention",
+          "pse_shift": "INT64[1] logical_end"
+        },
+        {
+          "torch_target": "qwen35_dflash.npu_cache_update.default",
+          "ge_op_type": "CacheUpdate"
+        },
+        {
+          "torch_target": "npu.npu_scatter_nd_update_.default",
+          "ge_op_type": "ScatterNdUpdate",
+          "minimum_occurrences": 0,
+          "converter_policy": "torchair-builtin"
+        }
+      ]
     },
     "state_policy": "recompute committed prefix"
   },
   "compiler": {
     "exporter": "TorchAir dynamo_export",
-    "custom_op_gate": "validate and propagate AIR custom_op_audit before ATC",
+    "custom_op_gate": "validate all declared custom-op contracts and SoftplusV2 audits for the entire graph suite before ATC; preserve builtin converters and audit their GE nodes",
     "atc_mode": 0,
     "atc_framework": 1,
-    "soc_policy": "exact 310P variant required; generic Ascend310P rejected"
+    "soc_policy": "exact 310P variant required; generic Ascend310P rejected",
+    "standard_operator_overrides": [
+      {
+        "torch_target": "aten.softplus.default",
+        "ge_op_type": "SoftplusV2",
+        "preserved_attributes": [
+          "beta",
+          "threshold"
+        ]
+      }
+    ]
   },
   "runtime": {
     "language": "C++17",
@@ -115,7 +167,40 @@
     "om_limit": 4,
     "commit": "acceptance and accepted+1 second GDR are internal to target_verify",
     "state": "explicit FP16 persistent GDN/conv/KV; FP32 GDR accumulator; current/next device banks and logical cursor",
-    "status": "HOST_VERIFIED_DEVICE_GATES_PENDING"
+    "status": "HOST_VERIFIED_DEVICE_GATES_PENDING",
+    "target_custom_operators": [
+      {
+        "torch_target": "npu.adn_rms_norm.default",
+        "ge_op_type": "RmsNorm",
+        "alternative_ge_op_type": "AdnRmsNorm"
+      },
+      {
+        "torch_target": "npu.npu_dynamic_quant.default",
+        "ge_op_type": "DynamicQuant",
+        "converter_policy": "torchair-builtin"
+      },
+      {
+        "torch_target": "qwen35_dflash.npu_quant_matmul_v4444.default",
+        "ge_op_type": "QuantBatchMatmulV4444",
+        "scale_dtype": "float32",
+        "output_dtype": "float16"
+      },
+      {
+        "torch_target": "npu.npu_chunk_gated_delta_rule.default",
+        "ge_op_type": "ChunkGatedDeltaRule",
+        "meta_rows": [
+          1,
+          16,
+          64
+        ]
+      },
+      {
+        "torch_target": "npu.adn_fused_infer_attention.default",
+        "ge_op_type": "AdnFusedInferAttention",
+        "pse_shift": "INT64[1] logical_end"
+      }
+    ],
+    "draft_custom_operators": []
   },
   "profiling": {
     "collector": "msprof dynamic CLI",

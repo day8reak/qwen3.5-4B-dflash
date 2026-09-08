@@ -8,7 +8,7 @@
     "canonical_package": "models.dflash_v1",
     "canonical_source_directory": "models/dflash_v1",
     "hiai_source_file": "models/modeling_qwen3_5_hiai_nd.py",
-    "hiai_source_sha256": "0aa2e5bf80edffe2d9b2bd50227d3f45b6adaf1a061538b28985cfcf9014a12f",
+    "hiai_source_sha256": "f9aa906f08132dfd956c4de7f8e6ee353dfa78a483e994264657476a0dc8bf8d",
     "hiai_source_policy": "repository-distributed direct Tensor ABI integration; validated before weight loading and never patched at runtime",
     "hiai_output_abi": "ordinary Tensor logits; feature-enabled tuple(logits, dflash_features)",
     "hiai_bridge_file": "models/internal_dflash_bridge.py",
@@ -129,7 +129,7 @@
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
     "wrapper_sha256": "fb634dbf46880820df462dfa728d18aab0cc56be690ba6de0ad186083a57c53c",
     "shared_qlinear_source_file": "models/modeling_qwen3_5_hiai_nd.py",
-    "shared_qlinear_source_sha256": "0aa2e5bf80edffe2d9b2bd50227d3f45b6adaf1a061538b28985cfcf9014a12f",
+    "shared_qlinear_source_sha256": "f9aa906f08132dfd956c4de7f8e6ee353dfa78a483e994264657476a0dc8bf8d",
     "policy": "persistent ordinary and DFlash sessions; prefill uses the original multi-token GDR route with 64-row real-token chunks, INT16[B] call-local effective length, and no padding commit; only the final real prompt row executes the LM head; T=K+1 verification and accepted+1 scalar state commit both reuse the original chunk GDR from the same round-start state and do not require GDR-MTP; optional Target W8A8 reuses the original QLinear while the Draft stays FP16; incremental Draft KV cache; no historical-prefix replay during verify; strict-greedy zero token mismatch"
   },
   "npu_benchmark": {
@@ -157,15 +157,15 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "8ce034ae0a120dc5cdca8b891c4c7900ee038e3309f9a28a1ff47d2e8c81b064"
+        "source_sha256": "a4bc625ade3a8f8a7ea76706a323dd1fe22849174e9850a245cecdac517e2b03"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "17f6863b308e19b8c92463741b1f94162e66b8663ada15d215ca527a0a119816"
+        "source_sha256": "6c19aee656d1b64f30ca005f594aef3ba8165993c5de829060cdbc7f117e0bcb"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
-        "source_sha256": "980bf214f7f957d021f67350f43f5ff9b70f0bb6c82f8cd1ae23bc08867d06ec"
+        "source_sha256": "7e97b19cadeca96e6aa44fcd9c6c18e2e53f27b5ad9ec1c19bf57ea2cf3a3831"
       },
       {
         "source_file": "framework/README.md",
@@ -209,11 +209,11 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/compiler.py",
-        "source_sha256": "8587c4278bff814e02396b692bf54d7b66da4493eb1346a094125c3c54cff344"
+        "source_sha256": "60c1e752bf33fff42df44b505df6d854322f7f936e37ee67d92eb656a4ce38f6"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/contracts.py",
-        "source_sha256": "0f7b3c8ee30354a484dd40588c9e112d6e1411c4e06d762d93597441345fbf68"
+        "source_sha256": "693c398a092c78fe84d5fda6cb3b1a8f73560608e054190d361ab0534501d5a9"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/cpp_runtime.py",
@@ -221,11 +221,11 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/custom_op_export.py",
-        "source_sha256": "735bfb9b101a19df3b52997bcf3e6913195d115a0e95b671a90178bff370a236"
+        "source_sha256": "988663c43260dc5937710014f13d42f9ea22bbccae13746646534add871c78a0"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/exporter.py",
-        "source_sha256": "3b156b132c7033a92be2f29c6fc81f92279c8b11a3129e345ee22c64537c89cd"
+        "source_sha256": "51ba51506b4538c5dc95e06e3f8518dd97a2e39ac975214f856a036df3bfec55"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/generation.py",
@@ -233,7 +233,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/incremental.py",
-        "source_sha256": "408fc0043b3eff358276c35d30394a3530d63a567f619d5996cf8a58958111ea"
+        "source_sha256": "0eb2eb976b760fad20aad22f903e8f6dae66e680c14c1483f4ab763b73ac8787"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/incremental_plan.py",
@@ -249,15 +249,19 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/quant_factory.py",
-        "source_sha256": "bbccbd9bfa685e6b1f061a1f9e202feb04b3574dcc1eef1a80aa2142ca2cd787"
+        "source_sha256": "819b5a23a0c7145cdd9d6e86475c7f25fb76147f944b2aa1c84055d52fa4441a"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/recompute_backend.py",
         "source_sha256": "071349a9557916409a0f1631fd97f9741e70812fd0f97099bf528b6951bb18e3"
       },
       {
+        "source_file": "framework/python/qwen35_dflash/ascend310p/standard_op_export.py",
+        "source_sha256": "8c4d210e76b321d17a37d66d7d8fdef45591396c8fa06f6668d65fc4d1b52a06"
+      },
+      {
         "source_file": "framework/python/qwen35_dflash/ascend310p/utils.py",
-        "source_sha256": "521de025eb15eb7ddf9980839d8652188f47f080d177b1cb86ac5567f8402011"
+        "source_sha256": "d3886905be1437976a307892f7b5323d4acf676257a59283dc850326788be6a8"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/workflow.py",
@@ -344,6 +348,10 @@
         "source_sha256": "926d162a1a27b4ffc5e89f4cbbee0650b61fc3b12791e508acbb4f134a975029"
       },
       {
+        "source_file": "tests/test_custom_op_export.py",
+        "source_sha256": "9435d615cfa95d07766271f20c0bbfc8b47d642da0e9c905e7d852fef6fe1719"
+      },
+      {
         "source_file": "tests/test_incremental_air_om.py",
         "source_sha256": "68e9f995c2f820bd12137360ae2e6bc52cf1fcc8af2b04255470675ad082086c"
       },
@@ -357,7 +365,7 @@
       },
       {
         "source_file": "tests/test_quant_air_om_framework.py",
-        "source_sha256": "58eb09d5c91803b5176626ff14977533d6179e08b316f26365b4f61af794c5f3"
+        "source_sha256": "564ac347c0ed77ee90daebace44887617452392dc57a3a8a79959705f535d3c0"
       },
       {
         "source_file": "tests/test_source_lock_benchmark.py",

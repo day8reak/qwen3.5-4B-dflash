@@ -546,6 +546,8 @@ def incremental_graph_specs(
         }
         if not ops:
             meta.pop("custom_op_export_contract", None)
+            meta.pop("custom_op_export_contracts", None)
+            meta.pop("standard_op_export_contracts", None)
         specs.append(
             AirGraphSpec(
                 name=name,

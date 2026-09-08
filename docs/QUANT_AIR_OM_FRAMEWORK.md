@@ -46,7 +46,7 @@ DFlash 运行加载 `target_prefill`、`target_verify`、`draft`；普通运行�
 | `include_ordinary_decode` | `true` 导出 4 图；`false` 只导出 DFlash 3 图 |
 | `dtype` | `float16` |
 | `device` | 例如 `npu:0` |
-| `adn_rms_norm_ge_op_type` | 默认 `RmsNorm`，必须是目标环境注册的 GE type |
+| `adn_rms_norm_ge_op_type` | 默认 `RmsNorm`；也支持已注册的 `AdnRmsNorm` |
 
 外部输入不能是 symlink；输入 manifest 冻结后不得修改对应内容。导出器在加载模型前检查
 输入 hash 和仓库 `SOURCE_LOCK.json`。物理 KV 容量为 C+64，额外行作为 scratch；
@@ -108,21 +108,41 @@ GDR 累加及算子 initial/final state 使用 FP32；OM 之间持久保存的 r
 
 ## 4. 自定义算子导出要求
 
-Target 使用 `npu_chunk_gated_delta_rule`、`adn_fused_infer_attention`、`adn_rms_norm`
-等 NPU 算子。每个导出节点都需要匹配的 dispatcher schema、Fake/Meta、TorchAir converter
-和 GE 注册。GDR `effective_length` 是本次有效行数，不能填写累计 KV 长度。
-fused attention 的 `pse_shift` 接收 `INT64[1] logical_end`，需要 receiver 软件栈支持导出。
+导出器在加载权重前验证所需 dispatcher schema，保留并验证已有 Meta kernel，
+为缺少 Meta 的算子注册 Fake 实现。Fake 仅描述输出 shape/dtype，实际计算仍由目标算子执行。
+随后逐图注册所需 converter，并在 `dynamo.pbtxt` 中核对保留的 GE 节点。
 
-`adn_rms_norm` 的导出对应关系为：
+| AIR 路径 | PyTorch 前端 | GE 节点与导出处理 |
+|---|---|---|
+| 三个 Target 图 | `npu::adn_rms_norm` | `RmsNorm` 或 `AdnRmsNorm`；按注册类型使用输入名 `x` 或 `self` |
+| 三个 Target 图 | `npu::npu_dynamic_quant` | `DynamicQuant`；保留 TorchAir 内置 converter，审计 GE 节点 |
+| 三个 Target 图 | `qwen35_dflash::npu_quant_matmul_v4444` | `QuantBatchMatmulV4444`；专用捕获前端避免覆盖 TorchAir 的量化 matmul converter |
+| 三个 Target 图 | `npu::npu_chunk_gated_delta_rule` | `ChunkGatedDeltaRule`；Meta 覆盖 R=1/16/64，保留两个输出和 FP32 recurrent state |
+| 三个 Target 图 | `npu::adn_fused_infer_attention` | `AdnFusedInferAttention`；保留 paged KV、mask、block table 和长度输入 |
+| 三个 Target 图 | `aten::softplus` | `SoftplusV2`；保留 beta/threshold 属性 |
+| 完整前缀图的缓存路径 | `qwen35_dflash::npu_cache_update` | `CacheUpdate`；功能化前端输出更新后的缓存，供 attention 消费 |
+| 完整前缀图的可选 scatter 路径 | `npu::npu_scatter_nd_update_` | `ScatterNdUpdate`；验证别名/Meta，保留内置 converter |
 
-```text
-torch_npu.adn_rms_norm → npu.adn_rms_norm.default → GE RmsNorm
-```
+增量四图的缓存写入使用 `index_copy`，不要求 `CacheUpdate` 或 `ScatterNdUpdate` 节点；
+Draft 图使用 Tensor 算子。完整前缀工厂按其实际缓存路径声明算子依赖。
+本分支的 verify 和 commit 都使用 `ChunkGatedDeltaRule`，不依赖 `GatedDeltaRuleMTP`。
 
-Fake/Meta 声明两个输出：第一个与 input 同 shape/dtype；第二个是
-`[*input.shape[:-1],1] FP32`。converter 一对一生成注册的 GE 节点，不执行 RMSNorm Tensor
-分解。导出要求 converter 命中，并在 `dynamo.pbtxt` 中找到对应 GE 节点；审计结果写入
-`air-manifest.json`，编译 OM 前再次检查。
+W8A8 的量化 activation/weight 保持 INT8，weight scale 和 per-token scale 保持 FP32，
+matmul 输出为 FP16。专用前端仅在工厂启用的 AIR 捕获期间生效。普通 NPU 推理的量化
+调用不变。RMSNorm 的两个输出分别为同 input shape/dtype 的 Tensor，以及
+`[*input.shape[:-1],1] FP32` 的 rstd。
+
+GDR 的 `effective_length: INT16[1]` 表示本次有效行数；
+attention 的 `pse_shift: INT64[1]` 表示 logical end。GDR GE 输入中
+`initial_state` 位于 `effective_length` 前；converter 显式按 GE 名称映射，
+不把 PyTorch 的参数顺序直接传给 GE。已配置的 vendor 环境需要通过 GDR/attention
+prototype 检查。
+
+`air-manifest.json` 保存 `operator_preflight`、每图的
+`custom_op_export_contracts`、`custom_op_audit` 和 `standard_op_overrides`。
+内置 converter 以 GE 节点审计为准；框架 converter 同时检查调用次数。
+解析同时支持 GE dump 的 `op:` 和 `type:` 字段，避免重复计数。
+编译前检查整个图集合的审计，缺少任意声明的算子或 SoftplusV2 记录都会拒绝进入 ATC。
 
 CPU、fixture 或 fake ACL 检查不证明目标环境的导出和算子数值正确。目标机需完成真实
 TorchAir/ATC、自定义算子、AscendCL 和 token 精度检查。

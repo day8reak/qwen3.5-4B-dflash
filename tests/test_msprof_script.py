@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,22 +14,19 @@ RUN_DOCUMENT = REPOSITORY / "docs" / "DFLASH_RUN_AND_VALIDATE.md"
 
 
 class MsprofScriptTests(unittest.TestCase):
-    def test_original_main_profile_uses_external_unquantized_inference(self) -> None:
+    def test_documented_ordinary_profile_uses_the_declared_model_entry(self) -> None:
         document = RUN_DOCUMENT.read_text(encoding="utf-8")
-        section = document.split("### 7.1 原 main 非 DFlash 模型", 1)[1].split(
-            "### 7.2 rollback 内部 ordinary 控制组", 1
-        )[0]
-        command = section.split("~~~bash", 1)[1].split("~~~", 1)[0]
-
-        self.assertIn("python3 inference.py", command)
-        self.assertIn("--config ./config/qwen3.5.ymal", command)
-        self.assertIn("--max_token 32", command)
-        self.assertIn("--no-msproftx", command)
-        self.assertNotIn("--quant_mode", command)
-        self.assertNotIn("--max_token 10", document)
-        self.assertNotIn("--max-new-tokens 10", document)
-        self.assertIn("不在本仓库中", document)
-        self.assertIn("并不是原 main 非 DFlash 模型", document)
+        commands = [block for block in re.findall(r"```bash\n(.*?)```", document, re.S)
+                    if "--profile-mode ordinary" in block]
+        self.assertTrue(commands, "ordinary profiling needs an executable example")
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIn("--profile-backend python", command)
+                self.assertIn("--profile-stage", command)
+                self.assertIn('"$MODEL_PYTHON" -B -m models.dflash_v1.run_npu', command)
+                self.assertIn('"${NPU_ARGS[@]}" "${QUANT_ARGS[@]}"', command)
+        self.assertTrue(any("--profile-stage all" in command for command in commands))
+        self.assertTrue(any("PROFILE_STAGE=decode" in command for command in commands))
 
     def test_wrapper_requires_no_git_checkout_or_vcs_metadata(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
