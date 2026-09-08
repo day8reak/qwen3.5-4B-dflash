@@ -3,6 +3,11 @@
 本文只保留可执行命令、报告门禁和性能口径。算法见[当前架构](DFLASH_ARCHITECTURE.md)，算子
 见[自定义算子清单](DFLASH_OPERATORS.md)。
 
+本文命令针对 PyTorch eager rollback。`framework/quant-air-om` 分支的 v41 默认 OM 部署
+请使用 [合并 Prefill + Decode1 + 静态 Draft + Verify16 指南](STATIC_SPLIT_OM_DEFAULT.md)。
+eager 验证、OM 元数据检查与真实 OM 推理是不同证据；不能拿本页的 Python 运行结果
+替代新四图的 ATC、AscendCL、显存或端到端验收。
+
 ## 1. 证据分级
 
 | 结论 | 最低证据 |

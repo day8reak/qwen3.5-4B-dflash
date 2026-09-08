@@ -3,8 +3,10 @@
 **v41 新默认部署与重跑命令以 [静态四图指南](STATIC_SPLIT_OM_DEFAULT.md) 为准**：
 合并 Prefill、保留 Decode1、独立静态 Draft N=64 和 Verify16，Draft/Verify 联合常驻。
 切换需要重建 runner 1.25.0 并重新导出 AIR、编译 OM。静态真机通过后再尝试动态。
-本文保留通用框架、历史排错和显式 fused/split-head/recompute 对照命令；这些显式
-factory/config 不会自动变成新默认。旧 [静态 fused 基线](STATIC_FUSED_OM_BASELINE.md)
+本文保留通用框架、历史排错和显式 fused/split-head/recompute 对照命令。第 4–11 节的
+`factory-fused.json`、`FUSED_BUNDLE`、`runner-fused.json` 与 fused 报告检查是一套旧对照流程，
+不是新默认的操作步骤；新部署完整遵循静态四图指南，不要从两套流程各取一半。
+这些显式 factory/config 不会自动变成新默认。旧 [静态 fused 基线](STATIC_FUSED_OM_BASELINE.md)
 使用 `fused_static_feature_rows`，新默认使用 `draft_static_feature_rows`，两者均不是
 `example_sequence_length`。
 v39 同时修复 Draft FP16 KV 头复制的 BroadcastTo auto-tiling 路径，
@@ -73,9 +75,11 @@ row，并只按接受数提交一个 GDN/conv state-bank 槽；后者固定提�
 
 ## 2. 冻结 ABI
 
-本节首先记录仍保留的单图重算诊断 ABI。fused 4-OM 的每个 role、状态 tensor、动态 gear 和
-commit/rollback 合同见 [增量 OM 与 C++ 高性能路线](INCREMENTAL_OM_PERFORMANCE.md)；主流程
-生成与运行命令从第 4 节开始全部使用该 4-OM ABI。
+v41 默认四图的物理 ABI 与报告门禁以 [静态四图指南](STATIC_SPLIT_OM_DEFAULT.md)、
+`framework/FRAMEWORK_LOCK.json` 和 `framework/abi/incremental-performance-v2.json` 为准。
+本节下表仅记录仍保留的单图重算诊断 ABI。旧 fused 4-OM 的状态 tensor、动态 gear 和
+commit/rollback 对照合同见 [增量 OM 与 C++ 高性能路线](INCREMENTAL_OM_PERFORMANCE.md)；
+第 4–11 节保留的 fused 命令使用旧 ABI，不能用它的 role 集合检查新静态四图。
 
 图名为 `quant_dflash_recompute`，batch 固定为 1：
 
@@ -112,7 +116,8 @@ modeling 中的 torch_npu.<op> 或 AIR 专用 qwen35_dflash::<op>
 ```
 
 当前锁定的八个算子如下。`required` 表示当前完整前缀重算图必须实际出现，`optional` 表示仍做
-schema/Meta 预检，但不能虚构一次图命中；GDR-MTP 仅在四 OM 的融合 verify 图中 required。
+schema/Meta 预检，但不能虚构一次图命中。增量路线的 GDR-MTP 在新四图的
+`target-verify-commit` 或旧融合的 `fused-speculative-step` 中 required，不在单图重算中要求。
 
 | 前端 FX target | Fake/Meta 输出合同 | 默认 GE type | converter | 当前图 |
 | --- | --- | --- | --- | --- |
@@ -120,7 +125,7 @@ schema/Meta 预检，但不能虚构一次图命中；GDR-MTP 仅在四 OM 的�
 | `qwen35_dflash.npu_quant_matmul_v4444.default` | broadcast batch + `[M,N]`，当前调用输出 FP16 | `QuantBatchMatmulV4444` | 框架注册 | required |
 | `npu.adn_rms_norm.default` | 输出 0 与 input 同 shape/dtype；输出 1 为 `[*input.shape[:-1],1]` FP32 | `AdnRmsNorm` | 框架注册 | required |
 | `npu.npu_chunk_gated_delta_rule.default` | output 为 value shape/query dtype；final state 为 initial-state shape/FP32 | `ChunkGatedDeltaRule` | 框架注册 | required |
-| `npu.npu_gated_delta_rule_mtp.default` | output 为 value shape/query dtype；state bank 为 initial-state shape/FP32 | `GatedDeltaRuleMTP` | 框架注册 | required（仅 `fused-speculative-step`） |
+| `npu.npu_gated_delta_rule_mtp.default` | output 为 value shape/query dtype；state bank 为 initial-state shape/FP32 | `GatedDeltaRuleMTP` | 框架注册 | required（`target-verify-commit` / 旧 `fused-speculative-step`） |
 | `qwen35_dflash.npu_cache_update.default` | 返回同 shape/dtype/device 的非 alias 更新值 | `CacheUpdate` | 框架注册 | required |
 | `npu.adn_fused_infer_attention.default` | 按 layout 推导；当前 packed `BNSD` 路径保持 query shape/FP16 | `AdnFusedInferAttention` | 框架映射 | required |
 | `npu.npu_scatter_nd_update_.default` | 返回同一个 `Tensor(a!)`，不能丢失写 alias | `ScatterNdUpdate` | TorchAir builtin | optional（仅 `forward1`） |
@@ -274,7 +279,7 @@ rg -n 'type: "SoftplusV2"' \
   "$AI_RUN_DIR/artifacts/quant-dflash/air/quant_dflash_recompute/dynamo.pbtxt"
 ```
 
-包含 Target Gated DeltaNet 的图至少应命中一次；四图中的 `target-prefill-head` 不经过 Target
+包含 Target Gated DeltaNet 的图至少应命中一次；旧 split-head 路线的 `target-prefill-head` 不经过 Target
 decoder，所以其合法最小值是 0。`air-manifest.json` 的 `standard_op_overrides` 会逐图记录
 `minimum_occurrences`、GE 节点数、converter 调用数和实际采用的 converter policy。这样不会因
 新 TorchAir 已生成正确 `SoftplusV2` 但框架计数器为 0 而误判，也不会放过需要 Softplus 的图中
@@ -295,7 +300,7 @@ rollback Target 需要为当前 `T=K+1` 行返回逐行 causal-conv state。PyTo
 
 ### 2.5 DFlash transaction tail 的 AIR 前缀扫描
 
-四图中的 `fused-speculative-step` 在设备端完成 EOS 截断、严格贪心最长前缀验收和状态 slot
+新四图的 `target-verify-commit` 和旧 `fused-speculative-step` 在设备端完成 EOS 截断、严格贪心最长前缀验收和状态 slot
 选择。receiver TorchAir 对 `aten.amin.default`、`aten.min.dim` 和 `aten.cumprod.default` 都没有
 可用 converter，所以不能把 `.amin(dim=1)` 仅机械替换成 `torch.min(..., dim=1).values`，也不能
 继续用 `cumprod` 计算连续匹配前缀。
@@ -310,7 +315,8 @@ frontend，并要求图中存在 `aten.cumsum.default`。
 
 ### 2.6 动态图外置权重的 Data-index 映射
 
-四图路线中的 `fused-speculative-step` 声明离散运行 shape，但 receiver 生成的 OM 也可能采用
+本节仅针对显式动态候选，不表示 v41 默认四图仍有动态输入。
+旧动态四图中的 `fused-speculative-step` 声明离散运行 shape，但 receiver 生成的 OM 也可能采用
 动态 Shape 接口，而不携带 ATC 分档控制输入。receiver TorchAir 在生成 AIR 时会把
 captured parameter 的 `Data` 节点替换成 `Const` 或 `FileConstant`；其旧实现错误地用“运行时输入
 序号”直接索引 `GraphDef.op`。动态图的 shape helper（例如 `Gather`、`Pack`）可能出现在后续
@@ -452,6 +458,10 @@ ADN 检查还会确认 prototype 的完整输入/输出/attr 顺序以及
 
 ## 4. 锁定外部模型和量化输入
 
+输入锁定方法通用；已有且仍校验通过的量化输入 manifest 可复用，无须重新量化。
+新默认接下来填写 static-split 模板并按 [静态四图指南](STATIC_SPLIT_OM_DEFAULT.md) 操作。
+本节后半及第 5–11 节保留的 `factory-fused.json` 命令只用于显式旧 fused 对照。
+
 先生成一次 hash-complete manifest。它会读取并哈希 Target、Draft、量化 Linear、量化
 embedding、量化 YAML 和 receiver wrapper。大权重首次哈希需要时间，这是防止生成 AIR 前后
 权重漂移的必要步骤。
@@ -469,7 +479,7 @@ embedding、量化 YAML 和 receiver wrapper。大权重首次哈希需要时间
 4B 权重前重新核验 manifest，并逐项核对仓库 `SOURCE_LOCK.json` 中的量化、Target、Draft、
 bridge 和 rollback 源码 hash；任意字节变化都会失败。
 
-复制并编辑 factory 配置：
+仅做旧 fused 对照时，复制并编辑以下 factory 配置：
 
 ```bash
 cp config/quant_air_om_fused_factory.example.json \
@@ -568,7 +578,11 @@ OM。它仍不是 OM 证据，但能在耗时导出之前发现 checkpoint、量
 
 ### 5.3 从拷贝源码目录采集完整 AIR 诊断
 
-NPU 机器上即使只有直接拷贝的源码、没有 `.git`，也可以执行：
+NPU 机器上即使只有直接拷贝的源码、没有 `.git`，也可以采集。下面是旧 fused 命令；
+新默认须同时将 factory 改为 `create_quant_incremental_state_graphs`，配置改为
+`factory-static-split64.json`，并使用新的 static-split 诊断 bundle，不能只改一个选择器。
+
+旧 fused 对照命令：
 
 ```bash
 "$MODEL_PYTHON" framework/scripts/collect_air_debug.py \
@@ -587,7 +601,7 @@ NPU 机器上即使只有直接拷贝的源码、没有 `.git`，也可以执行
 即使 AIR 导出失败，也会先在 `--output-dir` 生成 `air-debug-*.tar.gz`，随后返回原导出退出码；
 把该压缩包回传即可。若日志过大，可增加 `--no-dynamo-logs`，但第一次失败建议保留默认完整日志。
 
-## 6. 生成 AIR
+## 6. 生成 AIR（显式旧 fused 对照）
 
 ```bash
 export FUSED_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-fused"
@@ -737,7 +751,7 @@ AIR、伪文件或 CPU export 替代。若仍出现 `does not support running wi
 的完整 `npu.<op>.default`：本分支会预检上述八个 target，出现第九个算子表示 receiver 源码/算子
 包已经漂移，需要先锁定它的真实 schema、输出元数据和 GE IR，不能套用已有 Fake 合同。
 
-## 7. AIR 编译成 OM
+## 7. AIR 编译成 OM（显式旧 fused 对照）
 
 使用设备对应的精确 SoC 名称，例如真实环境确认是 `Ascend310P3` 时：
 
@@ -818,17 +832,18 @@ factory 重跑。不能把单图 manifest 交给多 OM runner。
   --device-memory-policy normal-only
 ```
 
-生产 runner 使用：
+构建方式同时适用于 v41 新默认和旧对照。生产 runner 使用：
 
 - `aclInit`、`aclrtSetDevice`、显式 context/stream；
-- `aclmdlLoadFromFileWithMem`，四个 role 在进程启动时各加载一次，共享串行 workspace；
+- `aclmdlLoadFromFileWithMem` 与共享串行 workspace；新默认按阶段驻留，Draft/Verify 联合常驻；
+  下面旧对照的 all-resident 配置才在启动后保持四个 role 一直加载；
 - `aclrtMallocHost` pinned host buffer；
 - 持久化 device buffer 和 dataset；
 - 默认把所有显式 device 分配编译为 `normal-only`；可在独立目录构建 `huge-first` 精确候选，
   两种 runner 都把策略写入报告；
 - Target/Draft KV、GDR/conv state、feature 和 proposal carrier 保持 device-resident；
-- prompt 以 64-row body 分块，仅末 chunk 执行一次 head；ordinary 后续只执行 decode1；
-- DFlash 每个物理 fused 调用依次完成 Draft proposal、固定 T16 Target verify 和精确 commit；
+- prompt 以 64-row body 分块；新默认每块合并计算 head、只消费末块结果，旧 split-head 对照才仅末块执行 head；
+- ordinary 后续只执行 decode1；新默认 DFlash 分别调用 Draft 与 Verify，旧 fused 才在一次物理调用中依次完成二者；
 - 每个同步窗口只下载 compact commit 结果，不把完整 state 搬回 host；
 - token 调度、DFlash 接受/correction/bonus、EOS 都在 C++17 中完成。
 
@@ -842,9 +857,10 @@ $AI_RUN_DIR/build/cpp-release/qwen35_dflash_acl_runner
 $AI_RUN_DIR/build/cpp-release/qwen35_dflash_incremental_acl_runner
 ```
 
-主流程必须使用第二个 `qwen35_dflash_incremental_acl_runner`。第一个二进制只运行单一重计算
-OM 基线；第二个二进制运行五图、统一 Target-step 四图或 fused speculative-step 四图常驻 OM
-候选。`build-cpp` 会同时构建并 host-test 两者，控制面会按 `state_policy` 严格核对二进制的
+新默认与本页旧 fused 对照都必须使用第二个 `qwen35_dflash_incremental_acl_runner`。
+第一个二进制只运行单一重计算 OM 基线；第二个支持合并 Prefill 的静态四图，以及旧五图、
+统一 Target-step 四图和 fused speculative-step 四图。`build-cpp` 会同时构建并 host-test 两者，
+控制面会按 `state_policy` 严格核对二进制的
 `--help` 合同，runner 选错会在加载 checkpoint/AIR/OM 前失败。各拓扑的导出 factory、runner
 配置、直接运行、report 门禁、同二进制
 `one-token-h2d`/`last-token-d2d` A/B 和 msprof 命令见
@@ -867,7 +883,7 @@ INT32 零值，slot 为 960 bytes，ordinary T=1 直接绑定该零值，不再�
 
 不要把 build 目录或二进制提交进源码仓库。
 
-## 9. 用 C++ 调用 OM 完整生成 token
+## 9. 用 C++ 调用 OM 完整生成 token（显式旧 fused 对照）
 
 复制并填写真实运行时身份：
 
@@ -927,7 +943,7 @@ Target/Draft 推理。`qwen35_dflash_acl_runner` 只认识 `--model` 单图 ABI�
 `prefill_ms`、`decode_ms` 和 `model_total_ms`。正式无人值守采样如需静默，可加
 `--no-progress`；日志文件仍会完整保留子进程输出。
 
-## 10. 一键端到端
+## 10. 一键端到端（显式旧 fused 对照）
 
 先构建 C++ runner，然后执行：
 
@@ -962,7 +978,12 @@ factory/runner JSON，不能继续带旧 fused 选择器。Python `run-e2e` 仍�
 
 ### 11.1 功能 PASS
 
-最终 `cpp-infer.json` 或 `e2e/reports/summary.json` 必须同时满足：
+下列角色集合、topology 和计数公式仅检查第 4–10 节的旧 fused all-resident 对照。
+新默认应按 [静态四图指南](STATIC_SPLIT_OM_DEFAULT.md) 检查
+`merged-prefill-four-static-split-v1`，不能要求存在独立 head/fused execution，
+也不能忽略换组同步或套用 all-resident 的加载计时口径。
+
+旧对照最终的 `cpp-infer.json` 或 `e2e/reports/summary.json` 必须同时满足：
 
 ```python
 assert report["status"] == "PASS"
@@ -1454,13 +1475,13 @@ INT32 count 和有界 dynamic Shape 的既有检查全部保留。
 | TorchAir graph break | 某个 Python/自定义 op 未被捕获 | 定位首个 graph break，补正式 converter；不要伪造 AIR |
 | ATC unsupported op | TorchAir 图中存在 ATC 不支持节点 | 保留算子名和编译日志，决定分解或正式自定义算子 |
 | generic `Ascend310P` rejected | SoC 身份不精确 | 从设备/ATC 支持列表填写真实 variant |
-| OM input/output count mismatch | 导出 ABI 漂移 | 必须恢复 2 input/2 output INT64 合同或版本化新 ABI |
+| OM input/output count mismatch | 导出 ABI 漂移或混用不同拓扑产物 | 新默认按 static-split 四角色分别检查 9/11、8/8、8/4、9/13 输入/输出数，并核对 dtype/shape/bytes；2 input/2 output 只适用于旧重算基线，不能套用到多图 |
 | C++ OM hash mismatch | OM 被替换或 manifest 错配 | 使用同一次 build 的 OM 和 deployment manifest |
 | `qwen35_dflash_acl_runner: unknown option --measurement-protocol` | 旧控制面把仅多 OM runner 支持的参数传给了单 OM runner，或选择了错误二进制 | 更新本分支；fused/五图/统一四图必须使用 `qwen35_dflash_incremental_acl_runner`。新 preflight 会在权重导出前拒绝这种组合 |
-| 期望多 OM 但只生成 `quant_dflash_recompute.om` | 命令省略/写错 factory，仍选择单图重算路线，或查看的是旧 bundle | 使用 `create_quant_fused_speculative_step_graphs` 和新的空 bundle；按第 7 节确认 manifest 恰好四个 role |
+| 期望多 OM 但只生成 `quant_dflash_recompute.om` | 使用旧源码/安装包、显式重算 factory、Python `run-e2e`/probe，或查看旧 bundle | 新默认使用本分支 `framework/python` 的 `create_quant_incremental_state_graphs` 与 static-split 配置、新 bundle；按静态四图指南检查四角色，不应改回旧 fused factory |
 | `ValueError: invalid literal for int() with base 10: 'input_ids'` | Python tokenizer 返回 `BatchEncoding`/Mapping，旧控制面误把字段名当 token ID 遍历；此时尚未启动 C++ runner | 更新本分支后重跑同一 `infer-cpp`；无需重新生成 AIR/OM，命令中的重复 `--chat`、`--max-new-tokens` 和 `--max-draft-tokens` 各保留一次 |
 | ordinary/DFlash token mismatch | 接受、correction、pad 或图语义错误 | 停止性能测试，定位首个 token 分叉 |
-| 延迟明显慢于闭源 | 完整前缀重算成为主瓶颈 | profile 后进入增量 OM state ABI，不要只优化 Python |
+| 延迟明显慢于闭源 | 仅凭总时延不能定位瓶颈；旧重算可能重复处理历史，新默认还包含补齐与换组成本 | 先核对源码、拓扑、计时范围和零 token 差异，再测量图执行、静态补齐、传输与换组开销；不能将旧重算根因直接套在新四图 |
 
 ## 13. 性能验证与后续候选
 

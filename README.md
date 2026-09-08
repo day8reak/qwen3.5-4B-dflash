@@ -24,6 +24,10 @@ torch-npu 自定义算子，包括 GDR 的 INT16 `effective_length` ABI。
 
 ## 当前实现
 
+下表与后面的 `models.dflash_v1` 命令描述 PyTorch eager rollback，不是静态 OM 的物理尺寸
+或常驻策略。AIR/OM 默认的四角色、N=64 补齐、重导步骤统一见
+[静态四图指南](docs/STATIC_SPLIT_OM_DEFAULT.md)，避免与 eager 的实际行数混淆。
+
 | 环节 | 当前行为 |
 | --- | --- |
 | Prompt | Target 按最多 64 个真实 token 分块 prefill；原 GDR 接收本次真实行数 `effective_length` |

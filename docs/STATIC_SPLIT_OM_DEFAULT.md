@@ -4,6 +4,24 @@
 greedy 对齐，再另建动态候选；本次不缩减模型、量化精度、KV 容量或请求长度。
 这是用户选择的源码默认值，不代表已经取得 Ascend310P 真机正确性或性能结论。
 
+## 文档入口与版本范围
+
+本页是当前 AIR/OM 部署的主操作入口。以下旧文档中的显式 factory、配置和报告检查
+不会随着 CLI 默认值变更自动迁移；不能仅凭“都是四个 OM”混用。
+
+| 需要做什么 | 使用的文档 | 适用范围 |
+| --- | --- | --- |
+| 新默认构图、重跑、静态尺寸与分组显存 | 本页及所链接的 static-split factory/runner 模板 | v41 / runner 1.25.0 起 |
+| 环境、自定义算子 ABI、历史 AIR/ATC 排错 | [框架参考](QUANT_AIR_OM_FRAMEWORK.md) | 第 4–11 节保留旧 fused 对照；不是默认运行命令 |
+| 复用旧正确静态 fused OM，仅修改生命周期 | [v40 显存说明](STATIC_OM_MEMORY.md) | 仅旧静态 fused，不适用新 Prefill ABI / Draft shape |
+| 旧 fused 静态导出或动态排错 | [静态 fused 基线](STATIC_FUSED_OM_BASELINE.md)、[性能候选参考](INCREMENTAL_OM_PERFORMANCE.md) | 显式回退 / 独立候选 |
+| PyTorch eager rollback 对照 | [rollback 运行与验证](DFLASH_RUN_AND_VALIDATE.md) | 不是 OM 生成或 OM 验收 |
+
+本页默认值对应源码提交 `acb43d5b3d975e3204e75d915e7a41375ed0f6b0`。
+该源码的主机验证为 Python 676 passed（另 43 subtests）、C++/fake ACL 32/32、
+ASan/UBSan 生命周期专项 4/4，以及 31 个 C++ 报告正例 / 186 个损坏报告拒绝用例。
+这些不是新 OM 的 ATC 编译、真机显存、零 token 差异或加速证据；设备门禁仍待执行。
+
 ## 构图和常驻范围
 
 | 物理 OM | 输入 / 输出数 | 固定物理行数 | 生命周期 |
@@ -84,6 +102,15 @@ manifest 或只重建 runner 转成新默认。v40 文档中“不用重新导�
    `$AI_RUN_DIR/runner-static-split.json`。必须填真实设备、CANN、driver、firmware 身份。
    首轮保持 `phase-resident`、`async-memset`、`fixed-16`、window 1、`separate`、fallback disabled。
 3. 在已经激活的模型/CANN 环境执行；每步成功后再进行下一步：
+
+命令须使用本分支的 `framework/python`，不要误用 workspace 旧参考实现或旧安装包。
+从当前部署源码根目录设置模块路径（不新建 Python 环境）：
+
+```bash
+export DFLASH_SOURCE="$PWD"
+export PYTHONPATH="$DFLASH_SOURCE/framework/python:$DFLASH_SOURCE${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
+```
 
 ```bash
 export STATIC_SPLIT_BUNDLE="$AI_RUN_DIR/artifacts/quant-dflash-static-split64"
