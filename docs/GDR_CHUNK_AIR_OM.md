@@ -597,6 +597,42 @@ PROFILE_STAGE=decode
 
 ## 14. DFlash 模式：分别采一次 prefill、draft、verify
 
+只采一次 verify 并按耗时排序算子，在第 1 步配置的同一终端执行：
+
+```bash
+cd "$REPO_ROOT"
+"$MODEL_PYTHON" -B tools/profile_verify_om.py \
+  --run-dir "$AI_RUN_DIR" --runner "$CPP_RUNNER" --device-id 0
+```
+
+脚本读取 `artifacts/deployment-manifest.json`，生成与现有 OM 配套的三图计划。
+prompt 和 EOS 优先取自 `reports/cpp-paired.json`；该文件不存在时，读取
+`prompt-ids.csv` 并使用 EOS `248044`。也可用 `--prompt-report /path/to/report.json`
+指定报告，或用 `--prompt-token-ids "..." --eos-token-ids 248044` 指定 token IDs。
+`--deployment-manifest` 可指定其他运行目录中的 OM 清单。
+
+默认预热一次，然后只采一次完整的 `target_verify.om` 调用；prefill、draft、模型加载、
+状态准备和预热都在采集窗口外。加载三个 OM 可能耗时数分钟，默认每次控制转换的等待上限
+为 600 秒。采集使用 msprof 动态 CLI，无需 pyACL。`MSPROF_BIN` 未设置时从 PATH 查找
+`msprof`。默认 `--max-new-tokens 32 --max-draft-tokens 15 --profile-warmup 1`。
+
+每次创建新的 `msprof/verify-<随机后缀>/`，开始时打印完整路径，完成时输出：
+
+| 文件 | 内容 |
+|---|---|
+| `hotspots.txt` | 耗时最高的 20 类算子和 20 个任务，保留 AI_CORE/AI_CPU、静态/动态和输入形状 |
+| `operator-types.csv` | 按算子类型、任务类型和 OP State 分组的次数、总时长、平均值、最大值，单位 ms |
+| `operator-tasks.csv` | 全部任务按耗时排序，保留名称、形状和输入 dtype |
+| `capture/verify-stage-summary.csv` | 同步的 verify 阶段时间 `profiled_elapsed_ms` |
+| `capture/profile/msprof/verify/` | 原始 PROF 数据、时间线和 `op_summary*.csv` |
+| `capture/log/` | 设备检查、msprof 和执行日志 |
+
+排序使用 msprof 的 `Task Duration(us)` 并换算成 ms。不同 stream 的任务可能重叠，
+算子时长之和不等于阶段耗时；多个 CSV 分别统计，不合并累加。阶段耗时包含 profiling
+开销。判断慢算子时，同时查看排序结果与时间线中的空隙。
+
+需要分别采 prefill、draft、verify 时，使用以下命令：
+
 ```bash
 "$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p prepare-chunk-plan \
   --deployment-manifest "$AI_RUN_DIR/artifacts/deployment-manifest.json" \

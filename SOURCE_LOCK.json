@@ -157,7 +157,7 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "ddb259faf05761e8da4d83263eb930ea593f426ba8760e1245c4939c04a9756b"
+        "source_sha256": "7fcdd6f4dd6250d30946ba38937cf1e7c85fcadc1cf9296c9c662872605e5c91"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -394,6 +394,14 @@
       {
         "source_file": "tests/test_atc_diagnostics.py",
         "source_sha256": "8d0ccdf39b226266fbe015fb0b356b2d09e4c4e94df43e45eb3854d6f5e9519c"
+      },
+      {
+        "source_file": "tools/profile_verify_om.py",
+        "source_sha256": "e1c74dd301d5e5f9ff8c7b361615ccb2995ba9a5fb405fe5996e69e3a3c9c3b6"
+      },
+      {
+        "source_file": "tests/test_profile_verify_om.py",
+        "source_sha256": "ef0729e2a78e1d0501e90ca35aad1662dd83d8642f94ac81ca3535436bdb7bc2"
       }
     ]
   }
