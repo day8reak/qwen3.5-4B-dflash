@@ -1,5 +1,9 @@
 # 基于 `quant` 分支的 AIR → OM → C++ token 推理框架
 
+v48 对所有本框架的 AIR→OM 编译强制保留原图 dtype，默认
+`--precision_mode=must_keep_origin_dtype`；不替换 GDR-MTP，不改变量化和状态 ABI。
+已有 AIR 可复用，但旧 OM 必须重编，详见 [编译精度保护](OM_COMPILER_PRECISION.md)。
+
 **v41 新默认部署与重跑命令以 [静态四图指南](STATIC_SPLIT_OM_DEFAULT.md) 为准**：
 合并 Prefill、保留 Decode1、独立静态 Draft N=64 和 Verify16，Draft/Verify 联合常驻。
 切换需要重建 runner 1.25.0 并重新导出 AIR、编译 OM。静态真机通过后再尝试动态。

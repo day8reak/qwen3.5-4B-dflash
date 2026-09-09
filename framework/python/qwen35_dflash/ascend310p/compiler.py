@@ -33,6 +33,13 @@ _FORBIDDEN_ATC_PREFIXES = (
     "--input_shape",
 )
 
+ATC_PRECISION_POLICY = "preserve_graph_dtypes"
+DEFAULT_ATC_PRECISION_ARG = "--precision_mode=must_keep_origin_dtype"
+_ORIGIN_PRECISION_ARGS = frozenset({
+    DEFAULT_ATC_PRECISION_ARG,
+    "--precision_mode_v2=origin",
+})
+
 
 class AtcCompileError(RuntimeError):
     """ATC failed or did not produce the promised OM artifact."""
@@ -134,9 +141,51 @@ def _validate_extra_args(arguments: Sequence[str]) -> list[str]:
         value = str(argument)
         if not value.startswith("--"):
             raise ValueError(f"ATC extra argument must start with '--': {value!r}")
-        if value.startswith(_FORBIDDEN_ATC_PREFIXES):
+        # ATC also accepts hyphenated option names. Check their canonical form
+        # so --soc-version/--input-shape cannot bypass the ABI guard.
+        option = "--" + value[2:].split("=", 1)[0].replace("-", "_")
+        if option.startswith(_FORBIDDEN_ATC_PREFIXES):
             raise ValueError(f"ATC core option cannot be overridden: {value!r}")
         result.append(value)
+    return result
+
+
+def validate_atc_args(arguments: Sequence[str]) -> list[str]:
+    """Keep the exported dtypes for every Target/Draft OM, including probes.
+
+    Explicit FP32 casts in AIR are not permission for ATC to lower the graph's
+    FP32 islands. This changes compiler policy only, not the MTP operator,
+    persistent-state precision, quantized weights or public tensor ABI.
+    Idempotent so build/e2e can reject bad flags before loading checkpoints,
+    while direct compile callers get the same guard.
+    """
+    result = _validate_extra_args(arguments)
+    precision_indices = []
+    for index, argument in enumerate(result):
+        name, separator, value = argument.partition("=")
+        option = "--" + name[2:].replace("-", "_")
+        if option in {"--customize_dtypes", "--input_fp16_nodes"}:
+            raise ValueError(
+                f"ATC option conflicts with {ATC_PRECISION_POLICY}: {argument!r}; "
+                "per-operator/input dtype overrides are not allowed"
+            )
+        if option in {"--precision_mode", "--precision_mode_v2"}:
+            canonical = option + separator + value
+            if canonical not in _ORIGIN_PRECISION_ARGS:
+                raise ValueError(
+                    f"ATC requires {ATC_PRECISION_POLICY}; use exactly one of "
+                    "--precision_mode=must_keep_origin_dtype or "
+                    f"--precision_mode_v2=origin; got {argument!r}"
+                )
+            result[index] = canonical
+            precision_indices.append(index)
+    if len(precision_indices) > 1:
+        raise ValueError(
+            "ATC precision options are mutually exclusive and must occur once; "
+            "do not combine or repeat --precision_mode/--precision_mode_v2"
+        )
+    if not precision_indices:
+        result.append(DEFAULT_ATC_PRECISION_ARG)
     return result
 
 
@@ -310,8 +359,9 @@ def compile_air_bundle(
     runner: Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]] | None = None,
     atc_identity: str | None = None,
 ) -> dict[str, Any]:
-    """Compile all AIR graphs with ``framework=1`` into the same run bundle."""
+    """Compile all AIR graphs with framework=1 and preserved graph dtypes."""
 
+    arguments = validate_atc_args(extra_args)
     manifest_path = Path(air_manifest_path).expanduser().resolve()
     root = require_run_output(manifest_path.parent)
     air_manifest = load_json_object(manifest_path)
@@ -340,7 +390,6 @@ def compile_air_bundle(
     exact_soc_version = validate_soc_version(soc_version)
     atc_path = resolve_atc_executable(atc_bin)
 
-    arguments = _validate_extra_args(extra_args)
     execute = runner or _default_runner
     om_root = root / "om"
     if om_root.exists() and any(om_root.iterdir()):
@@ -388,7 +437,9 @@ def compile_air_bundle(
         log_path.write_text(result.stdout or "", encoding="utf-8")
         if result.returncode != 0:
             raise AtcCompileError(
-                f"ATC failed for {name!r} with exit {result.returncode}; log={log_path}"
+                f"ATC failed for {name!r} with exit {result.returncode}; "
+                f"precision_policy={ATC_PRECISION_POLICY}; "
+                f"no precision fallback attempted; log={log_path}"
             )
         om_path = _resolve_atc_om_path(
             output_prefix, graph_name=name, log_path=log_path
@@ -436,6 +487,7 @@ def compile_air_bundle(
             "identity": atc_identity or _atc_identity(atc_path),
             "framework": 1,
             "extra_args": arguments,
+            "precision_policy": ATC_PRECISION_POLICY,
         },
         "graphs": compiled,
     }

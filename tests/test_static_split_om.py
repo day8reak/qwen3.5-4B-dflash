@@ -125,6 +125,9 @@ def test_static_split_rejects_invalid_carriers(rows):
 def test_compile_and_resolve_four_static_split_graphs(tmp_path, monkeypatch):
     deployed, commands = _compile_static_fixture(tmp_path, monkeypatch, _specs())
     assert len(commands) == 4
+    assert deployed["compiler"]["precision_policy"] == "preserve_graph_dtypes"
+    assert all(c.count("--precision_mode=must_keep_origin_dtype") == 1 for c in commands)
+    assert [g["atc_command"] for g in deployed["graphs"]] == commands
     assert all(not any(a.startswith(("--dynamic", "--input_shape")) for a in c) for c in commands)
     resolved, _ = cpp_runtime._resolve_incremental_oms(deployed["manifest_path"])
     assert list(resolved) == list(cpp_runtime._MERGED_STATIC_GRAPH_ABI)

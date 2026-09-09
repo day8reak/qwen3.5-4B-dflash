@@ -4,7 +4,11 @@
 greedy 对齐，再另建动态候选；本次不缩减模型、量化精度、KV 容量或请求长度。
 这是用户选择的源码默认值，不代表已经取得 Ascend310P 真机正确性或性能结论。
 
-**当前为 v47 / runner 1.29.0 / PASS report schema 13，四图拓扑保持 v41。**
+**当前为 v48 / runner 1.29.0 / PASS report schema 13，四图拓扑保持 v41。**
+v48 [强制 ATC 保留原图 dtype](OM_COMPILER_PRECISION.md)：四图编译默认添加
+`--precision_mode=must_keep_origin_dtype`，拒绝降精度/冲突参数；GDR-MTP 不变。
+本次只需更新 Python 并重新编译四个 OM；已有正确 AIR 可复用，C++ 无须重建。
+在新的活动 run 保留一份原 AIR payload 后编译，不能仅重跑旧 OM 或修改 manifest 标签。
 v47 增加[通用算子 dump / 同输入回放](OM_OPERATOR_DIAGNOSTICS.md)，不限于 GDR。
 只需更新 Python 并重建 C++，原失败 AIR/OM 保留；默认关闭，不能作为性能数据。
 v46 默认仍使用 `target_verify_gdr_policy="mtp-block-v1"`。
@@ -31,6 +35,7 @@ conv state 提交，并对齐当前分支 torch_npu 的 K、零接受回退和 E
 | 需要做什么 | 使用的文档 | 适用范围 |
 | --- | --- | --- |
 | 新默认构图、重跑、静态尺寸与分组显存 | 本页及所链接的 static-split factory/runner 模板 | v41 / runner 1.25.0 起 |
+| 保留原图 dtype 的编译策略及复用 AIR 重编 OM | [编译精度保护](OM_COMPILER_PRECISION.md) | v48，仅更新 Python，必须重编 OM |
 | 首个 Verify/Decode1 分歧的状态快照和重放 | [Target 定点诊断](OM_TARGET_PARITY_DIAGNOSTICS.md) | v45 / runner 1.28.0，默认关闭，不重导已有 v43+ OM |
 | 原 OM 中间张量、通用算子比较及同输入原生回放 | [通用算子诊断](OM_OPERATOR_DIAGNOSTICS.md) | v47 / runner 1.29.0，仅更新 Python/C++ |
 | 环境、自定义算子 ABI、历史 AIR/ATC 排错 | [框架参考](QUANT_AIR_OM_FRAMEWORK.md) | 第 4–11 节保留旧 fused 对照；不是默认运行命令 |
@@ -111,6 +116,8 @@ Verify 输出只有 16 行，不能假定其余 feature 区域已被覆写。
 ## 从哪里重新运行
 
 **首次迁移或尚未包含 v43 图内修复时，重建 C++ runner，并重新生成四图。**
+若已有当前 AIR，单独升级 v48 编译精度策略时，按 [AIR 复用步骤](OM_COMPILER_PRECISION.md#2-本次需要重建什么)
+复制完整 AIR payload 到新 bundle，再执行 compile-om；不需要重新导出或重建 C++。
 若只升级本次 v44 诊断，跳过 export-air / compile-om，按
 [诊断升级步骤](OM_FAILURE_DIAGNOSTICS.md#升级与运行)复用当前 bundle。
 v41 改变了 Prefill ABI 和 Draft 物理 shape：旧的 body/head/fused OM 不能靠改名、重排

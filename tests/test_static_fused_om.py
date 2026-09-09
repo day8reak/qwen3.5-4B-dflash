@@ -223,6 +223,8 @@ def _compile_static_fixture(tmp_path, monkeypatch, specs=None):
 def test_static_contract_survives_compile_to_runtime_manifest(tmp_path, monkeypatch):
     deployment, commands = _compile_static_fixture(tmp_path, monkeypatch)
     assert len(commands) == 4
+    assert deployment["compiler"]["precision_policy"] == "preserve_graph_dtypes"
+    assert all(c.count("--precision_mode=must_keep_origin_dtype") == 1 for c in commands)
     assert all(not any(a.startswith(("--dynamic", "--input_shape")) for a in c)
                for c in commands)
     assert all(g["dynamic"] is False and g["input_dim_gears"] == {}

@@ -338,10 +338,15 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 47
+    assert framework_lock["schema_version"] == 48
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v47"
+        "qwen3.5-4b-quant-air-om-ascendcl-v48"
     )
+    assert framework_lock["compiler"]["precision_policy"] == "preserve_graph_dtypes"
+    assert framework_lock["compiler"]["default_precision_arg"] == (
+        "--precision_mode=must_keep_origin_dtype"
+    )
+    assert framework_lock["static_verify_gdr_reference"]["default_policy"] == "mtp-block-v1"
     diagnostics = framework_lock["failure_diagnostics"]
     assert diagnostics["runner_version"] == "1.27.0"
     assert diagnostics["pass_report_schema"] == 13

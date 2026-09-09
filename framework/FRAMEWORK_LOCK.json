@@ -1,6 +1,6 @@
 {
-  "schema_version": 47,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v47",
+  "schema_version": 48,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v48",
   "operator_diagnostics": {
     "runner_version": "1.29.0",
     "default_enabled": false,
@@ -322,6 +322,14 @@
     "state_policy": "recompute committed prefix"
   },
   "compiler": {
+    "precision_policy": "preserve_graph_dtypes",
+    "default_precision_arg": "--precision_mode=must_keep_origin_dtype",
+    "allowed_precision_args": ["--precision_mode=must_keep_origin_dtype", "--precision_mode_v2=origin"],
+    "precision_gate": "all AIR bundle graphs, including static split/fused and legacy dynamic/recompute probes; exactly one origin option; normalize hyphenated precision names, reject duplicates, conflicting modes and customize_dtypes/input_fp16_nodes overrides; build/e2e reject before checkpoint loading; no retry at lower precision",
+    "precision_evidence": "deployment compiler.precision_policy and effective extra_args, plus each graph.atc_command; compiler policy only, not a measured dtype or numerical-parity audit",
+    "precision_regeneration": "update Python compiler and recompile every OM from the unchanged hash-locked AIR payload in a fresh bundle; runner 1.29.0, graph topology, GDR-MTP and state ABI unchanged",
+    "precision_device_status": "PENDING_REAL_ATC_AND_ZERO_MISMATCH_VALIDATION",
+    "precision_documentation": "docs/OM_COMPILER_PRECISION.md",
     "draft_kv_repeat_gate": "new cached Draft graphs declare gqa-head-repeat-tile-v1; trace each K/V ScatterElements through Concat and singleton-axis Unsqueeze to Tile with exact binary Const repeats and a Reshape consumer; require one distinct head replica per cache write before ATC and retain the audit in deployment; unrelated BroadcastTo and legacy rollback bundles are not relabeled as fixed",
     "draft_cache_index_gate": "new Draft-bearing graphs declare static-repeat-tile-v1; audit every ScatterElements indices edge in dynamo.pbtxt for Tile with Const repeats, require two scatter nodes per layer, reject missing/failed evidence before ATC and retain it in deployment; unrelated BroadcastTo operations are allowed and legacy bundles do not claim this fix",
     "runtime_input_abi_gate": "AIR schema 4 requires public-tensor-storage-identity-v1 normalization: Dynamo specialize_float=True preserves model Python float constants without freezing tensor dimensions; resolve Data.index against concrete serialization inputs before weights are externalized, canonicalize Data/RefData order to public tensor arguments, and reject every unknown scalar, duplicate, alias, or missing public input before serialization; compile-om validates and retains the passing audit",

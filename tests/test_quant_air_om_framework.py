@@ -2659,7 +2659,10 @@ def test_compile_uses_air_framework_and_hash_locks_payload(
         f"om/quant_dflash_recompute{om_suffix}"
     )
     assert commands[0][1:3] == ["--mode=0", "--framework=1"]
-    assert commands[0][-1] == "--soc_version=Ascend310P3"
+    assert "--soc_version=Ascend310P3" in commands[0]
+    assert commands[0][-1] == "--precision_mode=must_keep_origin_dtype"
+    assert result["compiler"]["precision_policy"] == "preserve_graph_dtypes"
+    assert result["compiler"]["extra_args"] == [commands[0][-1]]
 
 
 def test_atc_output_resolution_rejects_ambiguous_platform_names(

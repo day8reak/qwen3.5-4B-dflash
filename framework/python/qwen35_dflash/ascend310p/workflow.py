@@ -23,6 +23,7 @@ from .cpp_runtime import (
 from .compiler import (
     compile_air_bundle,
     resolve_atc_executable,
+    validate_atc_args,
     validate_soc_version,
 )
 from .exporter import export_air_bundle
@@ -381,6 +382,7 @@ def run_target_pipeline(
 ) -> dict[str, Any]:
     """Build one OM and produce gated ordinary and DFlash 3+10 reports."""
 
+    atc_args = validate_atc_args(atc_args)
     validate_backend_pair(ordinary_backend_options, dflash_backend_options)
     bundle_root = require_run_output(bundle_dir)
     report_root = require_run_output(report_dir)
@@ -536,6 +538,7 @@ def run_cpp_target_pipeline(
 ) -> dict[str, Any]:
     """Build the selected OM topology and run paired 3+10 in the C++ ACL path."""
 
+    atc_args = validate_atc_args(atc_args)
     runner_identity = validate_cpp_runner_options(runner_options, device_id)
     state_policy = str(runner_identity["state_policy"])
     if factory == QUANT_RECOMPUTE_GRAPH_FACTORY:

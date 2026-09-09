@@ -16,6 +16,7 @@ from .cpp_runtime import build_cpp_runner, run_cpp_pair, write_cpp_prompt_report
 from .compiler import (
     compile_air_bundle,
     resolve_atc_executable,
+    validate_atc_args,
     validate_soc_version,
 )
 from .exporter import export_air_bundle
@@ -79,6 +80,7 @@ def command_compile(args: argparse.Namespace) -> int:
 def command_build(args: argparse.Namespace) -> int:
     # Resolve every cheap target prerequisite before the factory loads the two
     # 4B checkpoints.
+    atc_args = validate_atc_args(args.atc_arg)
     atc_path = resolve_atc_executable(args.atc)
     exact_soc_version = validate_soc_version(args.soc_version)
     exported = export_air_bundle(
@@ -90,7 +92,7 @@ def command_build(args: argparse.Namespace) -> int:
         Path(exported["manifest_path"]),
         soc_version=exact_soc_version,
         atc_bin=atc_path,
-        extra_args=args.atc_arg,
+        extra_args=atc_args,
     )
     _print(payload)
     return 0
@@ -367,7 +369,11 @@ def _add_atc_arguments(parser: argparse.ArgumentParser) -> None:
         "--atc-arg",
         action="append",
         default=[],
-        help="additional non-core ATC option, repeatable",
+        help=(
+            "additional non-core ATC option, repeatable; graph dtypes are "
+            "preserved by default; only precision_mode=must_keep_origin_dtype "
+            "or precision_mode_v2=origin is accepted (not both)"
+        ),
     )
 
 
