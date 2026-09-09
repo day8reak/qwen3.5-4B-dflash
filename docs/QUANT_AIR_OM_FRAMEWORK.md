@@ -119,6 +119,12 @@ GDR 累加及算子 initial/final state 使用 FP32；OM 之间持久保存的 r
 部署 manifest 的 `compiler.precision_policy` 为 `preserve_graph_dtypes`，
 每张图的 `atc_command` 记录最终参数。
 
+增量 GDR 在 GE 保存前逐节点核对 `core_attn=FP16`、`last_recurrent_state=FP32`，
+报告为 `air/<图名>/gdr-output-dtypes.json`，并写入 `runtime_input_abi.gdr_output_dtypes`。
+这项检查覆盖未使用的物理输出；它证明 Python 交给 GE 的类型，不能替代接收端
+InferShape/InferDataType 和 ATC 的实际编译结果。ATC 失败时异常附带错误摘要，
+完整内容仍保存在每图编译日志中。
+
 ## 4. 自定义算子导出要求
 
 导出器在加载权重前验证所需 dispatcher schema，保留并验证已有 Meta kernel，

@@ -12,12 +12,51 @@ from __future__ import annotations
 from contextlib import contextmanager
 import copy
 import importlib
+from pathlib import Path
 from threading import RLock
 from typing import Any, Iterator, Mapping, Sequence
 
 import torch
 
+from .utils import atomic_write_json
+
 _PATCH_LOCK = RLock()
+
+
+def _gdr_output_dtype_audit(graph: Any) -> dict[str, Any]:
+    """Inspect real GE descriptors, including outputs unused by the FX graph.
+
+    Fake/Meta checks do not prove the descriptor passed to GE is correct.
+    Read protobuf enum names rather than comparing GE and protobuf dtype
+    integers, which use different encodings. This is the Python-to-GE save
+    boundary; it does not claim what CANN's later type inference produces.
+    """
+    expected = [("core_attn", "DT_FLOAT16"), ("last_recurrent_state", "DT_FLOAT")]
+
+    def describe(desc: Any) -> dict[str, Any]:
+        enum = desc.DESCRIPTOR.fields_by_name["dtype"].enum_type
+        value = enum.values_by_number.get(desc.dtype)
+        return {"name": desc.name,
+                "dtype": value.name if value is not None else f"UNKNOWN({desc.dtype})",
+                "shape": list(desc.shape.dim)}
+
+    nodes = []
+    for op in graph.op:
+        if op.type != "ChunkGatedDeltaRule":
+            continue
+        outputs = [describe(desc) for desc in op.output_desc]
+        nodes.append({
+            "name": op.name,
+            "inputs": [describe(desc) for desc in op.input_desc],
+            "outputs": outputs,
+            "status": "PASS" if [(d["name"], d["dtype"]) for d in outputs] == expected else "FAIL",
+        })
+    return {
+        "policy": "gdr-core-fp16-state-fp32-v1",
+        "scope": "torchair-before-ge-save",
+        "status": "FAIL" if any(node["status"] == "FAIL" for node in nodes) else "PASS",
+        "node_count": len(nodes), "nodes": nodes,
+    }
 
 
 def _indexed_graph_inputs(export_graph: Any) -> dict[int, Any]:
@@ -144,6 +183,19 @@ def canonical_runtime_input_abi(
             ]
             result = original(inputs, export_graph, file_path, weight_name)
             _normalize_public_nodes(export_graph, bindings)
+            gdr_dtypes = _gdr_output_dtype_audit(export_graph)
+            if gdr_dtypes["node_count"]:
+                audit["gdr_output_dtypes"] = gdr_dtypes
+                dtype_report = atomic_write_json(
+                    Path(file_path) / "gdr-output-dtypes.json", gdr_dtypes,
+                )
+                if gdr_dtypes["status"] != "PASS":
+                    failed = next(node for node in gdr_dtypes["nodes"] if node["status"] != "PASS")
+                    raise RuntimeError(
+                        f"ChunkGatedDeltaRule {failed['name']!r} GE output dtype mismatch "
+                        f"before AIR save: {failed['outputs']}; expected core_attn DT_FLOAT16 "
+                        f"and last_recurrent_state DT_FLOAT; report={dtype_report}"
+                    )
             if require_static_shapes:
                 final_nodes = _indexed_graph_inputs(export_graph)
                 for record in records:

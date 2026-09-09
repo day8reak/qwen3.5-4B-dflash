@@ -157,11 +157,11 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "d3927280e4b39481fabf2c5b44b9fe45fa107f88dec1ceb8ad53044378bc00a9"
+        "source_sha256": "ddb259faf05761e8da4d83263eb930ea593f426ba8760e1245c4939c04a9756b"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "78cfe8744259bf3fea5550708a6d20ff3a99bb34e5b7446356c16ac0d72004de"
+        "source_sha256": "3e0250f4247d29433824a9dd663e522be02a7ecaeabc5c9083d5b47ecb50b1ff"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
@@ -209,7 +209,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/compiler.py",
-        "source_sha256": "4f46ab221bc8c4f27c1ae383153ce6b4a9354c0037ec9804533e41c8fa791ee5"
+        "source_sha256": "b5726181fe01d7dfa0dc065ea20ed5e7cfbf14bf25e38d7b4e60f26ffcd67911"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/contracts.py",
@@ -257,7 +257,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/runtime_input_export.py",
-        "source_sha256": "9d94fe9a23cf98155a8c4116b0a7a03bf024c92633589c01014382b14a09ede0"
+        "source_sha256": "db5619b1e9f26c36ba321d7c8efbad6e202f191cd8634de79ca37e77ee37777a"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/standard_op_export.py",
@@ -373,7 +373,7 @@
       },
       {
         "source_file": "tests/test_runtime_input_export.py",
-        "source_sha256": "2edaf029c0c274441e9e61a63ca46891d95386676d873ce055a697034cbd97d0"
+        "source_sha256": "5483a6f3c4a2645da25e15800a8b66076f105bb583cc9eb70947bae5ea6642bf"
       },
       {
         "source_file": "tests/test_source_lock_benchmark.py",
@@ -390,6 +390,10 @@
       {
         "source_file": "tests/test_round_comparison.py",
         "source_sha256": "7f2008b9de9a30c7f53fad6da2edc6f0665ad80c9ba19e4c692959edde6be65c"
+      },
+      {
+        "source_file": "tests/test_atc_diagnostics.py",
+        "source_sha256": "8d0ccdf39b226266fbe015fb0b356b2d09e4c4e94df43e45eb3854d6f5e9519c"
       }
     ]
   }

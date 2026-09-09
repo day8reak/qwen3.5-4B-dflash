@@ -341,6 +341,13 @@ Target attention 使用 `all_seq_lengths_q=[C+64]`、
 如果 ATC 报 `pse_shift DT_INT64`，需要更新源码并重新导出 AIR；只重新编译已有
 AIR 无法改变错误的输入映射。编译器会提前拒绝使用整数 PSE 策略的增量 bundle。
 
+含 GDR 的图在交给 GE 保存前会生成 `air/<图名>/gdr-output-dtypes.json`，
+逐节点核对两个物理输出：`core_attn` 为 `DT_FLOAT16`，
+`last_recurrent_state` 为 `DT_FLOAT`（FP32）。Verify 第二次 GDR 的 `core_attn`
+即使没有被后续节点使用，也必须满足这个接口。类型不符会停止导出并保留这份报告。
+同一份检查结果写入 AIR manifest 的 `graphs[].runtime_input_abi.gdr_output_dtypes`。
+该检查的范围是 TorchAir 交给 GE 的描述，不代表 ATC 类型推导后的结果。
+
 ## 9. 将 AIR 转为 OM
 
 ```bash
@@ -358,6 +365,17 @@ AIR 无法改变错误的输入映射。编译器会提前拒绝使用整数 PSE
 启动 ATC 前还会检查整组图的 `runtime_input_abi`：要求 `status=PASS`，实际 Data 绑定
 与公开输入的顺序、dtype、静态 shape 一致。缺少或不通过这项审计时，须重新导出到空的
 bundle 目录；只编辑 manifest 无法修正 AIR 中的输入顺序。
+
+编译失败时，终端异常会附带 ATC 的首个结构化错误摘要，完整日志保存在
+`log/dflash-atc/<图名>.log`。如果出现
+`ChunkGatedDeltaRule ... DT_FLOAT of output [core_attn] is not supported`，
+说明 ATC 看到的 `core_attn` 为 FP32，而所列实现要求 FP16。
+同一条错误中其他 op store 的 `not found` 不能单独作为 kernel 缺失的依据。
+先查看对应的 `gdr-output-dtypes.json`：若交给 GE 前已经为 FP32，检查导出描述；
+若该检查通过，继续核对保存后的 AIR 以及接收端算子包的 InferShape/InferDataType
+实现和 ATC 变换。两个输出具有不同类型，不能一起改成 FP16，也不能仅凭
+`REG_OP` 使用 `TensorType::ALL()` 就认定实际类型推导正确或错误。
+
 成功后得到：
 
 ```text

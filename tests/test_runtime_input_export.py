@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import copy
+import json
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -12,9 +13,93 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "framework/python"))
 
 from qwen35_dflash.ascend310p.runtime_input_export import (
-    _normalize_public_nodes, _public_bindings, canonical_runtime_input_abi,
+    _gdr_output_dtype_audit, _normalize_public_nodes, _public_bindings, canonical_runtime_input_abi,
     validated_runtime_input_abi as _validated_runtime_input_abi,
 )
+
+
+def _gdr_node(core_dtype="DT_FLOAT16", state_dtype="DT_FLOAT"):
+    # Use protobuf descriptors, whose dtype numbers differ from ge.DataType.
+    # No NPU/TorchAir import or kernel execution is represented by this fixture.
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+    proto = descriptor_pb2.FileDescriptorProto(name="gdr_audit_test.proto")
+    dtype = proto.enum_type.add(name="DataType")
+    for number, name in enumerate(("DT_UNDEFINED", "DT_FLOAT", "DT_FLOAT16")):
+        dtype.value.add(name=name, number=number)
+    shape = proto.message_type.add(name="Shape")
+    shape.field.add(name="dim", number=1, type=3, label=3)
+    desc = proto.message_type.add(name="Desc")
+    desc.field.add(name="name", number=1, type=9, label=1)
+    desc.field.add(name="dtype", number=2, type=14, type_name=".DataType", label=1)
+    desc.field.add(name="shape", number=3, type=11, type_name=".Shape", label=1)
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(proto)
+    tensor_desc = message_factory.GetMessageClass(pool.FindMessageTypeByName("Desc"))
+    return SimpleNamespace(
+        name="ChunkGatedDeltaRule_23", type="ChunkGatedDeltaRule",
+        input_desc=[tensor_desc(name="query", dtype="DT_FLOAT16")],
+        output_desc=[tensor_desc(name="core_attn", dtype=core_dtype),
+                     tensor_desc(name="last_recurrent_state", dtype=state_dtype)],
+    )
+
+
+@pytest.mark.parametrize("core,state,passed", [
+    ("DT_FLOAT16", "DT_FLOAT", True),
+    ("DT_FLOAT", "DT_FLOAT", False),
+    ("DT_UNDEFINED", "DT_FLOAT", False),
+    ("DT_FLOAT16", "DT_FLOAT16", False),
+])
+def test_gdr_audit_reads_both_physical_output_dtypes(core, state, passed):
+    node = _gdr_node(core, state)
+    # Verify's commit pass may not consume core_attn, but its descriptor still
+    # participates in ATC kernel selection and must pass the same check.
+    graph = _Graph([node, _Op("consume_state_only", "Cast", inputs=(node.name + ":1",))])
+    audit = _gdr_output_dtype_audit(graph)
+    assert audit["node_count"] == 1
+    assert audit["status"] == ("PASS" if passed else "FAIL")
+    assert [o["dtype"] for o in audit["nodes"][0]["outputs"]] == [core, state]
+
+
+@pytest.mark.parametrize("damage", ["missing_state", "swapped_names"])
+def test_gdr_audit_rejects_missing_or_reordered_outputs(damage):
+    node = _gdr_node()
+    if damage == "missing_state":
+        node.output_desc.pop()
+    else:
+        node.output_desc.reverse()
+    assert _gdr_output_dtype_audit(_Graph([node]))["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("damage", [False, True])
+def test_serialization_gdr_audit_retains_evidence_and_restores_hook(monkeypatch, tmp_path, damage):
+    monkeypatch.setenv("AI_RUN_DIR", str(tmp_path))
+    torchair = ModuleType("torchair")
+    public = torch.zeros(1)
+    gdr = _gdr_node()
+    graph = _Graph([_Op("input", "Data", index=0), gdr])
+
+    def original(*args):
+        if damage:
+            gdr.output_desc[0].dtype = 1  # Proto DT_FLOAT, not GE DT_FLOAT16.
+        return False, 0
+
+    module = SimpleNamespace(_convert_data_to_const=original)
+    monkeypatch.setitem(sys.modules, "torchair", torchair)
+    monkeypatch.setitem(sys.modules, "torchair._utils.export_utils", module)
+    try:
+        with canonical_runtime_input_abi(
+            torchair, public_inputs=[public], public_names=["x"],
+        ) as audit:
+            module._convert_data_to_const([public], graph, str(tmp_path), {})
+    except RuntimeError as error:
+        assert damage and "GE output dtype mismatch before AIR save" in str(error)
+    else:
+        assert not damage
+        assert audit["gdr_output_dtypes"]["status"] == "PASS"
+    report = json.loads((tmp_path / "gdr-output-dtypes.json").read_text())
+    assert report["scope"] == "torchair-before-ge-save"
+    assert report["status"] == ("FAIL" if damage else "PASS")
+    assert module._convert_data_to_const is original
 
 
 class _Attr:

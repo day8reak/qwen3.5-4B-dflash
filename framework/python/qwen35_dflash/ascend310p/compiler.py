@@ -33,6 +33,41 @@ class AtcCompileError(RuntimeError):
     """ATC failed or did not produce the promised OM artifact."""
 
 
+def _atc_failure_detail(stdout: str, graph: Mapping[str, Any]) -> str:
+    """Surface ATC's diagnostic instead of just the Python wrapper traceback."""
+    lines = stdout.splitlines()
+    # Prefer the structured ATC summary over earlier engine-placement errors
+    # and later shutdown messages. Retain the complete output in the log file.
+    start = next((i for i, line in enumerate(lines)
+                  if re.search(r"\b\w+\(E[A-Z0-9]+\):", line)), None)
+    if start is None:
+        start = next((i for i, line in enumerate(lines) if "[ERROR]" in line),
+                     max(0, len(lines) - 8))
+    excerpt = "\n".join(lines[start:start + 8])[:6000].strip()
+    detail = f"\nATC diagnostic:\n{excerpt}" if excerpt else ""
+    if ("ChunkGatedDeltaRule" in stdout and
+            re.search(r"DT_FLOAT of output\s*\[core_attn\]", stdout)):
+        detail += (
+            "\nGDR output contract: core_attn=FP16, last_recurrent_state=FP32. "
+            "The reported core_attn dtype mismatch does not establish a missing kernel."
+        )
+        runtime_abi = graph.get("runtime_input_abi")
+        audit = runtime_abi.get("gdr_output_dtypes") if isinstance(runtime_abi, Mapping) else None
+        if (isinstance(audit, Mapping) and audit.get("status") == "PASS"
+                and audit.get("node_count", 0) > 0):
+            detail += (
+                " The Python GE descriptors passed the pre-save dtype check; "
+                "compare the saved AIR and CANN InferShape/InferDataType results "
+                "with gdr-output-dtypes.json before changing Fake/Meta or precision."
+            )
+        else:
+            detail += (
+                " This AIR has no pre-save GDR dtype audit; inspect its GE output "
+                "descriptors or re-export to obtain gdr-output-dtypes.json."
+            )
+    return detail
+
+
 def validate_soc_version(soc_version: str) -> str:
     """Require an ATC SoC variant instead of the generic 310P family name."""
 
@@ -328,6 +363,7 @@ def compile_air_bundle(
         if result.returncode != 0:
             raise AtcCompileError(
                 f"ATC failed for {name!r} with exit {result.returncode}; log={log_path}"
+                + _atc_failure_detail(result.stdout or "", graph)
             )
         if not om_path.is_file() or om_path.stat().st_size == 0:
             raise AtcCompileError(
