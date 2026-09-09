@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import runpy
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -28,8 +29,23 @@ NAMES = ("query", "key", "value", "g", "beta", "initial_state", "effective_lengt
 DTYPES = ("float16", "float16", "float16", "float32", "float16", "float32", "int16")
 SHAPES = ((1, 16, 32, 128),) * 3 + ((1, 16, 32),) * 2 + ((1, 32, 128, 128), (1,))
 ACL_TYPES = {"float16": 1, "float32": 0, "int16": 6}
-VARIANTS = ("both", "core", "state")
+BASE_VARIANTS = ("both", "core", "state")
+VARIANTS = (*BASE_VARIANTS, "core_no_state")
 ATTRS = dict(chunk_size=64, output_final_state=True, use_qk_l2norm_in_kernel=True)
+
+
+def attributes(variant):
+    if variant not in VARIANTS:
+        raise ValueError("invalid output variant")
+    return {**ATTRS, "output_final_state": variant != "core_no_state"}
+
+
+def cases(root):
+    graphs = json.loads((root / "om.json").read_text())["graphs"]
+    native_cases = [("native", "both")]
+    if "core_no_state" in graphs:
+        native_cases.append(("native", "core_no_state"))
+    return native_cases + [("om", v) for v in VARIANTS if v in graphs]
 
 
 def digest(path):
@@ -161,14 +177,15 @@ def require_device(device):
 
 
 def gdr_module(torch, operation, variant):
+    final_state = attributes(variant)["output_final_state"]
     class Gdr(torch.nn.Module):
         def forward(self, query, key, value, g, beta, initial_state, effective_length):
             core, state = operation(query, key, value, g=g, beta=beta,
                                     initial_state=initial_state, effective_length=effective_length,
-                                    chunk_size=64, output_final_state=True, use_qk_l2norm_in_kernel=True)
+                                    chunk_size=64, output_final_state=final_state, use_qk_l2norm_in_kernel=True)
             # Normalize the receiver's flattened core output without changing numerics.
             core = core.reshape(1, 16, 32, 128)
-            if variant == "core":
+            if variant in ("core", "core_no_state"):
                 return (core,)
             if variant == "state":
                 return (state,)
@@ -181,7 +198,7 @@ def gdr_module(torch, operation, variant):
 def output_specs(variant, length):
     specs = [("core_attn", "float16", SHAPES[0], length * 32 * 128 * 2),
              ("last_recurrent_state", "float32", SHAPES[5], 32 * 128 * 128 * 4)]
-    return specs if variant == "both" else [specs[0 if variant == "core" else 1]]
+    return specs if variant == "both" else [specs[0 if variant in ("core", "core_no_state") else 1]]
 
 
 def package_identity():
@@ -212,22 +229,35 @@ def export(args):
     proto = validate_gdr_ge_prototype_environment()
     fresh(root / "air")
     graphs = {}
-    for variant in VARIANTS:
+    for variant in getattr(args, "variants", BASE_VARIANTS):
         graph_dir = fresh(root / "air" / variant)
         # Distinct storages allow canonical_runtime_input_abi to retain all seven Data inputs.
         inputs = tuple(torch.from_numpy(a.copy()).to(f"npu:{args.device_id}") for a in data)
-        session = prepare_custom_op_export(CustomOpExportSpec(
-            "npu::npu_chunk_gated_delta_rule", "ChunkGatedDeltaRule"), torchair)
+        if variant == "core_no_state":
+            from tools.debug_gdr.no_state_frontend import register, serialized_audit
+            frontend = register(torch, torch_npu, torchair)
+            model = frontend.model
+            serialized_context = serialized_audit(frontend.audit)
+        else:
+            session = prepare_custom_op_export(CustomOpExportSpec(
+                "npu::npu_chunk_gated_delta_rule", "ChunkGatedDeltaRule"), torchair)
+            model = gdr_module(torch, operation, variant)
+            serialized_context = nullcontext()
         previous = Path.cwd()
         try:
             os.chdir(graph_dir)
             with torch.inference_mode(), canonical_runtime_input_abi(
-                    torchair, public_inputs=inputs, public_names=NAMES, require_static_shapes=True) as abi:
-                torchair.dynamo_export(*inputs, model=gdr_module(torch, operation, variant),
+                    torchair, public_inputs=inputs, public_names=NAMES, require_static_shapes=True) as abi, serialized_context:
+                torchair.dynamo_export(*inputs, model=model,
                     export_path=str(graph_dir), export_name=f"gdr_{variant}", dynamic=False)
         finally:
             os.chdir(previous)
-        audit = audit_custom_op_export([session], graph_dir, relative_to=root)
+        if variant == "core_no_state":
+            audit = frontend.audit
+            if audit["converter_calls"] != 1:
+                raise RuntimeError("expected one explicit output_final_state=False converter call")
+        else:
+            audit = audit_custom_op_export([session], graph_dir, relative_to=root)
         from qwen35_dflash.ascend310p.utils import count_ge_ir_nodes
         counts = count_ge_ir_nodes(graph_dir.rglob("dynamo.pbtxt"))
         if counts.get("ChunkGatedDeltaRule") != 1:
@@ -236,10 +266,11 @@ def export(args):
         if len(files) != 1:
             raise RuntimeError(f"expected one AIR for {variant}")
         graphs[variant] = {"air": str(files[0].relative_to(root)), "sha256": digest(files[0]),
-                           "public_input_abi": abi, "custom_op_audit": audit, "ge_nodes": counts}
+                           "public_input_abi": abi, "custom_op_audit": audit, "ge_nodes": counts,
+                           "attributes": attributes(variant)}
         print(f"[gdr-debug] exported {variant}: one GDR, seven runtime inputs", flush=True)
         torch._dynamo.reset()
-    write_json(root / "air.json", {"graphs": graphs, "attributes": ATTRS, "prototype": proto,
+    write_json(root / "air.json", {"graphs": graphs, "prototype": proto,
                "torch": str(torch.__version__), "torch_npu": str(torch_npu.__version__),
                "device": torch.npu.get_device_name(args.device_id), "packages": package_identity()})
 
@@ -267,7 +298,7 @@ def compile_models(args):
     manifest = json.loads((root / "air.json").read_text())
     fresh(root / "om")
     graphs = {}
-    for variant in VARIANTS:
+    for variant in manifest["graphs"]:
         rec = manifest["graphs"][variant]
         air = root / rec["air"]
         if digest(air) != rec["sha256"]:
@@ -277,7 +308,8 @@ def compile_models(args):
                f"--soc_version={args.soc_version}", "--precision_mode=must_keep_origin_dtype"]
         execute(cmd, root / "logs" / f"atc-{variant}.log")
         om = prefix.with_suffix(".om")
-        graphs[variant] = {"path": str(om.relative_to(root)), "sha256": digest(om), "command": cmd}
+        graphs[variant] = {"path": str(om.relative_to(root)), "sha256": digest(om), "command": cmd,
+                           "attributes": attributes(variant)}
     write_json(root / "om.json", {"graphs": graphs, "soc_version": args.soc_version,
                                    "packages": package_identity()})
     cmd = ["cmake", "-S", str(HERE), "-B", str(root / "build"), "-DCMAKE_BUILD_TYPE=Release"]
@@ -335,7 +367,7 @@ def native(args):
                 reference = hashes if reference is None else reference
                 samples.append({"elapsed_ms": elapsed, "valid_output_sha256": hashes, "stable": stable})
     write_json(out / "report.json", {"backend": "torch_npu", "cpu_fallback": False, "variant": args.variant,
-        "effective_length": args.length, "attributes": ATTRS, "warmup": args.warmup,
+        "effective_length": args.length, "attributes": attributes(args.variant), "warmup": args.warmup,
         "profiled": bool(profile), "samples": samples, "identity": identity,
         "stable": all(x["stable"] for x in samples),
         "timing_scope": "operator dispatch plus device synchronization; output allocation included; transfers/checks excluded"})
@@ -387,7 +419,7 @@ def benchmark(args):
     fresh(root / "measurements")
     # Alternate native and OM observations by effective length. Same immutable inputs.
     for length in lengths:
-        for backend, variant in [("native", "both")] + [("om", v) for v in VARIANTS]:
+        for backend, variant in cases(root):
             label = f"{backend}-{variant}-L{length}"
             out = root / "measurements" / label
             execute(child_command(root, args, backend, variant, length, out), root / "logs" / (label + ".log"))
@@ -413,7 +445,7 @@ def summarize(args):
     rows = []
     for length in m["lengths"]:
         refdir = root / "measurements" / f"native-both-L{length}"
-        for backend, variant in [("native", "both")] + [("om", v) for v in VARIANTS]:
+        for backend, variant in cases(root):
             label = f"{backend}-{variant}-L{length}"
             directory = root / "measurements" / label
             report = json.loads((directory / "report.json").read_text())
@@ -423,6 +455,7 @@ def summarize(args):
                 comparisons[name] = compare_output((refdir / (name + ".bin")).read_bytes(),
                                         (directory / (name + ".bin")).read_bytes(), dtype, valid_bytes)
             rows.append({"case": label, "backend": backend, "variant": variant, "length": length,
+                         "attributes": attributes(variant),
                          "median_ms": statistics.median(samples), "min_ms": min(samples),
                          "max_ms": max(samples), "measurements": len(samples), "stable": report["stable"],
                          "comparison_to_native": comparisons})
@@ -439,6 +472,48 @@ def summarize(args):
                      f'{row["max_ms"]:.6f} | {row["stable"]} | {exact} |')
     (root / "summary.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines), flush=True)
+
+
+def no_state(args):
+    """Append a False-attribute experiment using the previous frozen inputs/OMs."""
+    parent = output_dir(args.work_dir)
+    load_manifest(parent)
+    previous = json.loads((parent / "om.json").read_text())
+    reused = {}
+    for variant in BASE_VARIANTS:
+        record = previous["graphs"][variant]
+        om = (parent / record["path"]).resolve()
+        if digest(om) != record["sha256"]:
+            raise ValueError(f"previous OM changed: {variant}")
+        reused[variant] = {**record, "path": str(om), "attributes": attributes(variant),
+                           "reused_from_manifest": str(parent / "om.json")}
+    root = fresh(parent / ("outstate0-" + time.strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}"))
+    shutil.copytree(parent / "inputs", root / "inputs")
+    shutil.copyfile(parent / "inputs.json", root / "inputs.json")
+    manifest = load_manifest(root)
+    write_json(root / "experiment.json", {
+        "comparison": "core output only: output_final_state=True versus False",
+        "changed_attribute": {"output_final_state": {"baseline": True, "experiment": False}},
+        "fixed_attributes": {"chunk_size": 64, "use_qk_l2norm_in_kernel": True},
+        "parent": str(parent), "input_manifest_sha256": digest(parent / "inputs.json"),
+        "reused_om_manifest_sha256": digest(parent / "om.json"),
+        "lengths": manifest["lengths"],
+        "unused_state_policy": "False state output is never read, downloaded, hashed or compared"})
+    print(f"[gdr-debug] outstate=0 experiment: {root}", flush=True)
+    execute([sys.executable, "-B", str(HERE / "run.py"), "export", "--work-dir", str(root),
+             "--device-id", str(args.device_id), "--variants", "core_no_state"], root / "logs/export.log")
+    child = argparse.Namespace(**{**vars(args), "work_dir": str(root)})
+    compile_models(child)  # Only the new core_no_state AIR is compiled.
+    compiled = json.loads((root / "om.json").read_text())
+    compiled["graphs"] = {**reused, **compiled["graphs"]}
+    write_json(root / "om.json", compiled)
+    benchmark(child)
+    if args.profile:
+        for length in manifest["lengths"]:
+            for backend in ("native", "om"):
+                profile(argparse.Namespace(**{**vars(child), "backend": backend,
+                                             "variant": "core_no_state", "length": length}))
+    print(f"[gdr-debug] outstate=0 summary: {root / 'summary.md'}", flush=True)
 
 
 def profile(args):
@@ -475,7 +550,7 @@ def profile(args):
             comparisons[name] = compare_output((reference / (name + ".bin")).read_bytes(),
                                       (base / "result" / (name + ".bin")).read_bytes(), dtype, valid_bytes)
     write_json(base / "case.json", {"backend": args.backend, "variant": args.variant,
-        "effective_length": args.length, "attributes": ATTRS, "expected_gdr_calls": 1,
+        "effective_length": args.length, "attributes": attributes(args.variant), "expected_gdr_calls": 1,
         "comparison_to_unprofiled_native": comparisons,
         "scope": "one standalone GDR; protocol stage name verify is a controller routing label"})
     print(f"[gdr-debug] profile: {base}", flush=True)
@@ -576,7 +651,7 @@ def length_list(value):
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     subs = p.add_subparsers(dest="command", required=True)
-    for command in ("all", "prepare", "export", "compile", "benchmark", "summarize", "profile", "capture", "_native"):
+    for command in ("all", "no-state", "prepare", "export", "compile", "benchmark", "summarize", "profile", "capture", "_native"):
         s = subs.add_parser(command)
         s.add_argument("--work-dir", required=True, help="artifact directory below AI_RUN_DIR, outside source")
         s.add_argument("--device-id", type=int, default=0)
@@ -588,15 +663,17 @@ def parser():
             s.add_argument("--inputs", help="NPZ captured by the capture subcommand, or an equivalent seven-tensor NPZ")
             s.add_argument("--seed", type=int, default=20260909)
             s.add_argument("--lengths", type=length_list, default=[16, 8])
-        if command in ("all", "compile"):
+        if command == "export":
+            s.add_argument("--variants", nargs="+", choices=VARIANTS, default=BASE_VARIANTS)
+        if command in ("all", "compile", "no-state"):
             s.add_argument("--atc", default="atc")
             s.add_argument("--soc-version", default="Ascend310P3")
             s.add_argument("--ascendcl-root", default="")
-        if command in ("all", "profile"):
+        if command in ("all", "profile", "no-state"):
             s.add_argument("--msprof-bin", default="msprof")
             s.add_argument("--timeout", type=float, default=600)
-        if command == "all":
-            s.add_argument("--profile", action="store_true", help="also capture one warmed GDR for each of the eight cases")
+        if command in ("all", "no-state"):
+            s.add_argument("--profile", action="store_true", help="also capture one warmed GDR per case (no-state: new False cases only)")
         if command in ("profile", "_native"):
             s.add_argument("--variant", choices=VARIANTS, default="both")
             s.add_argument("--length", type=int, default=16)
@@ -630,10 +707,10 @@ def main(argv=None):
         benchmark(args)
         if args.profile:
             for length in args.lengths:
-                for backend, variant in [("native", "both")] + [("om", v) for v in VARIANTS]:
+                for backend, variant in cases(root):
                     profile(argparse.Namespace(**{**vars(args), "backend": backend, "variant": variant, "length": length}))
         return 0
-    {"prepare": prepare, "export": export, "compile": compile_models, "benchmark": benchmark,
+    {"no-state": no_state, "prepare": prepare, "export": export, "compile": compile_models, "benchmark": benchmark,
      "summarize": summarize, "profile": profile, "capture": capture, "_native": native}[args.command](args)
     return 0
 

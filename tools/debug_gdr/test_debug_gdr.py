@@ -99,7 +99,7 @@ def test_wrapper_keeps_operator_attributes_and_public_length(variant):
     inputs = tuple(torch.zeros(s, dtype=getattr(torch, d)) for s, d in zip(debug.SHAPES, debug.DTYPES))
     outputs = m(*inputs)
     call = calls[0][3]
-    assert {k: call[k] for k in debug.ATTRS} == debug.ATTRS
+    assert {k: call[k] for k in debug.ATTRS} == debug.attributes(variant)
     assert call['effective_length'] is inputs[-1] and call['initial_state'] is inputs[-2]
     assert [x.dtype for x in outputs] == [getattr(torch, x[1]) for x in debug.output_specs(variant, 16)]
     assert len(outputs) == (2 if variant == 'both' else 1)
@@ -122,7 +122,7 @@ def test_exported_graphs_keep_one_gdr_and_all_seven_inputs():
         assert len(ops) == 1
         node = ops[0]
         # torch.export canonicalizes dispatcher arguments to positional form.
-        assert node.args[6] == 64 and node.args[8:] == (True, True)
+        assert node.args[6] == 64 and node.args[8:] == (variant != 'core_no_state', True)
         assert node.args[5].name == 'effective_length'
         assert node.args[7].name == 'initial_state'
         assert len(next(n for n in nodes if n.op == 'output').args[0]) == (2 if variant == 'both' else 1)
@@ -192,10 +192,11 @@ def test_cpp_detects_unstable_valid_output(prepared, fake_runner):
     assert [x['stable'] for x in report['samples']] == [True, False, False]
 
 
-def test_cpp_profiles_exactly_one_call_after_warmup(prepared, fake_runner):
+@pytest.mark.parametrize('variant', ['both', 'core_no_state'])
+def test_cpp_profiles_exactly_one_call_after_warmup(prepared, fake_runner, variant):
     parent, child = socket.socketpair()
     parent.settimeout(10)
-    command, env, out = fake_command(prepared, fake_runner, profile=str(prepared / 'capture'))
+    command, env, out = fake_command(prepared, fake_runner, variant=variant, profile=str(prepared / 'capture'))
     env.update(PROFILING_MODE='dynamic', DFLASH_MSPROF_CONTROL_FD=str(child.fileno()), DFLASH_MSPROF_CONTROL_TIMEOUT='10')
     proc = subprocess.Popen(command, env=env, pass_fds=(child.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     child.close()
@@ -231,7 +232,8 @@ def test_profiler_rows_preserve_metrics_and_do_not_double_count_exports(tmp_path
     with pytest.raises(ValueError, match='exactly one GDR'): debug.extract_gdr_rows(tmp_path, output)
 
 
-def test_native_benchmark_restores_inputs_and_records_each_call(prepared, monkeypatch):
+@pytest.mark.parametrize('variant', ['both', 'core_no_state'])
+def test_native_benchmark_restores_inputs_and_records_each_call(prepared, monkeypatch, variant):
     import torch
     from types import SimpleNamespace
     original_to = torch.Tensor.to
@@ -241,9 +243,12 @@ def test_native_benchmark_restores_inputs_and_records_each_call(prepared, monkey
         return original_to(self, *args, **kwargs)
     monkeypatch.setattr(torch.Tensor, 'to', host_to)
     calls = []
+    flags = []
     def fake(q, k, v, **kw):
         calls.append(kw['initial_state'].clone())
-        return q.clone(), kw['initial_state'].clone()
+        flags.append(kw['output_final_state'])
+        # False may have no usable state value; the harness must never read it.
+        return q.clone(), kw['initial_state'].clone() if kw['output_final_state'] else None
     npu = SimpleNamespace(npu_chunk_gated_delta_rule=fake, __version__='HOST_TEST_ONLY')
     monkeypatch.setattr(torch, 'npu', SimpleNamespace(synchronize=lambda _: None,
                          get_device_name=lambda _: 'HOST_TEST_ONLY'), raising=False)
@@ -251,12 +256,15 @@ def test_native_benchmark_restores_inputs_and_records_each_call(prepared, monkey
     monkeypatch.setattr(debug, 'package_identity', lambda: {'scope': 'host test'})
     out = prepared / 'native-host-fixture'
     args = debug.parser().parse_args(['_native', '--work-dir', str(prepared), '--result-dir', str(out),
-                                     '--length', '8', '--warmup', '3', '--repetitions', '10'])
+                                     '--variant', variant, '--length', '8', '--warmup', '3', '--repetitions', '10'])
     debug.native(args)
     report = json.loads((out / 'report.json').read_text())
     assert len(calls) == 13 and len(report['samples']) == 10 and report['stable']
     assert all(torch.equal(calls[0], other) for other in calls)
     assert all(len(x['valid_output_sha256']['core_attn']) == 64 for x in report['samples'])
+    assert flags == [variant != 'core_no_state'] * 13
+    assert report['attributes'] == debug.attributes(variant)
+    assert (out / 'last_recurrent_state.bin').exists() == (variant == 'both')
 
 
 def test_summary_compares_valid_outputs_and_keeps_native_and_om_separate(prepared, fake_runner):
@@ -268,6 +276,9 @@ def test_summary_compares_valid_outputs_and_keeps_native_and_om_separate(prepare
         (ref / 'core_attn.bin').write_bytes((prepared / 'inputs/query.bin').read_bytes())
         (ref / 'last_recurrent_state.bin').write_bytes((prepared / 'inputs/initial_state.bin').read_bytes())
         debug.write_json(ref / 'report.json', {'samples': [{'elapsed_ms': 100}], 'stable': True})
+        no_state = directory / f'native-core_no_state-L{length}'; no_state.mkdir()
+        (no_state / 'core_attn.bin').write_bytes((prepared / 'inputs/query.bin').read_bytes())
+        debug.write_json(no_state / 'report.json', {'samples': [{'elapsed_ms': 50}], 'stable': True})
         for variant in debug.VARIANTS:
             out = directory / f'om-{variant}-L{length}'
             args = argparse.Namespace(device_id=0, warmup=1, repetitions=2, profile_output=None, metrics='Memory')
@@ -276,7 +287,7 @@ def test_summary_compares_valid_outputs_and_keeps_native_and_om_separate(prepare
             assert proc.returncode == 0, proc.stderr
     debug.summarize(argparse.Namespace(work_dir=str(prepared)))
     result = json.loads((prepared / 'summary.json').read_text())
-    assert len(result['rows']) == 8
+    assert len(result['rows']) == 12
     assert all(all(c['exact_equal'] for c in row['comparison_to_native'].values()) for row in result['rows'])
     assert result['rows'][0]['median_ms'] == 100
     assert {row['measurements'] for row in result['rows']} == {1, 2}
@@ -331,3 +342,111 @@ def test_capture_preserves_api_and_stops_after_selected_call(prepared, monkeypat
     assert json.loads((root / 'capture.json').read_text())['matching_call_index'] == 1
     with np.load(root / 'inputs.npz') as archive:
         assert debug.validate_arrays(dict(archive))['effective_length'][0] == 16
+
+
+def test_no_state_frontend_keeps_input_state_and_emits_false():
+    import torch
+    from types import SimpleNamespace as NS
+    from tools.debug_gdr import no_state_frontend as frontend
+    calls, ge_calls, registered = [], [], {}
+    def native(q, k, v, **kw):
+        calls.append(kw)
+        return q.clone(), None  # State is deliberately unusable.
+    class GeOutput:
+        def set_meta(self, value): self.meta = value
+    def custom_op(kind, **kw):
+        ge_calls.append((kind, kw))
+        return [GeOutput(), GeOutput()]
+    def registrar(op):
+        def save(fn): registered[op] = fn; return fn
+        return save
+    air = NS(ge=NS(custom_op=custom_op, attr=NS(Int=lambda x: x, Bool=lambda x: x)),
+             register_fx_node_ge_converter=registrar)
+    interface = frontend.register(torch, NS(npu_chunk_gated_delta_rule=native), air)
+    values = tuple(torch.zeros(s, dtype=getattr(torch, d)) for s, d in zip(debug.SHAPES, debug.DTYPES))
+    outputs = interface.model(*values)
+    assert len(outputs) == 1 and torch.equal(outputs[0], values[0])
+    assert calls[0]['initial_state'] is values[5] and calls[0]['effective_length'] is values[6]
+    assert {k: calls[0][k] for k in debug.ATTRS} == debug.attributes('core_no_state')
+    exported = torch.export.export(interface.model, values, strict=True)
+    nodes = list(exported.graph.nodes)
+    assert len([n for n in nodes if n.op == 'placeholder']) == 7
+    assert len([n for n in nodes if n.op == 'call_function' and n.target is interface.operation]) == 1
+    assert len(next(n for n in nodes if n.op == 'output').args[0]) == 1
+    inputs = [object() for _ in range(7)]
+    result = registered[interface.operation](*inputs)
+    kind, kw = ge_calls[0]
+    assert kind == 'ChunkGatedDeltaRule' and kw['attrs'] == debug.attributes('core_no_state')
+    assert list(kw['inputs']) == list(debug.NAMES)
+    assert list(kw['inputs'].values()) == inputs
+    assert kw['outputs'] == ['core_attn', 'last_recurrent_state']
+    assert interface.audit['converter_calls'] == 1
+    assert not isinstance(result, tuple)
+
+
+def test_no_state_save_audit_rejects_true_or_state_consumers(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tools.debug_gdr import no_state_frontend as frontend
+    node = NS(name='GDR', type='ChunkGatedDeltaRule', input=[], attr={
+        'chunk_size': NS(i=64), 'output_final_state': NS(b=False), 'use_qk_l2norm_in_kernel': NS(b=True)})
+    output = NS(name='NetOutput', type='NetOutput', input=['GDR:0'])
+    graph = NS(op=[node, output])
+    assert frontend.inspect_graph(graph)['attributes']['output_final_state'] is False
+    node.attr['output_final_state'].b = True
+    with pytest.raises(RuntimeError, match='wrong serialized'): frontend.inspect_graph(graph)
+    node.attr['output_final_state'].b = False
+    output.input.append('GDR:1')
+    with pytest.raises(RuntimeError, match='consumers'): frontend.inspect_graph(graph)
+    output.input.pop()
+    previous = lambda *args: 'previous ABI hook called'
+    utils = NS(_convert_data_to_const=previous)
+    monkeypatch.setattr(frontend.importlib, 'import_module', lambda _: utils)
+    audit = {}
+    with frontend.serialized_audit(audit):
+        assert utils._convert_data_to_const(inputs=None, export_graph=graph, file_path=None,
+                                           weight_name=None) == 'previous ABI hook called'
+    assert utils._convert_data_to_const is previous
+    assert audit['serialized_ge']['state_consumers'] == []
+
+
+def test_no_state_appends_one_om_preserving_previous_artifacts(prepared, monkeypatch):
+    fixture_models(prepared)
+    before = {path: debug.digest(path) for path in prepared.rglob('*') if path.is_file()}
+    compiled, captured = [], []
+    def execute(cmd, log, **_):
+        assert cmd[-2:] == ['--variants', 'core_no_state']
+        root = Path(cmd[cmd.index('--work-dir') + 1])
+        debug.write_json(root / 'air.json', {'graphs': {'core_no_state': {}}})
+    def compile_models(args):
+        root = Path(args.work_dir)
+        assert set(json.loads((root / 'air.json').read_text())['graphs']) == {'core_no_state'}
+        compiled.append(root)
+        om = root / 'gdr_core_no_state.om'; om.write_bytes(b'HOST_FIXTURE_NOT_OM')
+        debug.write_json(root / 'om.json', {'graphs': {'core_no_state': {
+            'path': om.name, 'sha256': debug.digest(om), 'attributes': debug.attributes('core_no_state')}}})
+    def benchmark(args):
+        root = Path(args.work_dir)
+        assert len(debug.cases(root)) == 6
+        for length in (16, 8):
+            assert all(a.tobytes() == b.tobytes() for a, b in zip(debug.arrays(root, length), debug.arrays(prepared, length)))
+        graphs = json.loads((root / 'om.json').read_text())['graphs']
+        for variant in debug.BASE_VARIANTS:
+            assert Path(graphs[variant]['path']) == prepared / f'gdr_{variant}.om'
+    monkeypatch.setattr(debug, 'execute', execute)
+    monkeypatch.setattr(debug, 'compile_models', compile_models)
+    monkeypatch.setattr(debug, 'benchmark', benchmark)
+    monkeypatch.setattr(debug, 'profile', lambda args: captured.append((args.backend, args.variant, args.length)))
+    args = debug.parser().parse_args(['no-state', '--work-dir', str(prepared), '--profile'])
+    debug.no_state(args)
+    assert len(compiled) == 1
+    assert captured == [(b, 'core_no_state', length) for length in (16, 8) for b in ('native', 'om')]
+    assert all(debug.digest(path) == checksum for path, checksum in before.items())
+
+
+def test_baseline_matrix_stays_at_eight_cases(prepared):
+    fixture_models(prepared)
+    manifest = json.loads((prepared / 'om.json').read_text())
+    del manifest['graphs']['core_no_state']
+    debug.write_json(prepared / 'om.json', manifest)
+    assert debug.cases(prepared) == [('native', 'both'), ('om', 'both'), ('om', 'core'), ('om', 'state')]
+    assert debug.parser().parse_args(['export', '--work-dir', str(prepared)]).variants == debug.BASE_VARIANTS
