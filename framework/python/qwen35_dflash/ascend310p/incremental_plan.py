@@ -7,15 +7,25 @@ from pathlib import Path
 
 from .utils import contained_path, load_json_object, require_run_output, sha256_file
 
-ABI = "qwen35-dflash-chunk-v2"
+ABI = "qwen35-dflash-chunk-v3"
 ATTENTION_EXPORT_POLICY = "receiver_adn_all_seq_lengths_q_static_capacity_causal_mask"
 DRAFT_LENGTH_POLICY = "anchor_plus_runtime_K_masked_in_every_attention_layer"
+VERIFY_STATE_OUTPUT_POLICY = "raw_fp32_device_only_discard_first_pass_commit_second_pass"
 ROLES = ("target_prefill", "target_decode", "target_verify", "draft")
 DTYPES = {"int64": 8, "int16": 2, "float16": 2, "float32": 4}
 
 
 def descriptor(name, dtype, shape):
     return {"name": name, "dtype": dtype, "shape": shape}
+
+
+def verify_discard_descriptors(c):
+    """Raw first-pass GDR outputs, ordered by linear layer, never cache state."""
+    states = {s["name"]: s for s in c["target_states"]}
+    return [
+        descriptor("verify_discard_" + name, "float32", states[name]["shape"])
+        for name in c["gdn_states"][1::2]
+    ]
 
 
 def _validate_tensor(tensor):
@@ -61,6 +71,8 @@ def expected_signatures(c):
         if rows != 1:
             outputs.append(feature(64))
         outputs += states
+        if verify:
+            outputs += c["verify_discard_states"]
         result[name] = {
             "inputs": [
                 descriptor("input_ids", "int64", [1, rows]),
@@ -144,6 +156,11 @@ def validate_incremental_bundle(graphs):
         raise ValueError("state partition is inconsistent")
     if len(c["capsules"]) != len(gdn) // 2 * 7:
         raise ValueError("GDR capsule count differs from linear layer count")
+    if (
+        c.get("verify_state_output_policy") != VERIFY_STATE_OUTPUT_POLICY
+        or c.get("verify_discard_states") != verify_discard_descriptors(c)
+    ):
+        raise ValueError("verify requires separate raw FP32 first-pass discard outputs")
     expected = expected_signatures(c)
     for graph in graphs:
         if graph["metadata"]["incremental_contract"] != c:

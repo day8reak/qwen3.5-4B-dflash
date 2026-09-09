@@ -15,6 +15,12 @@
 两种模式共用同一个 prefill OM。
 verify 包含状态提交计算，没有独立 commit OM。
 
+第一遍 GDR 保持双输出：core 用于后续 Target 计算，原始 FP32 state 作为
+`verify_discard_t<layer>_recurrent` 输出到独立设备缓冲区。
+第二遍 GDR 仍从本轮初始 state 计算接受前缀，只有它的结果进入缓存。
+24 份 discard 输出各为 FP32 `[1,32,128,128]`，合计 48 MiB，
+C++ 不将其拷回 CPU，也不在下一轮读取。OM 数量保持不变。
+
 设备适配状态：代码和主机模拟测试已具备；真实 TorchAir/ATC、AscendCL、token 精度和性能
 必须在目标设备完成验证，不能把模拟测试当作设备结果。
 
@@ -309,7 +315,7 @@ manifest 保存有序输入/输出的 dtype、shape、文件 hash、算子预检
 导出器按原始输入张量的存储身份确定 GE `Data.index` 和 Data 节点顺序，并记录
 `runtime_input_abi` 审计。不能仅靠 Python 参数名或 manifest 的 `input_names` 控制
 TorchDynamo 的捕获顺序；形状相同的多个 KV 状态也必须按张量身份区分。
-Draft 的公开输入顺序固定为 `features, start_position, valid_rows, anchor, ...KV states`。
+Draft 的公开输入顺序固定为 `features, start_position, valid_rows, anchor, proposal_count, ...KV states`。
 每个图必须只完成一次输入规范化，并保持公开输入的静态 shape；未知的运行时输入或
 捕获中丢失的公开输入会使导出失败。
 三个 Target 图均检查 `RmsNorm/AdnRmsNorm`、`DynamicQuant`、
@@ -347,6 +353,13 @@ AIR 无法改变错误的输入映射。编译器会提前拒绝使用整数 PSE
 即使没有被后续节点使用，也必须满足这个接口。类型不符会停止导出并保留这份报告。
 同一份检查结果写入 AIR manifest 的 `graphs[].runtime_input_abi.gdr_output_dtypes`。
 该检查的范围是 TorchAir 交给 GE 的描述，不代表 ATC 类型推导后的结果。
+
+verify 还生成 `air/target_verify/verify-discard-outputs.json`，
+逐项核对最后 24 个输出连接到第一遍 GDR 的第二个输出，并保持
+`output_final_state=True`。允许透明的 Identity 输出节点，不接受 Cast、算术替代
+或第二遍 commit state。检查失败会停止导出，报告保留在该目录。
+第一遍和第二遍的 GDR 参数与计算公式保持一致，仅有效长度分别为
+`valid_rows` 和 `accepted_count+1`；两遍都读取本轮开始时的 initial state。
 
 ## 9. 将 AIR 转为 OM
 
@@ -408,6 +421,12 @@ for graph in report["graphs"]:
     audit = graph["runtime_input_abi"]
     assert audit["status"] == "PASS" and audit["calls"] == 1
     assert [b["logical_name"] for b in audit["bindings"]] == graph["input_names"]
+    if graph["name"] == "target_verify":
+        assert audit["verify_discard_outputs"]["status"] == "PASS"
+        discard = graph["metadata"]["incremental_contract"]["verify_discard_states"]
+        assert len(discard) == 24
+        assert graph["metadata"]["tensor_abi"]["outputs"][-24:] == discard
+        assert all(t["dtype"] == "float32" and t["shape"] == [1,32,128,128] for t in discard)
 print("OM files: PASS")
 PY
 ```
@@ -427,6 +446,10 @@ export CPP_RUNNER="$AI_RUN_DIR/build/cpp/qwen35_dflash_acl_runner"
 需要生成 `qwen35_dflash_acl_runner`；名字带 `_fake` 的程序只用于主机测试。
 构建日志在 `$AI_RUN_DIR/log/dflash-cpp-build/`，编译身份及 runner hash 在 `cpp-build.json`。
 C++ 加载模型一次，持久保存 device buffer，循环使用 AscendCL 执行 OM。
+加载 paired/DFlash 模式时，日志应包含
+`verify_discard_buffer_bytes=50331648`，表示第一遍 GDR 的 24 份独立 FP32
+输出缓冲区；普通模式该值为 0。discard state 不分配 host buffer、不做 D2H，
+不会进入缓存交换或提交逻辑。
 更新 C++ 源码后再次执行 `build-cpp`，使用新的 `--build-dir` 和 `--output` 路径，
 并将 `CPP_RUNNER` 指向本次生成的可执行文件。构建器不覆盖非空目录或已有报告。
 
@@ -544,7 +567,7 @@ Draft OM 的物理 block 为 16 行。`proposal_count INT16[1]` 指定实际草�
 K=`min(max_draft_tokens, 剩余输出预算, 15)`，所有层的注意力都只允许
 anchor＋K 个 mask 作为有效 block key，包括非因果层。输出只读取前 K 项。
 该输入由 C++ 自动填写，推理命令无须增加参数。AIR、OM 和 C++ runner 使用同一
-`qwen35-dflash-chunk-v2` ABI；接口不一致时应从空 bundle 目录导出、编译并构建 runner。
+`qwen35-dflash-chunk-v3` ABI；接口不一致时应从空 bundle 目录导出、编译并构建 runner。
 逐轮差异应按相同已提交 token 前缀对齐，再检查 Target 特征和 Draft 的输入、计算与状态。
 工具比较 token 记录，不代表中间张量已逐项对齐。
 
@@ -710,7 +733,8 @@ msprof/ordinary-all/
 decode 或 paired。不同 OM 不会自动共享权重，设备显存要覆盖驻留模型和状态 buffer。
 
 状态语义与开销：Target verify 用本轮初始 recurrent state 做两次 GDR，第二次
-`effective_length=accepted+1`；C++ 核对接受数后统一发布状态。零接受后关闭 Draft，以
+`effective_length=accepted+1`；C++ 核对接受数后统一发布第二遍状态，
+第一遍的 raw FP32 state 仅保留设备输出缓冲区。零接受后关闭 Draft，以
 已加载的 `target_decode` 执行后续单 token 生成。单模式 DFlash 只加载三个 OM，
 继续使用 verify 的 `valid_rows=1`，其物理图仍为 16 行。
 `speculation_disable_events` 和 `target_only_fallback_rounds` 记录关闭 Draft 及后续轮数；

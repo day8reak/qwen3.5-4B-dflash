@@ -7,6 +7,7 @@
 #include <fstream>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,18 @@ struct FixtureModel {
 };
 std::map<std::uint32_t, FixtureModel> fixtures;
 std::uint32_t next_id = 1;
+std::map<void*, std::size_t> device_allocations;
+std::set<void*> discard_allocations;
+
+bool TouchesDiscard(const void* pointer, std::size_t bytes) {
+  const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+  for (auto* discard : discard_allocations) {
+    const auto base = reinterpret_cast<std::uintptr_t>(discard);
+    if (begin < base + device_allocations.at(discard) && base < begin + bytes)
+      return true;
+  }
+  return false;
+}
 
 aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, aclmdlDataset* output) {
   if (input->buffers.size() != model.inputs.size() || output->buffers.size() != model.outputs.size()) return 21;
@@ -46,6 +59,28 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
   std::map<std::string, aclDataBuffer*> in, out;
   for (std::size_t i = 0; i < model.inputs.size(); ++i) in[model.inputs[i].name] = input->buffers[i];
   for (std::size_t i = 0; i < model.outputs.size(); ++i) out[model.outputs[i].name] = output->buffers[i];
+  for (const auto& item : in)
+    if (TouchesDiscard(item.second->data, item.second->size)) return 29;
+  for (const auto& item : out) {
+    if (item.first.rfind("verify_discard_", 0) != 0) continue;
+    auto* buffer = item.second;
+    if (model.role != "target_verify" || !buffer->data ||
+        !device_allocations.count(buffer->data) ||
+        device_allocations.at(buffer->data) != buffer->size) return 30;
+    for (const auto& other : in)
+      if (other.second->data == buffer->data) return 31;
+    for (const auto& other : out)
+      if (other.first != item.first && other.second->data == buffer->data) return 32;
+    discard_allocations.insert(buffer->data);
+    // A poison value distinct from every committed cursor detects accidental
+    // publication on the next verify, decode, or reset/prefill.
+    std::fill_n(static_cast<float*>(buffer->data), buffer->size / sizeof(float), -1024.5f);
+    if (const auto* path = std::getenv("QWEN35_FAKE_MEMORY_LOG")) {
+      std::ofstream log(path, std::ios::app);
+      log << "[\"discard\",\"" << item.first << "\"," << buffer->size << ','
+          << reinterpret_cast<std::uintptr_t>(buffer->data) << "]\n";
+    }
+  }
   const auto start = *static_cast<std::int64_t*>(in.at("start_position")->data);
   const auto valid = *static_cast<std::int16_t*>(in.at("valid_rows")->data);
   if (const auto* path = std::getenv("QWEN35_FAKE_EVENT_LOG")) {
@@ -160,6 +195,7 @@ aclError aclrtDestroyStream(aclrtStream stream) {
 aclError aclrtSynchronizeStream(aclrtStream) { return ACL_SUCCESS; }
 aclError aclrtMemsetAsync(void* ptr, std::size_t maximum, std::int32_t value, std::size_t count, aclrtStream) {
   if (!ptr || count > maximum) return 1;
+  if (TouchesDiscard(ptr, count)) return 33;
   std::memset(ptr, value, count); return ACL_SUCCESS;
 }
 aclError aclUpdateDataBuffer(aclDataBuffer* buffer, void* ptr, std::size_t size) {
@@ -172,6 +208,10 @@ aclError aclrtMallocHost(void** host_ptr, std::size_t size) {
     return 1;
   }
   *host_ptr = std::malloc(size);
+  if (const auto* path = std::getenv("QWEN35_FAKE_MEMORY_LOG")) {
+    std::ofstream log(path, std::ios::app);
+    log << "[\"host_alloc\"," << size << "]\n";
+  }
   return *host_ptr == nullptr ? 1 : ACL_SUCCESS;
 }
 
@@ -185,10 +225,13 @@ aclError aclrtMalloc(void** device_ptr, std::size_t size, aclrtMemMallocPolicy) 
     return 1;
   }
   *device_ptr = std::malloc(size);
+  if (*device_ptr) device_allocations[*device_ptr] = size;
   return *device_ptr == nullptr ? 1 : ACL_SUCCESS;
 }
 
 aclError aclrtFree(void* device_ptr) {
+  discard_allocations.erase(device_ptr);
+  device_allocations.erase(device_ptr);
   std::free(device_ptr);
   return ACL_SUCCESS;
 }
@@ -203,6 +246,7 @@ aclError aclrtMemcpyAsync(
   if (destination == nullptr || source == nullptr || count > destination_max) {
     return 1;
   }
+  if (TouchesDiscard(source, count) || TouchesDiscard(destination, count)) return 34;
   std::memcpy(destination, source, count);
   return ACL_SUCCESS;
 }

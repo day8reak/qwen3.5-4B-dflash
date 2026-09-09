@@ -629,7 +629,7 @@ def create_quant_recompute_graph(
         from .incremental import incremental_graph_specs
 
         metadata.update({
-            "factory_id": "qwen3.5-4b-quant-w8a8-dflash-chunk-v2",
+            "factory_id": "qwen3.5-4b-quant-w8a8-dflash-chunk-v3",
             "gdr_effective_length_contract": "INT16[1] explicit call-local valid rows",
             "claim_boundary": "Explicit-state candidate; real TorchAir/ATC and device parity gates required.",
             "target_rollback_audit": dict(target.dflash_rollback_audit),

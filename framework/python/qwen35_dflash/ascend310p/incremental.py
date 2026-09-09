@@ -1,8 +1,9 @@
 """Functional, explicit-state AIR graphs for the two-pass chunk-GDR route.
 
 No Python bridge/cache object survives an invocation. Verify computes acceptance
-and executes both GDR passes in the same OM. Only fully committed states cross
-the OM boundary; the per-layer commit capsules remain graph intermediates.
+and executes both GDR passes in the same OM. Committed cache states and separate
+discard-only first-pass FP32 states cross the OM boundary. Commit capsules
+remain graph intermediates; first-pass states never become cache inputs.
 """
 
 from __future__ import annotations
@@ -14,7 +15,10 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .contracts import AirGraphSpec, CustomOpExportSpec
-from .incremental_plan import ABI, ATTENTION_EXPORT_POLICY, DRAFT_LENGTH_POLICY
+from .incremental_plan import (
+    ABI, ATTENTION_EXPORT_POLICY, DRAFT_LENGTH_POLICY,
+    VERIFY_STATE_OUTPUT_POLICY, verify_discard_descriptors,
+)
 
 CHUNK_ABI = ABI
 
@@ -208,6 +212,7 @@ class AirGdn(nn.Module):
             prefix_state(bank, valid_rows),
             final.to(recurrent.dtype),
             capsule,
+            final,
         )
 
 
@@ -264,16 +269,20 @@ class TargetRowsGraph(nn.Module):
         row_valid = (
             torch.arange(self.rows, device=input_ids.device) < valid_rows.to(torch.long)
         )[:, None]
-        next_state, capsules, features = [], [], []
+        next_state, capsules, features, verify_discard = [], [], [], []
         for index, (layer, block) in enumerate(zip(self.body.layers, self.blocks)):
             normalized = layer.input_layernorm(hidden)
             if isinstance(block, AirGdn):
-                mixed, conv, recurrent, capsule = block(
+                mixed, conv, recurrent, capsule, raw_final = block(
                     normalized, state[2 * index], state[2 * index + 1], valid_rows
                 )
                 next_state.extend((conv, recurrent))
                 if self.verify:
                     capsules.extend(capsule)
+                    # Keep the native FP32 output live at the OM boundary so
+                    # GE gives both first-pass GDR outputs real storage.
+                    # This state includes unaccepted proposals: never commit it.
+                    verify_discard.append(raw_final)
             else:
                 mixed, key, value = block(
                     normalized,
@@ -314,7 +323,7 @@ class TargetRowsGraph(nn.Module):
             if self.rows < 64:
                 features = F.pad(features, (0, 0, 0, 64 - self.rows))
             feature_output = (features,)
-        return (top1, *acceptance_output, *feature_output, *next_state)
+        return (top1, *acceptance_output, *feature_output, *next_state, *verify_discard)
 
 
 class TargetCommitGraph(nn.Module):
@@ -582,11 +591,13 @@ def incremental_graph_specs(
         "vocab_size": draft.config.vocab_size,
         "feature_width": draft.config.feature_size,
         "state_policy": "in-graph-acceptance-two-pass-gdr-atomic-fp16-state-output",
+        "verify_state_output_policy": VERIFY_STATE_OUTPUT_POLICY,
         "attention_export": ATTENTION_EXPORT_POLICY,
         "draft_length_policy": DRAFT_LENGTH_POLICY,
         "single_row_policy": "ordinary_decode1_chunk1; speculative_fallback_verify16_valid1",
         "commit_capsules": "internal_to_target_verify_not_external_OM_IO",
     }
+    contract["verify_discard_states"] = verify_discard_descriptors(contract)
     common = {**metadata, "incremental_contract": contract}
     specs = []
 
@@ -638,6 +649,12 @@ def incremental_graph_specs(
         out_names += selected_names
         state_by_name = dict(zip(names, state))
         out_tensors += [state_by_name[n] for n in selected_names]
+        if verify:
+            for tensor in contract["verify_discard_states"]:
+                out_names.append(tensor["name"])
+                out_tensors.append(torch.empty(
+                    tensor["shape"], dtype=torch.float32, device="meta"
+                ))
         graph = TargetRowsGraph(
             target,
             rows=rows,

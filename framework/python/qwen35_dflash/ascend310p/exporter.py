@@ -130,6 +130,11 @@ def export_air_bundle(
                 public_names=spec.input_names,
                 explicit_test_double=torchair_module is not None,
                 require_static_shapes=True,
+                public_output_names=spec.output_names,
+                verify_discard_output_names=(
+                    [s["name"] for s in spec.metadata["incremental_contract"]["verify_discard_states"]]
+                    if spec.name == "target_verify" else ()
+                ),
             )
             if spec.metadata.get("incremental_contract") else nullcontext(None)
         )

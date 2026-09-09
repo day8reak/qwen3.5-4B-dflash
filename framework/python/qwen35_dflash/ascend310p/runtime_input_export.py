@@ -79,6 +79,58 @@ def _indexed_graph_inputs(export_graph: Any) -> dict[int, Any]:
     return indexed
 
 
+def _verify_discard_output_audit(graph, public_names, discard_names):
+    """Prove raw first-pass state reaches each declared GE NetOutput slot."""
+    nodes = {op.name: op for op in graph.op}
+    net_outputs = [op for op in graph.op if op.type == "NetOutput"]
+    edges = (
+        [edge for edge in net_outputs[0].input if not edge.endswith(":-1")]
+        if len(net_outputs) == 1 else []
+    )
+    records = []
+    for name in discard_names:
+        index = public_names.index(name)
+        edge = edges[index] if index < len(edges) else ""
+        seen = set()
+        # TorchAir may insert an output Identity; casts/arithmetic are not raw
+        # state and must not be accepted as a substitute for the GDR output.
+        while edge and edge not in seen:
+            seen.add(edge)
+            producer, _, port = edge.rpartition(":")
+            node = nodes.get(producer)
+            if node is None or not port.isdigit():
+                break
+            if node.type == "Identity" and port == "0":
+                edge = node.input[0]
+            elif node.type == "IdentityN" and int(port) < len(node.input):
+                edge = node.input[int(port)]
+            else:
+                break
+        producer, _, port = edge.rpartition(":")
+        node = nodes.get(producer)
+        core_consumers = [
+            op.name for op in graph.op
+            if op.type != "NetOutput" and producer + ":0" in op.input
+        ] if node is not None else []
+        passed = (
+            len(edges) == len(public_names) and node is not None
+            and node.type == "ChunkGatedDeltaRule" and port == "1"
+            and "output_final_state" in node.attr and node.attr["output_final_state"].b
+            and bool(core_consumers)
+        )
+        records.append({
+            "logical_name": name, "output_index": index, "source": edge,
+            "core_consumers": core_consumers, "status": "PASS" if passed else "FAIL",
+        })
+    distinct = len({r["source"] for r in records}) == len(records)
+    return {
+        "status": "PASS" if records and distinct and all(r["status"] == "PASS" for r in records) else "FAIL",
+        "scope": "torchair-before-ge-save",
+        "policy": "raw-first-pass-state-to-netoutput",
+        "outputs": records,
+    }
+
+
 def _tensor_identity(value: Any) -> tuple[Any, ...] | None:
     if not isinstance(value, torch.Tensor) or value.device.type == "meta":
         return None
@@ -143,6 +195,8 @@ def canonical_runtime_input_abi(
     torchair: Any, *, public_inputs: Sequence[torch.Tensor],
     public_names: Sequence[str], explicit_test_double: bool = False,
     require_static_shapes: bool = False,
+    public_output_names: Sequence[str] = (),
+    verify_discard_output_names: Sequence[str] = (),
 ) -> Iterator[dict[str, Any]]:
     audit: dict[str, Any] = {
         "policy": "public-tensor-storage-identity-v1",
@@ -196,6 +250,19 @@ def canonical_runtime_input_abi(
                         f"before AIR save: {failed['outputs']}; expected core_attn DT_FLOAT16 "
                         f"and last_recurrent_state DT_FLOAT; report={dtype_report}"
                     )
+            if verify_discard_output_names:
+                discard = _verify_discard_output_audit(
+                    export_graph, public_output_names, verify_discard_output_names,
+                )
+                audit["verify_discard_outputs"] = discard
+                report = atomic_write_json(
+                    Path(file_path) / "verify-discard-outputs.json", discard,
+                )
+                if discard["status"] != "PASS":
+                    raise RuntimeError(
+                        "raw first-pass GDR states must reach separate OM outputs; "
+                        f"report={report}"
+                    )
             if require_static_shapes:
                 final_nodes = _indexed_graph_inputs(export_graph)
                 for record in records:
@@ -242,6 +309,20 @@ def validated_runtime_input_abi(
         return dict(record)
     if record.get("status") != "PASS":
         raise ValueError("AIR runtime_input_abi audit is not passing")
+    if graph.get("name") == "target_verify":
+        contract = graph.get("metadata", {}).get("incremental_contract", {})
+        discard_names = [t["name"] for t in contract.get("verify_discard_states", [])]
+        if discard_names:
+            discard = record.get("verify_discard_outputs", {})
+            if (
+                discard.get("status") != "PASS"
+                or discard.get("policy") != "raw-first-pass-state-to-netoutput"
+                or [o.get("logical_name") for o in discard.get("outputs", [])] != discard_names
+                or any(o.get("status") != "PASS" for o in discard.get("outputs", []))
+                or [o.get("output_index") for o in discard.get("outputs", [])]
+                != [graph["output_names"].index(name) for name in discard_names]
+            ):
+                raise ValueError("AIR lacks passing first-pass GDR discard output audit; re-export AIR")
     names = graph.get("input_names", [])
     bindings = record.get("bindings", [])
     if (record.get("policy") != "public-tensor-storage-identity-v1" or

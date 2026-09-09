@@ -161,8 +161,8 @@
   "claim_boundary": "Host and fake-ACL tests do not prove AIR export, OM conversion, physical 310P correctness, or latency. Those gates require the real locked target environment.",
   "incremental_graphs": {
     "factory": "qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_graphs",
-    "abi": "qwen35-dflash-chunk-v2",
-    "contract_file": "framework/abi/dflash-chunk-v2.json",
+    "abi": "qwen35-dflash-chunk-v3",
+    "contract_file": "framework/abi/dflash-chunk-v3.json",
     "dflash_oms": [
       "target_prefill",
       "target_verify",
@@ -172,6 +172,8 @@
     "om_limit": 4,
     "commit": "acceptance and accepted+1 second GDR are internal to target_verify",
     "state": "explicit FP16 persistent GDN/conv/KV; FP32 GDR accumulator; current/next device banks and logical cursor",
+    "verify_state_output_policy": "raw_fp32_device_only_discard_first_pass_commit_second_pass",
+    "verify_discard_outputs": "24 raw FP32 GDR first-pass states in independent device-only buffers; 50331648 bytes; never committed or transferred to host",
     "status": "HOST_VERIFIED_DEVICE_GATES_PENDING",
     "target_custom_operators": [
       {

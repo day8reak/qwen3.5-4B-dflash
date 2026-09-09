@@ -184,10 +184,15 @@ class AclChunkExecutor::Impl {
         Load(item.second);
       }
       // Cross-graph state/feature shapes are checked by the shared pool.
-      std::size_t bytes = 0;
-      for (const auto& item : memory) bytes += item.second->bytes;
+      std::size_t bytes = 0, discard_bytes = 0;
+      for (const auto& item : memory) {
+        bytes += item.second->bytes;
+        if (IsVerifyDiscardState(item.second->spec.name))
+          discard_bytes += item.second->bytes;
+      }
       std::cerr << "[chunk-runtime] loaded_models=" << models.size()
-                << " persistent_buffer_bytes=" << bytes << '\n';
+                << " persistent_buffer_bytes=" << bytes
+                << " verify_discard_buffer_bytes=" << discard_bytes << '\n';
     } catch (...) {
       Cleanup();
       throw;
@@ -242,7 +247,10 @@ class AclChunkExecutor::Impl {
     Check(
         aclrtMalloc(&buffer->device, buffer->bytes, ACL_MEM_MALLOC_NORMAL_ONLY),
         "aclrtMalloc");
-    if (!State(spec.name) && spec.name != "features")
+    // Discard outputs have private graph-scoped device allocations. No host
+    // allocation means Call queues neither H2D nor D2H for them.
+    if (!State(spec.name) && spec.name != "features" &&
+        !IsVerifyDiscardState(spec.name))
       Check(aclrtMallocHost(&buffer->host, buffer->bytes), "aclrtMallocHost");
     auto* pointer = buffer.get();
     memory.emplace(key, std::move(buffer));
@@ -437,7 +445,8 @@ class AclChunkExecutor::Impl {
     Healthy();
     Require(pending && rows == pending_commit && rows <= pending,
             "host acceptance disagrees with fused OM");
-    // All layers finished both GDR passes before this atomic host publication.
+    // Publish only named Target cache outputs, containing second-pass GDR
+    // states. First-pass verify_discard_* buffers never enter Swap('t').
     Swap('t');
     feature_start = cursor;
     feature_rows = rows;

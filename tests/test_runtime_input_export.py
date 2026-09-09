@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "framework/python"))
 
 from qwen35_dflash.ascend310p.runtime_input_export import (
     _gdr_output_dtype_audit, _normalize_public_nodes, _public_bindings, canonical_runtime_input_abi,
+    _verify_discard_output_audit,
     validated_runtime_input_abi as _validated_runtime_input_abi,
 )
 
@@ -68,6 +69,71 @@ def test_gdr_audit_rejects_missing_or_reordered_outputs(damage):
     else:
         node.output_desc.reverse()
     assert _gdr_output_dtype_audit(_Graph([node]))["status"] == "FAIL"
+
+
+def _discard_graph(damage=None):
+    first, second = _gdr_node(), _gdr_node()
+    first.name, second.name = "verify_gdr", "commit_gdr"
+    for node in (first, second):
+        node.input = []
+        node.attr = {"output_final_state": SimpleNamespace(b=True)}
+    core = _Op("consume_core", "Mul", inputs=("verify_gdr:0",))
+    committed = _Op("committed", "Cast", inputs=("commit_gdr:1",))
+    raw = _Op("raw_state", "Identity", inputs=("verify_gdr:1",))
+    if damage == "cast":
+        raw.type = "Cast"
+    elif damage == "commit":
+        raw.input[0] = "commit_gdr:1"
+    elif damage == "core":
+        raw.input[0] = "verify_gdr:0"
+    elif damage == "outstate_false":
+        first.attr["output_final_state"].b = False
+    elif damage == "unused_core":
+        core.input.clear()
+    output = _Op("NetOutput", "NetOutput", inputs=("committed:0", "raw_state:0"))
+    if damage == "missing":
+        output.input.pop()
+    return _Graph([first, core, second, committed, raw, output])
+
+
+@pytest.mark.parametrize("damage", [None, "cast", "commit", "core", "outstate_false", "unused_core", "missing"])
+def test_discard_audit_requires_raw_first_pass_state_in_netoutput(damage):
+    report = _verify_discard_output_audit(
+        _discard_graph(damage), ["t0_recurrent", "verify_discard_t0_recurrent"],
+        ["verify_discard_t0_recurrent"],
+    )
+    assert report["status"] == ("PASS" if damage is None else "FAIL")
+    if damage is None:
+        assert report["outputs"][0]["source"] == "verify_gdr:1"
+        assert report["outputs"][0]["output_index"] == 1
+
+
+@pytest.mark.parametrize("damage", [None, "cast", "outstate_false", "missing"])
+def test_serialization_checks_discard_liveness_and_retains_report(monkeypatch, tmp_path, damage):
+    monkeypatch.setenv("AI_RUN_DIR", str(tmp_path))
+    torchair = ModuleType("torchair")
+    public = torch.zeros(1)
+    graph = _discard_graph(damage)
+    graph.op.insert(0, _Op("input", "Data", index=0))
+    original = lambda *args: (False, 0)
+    module = SimpleNamespace(_convert_data_to_const=original)
+    monkeypatch.setitem(sys.modules, "torchair", torchair)
+    monkeypatch.setitem(sys.modules, "torchair._utils.export_utils", module)
+    try:
+        with canonical_runtime_input_abi(
+            torchair, public_inputs=[public], public_names=["x"],
+            public_output_names=["t0_recurrent", "verify_discard_t0_recurrent"],
+            verify_discard_output_names=["verify_discard_t0_recurrent"],
+        ) as audit:
+            module._convert_data_to_const([public], graph, str(tmp_path), {})
+    except RuntimeError as error:
+        assert damage and "raw first-pass GDR states" in str(error)
+    else:
+        assert damage is None
+        assert audit["verify_discard_outputs"]["status"] == "PASS"
+    report = json.loads((tmp_path / "verify-discard-outputs.json").read_text())
+    assert report["status"] == ("PASS" if damage is None else "FAIL")
+    assert module._convert_data_to_const is original
 
 
 @pytest.mark.parametrize("damage", [False, True])
@@ -383,8 +449,16 @@ def test_all_chunk_exports_normalize_actual_dynamo_input_order(tmp_path, monkeyp
                 consumer = _Op("consumer", "Add", inputs=tuple(n.name + ":0" for n in nodes))
                 consumer_edges = tuple(consumer.input)
                 graph = _Graph([*nodes, consumer])
-                export_utils._convert_data_to_const(actual, graph, "unused", weights)
-                assert tuple(graph.op[-1].input) == consumer_edges
+                if export_name == "target_verify":
+                    # Synthetic GE nodes for the serializer fixture. Actual
+                    # opaque-op torch.export output liveness has its own test.
+                    discard_graph = _discard_graph()
+                    discard_graph.op[-1].input = (
+                        ["consumer:0"] * (len(spec.output_names) - 1) + ["raw_state:0"]
+                    )
+                    graph.op.extend(discard_graph.op)
+                export_utils._convert_data_to_const(actual, graph, export_path, weights)
+                assert tuple(consumer.input) == consumer_edges
                 normalized = [n for n in graph.op if n.type == "Data"]
                 assert [n.attr["index"].i for n in normalized] == list(range(len(public)))
                 for index, node in enumerate(normalized):

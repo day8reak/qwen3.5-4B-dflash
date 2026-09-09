@@ -342,7 +342,8 @@ def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(valid_rows, ac
         )
         torch.testing.assert_close(out[3], ref[1], atol=2e-3, rtol=2e-3)
         torch.testing.assert_close(out[4], ref[2], atol=2e-3, rtol=2e-3)
-        for actual, expected in zip(out[5:], ref[3:]):
+        # Remaining outputs after the four cache tensors are discard-only.
+        for actual, expected in zip(out[5:7], ref[3:]):
             torch.testing.assert_close(
                 actual[:, :, : accepted + 1],
                 expected[:, :, : accepted + 1],
@@ -351,6 +352,103 @@ def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(valid_rows, ac
             )
     for actual, expected in zip(initial, verify.example_args[3:]):
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.fixture(scope="module")
+def gdr_output_fixture():
+    lib = torch.library.Library("verify_state_fixture", "DEF")
+    lib.define("gdr(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
+               "Tensor effective_length, Tensor initial_state, int chunk_size, "
+               "bool output_final_state, bool use_qk_l2norm_in_kernel) -> (Tensor, Tensor)")
+
+    def operation(query, key, value, g, beta, effective_length, initial_state,
+                  chunk_size, output_final_state, use_qk_l2norm_in_kernel):
+        assert chunk_size == 64 and output_final_state and use_qk_l2norm_in_kernel
+        return torch.zeros_like(value), initial_state + effective_length.float() * 0.0137
+
+    lib.impl("gdr", operation, "CPU")
+    lib.impl("gdr", lambda q, k, v, g, b, length, state, *attrs:
+             (torch.empty_like(v), torch.empty_like(state)), "Meta")
+    yield torch.ops.verify_state_fixture.gdr.default
+    lib._destroy()
+
+
+@pytest.mark.parametrize("valid_rows,accepted", [(16, 0), (16, 7), (16, 15), (8, 3), (1, 0)])
+def test_verify_retains_raw_first_pass_outputs_but_commits_second_pass(valid_rows, accepted, gdr_output_fixture):
+    import operator
+
+    # Two GDN layers separated by attention detect index/order mixups. This
+    # opaque host op tests output liveness through torch.export, not GDR math.
+    target = TinyTarget().eval()
+    target.dflash_execution_model.language_model.layers.append(
+        copy.deepcopy(target.dflash_execution_model.language_model.layers[0])
+    )
+    graph = TargetRowsGraph(
+        target, rows=16, verify=True, feature_layers=(0, 2),
+        gdr=gdr_output_fixture, attention=attention_op, rotary=rotary,
+    )
+    state = [t for pair in target._fresh_hybrid_cache(1) for t in pair]
+    state += [t.clone() for t in state[:2]]
+    state[1].fill_(0.1372)
+    state[5].fill_(0.2734)
+    frozen = [t.clone() for t in state]
+    ids = torch.zeros(1, 16, dtype=torch.int64)
+    if accepted + 1 < valid_rows:
+        ids[0, accepted + 1] = 1
+    args = (ids, torch.tensor([0]), torch.tensor([valid_rows], dtype=torch.int16), *state)
+    with torch.inference_mode():
+        target.head.weight.zero_()
+        eager = graph(*args)
+        ep = torch.export.export(graph, args)
+        actual = ep.module()(*args)
+    assert len(actual) == 11  # Top1, acceptance, features, six caches, two discards
+    assert int(actual[1][0]) == accepted
+    for a, b in zip(actual, eager):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    for index, layer in enumerate((0, 2)):
+        raw = actual[9 + index]
+        committed = actual[3 + 2 * layer + 1]
+        initial = state[2 * layer + 1].float()
+        assert raw.dtype == torch.float32 and committed.dtype == torch.float16
+        torch.testing.assert_close(raw, initial + valid_rows * 0.0137, rtol=0, atol=0)
+        torch.testing.assert_close(committed, (initial + (accepted + 1) * 0.0137).half(),
+                                   rtol=0, atol=0)
+    for a, b in zip(state, frozen):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    calls = [n for n in ep.graph.nodes if n.target == gdr_output_fixture]
+    outputs = next(n for n in ep.graph.nodes if n.op == "output").args[0]
+    assert len(calls) == 4
+    for first, second, output in zip(calls[:2], calls[2:], outputs[-2:]):
+        assert output.target == operator.getitem and output.args == (first, 1)
+        # Both calls read the round-start state; only effective_length changes.
+        assert first.args[6] is second.args[6]
+        assert first.args[5] is not second.args[5]
+        assert first.args[7:] == second.args[7:] == (64, True, True)
+
+@pytest.mark.parametrize("damage", ["missing", "fp16", "shape", "cache_alias", "input", "policy", "stale"])
+def test_verify_discard_contract_rejects_incompatible_artifacts(damage):
+    graphs = manifest_graphs(specs())
+    c = graphs[0]["metadata"]["incremental_contract"]
+    verify = next(g for g in graphs if g["name"] == "target_verify")
+    if damage == "missing":
+        verify["metadata"]["tensor_abi"]["outputs"].pop()
+        verify["output_names"].pop()
+    elif damage in {"fp16", "shape", "cache_alias"}:
+        tensor = c["verify_discard_states"][0]
+        if damage == "fp16":
+            tensor["dtype"] = "float16"
+        elif damage == "shape":
+            tensor["shape"] = [1]
+        else:
+            tensor["name"] = c["gdn_states"][1]
+    elif damage == "input":
+        verify["metadata"]["tensor_abi"]["inputs"].append(c["verify_discard_states"][0])
+    elif damage == "policy":
+        c.pop("verify_state_output_policy")
+    else:
+        c["abi"] = "qwen35-dflash-chunk-v2"
+    with pytest.raises(ValueError):
+        validate_incremental_bundle(graphs)
 
 
 @pytest.mark.parametrize("dim,shape", [(0, (192, 2, 16)), (2, (1, 2, 192, 16))])
@@ -984,6 +1082,81 @@ def test_pure_dflash_does_not_load_or_require_decode_om(chunk_bundle, tmp_path, 
         assert len(row["stage_ms"]["target_verify"]) == 31
         assert row["counters"]["target_only_fallback_rounds"] == 30
         assert "rounds" not in row
+
+
+@pytest.mark.parametrize("mode", ["paired", "dflash", "ordinary"])
+def test_cpp_discard_buffers_are_private_device_only_and_never_committed(
+    chunk_bundle, tmp_path, monkeypatch, mode,
+):
+    from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
+    from qwen35_dflash.ascend310p.utils import sha256_file
+
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER")
+    plan, _, c = write_incremental_plan(chunk_bundle, tmp_path / "plan.txt", mode=mode)
+    log = tmp_path / "memory.jsonl"
+    monkeypatch.setenv("QWEN35_FAKE_MEMORY_LOG", str(log))
+    monkeypatch.setenv("QWEN35_FAKE_ACCEPT", "7")
+    report = tmp_path / "report.json"
+    result = subprocess.run(
+        [runner, "--model", str(plan), "--model-sha256", sha256_file(plan),
+         "--model-kind", "chunk", "--mode", mode, "--prompt-token-ids", "4",
+         "--max-new-tokens", "32", "--output", str(report)],
+        capture_output=True, text=True,
+    )
+    # The fake ACL rejects any reuse/transfer/reset of discard buffers and
+    # validates committed cursors on every call, across 3+10 repetitions.
+    assert result.returncode == 0, result.stderr
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    discards = [r for r in records if r[0] == "discard"]
+    expected_bytes = 1 * 1 * 16 * 16 * 4  # Tiny fixture, not device evidence
+    assert all(r[1] != expected_bytes for r in records if r[0] == "host_alloc")
+    if mode == "ordinary":
+        assert not discards and "verify_discard_buffer_bytes=0" in result.stderr
+    else:
+        assert len(discards) > 13  # buffer is reused across rounds and requests
+        assert {r[1] for r in discards} == {t["name"] for t in c["verify_discard_states"]}
+        assert {r[2] for r in discards} == {expected_bytes}
+        assert len({r[3] for r in discards}) == 1
+        assert f"verify_discard_buffer_bytes={expected_bytes}" in result.stderr
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "PASS"
+
+
+@pytest.mark.parametrize("damage", ["missing", "dtype", "shape", "input", "order", "stale"])
+def test_cpp_rejects_invalid_discard_plan_before_loading(chunk_bundle, tmp_path, monkeypatch, damage):
+    from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
+    from qwen35_dflash.ascend310p.utils import sha256_file
+
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER")
+    plan, _, _ = write_incremental_plan(chunk_bundle, tmp_path / "plan.txt")
+    lines = plan.read_text().splitlines()
+    index = next(i for i, s in enumerate(lines) if s.startswith("O verify_discard_"))
+    if damage == "missing":
+        del lines[index]
+    elif damage == "dtype":
+        lines[index] = lines[index].replace("float32", "float16")
+    elif damage == "shape":
+        lines[index] = lines[index].replace("4 1 1 16 16", "4 1 1 16 32")
+    elif damage == "input":
+        lines[index] = "I " + lines[index][2:]
+    elif damage == "order":
+        lines[index - 1], lines[index] = lines[index], lines[index - 1]
+    else:
+        lines[0] = "qwen35-dflash-chunk-v2"
+    plan.write_text("\n".join(lines) + "\n")
+    result = subprocess.run(
+        [runner, "--model", str(plan), "--model-sha256", sha256_file(plan),
+         "--model-kind", "chunk", "--mode", "dflash", "--prompt-token-ids", "4",
+         "--output", str(tmp_path / "report.json")],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "discard" in result.stderr if damage != "stale" else "ABI" in result.stderr
+    assert "[chunk-runtime] load graph=" not in result.stderr
 
 
 @pytest.mark.parametrize("extra,expected", [

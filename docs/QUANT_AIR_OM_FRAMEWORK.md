@@ -56,8 +56,8 @@ Draft 使用 FP16 embedding、LM head 和主体；公开 embedding getter 保留
 
 ## 3. OM 有序输入/输出
 
-ABI 标识为 `qwen35-dflash-chunk-v2`，合同见
-[图与状态合同](../framework/abi/dflash-chunk-v2.json)。所有图固定 batch=1。
+ABI 标识为 `qwen35-dflash-chunk-v3`，合同见
+[图与状态合同](../framework/abi/dflash-chunk-v3.json)。所有图固定 batch=1。
 实际 tensor 顺序、dtype、shape 由加载后的模型推导，并冻结在 manifest 的
 `metadata.tensor_abi` 中。不要通过文件名猜测输入顺序。
 
@@ -78,7 +78,7 @@ ABI 标识为 `qwen35-dflash-chunk-v2`，合同见
 |---|---|
 | `target_prefill` | `target_top1 INT64[1,1]`、`features FP16[1,64,20480]`、完整 Target 状态 |
 | `target_decode` | `target_top1 INT64[1,1]`、完整 Target 状态 |
-| `target_verify` | `target_top1 INT64[1,16]`、`accepted_count INT64[1]`、`features FP16[1,64,20480]`、完整 Target 状态 |
+| `target_verify` | `target_top1 INT64[1,16]`、`accepted_count INT64[1]`、`features FP16[1,64,20480]`、完整 Target 状态、24 份第一遍 GDR 的原始 FP32 state |
 
 prefill/decode Top1 对应本次最后一个有效输入行。verify 输入为 `[anchor,d1,...,dK]`，
 右侧补齐至 16 行；`valid_rows=K+1`。接受数 `a` 是从第一个 proposal 起连续匹配的长度，
@@ -89,10 +89,26 @@ prefill/decode Top1 对应本次最后一个有效输入行。verify 输入为 `
 1. 从本轮初始状态计算全部有效 verify 行，完成第一遍 GDR 和 Target Top1。
 2. 比较 proposal 与 Target Top1，得到最长连续接受数 a。
 3. 从同一本轮初始 recurrent state，以 `effective_length=a+1` 完成第二遍 GDR。
-4. 选择对应 conv state，输出 committed features 和完整 Target 状态。
+4. 选择对应 conv state，输出 committed features 和完整 Target 状态；随后附加第一遍 GDR 的原始 FP32 state。
 
 第二遍 GDR 所需的中间量留在图内，没有独立 commit OM，也不回传主机。
 GDR 累加及算子 initial/final state 使用 FP32；OM 之间持久保存的 recurrent state 为 FP16。
+
+附加输出命名为 `verify_discard_t<layer>_recurrent`，按线性注意力层的顺序排列，
+每份为 FP32 `[1,32,128,128]`。它们直接来自第一遍 GDR 的第二个输出，
+保持 `output_final_state=True`，不经过 FP16 转换或零乘法。
+标准 4B verify 共 91 个输出，最后 24 个为这些 discard state。
+
+C++ 为每份 discard state 分配独立、持久的设备缓冲区，共 48 MiB；
+不分配对应 pinned host 内存，不做 H2D/D2H，也不在请求 reset 时清零。
+它们不是任何 OM 的输入，不参与 `current/next` 缓存交换，每轮由 GDR 覆盖。
+缓存只接收第二遍 commit 的输出。48 MiB 是这些输出缓冲区的大小，完整模型显存
+变化还取决于 ATC 的图内内存规划。普通模式只加载 prefill/decode，不分配这些缓冲区。
+
+导出器在 GE 保存前检查这些输出确实连接到第一遍 GDR 的 raw state，
+生成 `air/target_verify/verify-discard-outputs.json`。该报告证明保存前的输出连接；
+实际 OM 缓冲区由 C++ 加载时的逐输出 dtype/shape/bytes 校验和分配保证。
+接口版本必须与 runner 一致；使用新的空 bundle 目录导出 AIR、编译 OM，并重建 runner。
 
 ### 3.2 Draft 图
 

@@ -27,6 +27,7 @@ struct ChunkPlan {
 };
 ChunkPlan ReadChunkPlan(const std::filesystem::path& path,
                         const std::string& mode = "paired");
+bool IsVerifyDiscardState(const std::string& name);
 
 // The same scheduler is exercised by host fixtures and the real AscendCL path.
 class ChunkExecutor : public GraphExecutor {
