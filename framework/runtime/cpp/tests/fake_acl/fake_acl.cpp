@@ -777,7 +777,11 @@ struct aclmdlDesc {
 
 extern "C" {
 
-aclError aclInit(const char*) { return ACL_SUCCESS; }
+aclError aclInit(const char* config) {
+  const char* expected = std::getenv("QWEN35_DFLASH_FAKE_EXPECT_DUMP_CONFIG");
+  if (expected && (!config || std::string(config) != expected)) return 9008;
+  return ACL_SUCCESS;
+}
 aclError aclFinalize() {
   if (g_model_work_pending || !g_models.empty() || !g_device_allocations.empty()) {
     std::fputs("fake ACL cleanup left live model/work/device allocations\n", stderr);

@@ -178,6 +178,7 @@ void CompareState(std::ostream& out, const TargetStateSnapshot& reference,
 struct CapturedTransaction {
   std::string path;
   std::size_t proposal_limit = 0;
+  std::size_t execution_begin = 0, execution_end = 0;
   TargetStateSnapshot before, after;
   std::vector<std::int64_t> verify_ids;
   StatefulStep result;
@@ -230,7 +231,9 @@ class CaptureExecutor final : public StatefulGraphExecutor {
     t.path = path;
     t.proposal_limit = k;
     t.before = executor.CaptureTargetState();
+    t.execution_begin = executor.model_execution_trace().size();
     t.result = call();
+    t.execution_end = executor.model_execution_trace().size();
     t.verify_ids = executor.CaptureVerifyInputIds();
     t.after = executor.CaptureTargetState();
     transactions.push_back(std::move(t));
@@ -348,7 +351,8 @@ TargetParityDiagnostic DiagnoseTargetParity(
     if (progress) progress("stage=target-parity-replay-start transaction=" + std::to_string(i + 1));
     if (i) out << ',';
     out << "{\"transaction\":" << i + 1 << ",\"path\":\"" << t.path
-        << "\",\"generated_begin\":" << generated_begin
+        << "\",\"capture_execution_trace_range\":[" << t.execution_begin << ',' << t.execution_end << ']'
+        << ",\"generated_begin\":" << generated_begin
         << ",\"proposal_limit\":" << t.proposal_limit
         << ",\"accepted_draft_tokens\":" << t.result.accepted_draft_tokens
         << ",\"rejected_draft_tokens\":" << t.result.rejected_draft_tokens
@@ -362,7 +366,10 @@ TargetParityDiagnostic DiagnoseTargetParity(
     out << ",\"verify_cursor_transition_consistent\":" << (cursor_ok ? "true" : "false")
         << ",\"incoming_state_vs_chained_decode1\":";
     CompareState(out, chained, t.before);
+    const auto chained_begin = executor.model_execution_trace().size();
     const auto chained_ids = Replay(executor, chained, inputs);
+    out << ",\"chained_execution_trace_range\":[" << chained_begin << ','
+        << executor.model_execution_trace().size() << ']';
     chained = executor.CaptureTargetState();
     out << ",\"chained_decode1_tokens\":";
     result.token_parity &= CompareTokens(out, chained_ids, t, generated_begin,
@@ -370,7 +377,10 @@ TargetParityDiagnostic DiagnoseTargetParity(
         result.first_token_mismatch_json);
     out << ",\"chained_decode1_state_vs_verify\":";
     CompareState(out, chained, t.after);
+    const auto isolated_begin = executor.model_execution_trace().size();
     const auto isolated_ids = Replay(executor, t.before, inputs);
+    out << ",\"same_input_execution_trace_range\":[" << isolated_begin << ','
+        << executor.model_execution_trace().size() << ']';
     out << ",\"same_input_state_decode1_tokens\":";
     result.token_parity &= CompareTokens(out, isolated_ids, t, generated_begin,
         prompt.size(), options.max_new_tokens, i + 1, "same-input-state-decode1",

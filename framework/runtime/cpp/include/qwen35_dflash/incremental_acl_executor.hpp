@@ -255,7 +255,8 @@ class AclIncrementalExecutor final : public StatefulGraphExecutor {
       IncrementalDraftFeaturePolicy draft_feature_policy =
           IncrementalDraftFeaturePolicy::kFixedVerifyWidth,
       IncrementalModelResidencyPolicy model_residency_policy =
-          IncrementalModelResidencyPolicy::kAllResident);
+          IncrementalModelResidencyPolicy::kAllResident,
+      std::filesystem::path acl_dump_config = {});
   ~AclIncrementalExecutor() override;
 
   AclIncrementalExecutor(const AclIncrementalExecutor&) = delete;

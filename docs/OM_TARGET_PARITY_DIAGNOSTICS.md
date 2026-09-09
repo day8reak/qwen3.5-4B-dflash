@@ -1,6 +1,8 @@
 # v45：可选 Target 状态快照与 Decode1 重放
 
 runner 1.28.0 / Python 控制面提供默认关闭的 `--diagnose-target-parity`。
+runner 1.29.0 进一步提供可选 `--acl-dump-config`，捕获原 OM 的选定中间节点，
+配合[通用逐算子比较与原生回放](OM_OPERATOR_DIAGNOSTICS.md)；无需重编 AIR/OM。
 用于定位已报告的 ordinary/DFlash 首个 token 分歧，不修正模型数值、不替换普通
 Target 权威，也不把局部诊断当成整模型正确性或性能 PASS。
 
@@ -93,8 +95,14 @@ raw 的 `report_kind=cpp-ascendcl-target-parity-diagnostic`、`status=DIAGNOSTIC
 快速查看首个 token 分歧（报告是合法 JSON，包括布尔值和非有限数）：
 
 ```bash
-jq '.diagnostic | {captured_transactions, token_parity, cursor_parity, first_token_mismatch}' \
-  "$AI_RUN_DIR/reports/target-parity-diag128-runner-raw.json"
+"$AI_MODEL_PYTHON" - "$AI_RUN_DIR/reports/target-parity-diag128-runner-raw.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    diagnostic = json.load(stream)["diagnostic"]
+keys = ("captured_transactions", "token_parity", "cursor_parity", "first_token_mismatch")
+print(json.dumps({key: diagnostic.get(key) for key in keys}, indent=2, ensure_ascii=False))
+PY
 ```
 
 `first_token_mismatch` 直接给出 1-based transaction、重放种类、0-based Verify 行号、
@@ -123,3 +131,16 @@ compact 结果，不能分析 Top1–Top2 margin，也不是直接 OM/torch_npu 
 本地 fake ACL / CPU 回归验证参数开关、状态恢复、定位字段、EOS/K/回退边界、非零退出及
 报告保护；不冒充 Ascend310P 上的实际数值。用户已报告的真机 FAIL 仍未闭合。
 默认模式的首对即停、严格 zero mismatch 校验和当前权威模型均保持不变。
+
+v47 raw 另含 `model_execution_trace`（实际 model ID/role/物理行数）及每事务的
+`capture_execution_trace_range`、`chained_execution_trace_range`、
+`same_input_execution_trace_range`。区间是该数组的 0-based `[begin,end)`，**不是**
+CANN 的 task ID 或 dump data_index。配合 dump 子目录中的模型加载实例辨别调用，
+不能把第 N 个 dump 文件直接当第 N 个 decode 事务。
+
+## v46 可选模型对照说明
+
+上述状态重放可复用 runner 1.28.0；要启用 dump 必须重编为 1.29.0。
+仅增加诊断时不需要重编 AIR/OM；
+启用 [v46 GDR 递推对照](OM_VERIFY_GDR_REFERENCE.md) 时则必须重新导出、编译模型。
+默认仍用 GDR-MTP；请勿把新增对照理解为 MTP 已经修复。

@@ -1,5 +1,9 @@
 # v43：对齐当前分支 torch_npu 的状态与调度
 
+**v46 更新：**新增 [可选 Decode1 GDR 递推对照](OM_VERIFY_GDR_REFERENCE.md)，
+默认 GDR-MTP 和 eager torch_npu 均未改。该对照不是 MTP 内核修复，也没有证明
+两种 DFlash 实现的接受率相同；只有启用它才需要新 AIR/OM。
+
 后续真机日志报告了 ordinary/DFlash 一致性失败，不能把 v43 的源码/主机测试当作真机 PASS。
 v44 / runner 1.27.0 增加[首对即停和失败诊断](OM_FAILURE_DIAGNOSTICS.md)，不改变本页
 模型逻辑；已有 v43 bundle 时无需为诊断功能重新导出。以下保留 v43 的变更范围与历史证据。

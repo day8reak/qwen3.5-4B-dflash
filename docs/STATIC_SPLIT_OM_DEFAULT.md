@@ -4,7 +4,13 @@
 greedy 对齐，再另建动态候选；本次不缩减模型、量化精度、KV 容量或请求长度。
 这是用户选择的源码默认值，不代表已经取得 Ascend310P 真机正确性或性能结论。
 
-**当前为 v45 / runner 1.28.0 / PASS report schema 13，四图拓扑保持 v41。**
+**当前为 v47 / runner 1.29.0 / PASS report schema 13，四图拓扑保持 v41。**
+v47 增加[通用算子 dump / 同输入回放](OM_OPERATOR_DIAGNOSTICS.md)，不限于 GDR。
+只需更新 Python 并重建 C++，原失败 AIR/OM 保留；默认关闭，不能作为性能数据。
+v46 默认仍使用 `target_verify_gdr_policy="mtp-block-v1"`。
+可选 `decode1-recurrence-v1` 逐 token 调用普通 GDR 并保留每步 FP16 状态反馈边界，
+用于定位差异，详见 [可选 GDR 对照](OM_VERIFY_GDR_REFERENCE.md)。
+启用对照才需新 AIR/OM，runner 1.28.0 可以复用。不声称 MTP 已修复或接受率/性能提升。
 v45 可选开启 [Target 定点状态重放](OM_TARGET_PARITY_DIAGNOSTICS.md)，
 对比 Verify 与 Decode1 的相同输入状态/连续前缀重放；默认关闭，不改变正常调度和计时。
 该诊断只需重建 runner、更新 Python 控制面，不改现有 OM。
@@ -26,6 +32,7 @@ conv state 提交，并对齐当前分支 torch_npu 的 K、零接受回退和 E
 | --- | --- | --- |
 | 新默认构图、重跑、静态尺寸与分组显存 | 本页及所链接的 static-split factory/runner 模板 | v41 / runner 1.25.0 起 |
 | 首个 Verify/Decode1 分歧的状态快照和重放 | [Target 定点诊断](OM_TARGET_PARITY_DIAGNOSTICS.md) | v45 / runner 1.28.0，默认关闭，不重导已有 v43+ OM |
+| 原 OM 中间张量、通用算子比较及同输入原生回放 | [通用算子诊断](OM_OPERATOR_DIAGNOSTICS.md) | v47 / runner 1.29.0，仅更新 Python/C++ |
 | 环境、自定义算子 ABI、历史 AIR/ATC 排错 | [框架参考](QUANT_AIR_OM_FRAMEWORK.md) | 第 4–11 节保留旧 fused 对照；不是默认运行命令 |
 | 复用旧正确静态 fused OM，仅修改生命周期 | [v40 显存说明](STATIC_OM_MEMORY.md) | 仅旧静态 fused，不适用新 Prefill ABI / Draft shape |
 | 旧 fused 静态导出或动态排错 | [静态 fused 基线](STATIC_FUSED_OM_BASELINE.md)、[性能候选参考](INCREMENTAL_OM_PERFORMANCE.md) | 显式回退 / 独立候选 |
@@ -78,7 +85,8 @@ OM 自动共享权重。它避免四图权重同时常驻，但不能保证在�
 短到不进入 Draft 的请求允许仅 Prefill 组常驻，并不要求人为装载两张热图。
 
 Decode1 仍保留供 ordinary 使用。默认静态 split 的 DFlash 剩余预算为 1 时，Draft 尚未
-关闭则执行 K=1；首次零接受后使用 Verify16 K=0，保持 GDR-MTP 的 FP32 recurrent state，
+关闭则执行 K=1；首次零接受后使用 Verify16 K=0，默认保留 GDR-MTP 的 FP32 状态库。
+可选 `decode1-recurrence-v1` 对照逐 token 舍入为 FP16、再以 FP32 ABI 存储。两者都
 不切到 ordinary Decode1。旧 fused 无独立 Verify，仍是历史回退路径，不声称 eager 逐轮对齐。
 
 ## 静态尺寸与逻辑长度

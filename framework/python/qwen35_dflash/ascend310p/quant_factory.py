@@ -52,7 +52,10 @@ from .integrated import (
     enable_padded_draft_context,
     integrated_recompute_graph_spec,
 )
-from .incremental_graphs import incremental_state_graph_specs
+from .incremental_graphs import (
+    DECODE1_GDR_POLICY, MTP_GDR_POLICY, incremental_state_graph_specs,
+    resolve_verify_gdr_policy,
+)
 
 
 QUANT_BASE_REVISION = "28f93e784a2beed87020a80bd93c8788754eab1c"
@@ -740,6 +743,10 @@ def create_quant_incremental_state_graphs(
         raise TypeError("merged_prefill must be a boolean")
     if merged_prefill and (unified_target_step or fused_speculative_step):
         raise ValueError("merged_prefill requires separate Draft/Verify and decode1")
+    gdr_policy = resolve_verify_gdr_policy(
+        config.get("target_verify_gdr_policy"), merged_prefill=merged_prefill,
+        unified_target_step=unified_target_step,
+    )
     max_sequence_length = int(config.get("max_sequence_length", 0))
     if max_sequence_length <= 0 or max_sequence_length % _TARGET_GDN_CHUNK:
         raise ValueError(
@@ -782,18 +789,22 @@ def create_quant_incremental_state_graphs(
     if eos_table_width <= 0:
         raise ValueError("eos_table_width must be positive")
 
-    # Fail before checkpoint load if the one operator unique to verify is not
-    # registered. Exact schema/Meta/lowering validation still runs in exporter.
+    # Reject a missing selected GDR before loading checkpoints. The opt-in
+    # single-step reference reuses ordinary GDR and does not require MTP.
+    gdr_op_name = (
+        "npu_chunk_gated_delta_rule" if gdr_policy == DECODE1_GDR_POLICY
+        else "npu_gated_delta_rule_mtp"
+    )
     try:
         importlib.import_module("torch_npu")
-        mtp_operation = torch.ops.npu.npu_gated_delta_rule_mtp.default
+        gdr_operation = getattr(torch.ops.npu, gdr_op_name).default
     except (ImportError, AttributeError) as error:
         raise RuntimeError(
-            "incremental verify requires registered "
-            "npu::npu_gated_delta_rule_mtp before checkpoint load"
+            f"incremental verify policy {gdr_policy} requires registered "
+            f"npu::{gdr_op_name} before checkpoint load"
         ) from error
-    if getattr(mtp_operation, "_schema", None) is None:
-        raise RuntimeError("GDR-MTP does not expose a dispatcher schema")
+    if getattr(gdr_operation, "_schema", None) is None:
+        raise RuntimeError(f"{gdr_op_name} does not expose a dispatcher schema")
 
     target, draft, identity = _load_quant_components(
         config,
@@ -882,12 +893,13 @@ def create_quant_incremental_state_graphs(
         eos_table_width=eos_table_width,
         ordinary_custom_ops=ordinary_custom_ops,
         head_custom_ops=head_custom_ops,
-        verify_custom_ops=_target_custom_op_exports(config, mtp=True),
+        verify_custom_ops=_target_custom_op_exports(config, mtp=gdr_policy == MTP_GDR_POLICY),
         unified_target_step=unified_target_step,
         fused_speculative_step=fused_speculative_step,
         fused_static_feature_rows=fused_static_feature_rows,
         merged_prefill=merged_prefill,
         draft_static_feature_rows=draft_static_feature_rows,
+        target_verify_gdr_policy=gdr_policy,
         metadata=metadata,
     )
 

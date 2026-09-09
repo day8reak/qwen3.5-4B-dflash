@@ -121,7 +121,7 @@
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
     "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
     "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
-    "hiai_modeling_sha256": "1922e6e35866f8bc16ea374c05165a6f47618d4e81fc57276aea53f60372fb8d",
+    "hiai_modeling_sha256": "43485eaf095b409ae23ab7d5b3699ee68f15a223accac4e112b661418d57ae08",
     "ordinary_conv_commit_policy": "logical-effective-length-v1: commit history columns L..L+Kc-1 before padded physical rows; preserve selected native/Tensor convolution outputs",
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
     "wrapper_sha256": "a62e4a554cd566194455a993e37dd0bc045579424d99c85e789dd241b1408020",

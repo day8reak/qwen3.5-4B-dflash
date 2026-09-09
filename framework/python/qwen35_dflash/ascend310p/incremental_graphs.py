@@ -8,6 +8,7 @@ remain real-device proof gates.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Mapping
 
 import torch
@@ -27,6 +28,22 @@ SCALAR_STATE_SEED_POLICY = "per-linear-layer-jit-v1"
 CACHE_INDEX_POLICY = "once-per-verify-v1"
 DRAFT_ATTENTION_MASK_POLICY = "per-layer-logical-prefix-v1"
 CONV_STATE_COMMIT_POLICY = "logical-effective-length-v1"
+MTP_GDR_POLICY = "mtp-block-v1"
+DECODE1_GDR_POLICY = "decode1-recurrence-v1"
+
+
+def resolve_verify_gdr_policy(
+    policy: str | None, *, merged_prefill: bool, unified_target_step: bool,
+) -> str:
+    if policy is None:
+        # The single-step route is an opt-in numerical reference, not a
+        # replacement for the native multi-token production path.
+        policy = MTP_GDR_POLICY
+    if policy not in (MTP_GDR_POLICY, DECODE1_GDR_POLICY):
+        raise ValueError("target_verify_gdr_policy must be mtp-block-v1 or decode1-recurrence-v1")
+    if unified_target_step and policy == DECODE1_GDR_POLICY:
+        raise ValueError("decode1-recurrence-v1 requires fixed Verify rows; dynamic Target step is unsupported")
+    return policy
 
 
 class _ExplicitTargetGraph(nn.Module):
@@ -94,6 +111,7 @@ class _ExplicitTargetGraph(nn.Module):
         self.linear_layers = layer_types.count("linear_attention")
         self.full_layers = layer_types.count("full_attention")
         self.kv_cache_max_len = kv_cache_max_len
+        self.gdr_verify_policy = MTP_GDR_POLICY
 
     def _state_list(
         self,
@@ -220,6 +238,7 @@ class _ExplicitTargetGraph(nn.Module):
             output_dflash_features=output_features,
             accepted_tokens=accepted,
             gdr_effective_length=gdr_effective_length,
+            dflash_gdr_verify_policy=self.gdr_verify_policy,
             dflash_cache_target_blocks=cache_target_blocks,
             dflash_cache_offsets=cache_offsets,
         )
@@ -430,8 +449,21 @@ class TargetDecodeOneStateGraph(_ExplicitTargetGraph):
 class TargetVerifyCommitStateGraph(_ExplicitTargetGraph):
     """Verify fixed T=16 and embed exact accept/state selection in the graph."""
 
-    def __init__(self, target: nn.Module, *, kv_cache_max_len: int) -> None:
+    def __init__(
+        self, target: nn.Module, *, kv_cache_max_len: int,
+        gdr_verify_policy: str = MTP_GDR_POLICY,
+    ) -> None:
         super().__init__(target, kv_cache_max_len=kv_cache_max_len)
+        self.gdr_verify_policy = resolve_verify_gdr_policy(
+            gdr_verify_policy, merged_prefill=False, unified_target_step=False,
+        )
+        if self.gdr_verify_policy == DECODE1_GDR_POLICY and DECODE1_GDR_POLICY not in getattr(
+            self.language_model, "dflash_gdr_verify_policies", ()
+        ):
+            raise RuntimeError(
+                "Target receiver lacks decode1-recurrence-v1; update the loaded "
+                "modeling source before re-exporting AIR (do not bypass SOURCE_LOCK)"
+            )
         self.transaction = ExactAcceptCommitStateGraph(PROPOSAL_ROWS)
 
     def forward(
@@ -482,6 +514,18 @@ class TargetStepStateGraph(TargetVerifyCommitStateGraph):
     three row carriers back to the frozen 16-row external ABI.  State banks are
     not padded because the selected slot is always inside the physical prefix.
     """
+
+    def __init__(
+        self, target: nn.Module, *, kv_cache_max_len: int,
+        gdr_verify_policy: str = MTP_GDR_POLICY,
+    ) -> None:
+        resolve_verify_gdr_policy(
+            gdr_verify_policy, merged_prefill=False, unified_target_step=True,
+        )
+        super().__init__(
+            target, kv_cache_max_len=kv_cache_max_len,
+            gdr_verify_policy=gdr_verify_policy,
+        )
 
     @staticmethod
     def _pad_rows(value: Tensor, width: int) -> Tensor:
@@ -814,6 +858,7 @@ class FusedSpeculativeStepStateGraph(nn.Module):
         output_embedding: nn.Module,
         *,
         kv_cache_max_len: int,
+        gdr_verify_policy: str = MTP_GDR_POLICY,
     ) -> None:
         super().__init__()
         self.draft_propose = DraftProposeStateGraph(
@@ -825,6 +870,7 @@ class FusedSpeculativeStepStateGraph(nn.Module):
         self.target_verify = TargetVerifyCommitStateGraph(
             target,
             kv_cache_max_len=kv_cache_max_len,
+            gdr_verify_policy=gdr_verify_policy,
         )
 
     def forward(
@@ -895,6 +941,7 @@ def incremental_state_graph_specs(
     fused_static_feature_rows: int = 0,
     merged_prefill: bool = False,
     draft_static_feature_rows: int = 0,
+    target_verify_gdr_policy: str | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[AirGraphSpec, ...]:
     """Create one approved exact incremental physical-topology candidate."""
@@ -917,6 +964,10 @@ def incremental_state_graph_specs(
         raise TypeError("merged_prefill must be a boolean")
     if merged_prefill and (unified_target_step or fused_speculative_step):
         raise ValueError("merged_prefill requires separate static Draft/Verify and decode1")
+    gdr_policy = resolve_verify_gdr_policy(
+        target_verify_gdr_policy, merged_prefill=merged_prefill,
+        unified_target_step=unified_target_step,
+    )
     if isinstance(draft_static_feature_rows, bool) or not isinstance(draft_static_feature_rows, int):
         raise TypeError("draft_static_feature_rows must be an integer")
     if (merged_prefill != bool(draft_static_feature_rows) or
@@ -943,6 +994,20 @@ def incremental_state_graph_specs(
     layer_types = tuple(getattr(config, "layer_types", ()))
     linear_layers = layer_types.count("linear_attention")
     full_layers = layer_types.count("full_attention")
+    if gdr_policy == DECODE1_GDR_POLICY:
+        # The graph now invokes the ordinary operator once per physical row
+        # and linear layer. Keep all non-GDR export requirements unchanged.
+        verify_custom_ops = tuple(
+            replace(
+                item, torch_op="npu::npu_chunk_gated_delta_rule",
+                ge_op_type="ChunkGatedDeltaRule",
+                minimum_occurrences=linear_layers * VERIFY_ROWS,
+            )
+            if item.torch_op in {
+                "npu::npu_gated_delta_rule_mtp", "npu::npu_chunk_gated_delta_rule",
+            } else item
+            for item in verify_custom_ops
+        )
     key_heads = int(getattr(config, "linear_num_key_heads"))
     value_heads = int(getattr(config, "linear_num_value_heads"))
     key_dim = int(getattr(config, "linear_key_head_dim"))
@@ -1007,8 +1072,20 @@ def incremental_state_graph_specs(
         "state_owner": "C++ request context device buffers",
         "target_all_q_length_policy": "fixed kv_cache_max_len plus explicit causal mask and logical cursor",
         "target_all_q_length_evidence": "PENDING_REAL_NPU_EQUIVALENCE",
-        "verify_scalar_state_seed_policy": SCALAR_STATE_SEED_POLICY,
+        "target_verify_gdr_policy": gdr_policy,
+        "target_verify_gdr_evidence": "PENDING_REAL_NPU_EQUIVALENCE",
+        "target_verify_gdr_state_rounding": (
+            "FP32 -> FP16 -> FP32 after every token, including returned bank slots"
+            if gdr_policy == DECODE1_GDR_POLICY else
+            "native MTP bank; no explicit Decode1 per-token rounding"
+        ),
+        "verify_scalar_state_seed_policy": (
+            "committed-scalar-no-input-bank-v1"
+            if gdr_policy == DECODE1_GDR_POLICY else SCALAR_STATE_SEED_POLICY
+        ),
         "verify_scalar_state_seed_evidence": (
+            "ordinary GDR consumes committed scalar state directly; no recurrent input bank seed"
+            if gdr_policy == DECODE1_GDR_POLICY else
             "source graph passes committed scalar GDN state; causal-conv "
             "consumes scalar state directly and recurrent state is seeded one "
             "linear-attention layer at a time; AIR/ATC peak memory remains a "
@@ -1080,7 +1157,9 @@ def incremental_state_graph_specs(
     verify_type = (
         TargetStepStateGraph if unified_target_step else TargetVerifyCommitStateGraph
     )
-    verify = verify_type(target, kv_cache_max_len=kv_cache_max_len).eval()
+    verify = verify_type(
+        target, kv_cache_max_len=kv_cache_max_len, gdr_verify_policy=gdr_policy,
+    ).eval()
     propose = DraftProposeStateGraph(
         draft,
         input_embedding,
@@ -1094,6 +1173,7 @@ def incremental_state_graph_specs(
             input_embedding,
             output_embedding,
             kv_cache_max_len=kv_cache_max_len,
+            gdr_verify_policy=gdr_policy,
         ).eval()
         if fused_speculative_step
         else None

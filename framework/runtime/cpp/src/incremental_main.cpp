@@ -80,6 +80,7 @@ struct Arguments {
   int device_id = 0;
   bool progress = true;
   bool diagnose_target_parity = false;
+  std::filesystem::path acl_dump_config;
   std::size_t diagnostic_max_transactions = 2;
   IncrementalStateResetPolicy state_reset_policy =
       IncrementalStateResetPolicy::kAsyncMemset;
@@ -129,6 +130,7 @@ void Usage(std::ostream& stream) {
          "committed-prefix\n"
       << "  --progress true|false                    live stderr progress\n";
   stream << "  --diagnose-target-parity true|false      opt-in bounded Target state/token replay; no benchmark\n"
+         << "  --acl-dump-config JSON                   CANN node dump at aclInit; diagnosis only\n"
          << "  --diagnostic-max-transactions N          capture first 1..4 decode transactions (default 2)\n";
 }
 
@@ -384,6 +386,17 @@ Arguments ParseArguments(int argc, char** argv) {
   }
   result.diagnose_target_parity = ParseBool(
       TakeOptional(&values, "diagnose-target-parity", "false"), "diagnose-target-parity");
+  result.acl_dump_config = TakeOptional(&values, "acl-dump-config", "");
+  if (!result.acl_dump_config.empty()) {
+    if (!result.diagnose_target_parity) {
+      throw std::invalid_argument("acl-dump-config requires diagnose-target-parity; no timing evidence with dump");
+    }
+    result.acl_dump_config = std::filesystem::absolute(result.acl_dump_config);
+    if (!std::filesystem::is_regular_file(result.acl_dump_config) ||
+        std::filesystem::file_size(result.acl_dump_config) == 0) {
+      throw std::invalid_argument("acl-dump-config must name an existing nonempty JSON file");
+    }
+  }
   const bool has_diagnostic_limit = values.count("diagnostic-max-transactions") != 0;
   result.diagnostic_max_transactions = ParseSize(
       TakeOptional(&values, "diagnostic-max-transactions", "2"), "diagnostic-max-transactions");
@@ -1577,7 +1590,8 @@ int main(int argc, char** argv) {
         arguments.decode_carrier_policy,
         arguments.measurement_protocol == MeasurementProtocol::kProfile,
         arguments.draft_feature_policy,
-        arguments.model_residency_policy);
+        arguments.model_residency_policy,
+        arguments.acl_dump_config);
     const auto load_end = std::chrono::steady_clock::now();
     const std::size_t static_rows = executor.execution_stats().static_feature_rows;
     if (static_rows != arguments.static_feature_rows) {
@@ -1641,7 +1655,25 @@ int main(int argc, char** argv) {
         first_model = false;
         report << '"' << JsonEscape(model.role) << "\":\"" << model.sha256 << '"';
       }
-      report << "},\"diagnostic\":" << diagnostic.detail_json << '}';
+      report << "},\"acl_dump_config\":";
+      if (arguments.acl_dump_config.empty()) {
+        report << "null";
+      } else {
+        report << "{\"path\":\"" << JsonEscape(arguments.acl_dump_config.string())
+               << "\",\"sha256\":\"" << qwen35::dflash::Sha256File(arguments.acl_dump_config)
+               << "\",\"scope\":\"all selected-node executions in bounded capture and replays; not only the mismatching row\"}";
+      }
+      report << ",\"execution_trace_range_scope\":\"zero-based [begin,end) indices into model_execution_trace; not CANN task/data_index\""
+             << ",\"model_execution_trace\":[";
+      const auto& trace = executor.model_execution_trace();
+      for (std::size_t index = 0; index < trace.size(); ++index) {
+        if (index) report << ',';
+        const auto& event = trace[index];
+        report << "{\"ordinal\":" << event.ordinal << ",\"model_id\":" << event.model_id
+               << ",\"role\":\"" << JsonEscape(event.role)
+               << "\",\"physical_rows\":" << event.physical_rows << '}';
+      }
+      report << "],\"diagnostic\":" << diagnostic.detail_json << '}';
       AtomicWrite(arguments.output, report.str());
       PrintProgress(arguments.progress,
           "stage=target-parity-done status=DIAGNOSTIC report=" +

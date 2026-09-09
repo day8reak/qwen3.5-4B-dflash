@@ -338,9 +338,9 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     deployment = json.loads(DEPLOYMENT_PATH.read_text(encoding="utf-8"))
     performance = json.loads(PERFORMANCE_PATH.read_text(encoding="utf-8"))
 
-    assert framework_lock["schema_version"] == 45
+    assert framework_lock["schema_version"] == 47
     assert framework_lock["framework_id"] == (
-        "qwen3.5-4b-quant-air-om-ascendcl-v45"
+        "qwen3.5-4b-quant-air-om-ascendcl-v47"
     )
     diagnostics = framework_lock["failure_diagnostics"]
     assert diagnostics["runner_version"] == "1.27.0"
@@ -356,12 +356,18 @@ def test_current_integrated_runner_freezes_exact_ranged_io_evidence() -> None:
     assert (ROOT / diagnostics["documentation"]).is_file()
     replay = framework_lock["target_parity_diagnostics"]
     assert replay["default_enabled"] is False
-    assert replay["runner_version"] == "1.28.0"
+    assert replay["runner_version"] == "1.29.0"
     assert replay["default_max_transactions"] == 2
     assert replay["max_transactions_range"] == [1, 4]
     assert replay["extra_device_state_bytes"] == 0
     assert replay["report_schema"] == 1
     assert (ROOT / replay["documentation"]).is_file()
+    operators = framework_lock["operator_diagnostics"]
+    assert operators["default_enabled"] is False
+    assert operators["runner_version"] == "1.29.0"
+    assert "replay-operator" in operators["commands"]
+    assert "no AIR/OM rebuild" in operators["regeneration"]
+    assert (ROOT / operators["documentation"]).is_file()
     residency = framework_lock["runtime"]["incremental_model_residency"]
     assert residency["default"] == "phase-resident for merged static split; all-resident for legacy topologies"
     assert "all-resident rollback" in residency["candidate"]

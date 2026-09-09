@@ -265,6 +265,7 @@ def command_infer_cpp(args: argparse.Namespace) -> int:
         progress=args.progress,
         diagnose_target_parity=args.diagnose_target_parity,
         diagnostic_max_transactions=args.diagnostic_max_transactions,
+        acl_dump_config=args.acl_dump_config,
     )
     payload["control_plane"]["target_preflight"] = file_record(
         preflight_log, relative_to=run_root
@@ -492,6 +493,10 @@ def build_parser() -> argparse.ArgumentParser:
     infer_cpp.add_argument(
         "--diagnostic-max-transactions", type=int, choices=range(1, 5), default=2,
         help="capture first N decode transactions in diagnostic mode (default 2)",
+    )
+    infer_cpp.add_argument(
+        "--acl-dump-config", type=Path,
+        help="opt-in CANN node input/output dump JSON; requires --diagnose-target-parity",
     )
     infer_cpp.add_argument(
         "--eos-token-id", type=int, action="append", default=None,

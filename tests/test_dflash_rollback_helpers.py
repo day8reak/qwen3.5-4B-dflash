@@ -28,6 +28,7 @@ HELPERS = {
     "seed_dflash_recurrent_state_bank",
     "rebase_dflash_gdn_state_banks",
     "torch_dflash_causal_conv1d_mtp",
+    "_npu_decode1_gated_delta_rule_bank",
 }
 CONSTANTS = {
     "DFLASH_BLOCK_SIZE",
@@ -98,9 +99,10 @@ def assert_gdr_effective_length_source_contract() -> None:
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "npu_chunk_gated_delta_rule"
         ]
-        assert len(ordinary_calls) == 1
-        keyword_names = {item.arg for item in ordinary_calls[0].keywords}
-        assert "effective_length" in keyword_names
+        assert len(ordinary_calls) == (2 if source == SOURCE else 1)
+        for call in ordinary_calls:
+            keyword_names = {item.arg for item in call.keywords}
+            assert "effective_length" in keyword_names
 
     rollback_tree = ast.parse(
         SOURCE.read_text(encoding="utf-8"),

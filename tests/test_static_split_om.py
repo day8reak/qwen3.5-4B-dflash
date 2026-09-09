@@ -217,6 +217,8 @@ def test_public_factory_defaults_to_static_split_and_keeps_opt_in_rollback(monke
     monkeypatch.setattr(quant_factory.importlib, "import_module", lambda name: None)
     monkeypatch.setattr(torch.ops.npu, "npu_gated_delta_rule_mtp",
                         SimpleNamespace(default=SimpleNamespace(_schema="fixture")), raising=False)
+    monkeypatch.setattr(torch.ops.npu, "npu_chunk_gated_delta_rule",
+                        SimpleNamespace(default=SimpleNamespace(_schema="fixture")), raising=False)
     identity = {"locked_inputs": {"group_sha256": {
         name: "fixture" for name in ("target_checkpoint", "draft_checkpoint", "quant_linear_weights", "quant_embedding")},
         "manifest_sha256": "fixture"}, "quant_source_lock": {}, "target_dir": "target",
@@ -230,3 +232,4 @@ def test_public_factory_defaults_to_static_split_and_keeps_opt_in_rollback(monke
     selected = quant_factory.create_quant_incremental_state_graphs({"max_sequence_length": 256, **config})
     assert selected["merged_prefill"] is merged
     assert selected["draft_static_feature_rows"] == rows
+    assert selected["target_verify_gdr_policy"] == "mtp-block-v1"

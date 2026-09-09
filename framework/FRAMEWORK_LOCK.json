@@ -1,10 +1,38 @@
 {
-  "schema_version": 45,
-  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v45",
-  "target_parity_diagnostics": {
-    "runner_version": "1.28.0",
+  "schema_version": 47,
+  "framework_id": "qwen3.5-4b-quant-air-om-ascendcl-v47",
+  "operator_diagnostics": {
+    "runner_version": "1.29.0",
     "default_enabled": false,
-    "python_flags": ["--diagnose-target-parity", "--diagnostic-max-transactions"],
+    "python_module": "qwen35_dflash.ascend310p.operator_diagnostics",
+    "commands": ["prepare-dump", "compare", "replay-operator", "replay-gdr-mtp"],
+    "dump": "opt-in --acl-dump-config with bounded Target diagnosis; validated config snapshot passed to aclInit before any model load; selected compiled node names only",
+    "pairing": "explicit call/input/output mapping in declared causal order; no automatic layer/transaction/layout inference",
+    "generic_replay": "explicit installed aten/npu dispatcher schema, captured tensor/scalar/dtype arguments, all Tensor outputs required; real NPU only",
+    "comparison": "logical native-endian C-contiguous numeric NPY; exact dtype/shape; finite tolerances only for floating values, integer selectors and token IDs always exact",
+    "regeneration": "runner and Python only for original-OM runtime dump; no AIR/OM rebuild",
+    "claim_boundary": "mapped operator evidence only; no kernel culpability, full-model parity or formal timing claim",
+    "device_status": "PENDING_REAL_NPU_DUMP_AND_REPLAY",
+    "documentation": "docs/OM_OPERATOR_DIAGNOSTICS.md"
+  },
+  "static_verify_gdr_reference": {
+    "default_policy": "mtp-block-v1",
+    "opt_in_reference_policy": "decode1-recurrence-v1",
+    "scope": "opt-in fixed-row Verify GDR reference; default MTP, ordinary Decode1 and eager torch_npu unchanged",
+    "native_operator": "ChunkGatedDeltaRule, chunk_size=1, effective_length=INT16[1]=1",
+    "state_feedback": "FP32 -> FP16 -> FP32 after each physical input row",
+    "state_bank": "slot i is the rounded state after consuming row i; commit selects accepted_count",
+    "opt_in_qwen35_verify_gdr_nodes": 384,
+    "unchanged": "four OMs, public tensor ABI, weights, quantization, Draft, conv, full attention, acceptance, scheduling, residency",
+    "regeneration": "opt-in reference requires updated receiver modeling and new AIR/OM; default MTP and runner 1.28.0 remain compatible",
+    "device_accuracy_status": "PENDING_REAL_NPU_VALIDATION",
+    "performance": "not promoted; sixteen native GDR calls per linear layer may increase latency and compilation cost",
+    "documentation": "docs/OM_VERIFY_GDR_REFERENCE.md"
+  },
+  "target_parity_diagnostics": {
+    "runner_version": "1.29.0",
+    "default_enabled": false,
+    "python_flags": ["--diagnose-target-parity", "--diagnostic-max-transactions", "--acl-dump-config"],
     "default_max_transactions": 2,
     "max_transactions_range": [1, 4],
     "scope": "four static split OMs, sync-window=1, separate prefill; capture existing DFlash schedule then teacher-forced Decode1 replays",
@@ -45,7 +73,7 @@
     "target_conv_state_commit_policy": "logical-effective-length-v1",
     "proposal_budget": "K=min(max_draft_tokens,15,remaining); terminal all-accepted bonus is discarded, never a proposal",
     "default_zero_accept_fallback": "request-target-only",
-    "static_target_only_route": "Verify16 with K=0 selects FP32 GDR-MTP bank row 0; no Draft or ordinary Decode1 launch",
+    "static_target_only_route": "Verify16 with K=0 selects row 0 of the configured GDR bank; default remains native GDR-MTP; no Draft or ordinary Decode1 launch",
     "default_cpp_eos_token_ids": [248044],
     "round_policy_parity_scope": "static split, sync window 1, separate prefill; legacy fused/recompute and window>1 are not eager-round-parity claims",
     "runner_version": "1.26.0",
@@ -73,7 +101,7 @@
     "public_input_output_counts": [[9, 11], [8, 8], [8, 4], [9, 13]],
     "shape_policy": "all dynamic=false and input_dim_gears={}; prefill64, decode1, Draft N=64 by default, Verify16",
     "selectors": "merged_prefill=true and draft_static_feature_rows=64 by default; merged_prefill=false retains legacy five-OM dynamic-Draft route; fused/unified factories remain explicit rollback",
-    "regeneration": "v43 requires new AIR and OM bundle plus runner >=1.26.0; old prefill/head/fused artifacts cannot be renamed or relabelled",
+    "regeneration": "v46 opt-in GDR reference requires regenerated AIR/OM; unchanged default MTP artifacts and runner 1.28.0 can be reused; old artifacts cannot be renamed or relabelled",
     "claim_boundary": "user-selected source default only, not hardware or performance promotion"
   },
   "repository_base": {

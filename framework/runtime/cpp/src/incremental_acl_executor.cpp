@@ -944,7 +944,8 @@ class AclIncrementalExecutor::Impl {
       IncrementalDecodeCarrierPolicy decode_carrier_policy,
       bool profile_model_executions,
       IncrementalDraftFeaturePolicy draft_feature_policy,
-      IncrementalModelResidencyPolicy model_residency_policy)
+      IncrementalModelResidencyPolicy model_residency_policy,
+      const std::filesystem::path& acl_dump_config)
       : device_id_(device_id),
         fused_speculative_step_(!paths.fused_speculative_step.empty()),
         unified_target_step_(
@@ -1001,7 +1002,10 @@ class AclIncrementalExecutor::Impl {
       throw std::invalid_argument("phase-resident requires static fused or merged split topology");
     }
     try {
-      Check(aclInit(nullptr), "aclInit");
+      // Dump must be configured BEFORE any model load, including metadata
+      // inspection and later phase-resident reloads. Never change a live model.
+      const std::string dump_config = acl_dump_config.string();
+      Check(aclInit(dump_config.empty() ? nullptr : dump_config.c_str()), "aclInit");
       initialized_ = true;
       Check(aclrtSetDevice(device_id_), "aclrtSetDevice");
       device_set_ = true;
@@ -4404,7 +4408,8 @@ AclIncrementalExecutor::AclIncrementalExecutor(
     IncrementalDecodeCarrierPolicy decode_carrier_policy,
     bool profile_model_executions,
     IncrementalDraftFeaturePolicy draft_feature_policy,
-    IncrementalModelResidencyPolicy model_residency_policy)
+    IncrementalModelResidencyPolicy model_residency_policy,
+    std::filesystem::path acl_dump_config)
     : impl_(std::make_unique<Impl>(
           model_paths,
           device_id,
@@ -4413,7 +4418,8 @@ AclIncrementalExecutor::AclIncrementalExecutor(
           decode_carrier_policy,
           profile_model_executions,
           draft_feature_policy,
-          model_residency_policy)) {}
+          model_residency_policy,
+          acl_dump_config)) {}
 
 AclIncrementalExecutor::~AclIncrementalExecutor() = default;
 AclIncrementalExecutor::AclIncrementalExecutor(

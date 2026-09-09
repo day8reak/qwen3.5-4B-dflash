@@ -6,6 +6,11 @@ set(model_args
   --target-decode1 "${DECODE}" --target-decode1-sha256 "${DECODE_SHA}"
   --draft-propose "${DRAFT}" --draft-propose-sha256 "${DRAFT_SHA}"
   --target-verify-commit "${VERIFY}" --target-verify-commit-sha256 "${VERIFY_SHA}")
+# An explicit fake expectation proves the CLI path reaches aclInit, without
+# pretending the fake runtime writes real operator dumps.
+set(dump_config "${OUTPUT}-acl.json")
+file(WRITE "${dump_config}" "{}")
+set(ENV{QWEN35_DFLASH_FAKE_EXPECT_DUMP_CONFIG} "${dump_config}")
 foreach(fault none correction bonus gdr cursor kv-tail kv-live nan fp16 padded-cursor)
   set(ENV{QWEN35_DFLASH_FAKE_DIAGNOSTIC_FAULT} "${fault}")
   set(output "${OUTPUT}-${fault}.json")
@@ -13,6 +18,7 @@ foreach(fault none correction bonus gdr cursor kv-tail kv-live nan fp16 padded-c
   execute_process(COMMAND "${RUNNER}" ${model_args} --output "${output}"
     --prompt-token-ids 10 --max-new-tokens 32 --max-draft-tokens 3 --progress false
     --diagnose-target-parity true --diagnostic-max-transactions 2
+    --acl-dump-config "${dump_config}"
     RESULT_VARIABLE result OUTPUT_QUIET ERROR_VARIABLE stderr)
   if(NOT EXISTS "${output}")
     message(FATAL_ERROR "diagnostic report missing: ${fault}: ${stderr}")
@@ -24,6 +30,13 @@ foreach(fault none correction bonus gdr cursor kv-tail kv-live nan fp16 padded-c
   string(JSON count GET "${report}" diagnostic captured_transactions)
   string(JSON stop GET "${report}" diagnostic capture_stop_reason)
   string(JSON extra_device GET "${report}" diagnostic extra_device_state_bytes)
+  string(JSON dump_path GET "${report}" acl_dump_config path)
+  string(JSON trace_count LENGTH "${report}" model_execution_trace)
+  string(JSON capture_start GET "${report}" diagnostic transactions 0 capture_execution_trace_range 0)
+  string(JSON capture_end GET "${report}" diagnostic transactions 0 capture_execution_trace_range 1)
+  if(NOT dump_path STREQUAL dump_config OR trace_count LESS 1 OR NOT capture_end GREATER capture_start)
+    message(FATAL_ERROR "dump config or execution trace missing: ${report}")
+  endif()
   string(JSON inputs GET "${report}" diagnostic transactions 0 replayed_input_ids)
   string(JSON cursor GET "${report}" diagnostic transactions 0 incoming_state_vs_chained_decode1 reference_cursor)
   if(NOT kind STREQUAL "cpp-ascendcl-target-parity-diagnostic" OR NOT status STREQUAL "DIAGNOSTIC"
@@ -90,6 +103,7 @@ foreach(fault none correction bonus gdr cursor kv-tail kv-live nan fp16 padded-c
   endif()
 endforeach()
 unset(ENV{QWEN35_DFLASH_FAKE_DIAGNOSTIC_FAULT})
+unset(ENV{QWEN35_DFLASH_FAKE_EXPECT_DUMP_CONFIG})
 
 # No transaction was executed: do not claim a token comparison PASS.
 set(output "${OUTPUT}-eos.json")
@@ -143,7 +157,7 @@ endforeach()
 unset(ENV{QWEN35_DFLASH_FAKE_ZERO_ACCEPT})
 
 # Unsupported timing/policy combinations must fail before any model load.
-foreach(bad_case evidence window coalesce limit disabled)
+foreach(bad_case evidence window coalesce limit disabled dump-without-diagnostic)
   if(bad_case STREQUAL "evidence")
     set(extra --diagnose-target-parity true --measurement-protocol evidence)
   elseif(bad_case STREQUAL "window")
@@ -152,6 +166,8 @@ foreach(bad_case evidence window coalesce limit disabled)
     set(extra --diagnose-target-parity true --prefill-completion-policy coalesce-first-verify)
   elseif(bad_case STREQUAL "limit")
     set(extra --diagnose-target-parity true --diagnostic-max-transactions 5)
+  elseif(bad_case STREQUAL "dump-without-diagnostic")
+    set(extra --acl-dump-config "${dump_config}")
   else()
     set(extra --diagnostic-max-transactions 2)
   endif()

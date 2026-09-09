@@ -16,6 +16,11 @@ exactly ``K + 1`` input rows (``anchor + K proposals``).  In that mode:
   block crossing a 64-token cache boundary is correct with the existing
   ``npu_cache_update_`` ABI.
 
+The static OM accuracy policy ``decode1-recurrence-v1`` instead constructs the
+GDR bank from ordinary single-row native GDR calls, including Decode1's FP16
+state feedback boundary after every token. Eager callers keep the existing
+``mtp-block-v1`` default unless they explicitly request the alternate policy.
+
 This file is model-side integration code, not a complete scheduler.  The owner
 of the 32-layer cache must keep one shared accepted count and logical KV cursor,
 and must discard the whole provisional call on failure.  The correction/bonus
@@ -389,6 +394,53 @@ def _npu_gated_delta_rule_mtp(
     if not isinstance(result, (tuple, list)) or len(result) != 2:
         raise TypeError("npu_gated_delta_rule_mtp must return (out, state_bank)")
     return result[0], result[1]
+
+
+def _npu_decode1_gated_delta_rule_bank(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a fixed-row Verify bank with the ordinary Decode1 recurrence.
+
+    Decode1 rounds its returned recurrent state to FP16 after *each* token,
+    even though the public OM carrier is FP32. A final cast of an MTP bank
+    cannot reproduce that feedback boundary for later rows. Keep projections,
+    conv and the surrounding Target graph unchanged, but use the same native
+    chunk_size=1 call and FP16 roundtrip between every pair of GDR steps.
+    This is a graph adaptation, not a CPU fallback or a replacement kernel.
+    """
+    if initial_state.ndim != 4 or initial_state.dtype != torch.float32:
+        raise TypeError("Decode1-equivalent GDR requires FP32 [B,H,Dk,Dv] state")
+    rows = query.shape[1]
+    if not 1 <= rows <= DFLASH_MAX_VERIFY_TOKENS:
+        raise ValueError("Decode1-equivalent GDR requires 1..16 fixed rows")
+    effective = torch.ones(
+        (query.shape[0],), dtype=torch.int16, device=query.device
+    )
+    state = initial_state
+    outputs = []
+    states = []
+    for row in range(rows):
+        out, next_state = torch_npu.npu_chunk_gated_delta_rule(
+            query[:, row:row + 1].contiguous(),
+            key[:, row:row + 1].contiguous(),
+            value[:, row:row + 1].contiguous(),
+            g=g[:, row:row + 1].contiguous(),
+            beta=beta[:, row:row + 1].contiguous(),
+            effective_length=effective,
+            chunk_size=1,
+            initial_state=state.to(torch.float32),
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        state = next_state.to(torch.float16).to(torch.float32)
+        outputs.append(out)
+        states.append(state)
+    return torch.cat(outputs, dim=1), torch.stack(states, dim=1)
 
 
 class Qwen3_5RMSNorm(nn.Module):
@@ -1219,11 +1271,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         accepted_tokens: Optional[torch.Tensor] = None,
         gdr_effective_length: Optional[torch.Tensor] = None,
+        dflash_gdr_verify_policy: str = "mtp-block-v1",
         **kwargs: Unpack[TransformersKwargs],
     ):
         if cache_params is None or len(cache_params) != 2:
             raise ValueError("GDN requires (conv_state, recurrent_state)")
         batch_size, seq_len, _ = hidden_states.shape
+        if dflash_gdr_verify_policy not in (
+            "mtp-block-v1", "decode1-recurrence-v1"
+        ):
+            raise ValueError("unsupported DFlash GDR verify policy")
+        decode1_recurrence = dflash_gdr_verify_policy == "decode1-recurrence-v1"
         conv_state = cache_params[0]
         recurrent_state = cache_params[1]
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
@@ -1253,7 +1311,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     "([B,C,Kc], [B,H,Dk,Dv]) or banked "
                     "([B,K+1,C,Kc], [B,K+1,H,Dk,Dv])"
                 )
-            if scalar_state:
+            if scalar_state and not decode1_recurrence:
                 # The incremental OM persists only the committed scalar state.
                 # Causal-conv consumes that scalar directly; seed only the
                 # recurrent T-slot input immediately before this layer calls
@@ -1281,6 +1339,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_k_dim,
                 self.head_v_dim,
             )
+            if scalar_state and decode1_recurrence:
+                expected_recurrent = (
+                    batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim
+                )
             if tuple(conv_state.shape) != expected_conv:
                 raise ValueError(
                     f"DFlash conv_state must have shape {expected_conv}, "
@@ -1341,6 +1403,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
             )
             recurrent_state = last_recurrent_state.to(torch.float16)
+        elif decode1_recurrence:
+            # Scalar OM state is already committed. A banked caller must
+            # select its previous accepted slot before replaying new inputs.
+            selected_state = (
+                recurrent_state if scalar_state
+                else _select_dflash_state_slot(recurrent_state, accepted_tokens)
+            )
+            core_attn_out, recurrent_state = _npu_decode1_gated_delta_rule_bank(
+                query, key, value, g, beta, selected_state.contiguous()
+            )
         else:
             core_attn_out, next_recurrent_state = _npu_gated_delta_rule_mtp(
                 query,
@@ -1404,6 +1476,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         token_count=0,
         accepted_tokens: Optional[torch.Tensor] = None,
         gdr_effective_length: Optional[torch.Tensor] = None,
+        dflash_gdr_verify_policy: str = "mtp-block-v1",
         dflash_cache_target_blocks: Optional[torch.Tensor] = None,
         dflash_cache_offsets: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
@@ -1418,6 +1491,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 attention_mask=attention_mask,
                 accepted_tokens=accepted_tokens,
                 gdr_effective_length=gdr_effective_length,
+                dflash_gdr_verify_policy=dflash_gdr_verify_policy,
             )
         elif self.block_type == "full_attention":
             hidden_states, _, present_key_value = self.self_attn(
@@ -1489,6 +1563,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
     dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
     dflash_cache_index_policy = "once-per-verify-v1"
     dflash_conv_state_commit_policy = "logical-effective-length-v1"
+    dflash_gdr_verify_policies = ("mtp-block-v1", "decode1-recurrence-v1")
 
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__(config)
@@ -1521,6 +1596,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         output_dflash_features: bool = False,
         accepted_tokens: Optional[torch.Tensor] = None,
         gdr_effective_length: Optional[torch.Tensor] = None,
+        dflash_gdr_verify_policy: str = "mtp-block-v1",
         dflash_cache_target_blocks: Optional[torch.Tensor] = None,
         dflash_cache_offsets: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -1609,6 +1685,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 token_count=token_count,
                 accepted_tokens=accepted_tokens,
                 gdr_effective_length=gdr_effective_length,
+                dflash_gdr_verify_policy=dflash_gdr_verify_policy,
                 dflash_cache_target_blocks=dflash_cache_target_blocks,
                 dflash_cache_offsets=dflash_cache_offsets,
                 **kwargs,

@@ -53,6 +53,13 @@ def test_diagnostic_command_preserves_request_and_separates_report(tmp_path, mon
     resolved, _ = cpp_runtime._resolve_incremental_oms(deployed["manifest_path"])
     artifacts = {role: item[2]["sha256"] for role, item in resolved.items()}
     report = _report(artifacts)
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+    dump_config = tmp_path / "acl.json"
+    dump_config.write_text(json.dumps({"dump": {
+        "dump_path": str(dump_dir), "dump_list": [{"layer": ["gdr.0"]}],
+        "dump_mode": "all", "dump_data": "tensor", "dump_level": "op",
+    }}))
     calls = []
 
     def execute(command, **kwargs):
@@ -60,6 +67,10 @@ def test_diagnostic_command_preserves_request_and_separates_report(tmp_path, mon
         raw = Path(command[command.index("--output") + 1])
         invocation = json.loads(Path(str(raw) + ".invocation.json").read_text())
         assert invocation["command"] == command
+        snapshot = Path(command[command.index("--acl-dump-config") + 1])
+        assert snapshot != dump_config
+        assert json.loads(snapshot.read_text()) == json.loads(dump_config.read_text())
+        assert invocation["acl_dump_config"]["sha256"] == cpp_runtime.sha256_file(snapshot)
         raw.write_text(json.dumps(report))
         if failure:
             Path(str(raw) + ".failure.json").write_text(json.dumps({
@@ -76,6 +87,7 @@ def test_diagnostic_command_preserves_request_and_separates_report(tmp_path, mon
         device_id=0, max_new_tokens=32, max_draft_tokens=15,
         raw_output=tmp_path / "raw.json", log_output=tmp_path / "log.txt",
         execute=execute, progress=False, diagnose_target_parity=True,
+        acl_dump_config=dump_config,
     )
     if failure:
         with pytest.raises(RuntimeError, match="target_parity_report=.*raw.json"):

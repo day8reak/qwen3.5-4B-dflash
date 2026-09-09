@@ -39,6 +39,7 @@ class _FakeLanguageModel(nn.Module):
     dflash_scalar_state_seed_policy = "per-linear-layer-jit-v1"
     dflash_cache_index_policy = "once-per-verify-v1"
     dflash_conv_state_commit_policy = "logical-effective-length-v1"
+    dflash_gdr_verify_policies = ("mtp-block-v1", "decode1-recurrence-v1")
 
     def forward(
         self,

@@ -1,6 +1,17 @@
 # Quant AIR/OM 推理框架
 
-当前 v45 / runner 1.28.0 增加默认关闭的
+当前 v47 / runner 1.29.0 增加可选[通用逐算子诊断](../docs/OM_OPERATOR_DIAGNOSTICS.md)：
+原 OM 运行时选择节点 dump、显式输入/输出逐张量比较、同输入原生 `aten`/`npu`
+算子回放。GDR-MTP 只是附加 ABI 检查的专用入口，不限制其他算子的对照。
+默认关闭；只更新 Python/C++，不重导 AIR/OM。仍需真机采集和回放，未证明 GDR 或其他内核有错。
+
+v46 保留可选 Verify GDR 数值对照：按普通 Decode1 逐 token 调用
+`ChunkGatedDeltaRule(chunk_size=1)`，每步执行相同的 FP16 状态舍入。
+默认仍为 GDR-MTP；对照不是 MTP 内核修复，不声称真机 PASS，可能增加 Verify 时延。
+仅启用对照时需要重新导出 AIR / 编译 OM；runner 1.28.0 兼容，无需重新量化。
+详见 [可选对照与复验](../docs/OM_VERIFY_GDR_REFERENCE.md)。
+
+v45 / runner 1.28.0 增加默认关闭的
 [Target 定点状态重放](../docs/OM_TARGET_PARITY_DIAGNOSTICS.md)，使用
 `infer-cpp --diagnose-target-parity --diagnostic-max-transactions 2` 开启。
 保留 v44 的[首对即停与失败诊断](../docs/OM_FAILURE_DIAGNOSTICS.md)。

@@ -2224,6 +2224,7 @@ def run_cpp_pair(
     progress: bool = True,
     diagnose_target_parity: bool = False,
     diagnostic_max_transactions: int = 2,
+    acl_dump_config: str | Path | None = None,
     execute: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> dict[str, Any]:
     """Run paired generation, or opt-in bounded diagnosis, in one C++ process."""
@@ -2232,6 +2233,12 @@ def run_cpp_pair(
         raise ValueError("C++ generation limits must be positive")
     if not isinstance(diagnose_target_parity, bool):
         raise ValueError("diagnose_target_parity must be boolean")
+    dump_config_path = None
+    if acl_dump_config is not None:
+        if not diagnose_target_parity:
+            raise ValueError("acl_dump_config requires diagnose_target_parity")
+        from .operator_diagnostics import validate_acl_dump_config
+        dump_config_path = validate_acl_dump_config(acl_dump_config)
     if (type(diagnostic_max_transactions) is not int
             or not 1 <= diagnostic_max_transactions <= 4
             or (not diagnose_target_parity and diagnostic_max_transactions != 2)):
@@ -2380,6 +2387,20 @@ def run_cpp_pair(
             "--diagnose-target-parity", "true",
             "--diagnostic-max-transactions", str(diagnostic_max_transactions),
         ])
+    dump_identity = None
+    if dump_config_path is not None:
+        # Freeze the validated config beside this invocation. A later edit of
+        # the user's source JSON must not change what the runner loads.
+        snapshot = Path(str(raw_path) + ".acl-dump.json")
+        if snapshot.exists() or Path(str(snapshot) + ".tmp").exists():
+            raise FileExistsError(snapshot)
+        atomic_write_json(snapshot, load_json_object(dump_config_path))
+        validate_acl_dump_config(snapshot)
+        dump_identity = {
+            "source_path": str(dump_config_path), "path": str(snapshot),
+            "bytes": snapshot.stat().st_size, "sha256": sha256_file(snapshot),
+        }
+        command.extend(["--acl-dump-config", str(snapshot)])
     command.extend(["--progress", "true" if progress else "false"])
     deployment_path = Path(deployment_manifest).expanduser().resolve()
     # Persist before launch: even a signal or failure before JSON output must
@@ -2398,6 +2419,7 @@ def run_cpp_pair(
             "sha256": sha256_file(deployment_path),
         },
         "backend_metadata": identity,
+        "acl_dump_config": dump_identity,
         "artifacts": artifacts,
         "raw_output": str(raw_path),
         "log_output": str(log_path),
