@@ -129,6 +129,8 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
     // accepted prefix/fallback can still match ordinary generation exactly.
     if (variation == "draft_rejected_tail" && call_number == 3)
       proposals[7] = (proposals[7] + 7) % 64;
+    if (variation == "draft_private_output" && !model.workspace)
+      proposals[7] = (proposals[7] + 7) % 64;
   } else {
     auto* ids = static_cast<std::int64_t*>(in.at("input_ids")->data);
     auto* predictions = static_cast<std::int64_t*>(out.at("target_top1")->data);
@@ -165,6 +167,12 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
       std::memcpy(result->data, item.second->data, result->size);
       *static_cast<std::uint16_t*>(result->data) = static_cast<std::uint16_t>(start + committed);
     }
+  }
+  if (model.role == "draft" && call_number == 3) {
+    if (variation == "draft_input_mutation")
+      static_cast<unsigned char*>(in.at("d0_key")->data)[2] ^= 1;
+    if (variation == "draft_output_bytes")
+      static_cast<unsigned char*>(out.at("d0_key")->data)[2] ^= 1;
   }
   return ACL_SUCCESS;
 }

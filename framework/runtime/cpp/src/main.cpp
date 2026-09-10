@@ -43,6 +43,9 @@ struct Arguments {
   std::size_t repetitions = 10;
   bool trace_rounds = false;
   bool low_memory = false;
+  std::size_t debug_draft_replay = 0;
+  std::string debug_draft_workspace = "shared";
+  std::filesystem::path debug_draft_inputs;
   int device_id = 0;
   std::string model_kind = "recompute";
   std::string mode = "paired";
@@ -66,6 +69,9 @@ void Usage(std::ostream& stream) {
       << "  --warmup N                   target evidence requires 3\n"
       << "  --repetitions N              target evidence requires 10\n"
       << "  --device-id N                default 0\n";
+  stream << "  --debug-draft-replay N       frozen-input Draft diagnostic; N calls per phase, no msprof\n"
+         << "  --debug-draft-workspace MODE shared (default) or private; debug replay only\n"
+         << "  --debug-draft-inputs PATH    reuse a previous replay's inputs directory\n";
   stream << "  --trace-rounds               record chunk proposals, verify and emitted tokens\n";
   stream << "  --profile-stage STAGE       diagnostic prefill/decode (ordinary), prefill/draft/verify (dflash), or all\n"
          << "  --profile-mode MODE         ordinary or dflash; use tools/run_msprof.sh --profile-backend cpp\n"
@@ -268,6 +274,25 @@ Arguments ParseArguments(int argc, char** argv) {
     }
   } else if (!result.profile.output.empty() || result.profile.mode != "dflash" || result.profile.audit_draft_inputs) {
     throw std::invalid_argument("profile-output/profile-mode/profile-audit-draft-inputs requires profile-stage");
+  }
+  const auto debug_replay = TakeOptional(&values, "debug-draft-replay", "");
+  const auto debug_workspace = TakeOptional(&values, "debug-draft-workspace", "");
+  result.debug_draft_inputs = TakeOptional(&values, "debug-draft-inputs", "");
+  if (!debug_replay.empty()) {
+    result.debug_draft_replay = ParseSize(debug_replay, "debug-draft-replay");
+    result.debug_draft_workspace = debug_workspace.empty() ? "shared" : debug_workspace;
+    if (result.debug_draft_replay > 1000 || result.model_kind != "chunk" ||
+        result.mode != "dflash" || !result.profile.stage.empty() || result.low_memory)
+      throw std::invalid_argument("debug-draft-replay needs chunk dflash mode, 1..1000 calls and no profiler");
+    if (result.debug_draft_workspace != "shared" && result.debug_draft_workspace != "private")
+      throw std::invalid_argument("debug-draft-workspace must be shared or private");
+    const char* profiling = std::getenv("PROFILING_MODE");
+    if (profiling && *profiling && std::string(profiling) != "false")
+      throw std::invalid_argument("debug replay requires an environment without PROFILING_MODE");
+    if (std::filesystem::exists(result.output) || std::filesystem::is_symlink(result.output))
+      throw std::invalid_argument("debug replay report must be new");
+  } else if (!debug_workspace.empty() || !result.debug_draft_inputs.empty()) {
+    throw std::invalid_argument("debug-draft-workspace/inputs requires debug-draft-replay");
   }
   if (!values.empty()) {
     throw std::invalid_argument("unknown option --" + values.begin()->first);
@@ -565,7 +590,8 @@ int main(int argc, char** argv) {
     std::unique_ptr<qwen35::dflash::GraphExecutor> executor;
     if (arguments.model_kind == "chunk") {
       executor = std::make_unique<qwen35::dflash::AclChunkExecutor>(
-          arguments.model, arguments.device_id, arguments.low_memory ? "ordinary" : arguments.mode);
+          arguments.model, arguments.device_id, arguments.low_memory ? "ordinary" : arguments.mode,
+          arguments.debug_draft_workspace != "private");
     } else {
       executor = std::make_unique<qwen35::dflash::AclExecutor>(arguments.model, arguments.device_id);
     }
@@ -576,6 +602,24 @@ int main(int argc, char** argv) {
     options.max_draft_tokens = arguments.max_draft_tokens;
     options.eos_token_ids = arguments.eos_token_ids;
     options.trace_rounds = arguments.trace_rounds;
+    if (arguments.debug_draft_replay) {
+      auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(*executor);
+      const auto output = std::filesystem::absolute(arguments.output);
+      std::filesystem::create_directories(output.parent_path());
+      auto result = chunk.DebugDraftReplay(
+          arguments.prompt_token_ids, arguments.pad_token_id, arguments.max_draft_tokens,
+          arguments.debug_draft_replay, output.string() + ".replay", arguments.debug_draft_inputs);
+      result.second.pop_back();
+      const bool fake = std::string(QWEN35_DFLASH_RUNNER_VERSION).find("fake-acl") != std::string::npos;
+      result.second += ",\"runner_version\":\"" + JsonEscape(QWEN35_DFLASH_RUNNER_VERSION) +
+          "\",\"model_sha256\":\"" + arguments.model_sha256 +
+          "\",\"device_id\":" + std::to_string(arguments.device_id) +
+          ",\"fake_acl\":" + (fake ? "true" : "false") + "}";
+      chunk.Close();
+      AtomicWrite(output, result.second);
+      std::cout << result.second << '\n';
+      return result.first ? 0 : 1;
+    }
     if (!arguments.profile.stage.empty()) {
       auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(*executor);
       auto report = qwen35::dflash::ProfileChunk(chunk, arguments.prompt_token_ids, options, arguments.profile);

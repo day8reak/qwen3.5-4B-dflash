@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <utility>
 
 #include "qwen35_dflash/generation.hpp"
 
@@ -59,7 +60,8 @@ class AclChunkExecutor final : public ChunkExecutor {
  public:
   explicit AclChunkExecutor(const std::filesystem::path& plan,
                             int device_id = 0,
-                            const std::string& mode = "paired");
+                            const std::string& mode = "paired",
+                            bool share_workspace = true);
   ~AclChunkExecutor() override;
   void Close();
   void UnloadModels();
@@ -68,6 +70,13 @@ class AclChunkExecutor final : public ChunkExecutor {
   // Diagnostic only: snapshot OM inputs before a Draft capture window.
   std::map<std::string, std::string> DraftInputHashes(std::int64_t anchor,
                                                     std::size_t proposal_count);
+  // Temporary diagnostic: frozen inputs, no Draft output publication, no msprof.
+  // Returns {stable_valid_tokens_and_readonly_inputs, JSON report}.
+  std::pair<bool, std::string> DebugDraftReplay(
+      const std::vector<std::int64_t>& prompt, std::int64_t pad,
+      std::size_t proposal_count, std::size_t repetitions,
+      const std::filesystem::path& output_directory,
+      const std::filesystem::path& input_directory = {});
   std::size_t sequence_length() const noexcept override;
   std::int64_t vocabulary_size() const noexcept override;
   void Reset(std::int64_t) override;

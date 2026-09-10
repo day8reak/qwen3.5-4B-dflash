@@ -157,11 +157,11 @@
       },
       {
         "source_file": "docs/DFLASH_ARCHITECTURE.md",
-        "source_sha256": "838c8b576673105fe19f4b0fd40aa6700cabea8f58e0b5dae76a379a811c8ddd"
+        "source_sha256": "e6c396c0fd0b24b4ade94f60d30b8cc67e985bc2381ec34381e851b94e9466af"
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "4699fe4a5597d0d42047a46913f75960ac817ce6c3dc69fcc4c6ca8b26c58f5b"
+        "source_sha256": "0528cb12ad3c889cef1b640ae04beeedbb68d7392e4c6d78abe64448f87e9622"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -285,7 +285,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/chunk.hpp",
-        "source_sha256": "6e0faf82a80e63358fa84bbbb2019075ae3dbf55a360e331c6fe6619ce984070"
+        "source_sha256": "52215e67728826e633e84e5a835c709f50be5a876c9ccf29e54ab45adaaf5559"
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/generation.hpp",
@@ -301,7 +301,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_chunk.cpp",
-        "source_sha256": "97cb151018cfd1460d208d3c32b55f5e76a2585b61fbf122b4ef1dff0ec2dbc1"
+        "source_sha256": "1f8df950ca523d30f635873763c1c7f0d1f784a503845ab97d9c9d95d0c7e4cb"
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_executor.cpp",
@@ -317,7 +317,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/main.cpp",
-        "source_sha256": "79f1601d725c59b7b7954823b06f3948d634937e439d42120ece9321a8e1d38e"
+        "source_sha256": "3a6ce713ae5cbec7e830cbdfcd792c1e5b9a88b04ab65fea2d5d1ac1998673e0"
       },
       {
         "source_file": "framework/runtime/cpp/src/sha256.cpp",
@@ -333,7 +333,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/fake_acl.cpp",
-        "source_sha256": "108e4c395119a27693d1cd45e174cb5f522b801fc8c0323579d2ec1b93bee191"
+        "source_sha256": "d72bf7119864503d8bef5194aa5772d8fa53a2cd231253ec4e20088081c2cb1d"
       },
       {
         "source_file": "framework/runtime/cpp/tests/run_fake_runner.cmake",
@@ -426,6 +426,14 @@
       {
         "source_file": "tests/test_msprof_application_exit.py",
         "source_sha256": "67d39dd82a183aae1a2e98ad1bac5b26a12759c24a3db1624eba32b828f6a9e7"
+      },
+      {
+        "source_file": "tools/debug_draft_om.py",
+        "source_sha256": "227d82c4a8d42f961aae5a03aa77d1ed537cf1e202a657f43d875e77b0999793"
+      },
+      {
+        "source_file": "tests/test_debug_draft_om.py",
+        "source_sha256": "3038f7c8468c5df0f4a9fd6092e4a4f9d450559db2f7ae5672f4f81cfadda19f"
       }
     ]
   }

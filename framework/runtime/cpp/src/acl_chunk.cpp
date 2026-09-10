@@ -198,6 +198,41 @@ void ValidateModelIo(aclmdlDesc* desc, const ChunkGraph& graph) {
     }
   }
 }
+
+std::string DebugQuote(const std::string& value) {
+  std::ostringstream out;
+  out << '"';
+  for (unsigned char c : value) {
+    if (c == '"' || c == '\\') out << '\\' << c;
+    else if (c < 0x20) out << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                           << static_cast<unsigned>(c) << std::dec;
+    else out << c;
+  }
+  out << '"';
+  return out.str();
+}
+std::string DebugMap(const std::map<std::string, std::string>& values) {
+  std::ostringstream out;
+  out << '{';
+  bool first = true;
+  for (const auto& item : values) {
+    if (!first) out << ',';
+    first = false;
+    out << DebugQuote(item.first) << ':' << DebugQuote(item.second);
+  }
+  out << '}';
+  return out.str();
+}
+std::string DebugTokens(const std::vector<std::int64_t>& tokens) {
+  std::ostringstream out;
+  out << '[';
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    if (i) out << ',';
+    out << tokens[i];
+  }
+  out << ']';
+  return out.str();
+}
 struct Memory {
   explicit Memory(CleanupAudit& audit) : audit(audit) {}
   CleanupAudit& audit;
@@ -247,8 +282,10 @@ struct Loaded {
 
 class AclChunkExecutor::Impl {
  public:
-  Impl(const std::filesystem::path& path, int device, const std::string& mode)
-      : plan(ReadChunkPlan(path, mode)), plan_path(path), plan_sha256(Sha256File(path)), device_id(device) {
+  Impl(const std::filesystem::path& path, int device, const std::string& mode,
+       bool share_workspace)
+      : plan(ReadChunkPlan(path, mode)), plan_path(path), plan_sha256(Sha256File(path)),
+        device_id(device), share_workspace(share_workspace) {
     Require(device >= 0, "negative device ID");
     try {
       LogProcessIdentity();
@@ -297,7 +334,7 @@ class AclChunkExecutor::Impl {
         requirements.begin(), requirements.end(), [](const auto& item) {
           return item.second.status == ACL_SUCCESS;
         });
-    if (queried_all) {
+    if (queried_all && share_workspace) {
       for (const auto& item : requirements) {
         total_work += item.second.work;
         maximum_work = std::max(maximum_work, item.second.work);
@@ -316,7 +353,8 @@ class AclChunkExecutor::Impl {
                 << " saved_work_bytes=" << total_work - maximum_work << '\n';
     } else {
       std::cerr << "[chunk-runtime] workspace policy=per_model"
-                << " reason=memory_query_unavailable\n";
+                << " reason=" << (share_workspace ? "memory_query_unavailable" : "debug_private")
+                << '\n';
     }
     for (const auto* graph : selected) {
       Load(*graph, requirements.at(graph->name));
@@ -622,6 +660,220 @@ class AclChunkExecutor::Impl {
     }
     return hashes;
   }
+
+  std::pair<bool, std::string> DebugDraftReplay(
+      const std::vector<std::int64_t>& prompt, std::int64_t padding,
+      std::size_t proposal_count, std::size_t repetitions,
+      const std::filesystem::path& output_directory,
+      const std::filesystem::path& input_directory) {
+    Require(!prompt.empty() && prompt.size() + 16 <= plan.capacity,
+            "debug replay prompt needs room for a full Draft block");
+    Require(padding >= 0 && padding < plan.vocabulary &&
+                std::all_of(prompt.begin(), prompt.end(), [&](auto id) {
+                  return id >= 0 && id < plan.vocabulary;
+                }), "debug replay token outside vocabulary");
+    Require(repetitions > 0 && repetitions <= 1000 && proposal_count > 0 &&
+                proposal_count <= 15, "debug replay requires 1..1000 repetitions and 1..15 proposals");
+    Require(std::filesystem::create_directory(output_directory),
+            "debug replay directory must be new");
+    const auto snapshot_dir = output_directory / "inputs";
+    std::filesystem::create_directory(snapshot_dir);
+    std::ofstream trace(output_directory / "iterations.jsonl");
+    trace.exceptions(std::ios::badbit | std::ios::failbit);
+
+    const auto& graph = plan.graphs.at("draft");
+    Memory scratch(cleanup);
+    for (const auto& spec : graph.inputs) scratch.bytes = std::max(scratch.bytes, spec.bytes());
+    for (const auto& spec : graph.outputs) scratch.bytes = std::max(scratch.bytes, spec.bytes());
+    Check(aclrtMallocHost(&scratch.host, scratch.bytes), "aclrtMallocHost(debug replay)");
+    auto read_device = [&](Memory& mem) {
+      Check(aclrtMemcpyAsync(scratch.host, scratch.bytes, mem.device, mem.bytes,
+                             ACL_MEMCPY_DEVICE_TO_HOST, stream), "aclrtMemcpyAsync(debug read)");
+      Check(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(debug read)");
+      return std::string(static_cast<const char*>(scratch.host), mem.bytes);
+    };
+    auto write_file = [](const std::filesystem::path& path, const std::string& bytes) {
+      std::ofstream out(path, std::ios::binary);
+      out.exceptions(std::ios::badbit | std::ios::failbit);
+      out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    };
+    auto read_file = [](const std::filesystem::path& path, std::size_t bytes) {
+      Require(std::filesystem::is_regular_file(path) && std::filesystem::file_size(path) == bytes,
+              "debug snapshot file size mismatch");
+      std::string result(bytes, '\0');
+      std::ifstream in(path, std::ios::binary);
+      in.exceptions(std::ios::badbit | std::ios::failbit);
+      in.read(result.data(), static_cast<std::streamsize>(bytes));
+      return result;
+    };
+
+    // Bind imported bytes to the exact Draft OM, shape ABI, prompt and controls.
+    // ATC precision changes need a new snapshot contract, not a silent A/B.
+    std::ostringstream contract;
+    contract << "qwen35-draft-replay-inputs-v1\n" << graph.sha256 << '\n'
+             << plan.capacity << ' ' << padding << ' ' << proposal_count << '\n';
+    for (auto id : prompt) contract << id << ' ';
+    contract << '\n';
+    for (const auto& spec : graph.inputs) {
+      Require(spec.name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+                  == std::string::npos && !spec.name.empty(), "unsafe snapshot tensor name");
+      contract << spec.name << ' ' << spec.dtype << ' ' << spec.bytes();
+      for (auto dim : spec.shape) contract << ' ' << dim;
+      contract << '\n';
+    }
+    if (!input_directory.empty())
+      Require(std::filesystem::is_regular_file(input_directory / "contract.txt") &&
+                  std::filesystem::file_size(input_directory / "contract.txt") == contract.str().size() &&
+                  read_file(input_directory / "contract.txt", contract.str().size()) == contract.str(),
+              "debug snapshot contract differs from Draft OM/prompt/ABI");
+    write_file(snapshot_dir / "contract.txt", contract.str());
+
+    Reset(padding);
+    const auto anchor = Prefill(prompt, true);
+    PrepareDraft(anchor, proposal_count);
+    std::ifstream imported_hashes;
+    if (!input_directory.empty()) {
+      imported_hashes.open(input_directory / "sha256.txt");
+      imported_hashes.exceptions(std::ios::badbit | std::ios::failbit);
+    }
+    std::map<std::string, std::string> frozen, frozen_hashes;
+    std::ostringstream snapshot_hashes;
+    for (const auto& spec : graph.inputs) {
+      auto& mem = Get(spec, "draft", false);
+      std::string bytes;
+      if (input_directory.empty()) {
+        bytes = mem.host ? std::string(static_cast<const char*>(mem.host), mem.bytes) : read_device(mem);
+      } else {
+        bytes = read_file(input_directory / (spec.name + ".bin"), mem.bytes);
+        std::string expected_name, expected_hash;
+        imported_hashes >> expected_name >> expected_hash;
+        Require(expected_name == spec.name && Sha256(bytes) == expected_hash,
+                "debug snapshot input hash mismatch");
+      }
+      frozen_hashes[spec.name] = Sha256(bytes);
+      snapshot_hashes << spec.name << ' ' << frozen_hashes.at(spec.name) << '\n';
+      write_file(snapshot_dir / (spec.name + ".bin"), bytes);
+      frozen.emplace(spec.name, std::move(bytes));
+    }
+    write_file(snapshot_dir / "sha256.txt", snapshot_hashes.str());
+    auto hashes = [&](bool output) {
+      std::map<std::string, std::string> result;
+      for (const auto& spec : output ? graph.outputs : graph.inputs)
+        result[spec.name] = Sha256(read_device(Get(spec, "draft", output)));
+      return result;
+    };
+    auto addresses = [&](bool output) {
+      std::map<std::string, std::string> result;
+      for (const auto& spec : output ? graph.outputs : graph.inputs) {
+        std::ostringstream address;
+        address << Get(spec, "draft", output).device;
+        result[spec.name] = address.str();
+      }
+      return result;
+    };
+
+    bool stable = true;
+    std::vector<std::int64_t> reference;
+    std::map<std::string, std::string> reference_outputs;
+    std::ostringstream phases;
+    for (const std::string phase : {"isolated", "interleaved_prefill"}) {
+      std::size_t token_mismatches = 0, restore_mismatches = 0, input_mutations = 0, output_hash_mismatches = 0;
+      if (phase != "isolated") phases << ',';
+      for (std::size_t iteration = 0; iteration < repetitions; ++iteration) {
+        if (phase == "interleaved_prefill") {
+          Reset(padding);
+          static_cast<void>(Prefill(prompt, true));
+        }
+        // Restore all 17 actual inputs, including every physical KV row and
+        // controls. Never publish the replay's Draft outputs with Swap('d').
+        for (const auto& spec : graph.inputs) {
+          auto& mem = Get(spec, "draft", false);
+          const auto& bytes = frozen.at(spec.name);
+          if (mem.host) std::memcpy(mem.host, bytes.data(), bytes.size());
+          std::memcpy(scratch.host, bytes.data(), bytes.size());
+          Check(aclrtMemcpyAsync(mem.device, mem.bytes, scratch.host, mem.bytes,
+                                 ACL_MEMCPY_HOST_TO_DEVICE, stream), "aclrtMemcpyAsync(debug restore)");
+          // The single pinned staging buffer must stay alive until H2D completes.
+          Check(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(debug restore)");
+        }
+        const auto before = hashes(false);
+        trace << "{\"event\":\"prepared\",\"phase\":" << DebugQuote(phase)
+              << ",\"iteration\":" << iteration << ",\"input_sha256\":" << DebugMap(before) << "}\n";
+        trace.flush();
+        Call("draft");
+        auto tokens = Tokens("draft", "draft_top1");
+        Require(tokens.size() >= proposal_count, "debug Draft token output too short");
+        tokens.resize(proposal_count);
+        const auto after = hashes(false), outputs = hashes(true);
+        if (phase == "isolated" && iteration == 0) {
+          reference = tokens;
+          reference_outputs = outputs;
+        }
+        const bool input_match = before == frozen_hashes;
+        const bool readonly = before == after;
+        const bool token_match = reference == tokens;
+        const bool tokens_valid = std::all_of(tokens.begin(), tokens.end(), [&](auto id) {
+          return id >= 0 && id < plan.vocabulary;
+        });
+        if (!input_match) ++restore_mismatches;
+        if (!readonly) ++input_mutations;
+        if (!token_match || !tokens_valid) ++token_mismatches;
+        if (outputs != reference_outputs) ++output_hash_mismatches;
+        const bool ok = input_match && readonly && token_match && tokens_valid;
+        stable = stable && ok;
+        trace << "{\"event\":\"completed\",\"phase\":" << DebugQuote(phase)
+              << ",\"iteration\":" << iteration << ",\"profiled\":false"
+              << ",\"status\":" << DebugQuote(ok ? "PASS" : "FAIL")
+              << ",\"input_sha256\":" << DebugMap(before)
+              << ",\"input_after_sha256\":" << DebugMap(after)
+              << ",\"output_sha256\":" << DebugMap(outputs)
+              << ",\"input_device_addresses\":" << DebugMap(addresses(false))
+              << ",\"output_device_addresses\":" << DebugMap(addresses(true))
+              << ",\"input_matches_snapshot\":" << (input_match ? "true" : "false")
+              << ",\"inputs_unchanged\":" << (readonly ? "true" : "false")
+              << ",\"valid_tokens_match\":" << (token_match ? "true" : "false")
+              << ",\"valid_tokens_in_range\":" << (tokens_valid ? "true" : "false")
+              << ",\"all_output_bytes_match\":" << (outputs == reference_outputs ? "true" : "false")
+              << ",\"output_token_ids\":" << DebugTokens(tokens)
+              << ",\"first_token_difference\":";
+        if (token_match) trace << "null";
+        else {
+          const auto index = static_cast<std::size_t>(std::mismatch(reference.begin(), reference.end(), tokens.begin()).first - reference.begin());
+          trace << "{\"index\":" << index << ",\"reference\":" << reference[index]
+                << ",\"actual\":" << tokens[index] << '}';
+        }
+        trace << "}\n";
+        trace.flush();
+        std::cerr << "[draft-replay] phase=" << phase << " iteration=" << iteration
+                  << " input_match=" << input_match << " readonly=" << readonly
+                  << " tokens_match=" << token_match << '\n';
+      }
+      phases << "{\"phase\":" << DebugQuote(phase) << ",\"iterations\":" << repetitions
+             << ",\"token_mismatch_iterations\":" << token_mismatches
+             << ",\"input_restore_mismatch_iterations\":" << restore_mismatches
+             << ",\"input_mutation_iterations\":" << input_mutations
+             << ",\"full_output_hash_mismatch_iterations\":" << output_hash_mismatches << '}';
+    }
+    // This diagnostic leaves no cache branch eligible for continued generation.
+    invalid = true;
+    std::ostringstream report;
+    report << "{\"schema_version\":1,\"status\":" << DebugQuote(stable ? "PASS_REPLAY_CHECKS" : "FAIL_REPLAY_CHECKS")
+           << ",\"scope\":\"frozen Draft OM input replay; valid tokens and readonly inputs\""
+           << ",\"formal_latency_evidence\":false,\"ordinary_parity\":\"NOT_RUN\""
+           << ",\"profiled\":false,\"draft_outputs_committed\":false"
+           << ",\"requested_workspace\":" << DebugQuote(share_workspace ? "shared" : "private")
+           << ",\"actual_workspace_policy\":" << DebugQuote(workspace ? "shared_serial" : "per_model")
+           << ",\"draft_om_sha256\":" << DebugQuote(graph.sha256)
+           << ",\"input_directory\":" << DebugQuote(snapshot_dir.string())
+           << ",\"trace\":" << DebugQuote((output_directory / "iterations.jsonl").string())
+           << ",\"snapshot_sha256\":" << DebugMap(frozen_hashes)
+           << ",\"reference_token_ids\":" << DebugTokens(reference)
+           << ",\"reference_output_sha256\":" << DebugMap(reference_outputs)
+           << ",\"phases\":[" << phases.str() << "]"
+           << ",\"note\":\"All output hashes include physical padding; inspect them separately. "
+              "Restores, readbacks and synchronization perturb execution. A passing replay does not close the original instability.\"}";
+    return {stable, report.str()};
+  }
   std::vector<std::int64_t> Propose(std::int64_t anchor, std::size_t proposal_count) {
     PrepareDraft(anchor, proposal_count);
     Call("draft");
@@ -670,6 +922,7 @@ class AclChunkExecutor::Impl {
   std::filesystem::path plan_path;
   std::string plan_sha256;
   int device_id;
+  bool share_workspace;
   bool initialized = false, device_set = false, invalid = true, cleaned = false;
   aclrtContext context = nullptr;
   aclrtStream stream = nullptr;
@@ -684,8 +937,9 @@ class AclChunkExecutor::Impl {
 };
 
 AclChunkExecutor::AclChunkExecutor(const std::filesystem::path& plan,
-                                   int device, const std::string& mode)
-    : impl_(std::make_unique<Impl>(plan, device, mode)) {}
+                                   int device, const std::string& mode,
+                                   bool share_workspace)
+    : impl_(std::make_unique<Impl>(plan, device, mode, share_workspace)) {}
 AclChunkExecutor::~AclChunkExecutor() = default;
 void AclChunkExecutor::Close() {
   impl_->Cleanup();
@@ -733,6 +987,14 @@ std::map<std::string, std::string> AclChunkExecutor::DraftInputHashes(
 std::vector<std::int64_t> AclChunkExecutor::Verify(
     const std::vector<std::int64_t>& ids) {
   return impl_->Verify(ids);
+}
+std::pair<bool, std::string> AclChunkExecutor::DebugDraftReplay(
+    const std::vector<std::int64_t>& prompt, std::int64_t pad,
+    std::size_t proposal_count, std::size_t repetitions,
+    const std::filesystem::path& output_directory,
+    const std::filesystem::path& input_directory) {
+  return impl_->DebugDraftReplay(prompt, pad, proposal_count, repetitions,
+                                output_directory, input_directory);
 }
 void AclChunkExecutor::Commit(std::size_t rows) { impl_->Commit(rows); }
 std::int64_t AclChunkExecutor::Decode(std::int64_t anchor) {

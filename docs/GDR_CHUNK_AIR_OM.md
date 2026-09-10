@@ -857,6 +857,85 @@ op_name、stream/task ID、输入输出形状，可定位具体 GDR 或矩阵乘
 调用次数错误、进程失败、空导出或没有有效任务时长时整体 FAIL，不生成成功的算子汇总。
 `PASS_CAPTURE` 表示采集流程完成，不能替代完整 token/接受率验证。
 
+
+### 15.1 输入 hash 相同但候选变化：固定输入回放
+
+若 Draft 的 17 个边界输入 hash 全部相同，而未采集的预热仍出现候选差异，
+先用临时工具 [debug_draft_om.py](../tools/debug_draft_om.py)。
+它不启动 msprof，也不重新导出或编译 OM；只需编译带回放入口的新 C++ runner：
+
+```bash
+# 使用新的构建路径；已有构建目录/报告不会被覆盖。
+"$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p build-cpp \
+  --build-dir "$AI_RUN_DIR/build/cpp-draft-replay" \
+  --ascendcl-root "$CANN_ROOT" \
+  --output "$AI_RUN_DIR/reports/cpp-build-draft-replay.json"
+export CPP_RUNNER="$AI_RUN_DIR/build/cpp-draft-replay/qwen35_dflash_acl_runner"
+
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/debug_draft_om.py" \
+  --run-dir "$AI_RUN_DIR" --runner "$CPP_RUNNER" \
+  --deployment-manifest "$DEPLOYMENT_MANIFEST" \
+  --device-id 0 --max-draft-tokens 15 --repetitions 20 --workspace both
+```
+
+prompt 默认读取本 run 的 `reports/cpp-paired.json`，其次为 `prompt-ids.csv`；
+也可传 `--prompt-report` 或 `--prompt-token-ids`。`--repetitions` 是每个实验阶段的
+Draft 次数，不是正式 benchmark 的 3+10 协议。
+
+工具在 run 下新建 `debug-draft-*`。`both` 顺序运行两个进程：
+先共享工作内存，再由 GE 为各 OM 单独分配工作内存。两边仍只加载 DFlash 的三张图，
+权重始终各自独立；独立工作内存可能提高峰值占用，实际需求见对应 `.log` 的
+`om-memory` 查询。两个进程共享同一份锁定的 Draft 输入快照，不重新取样作为 A/B 输入。
+快照绑定 Draft OM hash、tensor ABI、prompt、proposal_count；复用时逐文件校验。
+既有正式生成和 profiling 的内存策略不变。
+
+每个进程依次执行：
+
+| 阶段 | 操作 |
+|---|---|
+| `isolated` | 一次 Prefill 准备之后，只重复 Draft。每次恢复同一份完整输入，输入/输出地址固定，不交换或提交回放输出 KV |
+| `interleaved_prefill` | 每次 Reset + Prefill，然后覆盖全部 Draft 输入为原快照，再执行 Draft；用于检查前序图执行和工作内存历史的影响 |
+
+长 prompt 的 Prefill 准备仍按原路径初始化较早分块的 Draft KV，这些调用不计入回放次数。
+两个阶段都不执行 Target verify，不推进解码。每次记录实际设备输入的执行前/后 hash、
+所有输出 hash、有效候选、设备地址及第一个不同位置。额外同步与读回会改变执行条件；
+回放全通过不能排除原故障，也不能用这里的耗时作性能结论。
+
+结果在 `comparison.json`、`shared.json`、`private.json`，逐次记录路径由报告的
+`trace` 给出。`input_directory` 下保留原始输入二进制，供后续逐层/单算子复现。
+即使发现候选变化或输入被改写，也继续完成本组次数、保存 FAIL 报告并返回非零。
+ACL 执行错误则立即退出并保留已有 trace 和日志，不发布成功报告。
+正常生成与 msprof 原来的严格检查没有放宽。
+
+| 观察 | 可以缩小的范围 |
+|---|---|
+| `inputs_unchanged=false` | 图执行后改写了只读边界输入；按不同 hash 的名字查 alias、越界写或输入算子契约 |
+| `isolated` 中输入完全相同但候选不同 | 无需重新生成 Prefill 特征或跨图交替就能复现；继续定位 Draft 内部中间张量、算子与运行时 |
+| 仅共享工作内存且交替 Prefill 时复现 | 工作内存复用/前序图执行是优先对照方向，尚不能仅凭此认定具体 kernel |
+| token 相同、`full_output_hash_mismatch_iterations` 非零 | 检查 KV 输出；完整 hash 包含物理填充区，不能直接等同有效缓存错误 |
+| 全部通过 | 本次扰动下未复现，保留原故障为待定位，不能宣布修复 |
+
+`PASS_REPLAY_CHECKS` 只表示有效 token 重复一致、恢复后的输入正确且调用未改写输入；
+完整输出字节一致性另外报告。`distinct_workspace_policies_exercised=false` 表示没有完成
+真正的共享/独立对照，例如工作内存查询失败导致共享侧回退。主机 fake ACL 报告明确标记
+`fake_acl=true`，不能作为 NPU 证据。
+
+对照还检查两个进程的参考候选是否一致（`reference_tokens_match_across_processes`）；
+即使各自重复稳定，只要同一快照在两个进程输出不同，对照仍返回失败。
+
+只跑一个内存策略可用 `--workspace shared` 或 `private`；复用已有快照加
+`--inputs "<上一份报告的 input_directory>"`。直接调用 runner 的临时参数为
+`--debug-draft-replay N --debug-draft-workspace shared|private`，可另带
+`--debug-draft-inputs PATH`；仅允许 `--model-kind chunk --mode dflash`，不能与 profiling 混用。
+
+同 stream 串行执行时共享工作内存本身符合
+[AscendCL 的接口约束](https://www.hiascend.com/document/detail/zh/canncommercial/5046/inferapplicationdev/aclcppdevg/aclcppdevg_03_0079.html)。
+如果固定输入仍变，可继续对照 ATC 的
+[确定性计算选项](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/devaids/atctool/atlasatcparam_16_0090.html)
+`--deterministic=1`；默认是 0。这需要重新编译受测 OM，并记录新 hash，
+不能靠 C++ 环境变量宣称旧 OM 已确定。该选项是否覆盖实际出问题的算子仍需设备实测。
+仅降低到 FP16 不足以解释同输入为什么变化，不能在没有中间结果证据时认定精度是根因。
+
 ## 16. 单模式运行和部署容量
 
 生成单模式加载计划，再启动 DFlash 生成：
