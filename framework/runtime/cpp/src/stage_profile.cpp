@@ -12,6 +12,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -37,6 +38,104 @@ std::string Quote(const std::string& text) {
   out << '"';
   return out.str();
 }
+std::string TokensJson(const std::vector<std::int64_t>& tokens) {
+  std::ostringstream out;
+  out << '[';
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    if (i) out << ',';
+    out << tokens[i];
+  }
+  return out.str() + ']';
+}
+std::string NumberJson(std::optional<std::int64_t> value) {
+  return value ? std::to_string(*value) : "null";
+}
+struct Sample {
+  std::size_t iteration = 0;
+  bool measured = false;
+  std::vector<std::int64_t> input, output, raw_output;
+  std::optional<std::int64_t> accepted;
+};
+struct Difference {
+  std::string field;
+  std::size_t index = 0;
+  std::optional<std::int64_t> reference, actual;
+};
+Difference Compare(const Sample& reference, const Sample& actual) {
+  for (bool input : {true, false}) {
+    const auto& a = input ? reference.input : reference.output;
+    const auto& b = input ? actual.input : actual.output;
+    for (std::size_t i = 0; i < std::max(a.size(), b.size()); ++i) {
+      const auto av = i < a.size() ? std::optional<std::int64_t>(a[i]) : std::nullopt;
+      const auto bv = i < b.size() ? std::optional<std::int64_t>(b[i]) : std::nullopt;
+      if (av != bv)
+        return {input ? "input_token_ids" : "output_token_ids", i, av, bv};
+    }
+  }
+  if (reference.accepted != actual.accepted)
+    return {"accepted_draft_tokens", 0, reference.accepted, actual.accepted};
+  return {};
+}
+class IterationTrace {
+ public:
+  explicit IterationTrace(const std::filesystem::path& raw_output)
+      : path(raw_output.string() + ".iterations.jsonl") {
+    // Keep the trace beside the raw directory: msprof must create that directory
+    // itself, and the trace must survive even if the final PASS report is absent.
+    if (!path.parent_path().empty())
+      std::filesystem::create_directories(path.parent_path());
+    fd_ = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd_ < 0) throw std::runtime_error("cannot create profile iteration trace: " + path.string());
+    std::cerr << "[stage-profile] iteration_trace=" << path << '\n';
+  }
+  ~IterationTrace() { if (fd_ >= 0) close(fd_); }
+  IterationTrace(const IterationTrace&) = delete;
+  IterationTrace& operator=(const IterationTrace&) = delete;
+
+  void Record(const std::string& mode, const std::string& stage,
+              const Sample& sample, const Sample* reference,
+              const char* event, const char* status, const Difference& difference = {}) {
+    const auto match = [&](bool value) {
+      return reference ? (value ? "true" : "false") : "null";
+    };
+    const auto tail = [](const Sample& value) {
+      return std::vector<std::int64_t>(value.raw_output.begin() + value.output.size(),
+                                       value.raw_output.end());
+    };
+    std::ostringstream out;
+    out << "{\"schema_version\":1,\"event\":" << Quote(event)
+        << ",\"profile_mode\":" << Quote(mode) << ",\"profile_stage\":" << Quote(stage)
+        << ",\"iteration\":" << sample.iteration
+        << ",\"measured\":" << (sample.measured ? "true" : "false")
+        << ",\"input_token_ids\":" << TokensJson(sample.input)
+        << ",\"output_token_ids\":" << TokensJson(sample.output)
+        << ",\"raw_output_token_ids\":" << TokensJson(sample.raw_output)
+        << ",\"verify_valid_rows\":" << (stage == "verify" ? std::to_string(sample.input.size()) : "null")
+        << ",\"padding_output_rows\":" << sample.raw_output.size() - sample.output.size()
+        << ",\"accepted_draft_tokens\":" << NumberJson(sample.accepted)
+        << ",\"input_state_comparison\":\"NOT_RUN\",\"check\":{\"status\":" << Quote(status)
+        << ",\"reference_iteration\":" << (reference ? std::to_string(reference->iteration) : "null")
+        << ",\"input_token_ids_match\":" << match(reference && sample.input == reference->input)
+        << ",\"output_token_ids_match\":" << match(reference && sample.output == reference->output)
+        << ",\"padding_token_ids_match\":" << match(reference && tail(sample) == tail(*reference))
+        << ",\"first_difference\":";
+    if (difference.field.empty()) out << "null";
+    else out << "{\"field\":" << Quote(difference.field) << ",\"index\":" << difference.index
+             << ",\"reference\":" << NumberJson(difference.reference)
+             << ",\"actual\":" << NumberJson(difference.actual) << '}';
+    const auto line = out.str() + "}}\n";
+    std::size_t offset = 0;
+    while (offset < line.size()) {
+      const auto n = write(fd_, line.data() + offset, line.size() - offset);
+      if (n < 0 && errno == EINTR) continue;
+      Require(n > 0, "cannot write profile iteration trace");
+      offset += static_cast<std::size_t>(n);
+    }
+  }
+  const std::filesystem::path path;
+ private:
+  int fd_ = -1;
+};
 std::vector<std::string> Stages(const std::string& mode) {
   return mode == "ordinary"
              ? std::vector<std::string>{"prefill", "decode"}
@@ -162,6 +261,7 @@ std::string ProfileChunk(AclChunkExecutor& executor,
   Require(prompt.size() + extra <= executor.sequence_length(),
           "profile requires prompt plus full stage input capacity");
   Channel channel;
+  IterationTrace trace(p.output);
   std::vector<std::string> reports;
   for (const auto& stage : stages) {
     const auto output = p.stage == "all" ? p.output / stage : p.output;
@@ -202,24 +302,36 @@ std::string ProfileChunk(AclChunkExecutor& executor,
         if (delta) captured[item.first] = delta;
       }
     };
-    auto once = [&](bool measured) {
+    auto once = [&](bool measured, std::size_t iteration) {
       executor.Reset(generation.pad_token_id);
-      std::vector<std::int64_t> result;
+      Sample sample;
+      sample.iteration = iteration;
+      sample.measured = measured;
+      auto prepared = [&] { trace.Record(p.mode, stage, sample, nullptr, "prepared", "PREPARED"); };
       if (stage == "prefill") {
+        sample.input = prompt;
+        prepared();
         invoke(measured,
-               [&] { result.push_back(executor.Prefill(prompt, false)); });
+               [&] { sample.raw_output.push_back(executor.Prefill(prompt, false)); });
+        sample.output = sample.raw_output;
       } else {
         const auto anchor = executor.Prefill(prompt, p.mode == "dflash");
         token_ok(anchor);
         Require(!eos.count(anchor),
                 "prefill anchor is EOS; no decode round to profile");
         if (stage == "decode") {
-          invoke(measured, [&] { result.push_back(executor.Decode(anchor)); });
+          sample.input = {anchor};
+          prepared();
+          invoke(measured, [&] { sample.raw_output.push_back(executor.Decode(anchor)); });
+          sample.output = sample.raw_output;
         } else if (stage == "draft") {
+          sample.input = {anchor};
+          prepared();
           invoke(measured, [&] {
-            result = executor.Propose(anchor, proposal_count);
-            result.resize(proposal_count);
+            sample.raw_output = executor.Propose(anchor, proposal_count);
           });
+          Require(sample.raw_output.size() >= proposal_count, "Draft output is shorter than proposal count");
+          sample.output.assign(sample.raw_output.begin(), sample.raw_output.begin() + proposal_count);
         } else {
           auto proposals = executor.Propose(anchor, proposal_count);
           proposals.resize(proposal_count);
@@ -229,23 +341,49 @@ std::string ProfileChunk(AclChunkExecutor& executor,
             block.push_back(t);
             if (eos.count(t)) break;
           }
-          invoke(measured, [&] { result = executor.Verify(block); });
+          sample.input = block;
+          prepared();
+          invoke(measured, [&] { sample.raw_output = executor.Verify(block); });
+          Require(sample.raw_output.size() >= block.size(), "verify output is shorter than valid rows");
+          // Match GenerateChunk's logical row contract. Padding is retained in
+          // the trace for diagnosis but never treated as generated token data.
+          sample.output.assign(sample.raw_output.begin(), sample.raw_output.begin() + block.size());
           std::size_t accepted = 0;
           while (accepted + 1 < block.size() &&
-                 block[accepted + 1] == result.at(accepted))
+                 block[accepted + 1] == sample.output.at(accepted))
             ++accepted;
           executor.Commit(accepted + 1);
+          sample.accepted = static_cast<std::int64_t>(accepted);
         }
       }
-      for (auto token : result) token_ok(token);
-      return result;
+      for (auto token : sample.output) token_ok(token);
+      return sample;
     };
-    std::vector<std::int64_t> reference;
+    std::optional<Sample> reference;
+    Sample measured;
+    auto check = [&](const Sample& sample) {
+      const auto difference = reference ? Compare(*reference, sample) : Difference{};
+      const auto* status = !difference.field.empty() ? "FAIL" : reference ? "PASS"
+                                       : sample.measured ? "NO_WARMUP" : "REFERENCE";
+      trace.Record(p.mode, stage, sample, reference ? &*reference : nullptr,
+                   "completed", status, difference);
+      if (!difference.field.empty()) {
+        throw std::runtime_error(
+            std::string(difference.field == "input_token_ids" ? "profile input token IDs differ" : "profile output differs") +
+            " from warmup stage=" + stage + " iteration=" + std::to_string(sample.iteration) +
+            " measured=" + (sample.measured ? "true" : "false") + " field=" + difference.field +
+            " index=" + std::to_string(difference.index) + " reference=" + NumberJson(difference.reference) +
+            " actual=" + NumberJson(difference.actual) + "; trace=" + trace.path.string());
+      }
+    };
     try {
-      for (std::size_t i = 0; i < p.warmup; ++i) reference = once(false);
-      const auto measured = once(true);
-      Require(!p.warmup || measured == reference,
-              "profile output differs from warmup");
+      for (std::size_t i = 0; i < p.warmup; ++i) {
+        const auto sample = once(false, i);
+        check(sample);
+        if (!reference) reference = sample;
+      }
+      measured = once(true, p.warmup);
+      check(measured);
     } catch (...) {
       executor.Abort();
       throw;
@@ -274,6 +412,10 @@ std::string ProfileChunk(AclChunkExecutor& executor,
            << ",\"warmup_iterations\":" << p.warmup
            << ",\"proposal_count\":" << ((stage == "draft" || stage == "verify") ? proposal_count : 0)
            << ",\"warmup_output_match\":" << (p.warmup ? "true" : "null")
+           << ",\"warmup_input_token_ids_match\":" << (p.warmup ? "true" : "null")
+           << ",\"compared_output_rows\":" << measured.output.size()
+           << ",\"output_comparison_scope\":\"valid rows only; padding retained in iteration trace\""
+           << ",\"input_state_comparison\":\"NOT_RUN\",\"iteration_trace\":" << Quote(trace.path.string())
            << ",\"formal_latency_evidence\":false,\"correctness_gate\":{"
               "\"status\":\"NOT_RUN_STAGE_DIAGNOSTIC\"}}";
     reports.push_back(report.str());
@@ -284,6 +426,7 @@ std::string ProfileChunk(AclChunkExecutor& executor,
       << Quote(p.mode) << ",\"profile_stage\":" << Quote(p.stage)
       << ",\"profile_output\":" << Quote(p.output.string())
       << ",\"capture_windows\":" << reports.size()
+      << ",\"iteration_trace\":" << Quote(trace.path.string())
       << ",\"operator_fallback_enabled\":false,\"device_id\":" << p.device_id
       << ",\"runtime\":\"AscendCL\",\"prompt_tokens\":" << prompt.size()
       << ",\"formal_latency_evidence\":false,\"correctness_gate\":{\"status\":"

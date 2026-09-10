@@ -137,6 +137,8 @@ def run_profile(args: argparse.Namespace) -> Path:
     digest = hashlib.sha256(plan.read_bytes()).hexdigest()
     print("Loading selected OMs once. Each stage gets fresh-state warmup and one capture window; "
           "prefill includes all prompt chunks. Model loading can take several minutes.", flush=True)
+    print(f"Per-iteration input/output trace: {capture / 'profile/msprof' / (stage + '.iterations.jsonl')}",
+          flush=True)
     subprocess.run([
         "bash", str(REPOSITORY / "tools/run_msprof.sh"),
         "--label", stage, "--output-dir", str(capture), "--python", sys.executable,
@@ -160,7 +162,8 @@ def main(argv: list[str] | None = None, *, default_stage="all") -> int:
         run_profile(args)
     except subprocess.CalledProcessError as error:
         print(f"profile_om: command failed (exit {error.returncode}); "
-              "inspect the Output directory printed above, including capture/log", file=sys.stderr)
+              "inspect capture/log and capture/profile/msprof/*.iterations.jsonl "
+              "under the Output directory printed above", file=sys.stderr)
         return error.returncode if error.returncode > 0 else 1
     except (OSError, ValueError, KeyError) as error:
         print(f"profile_om: {error}", file=sys.stderr)

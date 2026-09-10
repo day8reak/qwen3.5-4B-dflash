@@ -517,6 +517,7 @@ payload = {
     "application": redacted_application,
     "artifacts": {
         "profile_dir": profile_dir, "runtime_log": runtime_log,
+        "iteration_trace": profile_dir + ".iterations.jsonl" if profile_stage and profile_backend == "cpp" else None,
         "stage_report": stage_report if profile_stage else None,
         "control_report": control_report if profile_stage else None,
         "stage_summary": str(Path(manifest_path).parent.parent / (label + "-stage-summary.csv")) if profile_stage else None,

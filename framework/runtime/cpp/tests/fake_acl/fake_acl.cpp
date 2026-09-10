@@ -47,6 +47,7 @@ std::set<void*> discard_allocations;
 std::size_t live_contexts = 0, live_streams = 0, live_descs = 0;
 std::size_t live_datasets = 0, live_data_buffers = 0, allocations_after_execute = 0;
 bool executed = false, initialized_once = false;
+std::map<std::string, std::size_t> profile_fixture_calls;
 
 bool FailCleanup(const char* operation) {
   const auto* failure = std::getenv("QWEN35_FAKE_CLEANUP_FAIL");
@@ -94,6 +95,11 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
   }
   const auto start = *static_cast<std::int64_t*>(in.at("start_position")->data);
   const auto valid = *static_cast<std::int16_t*>(in.at("valid_rows")->data);
+  const auto* active_file = std::getenv("TEST_ACTIVE");
+  const bool profiled = active_file && std::filesystem::exists(active_file);
+  const auto* variation_env = std::getenv("QWEN35_FAKE_PROFILE_VARIATION");
+  const std::string variation = variation_env ? variation_env : "";
+  const auto call_number = ++profile_fixture_calls[model.role];
   if (const auto* path = std::getenv("QWEN35_FAKE_EVENT_LOG")) {
     const auto* active = std::getenv("TEST_ACTIVE");
     std::ofstream log(path, std::ios::app);
@@ -116,18 +122,29 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
     const int accepted = requested ? std::atoi(requested) : 15;
     for (int i = 0; i < 15; ++i)
       proposals[i] = i < proposal_count ? (anchor + i + 1 + (i == accepted ? 7 : 0)) % 64 : 0;
+    if ((variation == "draft_output" && profiled) ||
+        (variation == "draft_input" && call_number == 2))
+      proposals[0] = (proposals[0] + 7) % 64;
   } else {
     auto* ids = static_cast<std::int64_t*>(in.at("input_ids")->data);
     auto* predictions = static_cast<std::int64_t*>(out.at("target_top1")->data);
     if (model.role == "target_verify") {
       if (valid > 16) return 25;
       for (int i = 0; i < 16; ++i) predictions[i] = (ids[i] + 1) % 64;
+      // Only the output tail changes; all valid rows and acceptance stay exact.
+      if (variation == "padding" && profiled)
+        for (int i = valid; i < 16; ++i) predictions[i] = 43;
+      if ((variation == "verify_output" && profiled) ||
+          (variation == "warmup_middle" && call_number == 2))
+        predictions[valid - 1] = (predictions[valid - 1] + 7) % 64;
       std::size_t accepted = 0;
       while (accepted + 1 < static_cast<std::size_t>(valid) && ids[accepted + 1] == predictions[accepted]) ++accepted;
       committed = accepted + 1;
       *static_cast<std::int64_t*>(out.at("accepted_count")->data) = std::getenv("QWEN35_FAKE_BAD_ACCEPT") ? 0 : static_cast<std::int64_t>(accepted);
     } else {
       predictions[0] = (ids[valid - 1] + 1) % 64;
+      if (variation == model.role + "_output" && profiled)
+        predictions[0] = (predictions[0] + 7) % 64;
     }
     if (out.count("features")) {
       std::memset(out.at("features")->data, 0, out.at("features")->size);

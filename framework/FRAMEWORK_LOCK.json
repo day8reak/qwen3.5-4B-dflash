@@ -258,6 +258,9 @@
       "verify"
     ],
     "all": "one fresh-state window per declared stage, same loaded application PID",
+    "cpp_warmup_comparison": "compare every warmup and measured sample with the first warmup: input token IDs and valid output rows; padding is diagnostic only; fail on logical differences",
+    "cpp_iteration_trace": "profile/msprof/<label>.iterations.jsonl; prepared/completed records survive failure and identify the first difference",
+    "cpp_input_state_comparison": "NOT_RUN; token equality does not establish cache or feature tensor equality",
     "python_profile_api": false,
     "om_entry": "tools/profile_om.py",
     "om_entry_default": "dflash/all; fresh mode-specific plan from the selected deployment manifest",

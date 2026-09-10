@@ -695,7 +695,11 @@ DFlash 只加载 prefill、draft、verify 三张 OM，`all` 复用同一个进�
 由同一套动态 msprof 控制器完成 start/stop/quit；无需 pyACL，也不用再套外层 msprof。
 
 默认 `--profile-warmup 1 --profile-timeout 600 --aic-metrics PipeUtilization`。
-每次 warmup 和采集前都重新准备相同状态，模型只加载一次；加载可能耗时数分钟，
+每次 warmup 和采集前都清零请求缓存，从同一 prompt 重新执行准备步骤。
+所有 warmup 和采集结果都与第一次 warmup 比较输入 token 和有效输出；
+verify 只比较实际 block 的有效行，物理 16 行中的填充输出保留在日志中，不参与通过判定。
+有效输出或输入 token 不一致仍返回失败；中间缓存和特征张量尚未逐项比较。
+模型只加载一次；加载可能耗时数分钟，
 必要时提高控制转换的 `--profile-timeout`。指标也可选 `Memory` 或 `MemoryUB`。
 
 | 阶段 | 采集窗口内 | 窗口外 |
@@ -732,6 +736,7 @@ msprof/<mode>-<stage>-<随机后缀>/
     all-operator-types.csv             # 各阶段、各精度的算子次数/耗时
     all-operator-tasks.csv              # 每个任务及输入输出形状、dtype
     all-hotspots.txt                    # 各阶段的慢算子排序
+    profile/msprof/all.iterations.jsonl # 各次预热/采集的输入、输出与比较结果
     profile/msprof/all/prefill/         # 原始 PROF_*、op_summary*.csv
     profile/msprof/all/draft/           # 普通模式对应 decode
     profile/msprof/all/verify/
@@ -743,6 +748,24 @@ msprof/<mode>-<stage>-<随机后缀>/
 示例为 `--profile-stage all`；单阶段时文件前缀改为阶段名，
 raw 目录直接是 `profile/msprof/<stage>/`。直接使用 `run_msprof.sh` 时，
 同样生成这些汇总，文件前缀为指定的 `--label`。
+
+若 start/stop/quit 均成功，随后出现 `profile output differs from warmup`，
+表示采集后的输出一致性检查失败。正常的模型卸载和 `cleanup_end errors=0`
+是退出清理记录。原始采集目录和 `*.iterations.jsonl` 会保留；此时不生成通过报告，
+也可能尚未导出 CSV。
+
+读取 `iterations.jsonl` 中最后一条 `event="completed"`、`check.status="FAIL"`：
+`check.first_difference` 给出字段、从 0 开始的下标、参考值和实际值。
+`input_token_ids` 不同表示准备阶段已产生不同输入；verify 的第一项是 anchor，
+其后是实际候选。输入相同但 `output_token_ids` 不同，表示有效输出发生变化，
+需要继续核对设备上的缓存、特征和算子结果。`input_state_comparison="NOT_RUN"`
+明确表示未比较中间张量，不能仅凭 token 相同认定全部设备输入相同。
+`verify_valid_rows` 给出实际比较行数；仅 `padding_token_ids_match=false`
+不会报错。若有效行数为 16，则填充行不能解释差异。
+
+日志中的 `iteration_trace=` 和 `manifest/<label>.json` 的
+`artifacts.iteration_trace` 都指向该记录。预热之间的差异也会保留记录并立即失败；
+关闭预热会失去此项检查，不能用于确认问题已修复。
 
 `operator-types.csv` 按 stage、原始 CSV、device/model、算子类型、任务类型、OP State、
 输入和输出 dtype 分组，包含 count、total_ms、mean_ms、max_ms。

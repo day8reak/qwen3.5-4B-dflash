@@ -11,10 +11,12 @@ import pytest
 
 from test_incremental_air_om import chunk_bundle  # noqa: F401
 from test_msprof_stage_script import sandbox  # noqa: F401
+from rms_norm_test_support import adn_rms_norm_cpu  # noqa: F401
 from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
 from qwen35_dflash.ascend310p.utils import sha256_file
 
 SOURCE = Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.usefixtures("adn_rms_norm_cpu")
 
 
 @pytest.mark.parametrize(
@@ -187,3 +189,75 @@ def test_shared_om_entry_builds_matching_plan_and_profiles_all(chunk_bundle, san
                for item in control["captures"])
     with (output / "capture/all-operator-types.csv").open(newline="") as stream:
         assert [row["stage"] for row in csv.DictReader(stream)] == stages
+
+
+@pytest.mark.parametrize("stage,variation,warmup,draft_limit,new_tokens,eos,field", [
+    ("verify", "padding", 1, 2, 32, "", None),
+    ("verify", "padding", 1, 15, 3, "", None),
+    ("verify", "padding", 1, 15, 32, "7", None),
+    ("all", "padding", 1, 2, 32, "", None),
+    ("verify", "verify_output", 1, 15, 32, "", "output_token_ids"),
+    ("verify", "draft_input", 1, 15, 32, "", "input_token_ids"),
+    ("verify", "warmup_middle", 3, 15, 32, "", "output_token_ids"),
+    ("decode", "target_decode_output", 1, 15, 32, "", "output_token_ids"),
+    ("prefill", "target_prefill_output", 1, 15, 32, "", "output_token_ids"),
+    ("draft", "draft_output", 1, 15, 32, "", "output_token_ids"),
+    ("verify", "padding", 0, 2, 32, "", None),
+])
+def test_cpp_profile_checks_logical_outputs_and_records_differences(
+    chunk_bundle, sandbox, stage, variation, warmup, draft_limit, new_tokens, eos, field,
+):
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER to the fake ACL runner")
+    root = sandbox["tmp"]
+    mode = "ordinary" if stage in {"prefill", "decode"} else "dflash"
+    plan, _, _ = write_incremental_plan(chunk_bundle, root / "plan.txt", mode=mode)
+    sandbox["env"]["QWEN35_FAKE_PROFILE_VARIATION"] = variation
+    output = root / "profile-run"
+    result = subprocess.run([
+        "bash", str(SOURCE / "tools/run_msprof.sh"), "--label", "check",
+        "--output-dir", str(output), "--python", sys.executable,
+        "--msprof-bin", sandbox["msprof"], "--profile-backend", "cpp",
+        "--profile-mode", mode, "--profile-stage", stage,
+        "--profile-warmup", str(warmup), "--profile-timeout", "5", "--",
+        runner, "--model-kind", "chunk", "--model", str(plan),
+        "--model-sha256", sha256_file(plan), "--prompt-token-ids", ",".join(["4"] * 17),
+        "--eos-token-ids", eos, "--max-draft-tokens", str(draft_limit),
+        "--max-new-tokens", str(new_tokens),
+    ], env=sandbox["env"], capture_output=True, text=True, timeout=40)
+    log = result.stdout + result.stderr
+    manifest = json.loads((output / "manifest/check.json").read_text())
+    if field:
+        assert result.returncode != 0 and manifest["status"] == "FAIL", log
+        assert f"field={field}" in log
+        assert "index=" in log and "reference=" in log and "actual=" in log
+        assert not (output / "check-stage-report.json").exists()
+    else:
+        assert result.returncode == 0 and manifest["status"] == "PASS", log
+    trace = output / "profile/msprof/check.iterations.jsonl"
+    assert manifest["artifacts"]["iteration_trace"] == str(trace)
+    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    completed = [r for r in rows if r["event"] == "completed"]
+    assert completed and all(r["input_state_comparison"] == "NOT_RUN" for r in completed)
+    assert all(r["output_token_ids"] == r["raw_output_token_ids"][:len(r["output_token_ids"])]
+               for r in completed)
+    if field:
+        failure = completed[-1]
+        assert failure["check"]["status"] == "FAIL"
+        assert failure["check"]["first_difference"]["field"] == field
+        assert failure["measured"] is (variation != "warmup_middle")
+        if variation == "warmup_middle":
+            assert failure["iteration"] == 1
+            assert "msprof_start_sent" not in log
+        if variation == "draft_input":
+            assert failure["check"]["input_token_ids_match"] is False
+    else:
+        measured = [r for r in completed if r["measured"]]
+        assert len(measured) == (3 if stage == "all" else 1)
+        assert all(r["check"]["status"] == ("PASS" if warmup else "NO_WARMUP") for r in measured)
+        verify = next(r for r in measured if r["profile_stage"] == "verify")
+        assert verify["verify_valid_rows"] == 3
+        assert verify["padding_output_rows"] == 13
+        assert verify["raw_output_token_ids"][3:] == [43] * 13
+        assert verify["check"]["padding_token_ids_match"] is (False if warmup else None)

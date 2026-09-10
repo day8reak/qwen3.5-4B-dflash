@@ -56,6 +56,11 @@ OM Draft 的 QK/PV 矩阵乘默认使用 FP16 输入，缩放、Mask、Softmax �
 每阶段自动生成算子类型汇总、单任务明细和慢算子排序，FP16/FP32 输入分开统计，
 用于检查 AdnRmsNorm、CacheUpdate、GDR、矩阵乘耗时；Python NPU 的 wrapper 同样提供这些报告。
 
+C++ 采集会比较各次预热和采集的输入 token、有效输出，并保存
+`profile/msprof/<label>.iterations.jsonl`。verify 的填充行只记录，不参与判定；
+有效输出或输入变化会返回失败并写出首个差异。记录在失败后仍保留，
+路径也写入 invocation manifest；中间设备状态未逐项比较。
+
 `infer-cpp --trace-rounds` 记录每轮 proposal、Target 验证、接受前缀和实际输出，
 `--eos-token-id` 可对齐 NPU 的 EOS 策略。
 `infer-cpp --low-memory` 先测试普通模式、卸载模型后再测试 DFlash，
