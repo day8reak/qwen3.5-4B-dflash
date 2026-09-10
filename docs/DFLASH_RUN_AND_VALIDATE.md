@@ -340,7 +340,7 @@ PROFILE_STAGE=all
 
 | 阶段 | 窗口内 |
 |---|---|
-| `prefill` | 完整 Target prefill、特征收集、末行 LM head；不含 Draft 投影和 anchor Top1 |
+| `prefill` | begin 调用内的缓存清零、完整 Target prefill、特征收集、末行 LM head；不含 Draft 投影和 anchor Top1 |
 | `feature-project` | prompt 特征的 Draft `fc + hidden_norm` |
 | `draft` | 一次 Draft 生成，含首轮 Draft KV 构建和 Draft Top1 |
 | `verify-input` | proposal token 回读、EOS 截断、verify block 创建与上传 |
@@ -352,6 +352,9 @@ PROFILE_STAGE=all
 
 verify 使用窗口外真实 prefill 和 Draft 产生的输入。commit 的第二遍 GDR 从本轮初始状态
 执行 `effective_length=accepted+1`，零接受时也会执行，不能当作没有算子的纯主机阶段。
+Target 的 CacheUpdate 位于 prefill、普通 decode 和 verify 窗口中；Draft 的 KV 操作属于
+Draft 窗口。C++ OM 将两遍 GDR 和接受/提交放在一张 verify 图内，其 `verify` 计时范围更大，
+不能直接与 Python `verify` 的时间比较。
 `draft-verify` 和 `decode-round` 的内部不添加采集边界同步；单独阶段的时长不能直接相加
 当作联合窗口时长。
 
@@ -365,6 +368,9 @@ msprof/ordinary-all/
   profile/msprof/python-ordinary-all/decode/
   python-ordinary-all-stage-report.json
   python-ordinary-all-stage-summary.csv
+  python-ordinary-all-operator-types.csv
+  python-ordinary-all-operator-tasks.csv
+  python-ordinary-all-hotspots.txt
   manifest/python-ordinary-all.json
   manifest/python-ordinary-all-control.json
   log/msprof-python-ordinary-all.log
@@ -376,11 +382,20 @@ msprof/ordinary-all/
 | 文件/字段 | 用途 |
 |---|---|
 | `op_summary*.csv` | 具体算子的执行时间 |
-| `<label>-stage-summary.csv` | 每阶段同步时长、算子行数、数据目录 |
+| `<label>-stage-summary.csv` | 每阶段同步时长、`stage_scope`、算子行数、数据目录 |
+| `<label>-operator-types.csv` | 每阶段各算子类型的次数、总时长、平均及最大时长，单位 ms |
+| `<label>-operator-tasks.csv` | 每个任务的算子名、时长、stream/task ID、输入输出形状及 dtype |
+| `<label>-hotspots.txt` | 各阶段慢算子类型和单任务排序 |
 | `profiled_elapsed_ms` | 带 profiling 开销的同步窗口时间，排除控制器等待 |
 | `captured_ordinary_calls` | decode 窗口中 `ordinary_prefill_token_calls=0`、`ordinary_decode_calls=1`；prefill 字段按最多 64 行的块计数 |
 | `captured_gdr_layer_calls` | 检查 verify/commit 的 GDR 调用是否属于所选窗口 |
 | `<label>-control.json` | 应用/采集 PID、start/stop/quit 回执、退出状态 |
+
+算子汇总由 wrapper 自动生成，按阶段、原始 CSV、device/model、算子类型、任务类型、
+OP State 及输入/输出 dtype 分组。`FLOAT;FLOAT` 与 `FLOAT16;FLOAT16` 矩阵乘分开统计；
+筛选 `op_type=CacheUpdate` 或 `ChunkGatedDeltaRule` 可查看对应算子。
+不同 stream 可能重叠，任务时长之和不等于窗口时长。多个导出 CSV 和联合窗口分别统计，
+不会把 `draft`、`verify`、`draft-verify` 的重叠范围累加成请求时延。
 
 `--profile-warmup 1` 表示先在窗口外预热一次，测量时再次从相同 prompt 准备状态。
 阶段诊断忽略 `--max-new-tokens` 的生成预算，block 不按剩余输出预算截短。

@@ -136,12 +136,12 @@
     "runner_file": "models/dflash_v1/benchmark_npu.py",
     "runner_sha256": "f1832a595d5aaf4771b84d7f3e051ff6047a60ac3919735fc045312aba3c2077",
     "msprof_wrapper_file": "tools/run_msprof.sh",
-    "msprof_wrapper_sha256": "036f8e96e1f563b4ed9e6b87481aa8f38f1abe112ba6f9ea29374350a1d5ede2",
+    "msprof_wrapper_sha256": "bfe5095ce82ab33faa28a3080274393fd7ee4e2a0fbe1894847c68e965de9dcb",
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "b5fdd64b1eaea44b3f53452bc260cf62de53ca38b1fcd8699bf4f9e358d99c76",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "01633bcc2e80e0604f468ba0a0cbfd048e2f0c4dc8e9d07ebd26f0181dac4ba6",
-    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks and rollback verify/accepted+1 commit uses two original-GDR chunk calls; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback; native msprof dynamic CLI single-stage and all-stage diagnostics with one loaded application, independent fresh-state warmups and one acknowledged window per stage; verify collects the first original chunk GDR pass, accept-commit includes the mandatory accepted+1 second GDR pass even at zero acceptance, and decode-round collects both; per-window GDR verify/commit layer counters and nonempty operator exports are required; separate raw directories and synchronized timing CSV; no pyACL and no formal latency or strict-greedy accuracy claim from stage diagnostics; ordinary Python and C++ prefill/decode/all windows; C++ DFlash prefill/draft/fused-verify/all windows; native C++ socket barriers and standard-library Python controller; actual graph-call counts checked; no device-performance claim from host fixtures"
+    "documentation_sha256": "789f3b2a108c6b52272dcd670ee1e0fab3b9b4bee2f6c61f62e8a6a4296dd973",
+    "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks and rollback verify/accepted+1 commit uses two original-GDR chunk calls; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback; native msprof dynamic CLI single-stage and all-stage diagnostics with one loaded application, independent fresh-state warmups and one acknowledged window per stage; verify collects the first original chunk GDR pass, accept-commit includes the mandatory accepted+1 second GDR pass even at zero acceptance, and decode-round collects both; per-window GDR verify/commit layer counters and nonempty operator exports are required; separate raw directories and synchronized timing CSV; no pyACL and no formal latency or strict-greedy accuracy claim from stage diagnostics; ordinary Python and C++ prefill/decode/all windows; C++ DFlash prefill/draft/fused-verify/all windows; native C++ socket barriers and standard-library Python controller; actual graph-call counts checked; no device-performance claim from host fixtures; shared per-stage operator type/task reports grouped by input/output dtype, device/model and original CSV; general OM profiling entry prepares a fresh mode-specific plan from the selected deployment manifest"
   },
   "incremental_om_framework": {
     "abi": "qwen35-dflash-chunk-v3",
@@ -157,23 +157,23 @@
       },
       {
         "source_file": "docs/DFLASH_ARCHITECTURE.md",
-        "source_sha256": "ad9accce427b46c67044589fd394a8581b91465e34e8adc8047e93d97c2fb34a"
+        "source_sha256": "30021763c3eff3c8173a7e44c23a855b06c5ad2738a8e71b77d17372c55f6962"
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "efc4c9963c764424e66dfcfc715bc90d1002405be5f01016cb9cb974957f864d"
+        "source_sha256": "cdbc87646620991d235a98cdf17adc6aebe3004dfb9c6f8158f2b7b2aeb5889b"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "bf7f95c27969166dfb3aeae52d47f086961e0589d15553ea7fe9074078a5faef"
+        "source_sha256": "0eefb5dde36f8157638ce2331b105beadeca57cc846c72bbce3a218aaf45dda5"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
-        "source_sha256": "ff99489b24b914717633b4025a47e13715274759283830cdfa1a0a5a31a8d65c"
+        "source_sha256": "ee053a01221e1c9fc5d049d0effb7d6d3325c1b0ab021a5709b822763289550d"
       },
       {
         "source_file": "framework/README.md",
-        "source_sha256": "585e7ca62b78d954ae373a0ae0a46f0bd61f57027eb923d1c0e97fa5883b13fb"
+        "source_sha256": "6ab8194a841e22db77d1e6335a1e5ba335019f1cbbf6b581944baf17e11218b7"
       },
       {
         "source_file": "framework/abi/closed-runtime-baseline-v1.json",
@@ -353,7 +353,7 @@
       },
       {
         "source_file": "tests/test_cpp_stage_profile.py",
-        "source_sha256": "2b14542cd0e77b2e46b70f51edf7cf0b37a6407284ee92f30afc0dd89ac8203f"
+        "source_sha256": "504442cad28c8c7c754a556664a016fb9f078ee66f25c8b1df1b9be18c1899d4"
       },
       {
         "source_file": "tests/test_custom_op_export.py",
@@ -365,7 +365,7 @@
       },
       {
         "source_file": "tests/test_msprof_stage_script.py",
-        "source_sha256": "7dc9ecf9925fe5a6040059a1b35c37825e6f4e5b97917b400724ec2dcb0cfc3a"
+        "source_sha256": "36a4f7fc3aa42d2ea5424527bbd9ba73d2365680c743129143b2344577c02824"
       },
       {
         "source_file": "tests/test_prompt_tokenization.py",
@@ -401,11 +401,19 @@
       },
       {
         "source_file": "tools/profile_verify_om.py",
-        "source_sha256": "e1c74dd301d5e5f9ff8c7b361615ccb2995ba9a5fb405fe5996e69e3a3c9c3b6"
+        "source_sha256": "3742cca061687a833684cd6d5ca59b3687d8b031c627b76ad9b00da4391d809d"
       },
       {
         "source_file": "tests/test_profile_verify_om.py",
-        "source_sha256": "ef0729e2a78e1d0501e90ca35aad1662dd83d8642f94ac81ca3535436bdb7bc2"
+        "source_sha256": "3b54055cbe44967adf46581eecb8dbde7c6ecd1cac9edf641ea03b1bdf3eefd6"
+      },
+      {
+        "source_file": "tools/profile_om.py",
+        "source_sha256": "e1db1bdc49597cfd83b51a041c3b6abcf9bb122920d4048699e967a3c209705d"
+      },
+      {
+        "source_file": "models/dflash_v1/msprof_summary.py",
+        "source_sha256": "8addd6f898f099a0989038a665164fcc095f1425782dd15ec60b041db30c9b7f"
       }
     ]
   }

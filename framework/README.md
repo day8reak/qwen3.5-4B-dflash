@@ -42,11 +42,15 @@ OM Draft 的 QK/PV 矩阵乘默认使用 FP16 输入，缩放、Mask、Softmax �
 1. 使用 `infer-cpp` 进行普通/DFlash 各 3 次预热和 10 次测量。
 2. 比较 NPU ordinary/DFlash、OM ordinary/DFlash 的 token IDs、EOS 和停止原因。
 3. 使用 `prepare-chunk-plan` 生成所需模式的加载计划。
-4. 使用 `tools/run_msprof.sh --profile-backend cpp` 采集单个阶段或 `all`。
+4. 使用 `tools/profile_om.py --profile-mode ordinary|dflash --profile-stage all`，
+   指定运行目录、runner 和 deployment manifest，自动准备加载计划并分别采集各阶段。
+   单阶段将 `all` 替换为阶段名；内部统一调用 `tools/run_msprof.sh --profile-backend cpp`。
 
 普通模式支持 `prefill|decode|all`；DFlash 支持 `prefill|draft|verify|all`。
 `all` 在一个 C++ 进程中为各阶段分别创建一次采集窗口。全部命令、参数和报告路径均在
 [完整手册](../docs/GDR_CHUNK_AIR_OM.md)中。
+每阶段自动生成算子类型汇总、单任务明细和慢算子排序，FP16/FP32 输入分开统计，
+用于检查 CacheUpdate、GDR、矩阵乘耗时；Python NPU 的 wrapper 同样提供这些报告。
 
 `infer-cpp --trace-rounds` 记录每轮 proposal、Target 验证、接受前缀和实际输出，
 `--eos-token-id` 可对齐 NPU 的 EOS 策略。

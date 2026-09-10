@@ -334,6 +334,11 @@ correction 或 bonus 成为下一轮 anchor，本轮不提前把它写入已提�
 
 ## 8. msprof 窗口
 
+OM 命令使用 `tools/profile_om.py --profile-mode ordinary|dflash --profile-stage all`，
+指定 `--run-dir`、`--runner` 和 `--deployment-manifest` 即可自动生成匹配的加载计划并采集。
+每次创建独立输出目录并记录清单、runner hash；单阶段将 `all` 替换为所需阶段。
+准备计划使用模型 Python 环境，采集由 C++ runner 执行。
+
 统一 wrapper 为 `tools/run_msprof.sh`。C++ 使用 `--profile-backend cpp`，
 普通模式选 `--profile-mode ordinary --profile-stage prefill|decode|all`，DFlash 选
 `--profile-mode dflash --profile-stage prefill|draft|verify|all`。这些参数放在 wrapper 的
@@ -344,4 +349,10 @@ correction 或 bonus 成为下一轮 anchor，本轮不提前把它写入已提�
 
 Python NPU 支持更细的投影、输入准备、Top1、接受/提交和联合窗口，完整范围见
 [Python NPU 手册](DFLASH_RUN_AND_VALIDATE.md)。两个后端均由 msprof 动态 PID CLI 控制，
-无需 pyACL。每段算子耗时查看 `op_summary*.csv`，阶段同步耗时查看 stage report/summary。
+无需 pyACL。Python `verify` 只包含第一遍 GDR，第二遍在 `accept-commit`；
+与 C++ 融合 verify 比较时先核对范围。
+两个后端的 wrapper 都自动输出 `<label>-operator-types.csv`、`operator-tasks.csv` 和
+`hotspots.txt`（三者都有 label 前缀），按阶段、原始 CSV、device/model、算子/任务类型、
+OP State、输入/输出 dtype 分组。可分别查看 CacheUpdate、GDR 和 FP16/FP32 矩阵乘，
+原始证据保留在 `op_summary*.csv`。阶段同步耗时及范围查看 stage report/summary；
+不同阶段或导出文件不合并，算子耗时之和不能作为端到端时延。

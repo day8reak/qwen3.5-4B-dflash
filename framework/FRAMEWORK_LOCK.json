@@ -216,7 +216,11 @@
       {
         "torch_target": "qwen35_dflash.npu_cache_update.default",
         "ge_op_type": "CacheUpdate",
-        "minimum_air_occurrences": {"target_prefill": 16, "target_decode": 16, "target_verify": 256}
+        "minimum_air_occurrences": {
+          "target_prefill": 16,
+          "target_decode": 16,
+          "target_verify": 256
+        }
       }
     ],
     "draft_custom_operators": [],
@@ -239,6 +243,27 @@
       "verify"
     ],
     "all": "one fresh-state window per declared stage, same loaded application PID",
-    "python_profile_api": false
+    "python_profile_api": false,
+    "om_entry": "tools/profile_om.py",
+    "om_entry_default": "dflash/all; fresh mode-specific plan from the selected deployment manifest",
+    "operator_summary": "models/dflash_v1/msprof_summary.py",
+    "operator_reports": [
+      "<label>-operator-types.csv",
+      "<label>-operator-tasks.csv",
+      "<label>-hotspots.txt"
+    ],
+    "operator_grouping": "per stage and original CSV; device/model, op/task type, OP State, input/output dtype; do not sum exports or independent/combined windows as request latency",
+    "python_dflash_stages": [
+      "prefill",
+      "feature-project",
+      "draft",
+      "verify-input",
+      "verify",
+      "target-top1",
+      "accept-commit",
+      "draft-verify",
+      "decode-round"
+    ],
+    "verify_scope": "Python verify contains first-pass GDR, accept-commit contains second-pass GDR; C++ verify contains both passes and in-graph acceptance/committed state"
   }
 }

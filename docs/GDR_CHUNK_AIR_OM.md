@@ -642,149 +642,125 @@ anchor＋K 个 mask 作为有效 block key，包括非因果层。输出只读�
 报告的 `stage_ms` 按图保留每次同步 OM 调用时间，包含必要的输入/输出复制。具体算子时间
 使用下一步的 msprof。不要把不同计时范围、精度、prompt 或输出长度的结果直接计算加速比。
 
-## 13. 普通模式：只采一次 prefill 和一次 decode
+## 13. 普通模式：分别采一次 prefill 和 decode
 
-先生成加载计划，再由 wrapper 启动 C++。需要支持动态 PID 采集的 msprof：
+配置 msprof 和要测量的 OM 清单，然后运行统一采集入口：
 
 ```bash
 export MSPROF_BIN=/absolute/path/msprof
-"$MSPROF_BIN" --version
-"$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p prepare-chunk-plan \
-  --deployment-manifest "$AI_RUN_DIR/artifacts/deployment-manifest.json" \
-  --mode ordinary --output "$AI_RUN_DIR/ordinary-plan.txt"
-read -r ORDINARY_PLAN_SHA _ < <(sha256sum "$AI_RUN_DIR/ordinary-plan.txt")
-read -r PROMPT_TOKEN_IDS < "$AI_RUN_DIR/prompt-ids.csv"
+export DEPLOYMENT_MANIFEST="$AI_RUN_DIR/artifacts/deployment-manifest.json"
 
-"$REPO_ROOT/tools/run_msprof.sh" \
-  --label om-ordinary-all --output-dir "$AI_RUN_DIR/msprof/ordinary-all" \
-  --python "$MODEL_PYTHON" --msprof-bin "$MSPROF_BIN" \
-  --profile-backend cpp --profile-mode ordinary \
-  --profile-stage all --profile-warmup 1 --aic-metrics PipeUtilization \
-  -- "$CPP_RUNNER" --model-kind chunk \
-    --model "$AI_RUN_DIR/ordinary-plan.txt" --model-sha256 "$ORDINARY_PLAN_SHA" \
-    --prompt-token-ids "$PROMPT_TOKEN_IDS" --eos-token-ids 248044 --device-id 0
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/profile_om.py" \
+  --run-dir "$AI_RUN_DIR" --runner "$CPP_RUNNER" \
+  --deployment-manifest "$DEPLOYMENT_MANIFEST" \
+  --profile-mode ordinary --profile-stage all --device-id 0
 ```
 
-`all` 分别开启 prefill 和 decode 两个窗口，每个只采一次。
-每次 warmup 和测量都从相同 prompt 重建状态；decode 的 prefill/KV 准备在窗口外。
-普通 C++ 只加载两个 OM。控制器只需要 Python 标准库；C++ 推理和采集不调用 pyACL。
+`DEPLOYMENT_MANIFEST` 指向本次要测量的模型产物；如果使用其他 bundle 目录，在这里设置对应路径。
+脚本根据清单重新生成加载计划并记录清单、runner 的 SHA-256，不复用手工保存的计划。
+准备计划使用上述模型 Python 环境；实际采集由 C++ runner 执行，普通模式只加载 prefill 和 decode 两张 OM。
 
-只测单个阶段时，执行以下完整命令；`PROFILE_STAGE` 可填 `prefill` 或 `decode`：
+`all` 在一个 C++ 进程中分别采一次 prefill、一次 decode，每个窗口都从相同 prompt
+重建状态并在窗口外预热。只测其中一项时，将 `--profile-stage all` 改为
+`--profile-stage prefill` 或 `--profile-stage decode`。
 
-```bash
-PROFILE_STAGE=decode
-"$REPO_ROOT/tools/run_msprof.sh" \
-  --label "om-ordinary-$PROFILE_STAGE" --output-dir "$AI_RUN_DIR/msprof/ordinary-$PROFILE_STAGE" \
-  --python "$MODEL_PYTHON" --msprof-bin "$MSPROF_BIN" \
-  --profile-backend cpp --profile-mode ordinary \
-  --profile-stage "$PROFILE_STAGE" --profile-warmup 1 --aic-metrics PipeUtilization \
-  -- "$CPP_RUNNER" --model-kind chunk \
-    --model "$AI_RUN_DIR/ordinary-plan.txt" --model-sha256 "$ORDINARY_PLAN_SHA" \
-    --prompt-token-ids "$PROMPT_TOKEN_IDS" --eos-token-ids 248044 --device-id 0
-```
+prompt 和 EOS 优先取自 `reports/cpp-paired.json`；不存在时读取 `prompt-ids.csv`，
+EOS 默认 `248044`。可用 `--prompt-report /path/to/report.json` 指定推理报告，
+或用 `--prompt-token-ids "..." --eos-token-ids 248044` 指定相同的输入。
+每次生成新的输出目录，开始时打印路径和所用 prompt 来源。
 
 ## 14. DFlash 模式：分别采一次 prefill、draft、verify
 
-只采一次 verify 并按耗时排序算子，在第 1 步配置的同一终端执行：
-
 ```bash
-cd "$REPO_ROOT"
-"$MODEL_PYTHON" -B tools/profile_verify_om.py \
-  --run-dir "$AI_RUN_DIR" --runner "$CPP_RUNNER" --device-id 0
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/profile_om.py" \
+  --run-dir "$AI_RUN_DIR" --runner "$CPP_RUNNER" \
+  --deployment-manifest "$DEPLOYMENT_MANIFEST" \
+  --profile-mode dflash --profile-stage all --device-id 0 \
+  --max-new-tokens "$MAX_NEW_TOKENS" --max-draft-tokens 15
 ```
 
-脚本读取 `artifacts/deployment-manifest.json`，生成与现有 OM 配套的三图计划。
-prompt 和 EOS 优先取自 `reports/cpp-paired.json`；该文件不存在时，读取
-`prompt-ids.csv` 并使用 EOS `248044`。也可用 `--prompt-report /path/to/report.json`
-指定报告，或用 `--prompt-token-ids "..." --eos-token-ids 248044` 指定 token IDs。
-`--deployment-manifest` 可指定其他运行目录中的 OM 清单。
+`--profile-stage` 可选 `prefill`、`draft`、`verify`、`all`。
+例如只测一次验证，将上面的 `all` 改为 `verify`。
+DFlash 只加载 prefill、draft、verify 三张 OM，`all` 复用同一个进程，
+按顺序开启三个独立窗口，每个阶段只采一次。内部统一调用 `tools/run_msprof.sh`，
+由同一套动态 msprof 控制器完成 start/stop/quit；无需 pyACL，也不用再套外层 msprof。
 
-默认预热一次，然后只采一次完整的 `target_verify.om` 调用；prefill、draft、模型加载、
-状态准备和预热都在采集窗口外。加载三个 OM 可能耗时数分钟，默认每次控制转换的等待上限
-为 600 秒。采集使用 msprof 动态 CLI，无需 pyACL。`MSPROF_BIN` 未设置时从 PATH 查找
-`msprof`。默认 `--max-new-tokens 32 --max-draft-tokens 15 --profile-warmup 1`。
+默认 `--profile-warmup 1 --profile-timeout 600 --aic-metrics PipeUtilization`。
+每次 warmup 和采集前都重新准备相同状态，模型只加载一次；加载可能耗时数分钟，
+必要时提高控制转换的 `--profile-timeout`。指标也可选 `Memory` 或 `MemoryUB`。
 
-每次创建新的 `msprof/verify-<随机后缀>/`，开始时打印完整路径，完成时输出：
-
-| 文件 | 内容 |
-|---|---|
-| `hotspots.txt` | 耗时最高的 20 类算子和 20 个任务，保留 AI_CORE/AI_CPU、静态/动态和输入形状 |
-| `operator-types.csv` | 按算子类型、任务类型和 OP State 分组的次数、总时长、平均值、最大值，单位 ms |
-| `operator-tasks.csv` | 全部任务按耗时排序，保留名称、形状和输入 dtype |
-| `capture/verify-stage-summary.csv` | 同步的 verify 阶段时间 `profiled_elapsed_ms` |
-| `capture/profile/msprof/verify/` | 原始 PROF 数据、时间线和 `op_summary*.csv` |
-| `capture/log/` | 设备检查、msprof 和执行日志 |
-
-排序使用 msprof 的 `Task Duration(us)` 并换算成 ms。不同 stream 的任务可能重叠，
-算子时长之和不等于阶段耗时；多个 CSV 分别统计，不合并累加。阶段耗时包含 profiling
-开销。判断慢算子时，同时查看排序结果与时间线中的空隙。
-
-需要分别采 prefill、draft、verify 时，使用以下命令：
-
-```bash
-"$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p prepare-chunk-plan \
-  --deployment-manifest "$AI_RUN_DIR/artifacts/deployment-manifest.json" \
-  --mode dflash --output "$AI_RUN_DIR/dflash-plan.txt"
-read -r DFLASH_PLAN_SHA _ < <(sha256sum "$AI_RUN_DIR/dflash-plan.txt")
-
-PROFILE_STAGE=all
-"$REPO_ROOT/tools/run_msprof.sh" \
-  --label "om-dflash-$PROFILE_STAGE" --output-dir "$AI_RUN_DIR/msprof/dflash-$PROFILE_STAGE" \
-  --python "$MODEL_PYTHON" --msprof-bin "$MSPROF_BIN" \
-  --profile-backend cpp --profile-mode dflash \
-  --profile-stage "$PROFILE_STAGE" --profile-warmup 1 --aic-metrics PipeUtilization \
-  -- "$CPP_RUNNER" --model-kind chunk \
-    --model "$AI_RUN_DIR/dflash-plan.txt" --model-sha256 "$DFLASH_PLAN_SHA" \
-    --prompt-token-ids "$PROMPT_TOKEN_IDS" --eos-token-ids 248044 --device-id 0
-```
-
-`PROFILE_STAGE` 可填 `prefill`、`draft`、`verify`、`all`。`all` 复用一个 C++ 进程，
-依次为三个阶段创建独立窗口；DFlash 不加载 decode OM。
-
-| 阶段 | 窗口内 | 窗口外的准备 |
+| 阶段 | 采集窗口内 | 窗口外 |
 |---|---|---|
-| `prefill` | 全部 Target prompt 分块，包含各块 Top1 | 状态清零；不执行 Draft |
-| `decode` | 一次一行 Target decode、LM head、Top1 和状态更新 | prefill、KV 初始化 |
-| `draft` | 一次 draft OM：末块特征投影、Draft KV 追加、K token proposal | Target prefill、长 prompt 前面分块的 Draft KV 初始化 |
-| `verify` | 一次 verify OM：两次 GDR、Target Top1、接受判断和 committed state | prefill、Draft、EOS 截断、block 整理；之后的 C++ 状态指针发布 |
+| `prefill` | 完整 Target prompt，包含全部 64 行分块、CacheUpdate 和各块 Top1 | 状态清零；不执行 Draft |
+| `decode` | 一次一行 Target decode、CacheUpdate、LM head、Top1 和状态更新 | prefill、KV 初始化 |
+| `draft` | 一次 draft OM：末块特征投影、dense KV 追加、候选生成和 Top1 | Target prefill、长 prompt 前面分块的 Draft KV 初始化 |
+| `verify` | 一次 verify OM：CacheUpdate、两遍 GDR、Target Top1、接受判断和 committed state | prefill、Draft、EOS 截断、block 整理；之后的 C++ 状态指针发布 |
 
-一次 prefill 窗口可以有多次 64 行 OM 调用。verify 内部已经融合 commit，C++ 不提供
-独立 `accept-commit` 窗口；内部算子可从 verify 的算子 CSV 查看。
-采集时 K=`min(max_draft_tokens, max_new_tokens-1, 15)`，减去的一项是 prefill
-已经输出的 anchor。可在 C++ runner 参数中设置 `--max-draft-tokens` 和
-`--max-new-tokens`；默认 K=15。各窗口的报告记录 `proposal_count`。
-普通 decode 需要 prompt 后至少留一行 KV，DFlash verify/all 需要 K+1 行空间。
-anchor 为 EOS 时退出，不伪造空的 decode/verify 采集。
+一次 prefill 窗口可能包含多次 OM 调用。verify 已融合 commit，第一遍 GDR 的 state
+只保留设备缓冲区并丢弃，第二遍 state 才提交。无需为内部 commit 另建 OM 或采集窗口。
+AIR 的 CacheUpdate 节点约束是每次 prefill 16 个、decode 16 个、verify 256 个；
+实际 OM 任务以 msprof 导出为准。Draft 的 dense KV 仍可出现 ScatterElements。
 
-## 15. 读取 msprof 输出
+采集时 K=`min(max_draft_tokens, max_new_tokens-1, 15)`；EOS 截断可能进一步缩短
+verify 的有效输入。普通 decode 需要 prompt 后至少留一行 KV，DFlash verify/all 需要
+K+1 行空间。anchor 为 EOS 时退出，不伪造空的 decode/verify 采集。
 
-第 13 步 `all` 的输出为：
+Python NPU 的 `verify` 只采第一遍 GDR，`accept-commit` 单独采第二遍及提交；
+C++ OM 的 `verify` 采整个融合图。两者同名窗口范围不同，不能直接比较其时间。
+Python 的细分和联合阶段见 [Python NPU 手册](DFLASH_RUN_AND_VALIDATE.md)。
+
+## 15. 读取每阶段算子耗时
+
+统一入口为每次运行创建目录：
 
 ```text
-msprof/ordinary-all/
-  profile/msprof/om-ordinary-all/prefill/   # 原始 PROF_* 和 op_summary*.csv
-  profile/msprof/om-ordinary-all/decode/
-  om-ordinary-all-stage-report.json
-  om-ordinary-all-stage-summary.csv
-  manifest/om-ordinary-all.json
-  manifest/om-ordinary-all-control.json
-  log/msprof-om-ordinary-all.log
+msprof/<mode>-<stage>-<随机后缀>/
+  profile-request.json                 # 模型清单、runner hash、输入和采集参数
+  plan.txt                             # 从指定清单生成的加载计划
+  capture/
+    all-stage-report.json
+    all-stage-summary.csv              # 各窗口同步时延和 stage_scope
+    all-operator-types.csv             # 各阶段、各精度的算子次数/耗时
+    all-operator-tasks.csv              # 每个任务及输入输出形状、dtype
+    all-hotspots.txt                    # 各阶段的慢算子排序
+    profile/msprof/all/prefill/         # 原始 PROF_*、op_summary*.csv
+    profile/msprof/all/draft/           # 普通模式对应 decode
+    profile/msprof/all/verify/
+    manifest/all.json
+    manifest/all-control.json
+    log/msprof-all.log
 ```
 
-单阶段的 raw 目录是 `profile/msprof/<label>/`，没有阶段子目录。
-`op_summary*.csv` 提供算子执行时间；`stage-summary.csv` 提供同步阶段时间、算子行数和路径。
-`profiled_elapsed_ms` 包含 profiling 开销，排除 msprof attach/start/stop/quit 等待。
+示例为 `--profile-stage all`；单阶段时文件前缀改为阶段名，
+raw 目录直接是 `profile/msprof/<stage>/`。直接使用 `run_msprof.sh` 时，
+同样生成这些汇总，文件前缀为指定的 `--label`。
 
-控制器等待 start 回执后放行应用，同步设备并收到 stop/quit 回执后完成一个窗口。
-所有窗口都要求调用次数正确、进程成功退出且导出非空算子 CSV，任一失败则整体 FAIL。
-`--profile-timeout` 默认 600 秒；应按模型加载和阶段执行时间设置。
-每次采集使用新的 label/输出路径，已有 raw 数据及报告不会被覆盖。
+`operator-types.csv` 按 stage、原始 CSV、device/model、算子类型、任务类型、OP State、
+输入和输出 dtype 分组，包含 count、total_ms、mean_ms、max_ms。
+筛选 `op_type=CacheUpdate` 可查看缓存更新；筛选矩阵乘时，
+`FLOAT;FLOAT` 与 `FLOAT16;FLOAT16` 分开统计。`operator-tasks.csv` 保留
+op_name、stream/task ID、输入输出形状，可定位具体 GDR 或矩阵乘节点。
+
+排序将 `Task Duration(us)` 换算为 ms。不同 stream 的任务可能重叠，算子时长之和
+不等于阶段时间；多个 CSV、不同阶段分别统计，不合并累加。`stage-summary.csv` 中的
+`profiled_elapsed_ms` 包含 profiling 开销，排除 msprof 控制等待。
+判断端到端是否提速仍使用不带 profiler 的 3+10 测量。
+
+控制器收到 start 回执才放行应用，设备同步后收到 stop/quit 回执才完成窗口。
+调用次数错误、进程失败、空导出或没有有效任务时长时整体 FAIL，不生成成功的算子汇总。
+`PASS_CAPTURE` 表示采集流程完成，不能替代完整 token/接受率验证。
 
 ## 16. 单模式运行和部署容量
 
-使用第 14 步生成的三图计划，可直接启动 DFlash 生成：
+生成单模式加载计划，再启动 DFlash 生成：
 
 ```bash
+"$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p prepare-chunk-plan \
+  --deployment-manifest "$DEPLOYMENT_MANIFEST" \
+  --mode dflash --output "$AI_RUN_DIR/dflash-plan.txt"
+read -r DFLASH_PLAN_SHA _ < <(sha256sum "$AI_RUN_DIR/dflash-plan.txt")
+read -r PROMPT_TOKEN_IDS < "$AI_RUN_DIR/prompt-ids.csv"
+
 "$CPP_RUNNER" --model-kind chunk --mode dflash \
   --model "$AI_RUN_DIR/dflash-plan.txt" --model-sha256 "$DFLASH_PLAN_SHA" \
   --prompt-token-ids "$PROMPT_TOKEN_IDS" --eos-token-ids 248044 \
@@ -805,7 +781,7 @@ decode 或 paired。不同 OM 不会自动共享权重，设备显存要覆盖�
 `speculation_disable_events` 和 `target_only_fallback_rounds` 记录关闭 Draft 及后续轮数；
 `stage_ms` 显示实际调用了 decode 还是 verify。两种后备路径都需要与 ordinary 检查
 token 等价。固定 64 行 Draft gear、非末尾 prompt 块的 Draft KV 初始化、每块 prefill
-的 LM head，以及 functional KV 更新，都可能增加开销，应按实际 msprof 数据评估。
+的 LM head，以及 Draft dense KV 和图边界状态复制，都可能增加开销，应按实际 msprof 数据评估。
 
 ## 17. 失败定位
 

@@ -261,15 +261,21 @@ Python NPU 方式直接调用 Torch-NPU 执行模型，适合验证和更细的�
 OM/C++ 方式将计算放进静态图，生成循环由 C++ 执行。两者使用相同的最长前缀接受规则，
 应分别检查最终 token 一致性与逐轮候选差异。
 
-统一入口为 `tools/run_msprof.sh`，采集使用 msprof 动态 PID 功能，无需 pyACL：
+OM 使用 `tools/profile_om.py --profile-mode ordinary|dflash --profile-stage all`，
+自动从指定 deployment manifest 生成加载计划。Python NPU 使用 `tools/run_msprof.sh`；
+OM 入口也调用这个 wrapper，共用 msprof 动态 PID 控制器，无需 pyACL：
 
 | C++ 模式 | 可以单独采一次的阶段 | `all` |
 |---|---|---|
 | 普通模式 | `prefill`、`decode` | 同进程分别采两个阶段 |
 | DFlash | `prefill`、`draft`、`verify` | 同进程分别采三个阶段；verify 包含两遍 GDR 和 commit |
 
-预热和待测状态准备放在采集窗口外。Python 还可单独采 feature projection、接受/提交等细分阶段，
-范围和命令见运行手册。判断“是否更快”用不带 profiler 的 3+10 测量；msprof 用来回答
+预热放在采集窗口外；C++ prefill 的状态清零也在窗口外，Python prefill 则包含 begin 调用内的清零。
+Python 还可单独采 feature projection、接受/提交等细分阶段，
+其中 Python `verify` 只含第一遍 GDR，`accept-commit` 含第二遍；C++ `verify` 含整个融合图。
+两个后端每阶段均输出算子类型汇总、单任务明细和慢算子排序，按原始 CSV 和输入/输出 dtype
+分别统计，可直接查看 CacheUpdate、GDR 及 FP16/FP32 矩阵乘。范围和命令见运行手册。
+判断“是否更快”用不带 profiler 的 3+10 测量；msprof 用来回答
 “时间花在哪些算子上”，算子耗时简单求和不能替代端到端时延。
 
 ## 8. 对应源码在哪里
@@ -282,6 +288,7 @@ OM/C++ 方式将计算放进静态图，生成循环由 C++ 执行。两者使�
 | C++ 逐轮生成、接受和停止 | [chunk.cpp](../framework/runtime/cpp/src/chunk.cpp) |
 | OM 加载、设备缓冲区、状态发布 | [acl_chunk.cpp](../framework/runtime/cpp/src/acl_chunk.cpp) |
 | Python NPU 的 Target 和调度 | [modeling_qwen3_5_hiai_nd_dflash_rollback.py](../models/modeling_qwen3_5_hiai_nd_dflash_rollback.py)、[dflash_rollback_decode.py](../models/dflash_v1/dflash_rollback_decode.py) |
+| OM 分阶段入口、公共采集和算子汇总 | [profile_om.py](../tools/profile_om.py)、[run_msprof.sh](../tools/run_msprof.sh)、[msprof_summary.py](../models/dflash_v1/msprof_summary.py) |
 
 按步骤运行见 [AIR/OM/C++ 部署手册](GDR_CHUNK_AIR_OM.md)；
 tensor ABI 和参数定义见 [接口参考](QUANT_AIR_OM_FRAMEWORK.md)，

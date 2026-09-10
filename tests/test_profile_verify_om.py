@@ -14,6 +14,8 @@ SCRIPT = Path(__file__).resolve().parents[1] / "tools/profile_verify_om.py"
 spec = importlib.util.spec_from_file_location("profile_verify_om", SCRIPT)
 profile = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(profile)
+import profile_om as unified
+from msprof_summary import summarize_windows
 
 
 def operator_csv(path, rows, header=None):
@@ -138,17 +140,67 @@ def test_one_verify_capture_uses_fresh_plan_and_propagates_failure(tmp_path, mon
             output = Path(before[before.index("--output-dir") + 1])
             operator_csv(output / "raw/op_summary.csv", [["TEST_ONLY", 1000]],
                          ["Op Name", "Task Duration(us)"])
+            # run_msprof.sh owns the shared post-capture summary as well.
+            summarize_windows([{"stage": "verify", "profile_mode": "dflash",
+                                "profile_backend": "cpp", "profile_output": str(output / "raw")}],
+                              output, prefix="verify")
 
     monkeypatch.setattr(profile.subprocess, "run", invoke)
     if failure:
         with pytest.raises(subprocess.CalledProcessError):
             profile.run_profile(args)
-        assert not list(run.rglob("hotspots.txt"))
+        assert not list(run.rglob("*hotspots.txt"))
         assert len(calls) == (1 if failure == "prepare" else 2)
     else:
         first = profile.run_profile(args)
         second = profile.run_profile(args)
         assert first != second
         assert first.is_relative_to(run) and second.is_relative_to(run)
-        assert (first / "hotspots.txt").is_file() and (second / "hotspots.txt").is_file()
+        assert (first / "capture/verify-hotspots.txt").is_file()
+        assert (second / "capture/verify-hotspots.txt").is_file()
         assert len(calls) == 4
+
+
+def test_stages_and_precision_groups_never_merge(tmp_path):
+    windows = []
+    for stage in ("prefill", "verify"):
+        capture = tmp_path / stage
+        operator_csv(capture / "one/op_summary.csv", [
+            ["M16", "BatchMatMul", "AI_CORE", "static", 1000, "1,16,16", "FLOAT16;FLOAT16"],
+            ["M32", "BatchMatMul", "AI_CORE", "static", 9000, "1,16,16", "FLOAT;FLOAT"],
+            ["KV", "CacheUpdate", "AI_CORE", "static", 10, "3,2,64,16", "FLOAT16;FLOAT16;INT32;INT32"],
+        ])
+        operator_csv(capture / "two/op_summary.csv", [
+            ["M16", "BatchMatMul", "AI_CORE", "static", 2000, "1,16,16", "FLOAT16;FLOAT16"],
+        ])
+        windows.append({"stage": stage, "profile_mode": "dflash",
+                        "profile_backend": "cpp", "profile_output": str(capture)})
+    summarize_windows(windows, tmp_path, prefix="all")
+    with (tmp_path / "all-operator-types.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 8
+    for stage in ("prefill", "verify"):
+        current = [r for r in rows if r["stage"] == stage]
+        assert [float(r["total_ms"]) for r in current] == [9, 1, 0.01, 2]
+        assert current[0]["input_data_types"] == "FLOAT;FLOAT"
+        assert current[1]["input_data_types"] == "FLOAT16;FLOAT16"
+        assert current[2]["op_type"] == "CacheUpdate" and current[2]["count"] == "1"
+    with pytest.raises(ValueError, match="already exists"):
+        summarize_windows(windows, tmp_path, prefix="all")
+
+
+@pytest.mark.parametrize("mode,stage", [
+    ("ordinary", "draft"), ("ordinary", "verify"), ("dflash", "decode"),
+])
+def test_invalid_mode_stage_fails_before_creating_output(tmp_path, mode, stage):
+    run, args = setup_run(tmp_path)
+    args.profile_mode, args.profile_stage = mode, stage
+    with pytest.raises(ValueError, match="stages:"):
+        unified.run_profile(args)
+    assert not (run / "msprof").exists()
+
+
+def test_shared_entry_defaults_and_compatibility():
+    assert unified.parser().parse_args([]).profile_stage == "all"
+    assert profile.parser().parse_args([]).profile_stage == "verify"
+    assert profile.run_profile is unified.run_profile

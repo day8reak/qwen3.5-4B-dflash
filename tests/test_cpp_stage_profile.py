@@ -1,5 +1,6 @@
 """Real C++ socket barriers + real controller, fake ACL/msprof. No device evidence."""
 
+import csv
 import json
 import os
 from pathlib import Path
@@ -138,7 +139,51 @@ def test_cpp_stage_windows(chunk_bundle, sandbox, mode, stage, failure, draft_li
         if role == "target_verify":
             assert valid == count + 1
     assert all(r["warmup_output_match"] for r in reports)
+    with Path(manifest["artifacts"]["operator_types"]).open(newline="") as stream:
+        operators = list(csv.DictReader(stream))
+    assert [row["stage"] for row in operators] == stages
+    assert all(row["profile_mode"] == mode and row["profile_backend"] == "cpp" for row in operators)
     if stage == "decode":
         assert all(not r[1] for r in rows if r[0] == "target_prefill")
     if mode == "ordinary":
         assert not any(r[0] in {"draft", "target_verify"} for r in rows)
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "dflash"])
+def test_shared_om_entry_builds_matching_plan_and_profiles_all(chunk_bundle, sandbox, mode):
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER to the fake ACL runner")
+    root = sandbox["tmp"]
+    # Preparing a plan uses the model-side CLI (and its Torch imports).
+    # The C++ collector itself remains standard-library-only, tested above.
+    (root / "stubs/torch.py").unlink()
+    for module in ("torch_npu", "acl"):
+        (root / ("stubs/" + module + ".py")).write_text(
+            'raise AssertionError("OM plan/capture must not initialize NPU Python bindings")\n')
+    events = root / "all-events.jsonl"
+    sandbox["env"]["QWEN35_FAKE_EVENT_LOG"] = str(events)
+    result = subprocess.run([
+        sys.executable, "-B", str(SOURCE / "tools/profile_om.py"),
+        "--run-dir", str(root), "--runner", runner,
+        "--deployment-manifest", str(chunk_bundle),
+        "--prompt-token-ids", ",".join(["4"] * 65), "--eos-token-ids", "248044",
+        "--profile-mode", mode, "--profile-stage", "all", "--profile-timeout", "5",
+        "--msprof-bin", sandbox["msprof"],
+    ], env=sandbox["env"], text=True, capture_output=True, timeout=40)
+    assert result.returncode == 0, result.stdout + result.stderr
+    outputs = list((root / "msprof").glob(mode + "-all-*"))
+    assert len(outputs) == 1
+    output = outputs[0]
+    request = json.loads((output / "profile-request.json").read_text())
+    assert request["deployment_manifest"]["sha256"] == sha256_file(chunk_bundle)
+    assert request["runner"]["sha256"] == sha256_file(runner)
+    control = json.loads((output / "capture/manifest/all-control.json").read_text())
+    assert control["status"] == "PASS_CONTROL"
+    stages = ["prefill", "decode"] if mode == "ordinary" else ["prefill", "draft", "verify"]
+    assert control["stages"] == request["stages"] == stages
+    assert len(control["captures"]) == len(stages)
+    assert all(f'--pid={control["application_pid"]}' in item["msprof_arguments"]
+               for item in control["captures"])
+    with (output / "capture/all-operator-types.csv").open(newline="") as stream:
+        assert [row["stage"] for row in csv.DictReader(stream)] == stages

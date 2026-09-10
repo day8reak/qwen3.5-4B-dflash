@@ -30,6 +30,8 @@ Options:
 Python requires a real torch_npu device; C++ initializes the device through AscendCL.
 Both require npu-smi and reject CPU/operator fallback. No pyACL profiling API is used.
 Profile data, logs, and the invocation manifest are written below --output-dir.
+Stage captures also produce LABEL-operator-types.csv, LABEL-operator-tasks.csv
+and LABEL-hotspots.txt, grouped separately by stage, export and tensor dtype.
 EOF
 }
 
@@ -271,6 +273,10 @@ device_log="$log_dir/device-$label.log"
 [[ ! -e "$control_report" && ! -L "$control_report" ]] || fail "control report already exists: $control_report"
 if [[ -n "$profile_stage" ]]; then
   [[ ! -e "$summary_report" && ! -L "$summary_report" ]] || fail "summary already exists: $summary_report"
+  for suffix in operator-types.csv operator-tasks.csv hotspots.txt; do
+    [[ ! -e "$output_root/$label-$suffix" && ! -L "$output_root/$label-$suffix" ]] || \
+      fail "operator summary already exists: $output_root/$label-$suffix"
+  done
 fi
 mkdir -p "$output_root/profile/msprof" "$log_dir" "$manifest_dir"
 
@@ -443,6 +449,9 @@ source_paths = [
     root / "models" / "modeling_qwen3_5_hiai_nd_dflash_rollback.py",
     root / "models" / "export_model_wrapper_qwen3_5_dflash_rollback.py",
     root / "tools" / "run_msprof.sh",
+    root / "tools" / "profile_om.py",
+    root / "tools" / "profile_verify_om.py",
+    root / "models" / "modeling_qwen3_5_hiai_nd.py",
     root / "docs" / "DFLASH_RUN_AND_VALIDATE.md",
     root / "docs" / "QUANT_AIR_OM_FRAMEWORK.md",
     root / "docs" / "GDR_CHUNK_AIR_OM.md",
@@ -465,7 +474,7 @@ for path in sorted(set(expanded)):
     source_files += 1
 
 payload = {
-    "schema_version": 6,
+    "schema_version": 7,
     "status": run_status,
     "exit_code": int(exit_code),
     "label": label,
@@ -511,6 +520,9 @@ payload = {
         "stage_report": stage_report if profile_stage else None,
         "control_report": control_report if profile_stage else None,
         "stage_summary": str(Path(manifest_path).parent.parent / (label + "-stage-summary.csv")) if profile_stage else None,
+        "operator_types": str(Path(manifest_path).parent.parent / (label + "-operator-types.csv")) if profile_stage else None,
+        "operator_tasks": str(Path(manifest_path).parent.parent / (label + "-operator-tasks.csv")) if profile_stage else None,
+        "hotspots": str(Path(manifest_path).parent.parent / (label + "-hotspots.txt")) if profile_stage else None,
     },
     "claim_boundary": (
         "msprof is diagnostic evidence, not the latency baseline; retain "
@@ -645,6 +657,7 @@ for selected, capture, handshake in zip(stages, reports, controls):
     summary.append({
         "stage": selected, "profiled_elapsed_ms": elapsed,
         "profile_mode": mode, "profile_backend": backend,
+        "stage_scope": capture.get("stage_scope", ""),
         "operator_rows": rows,
         "gdr_verify_layer_calls": gdr_calls["verify"],
         "gdr_commit_layer_calls": gdr_calls["commit"],
@@ -657,6 +670,12 @@ with Path(summary_path).open("x", encoding="utf-8", newline="") as stream:
     writer.writerows(summary)
 print(f"Stage timing summary: {summary_path}")
 PY
+    msprof_status=${PIPESTATUS[0]}
+  fi
+  if ((msprof_status == 0)); then
+    "$python_bin" -B "$source_root/models/dflash_v1/msprof_summary.py" \
+      --stage-summary "$summary_report" --output-dir "$output_root" --prefix "$label" \
+      2>&1 | tee -a "$runtime_log"
     msprof_status=${PIPESTATUS[0]}
   fi
 else

@@ -422,6 +422,12 @@ def test_all_stage_wrapper_reattaches_one_application_and_checks_every_result(sa
         assert rows[6]["gdr_verify_layer_calls"] == "0"
         assert rows[-1]["gdr_commit_layer_calls"] == rows[-1]["gdr_verify_layer_calls"] == "24"
         assert manifest["artifacts"]["stage_summary"] == str(summary_path)
+        with Path(manifest["artifacts"]["operator_types"]).open(newline="") as stream:
+            operators = list(csv.DictReader(stream))
+        assert [row["stage"] for row in operators] == stages
+        assert all(float(row["total_ms"]) == 0.001 for row in operators)
+        assert Path(manifest["artifacts"]["operator_tasks"]).is_file()
+        assert Path(manifest["artifacts"]["hotspots"]).is_file()
     else:
         assert completed.returncode != 0, completed.stdout + completed.stderr
         assert manifest["status"] == "FAIL"
