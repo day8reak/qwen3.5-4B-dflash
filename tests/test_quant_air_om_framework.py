@@ -347,7 +347,7 @@ def test_quant_target_adapter_bypasses_eager_guards_and_sync() -> None:
 
 def test_air_ops_match_quant_branch_decomposed_golden() -> None:
     torch.manual_seed(7)
-    ops = AirDFlashOps()
+    ops = AirDFlashOps(attention_matmul_dtype="float32")
     value = torch.randn(1, 3, 8, dtype=torch.float32)
     weight = torch.randn(8, dtype=torch.float32)
     torch.testing.assert_close(
@@ -378,6 +378,63 @@ def test_air_ops_match_quant_branch_decomposed_golden() -> None:
         golden_ops.attention(query, key, val, visible, 0.125, 2),
         rtol=0,
         atol=0,
+    )
+
+
+@pytest.mark.parametrize("matmul_dtype", ["bfloat16", "float64", "fp16", None, 16])
+def test_air_ops_reject_invalid_attention_matmul_dtype(matmul_dtype) -> None:
+    with pytest.raises(ValueError, match="draft_attention_matmul_dtype"):
+        AirDFlashOps(attention_matmul_dtype=matmul_dtype)
+    # Invalid configuration must fail before paths, NPU import or weights.
+    with pytest.raises(ValueError, match="draft_attention_matmul_dtype"):
+        create_quant_recompute_graph({
+            "max_sequence_length": 64,
+            "draft_attention_matmul_dtype": matmul_dtype,
+        })
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("groups", [1, 4])
+def test_air_attention_fp16_operands_and_fp32_softmax(input_dtype, groups) -> None:
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class ObserveDtypes(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.matmul_inputs = []
+            self.softmax_inputs = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default):
+                self.matmul_inputs.append((args[0].dtype, args[1].dtype))
+            if func == torch.ops.aten._softmax.default:
+                self.softmax_inputs.append(args[0].dtype)
+            return func(*args, **(kwargs or {}))
+
+    torch.manual_seed(71)
+    # Noncontiguous heads, GQA and a masked tail exercise the production
+    # attention contract. This small CPU error check is not acceptance proof.
+    query = torch.randn(2, 7, 2 * groups, 16, dtype=input_dtype).transpose(1, 2)
+    key = torch.randn(2, 19, 2, 16, dtype=input_dtype).transpose(1, 2)
+    value = torch.randn_like(key)
+    visible = torch.ones(2, 1, 7, 19, dtype=torch.bool)
+    visible[..., -3:] = False
+    expected = golden_ops.attention(query, key, value, visible, 0.25, groups)
+    ops = AirDFlashOps()
+    observer = ObserveDtypes()
+    with observer:
+        actual = ops.attention(query, key, value, visible, 0.25, groups)
+    assert observer.matmul_inputs == [(torch.float16, torch.float16)] * 2
+    assert observer.softmax_inputs == [torch.float32]
+    assert actual.dtype == input_dtype
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+    # Invalid cache positions must not affect any live output.
+    changed = value.clone()
+    changed[..., -3:, :] = 100
+    torch.testing.assert_close(
+        ops.attention(query, key, changed, visible, 0.25, groups),
+        actual, rtol=0, atol=0,
     )
 
 
@@ -599,9 +656,11 @@ def test_quant_input_manifest_hashes_and_rechecks_external_artifacts(
         verify_quant_input_manifest(output)
 
 
+@pytest.mark.parametrize("attention_matmul_dtype", [None, "float16", "float32"])
 def test_quant_factory_builds_graph_from_quant_branch_loader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    attention_matmul_dtype: str | None,
 ) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -653,11 +712,13 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
         "load_qwen35_target",
         lambda *args, **kwargs: fake_target,
     )
-    monkeypatch.setattr(
-        modeling_dflash.DFlashDraftModel,
-        "from_pretrained",
-        lambda *args, **kwargs: fake_draft,
-    )
+    captured_draft_ops = []
+
+    def load_draft(*args, **kwargs):
+        captured_draft_ops.append(kwargs["ops"])
+        return fake_draft
+
+    monkeypatch.setattr(modeling_dflash.DFlashDraftModel, "from_pretrained", load_draft)
     def cpu_graph_spec(
         target_model: nn.Module,
         draft_model: nn.Module,
@@ -711,12 +772,19 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
             "example_sequence_length": 2,
             "dtype": "float16",
             "device": "npu:0",
+            **({"draft_attention_matmul_dtype": attention_matmul_dtype}
+               if attention_matmul_dtype is not None else {}),
         }
     )
     assert len(specs) == 1
     spec = specs[0]
     assert spec.name == "quant_dflash_recompute"
     assert spec.metadata["target_quant_mode"] == "w8a8_dynamic"
+    expected_dtype = attention_matmul_dtype or "float16"
+    assert spec.metadata["draft_attention_matmul_dtype"] == expected_dtype
+    assert spec.metadata["draft_attention_softmax_dtype"] == "float32"
+    assert len(captured_draft_ops) == 1
+    assert captured_draft_ops[0].attention_matmul_dtype == getattr(torch, expected_dtype)
     assert spec.metadata["gdr_effective_length_contract"] == (
         "INT16[B] call-local valid rows derived from attention_mask"
     )

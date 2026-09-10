@@ -285,6 +285,7 @@ config = {
     "receiver_models_dir": os.environ["RECEIVER_MODELS_DIR"],
     "max_sequence_length": int(os.environ["MAX_SEQUENCE_LENGTH"]),
     "include_ordinary_decode": True,
+    "draft_attention_matmul_dtype": "float16",
     "dtype": "float16", "device": "npu:0", "adn_rms_norm_ge_op_type": "RmsNorm",
 }
 (run / "factory.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -295,6 +296,18 @@ PY
 `RmsNorm` 必须是目标环境注册的 GE type；自定义包注册的是 `AdnRmsNorm` 时，填写
 `"adn_rms_norm_ge_op_type": "AdnRmsNorm"`。两者的 GE 输入名分别为 `x` 和 `self`，
 导出器按所选类型处理，不接受任意 GE 名称。
+
+`draft_attention_matmul_dtype` 默认 `float16`，控制 OM Draft attention 的 QK 和 PV
+两次矩阵乘：Q/K/V 和 Softmax 概率在进入 MatMul 前转为 FP16，结果转为 FP32；
+缩放、Mask 和 Softmax 在 FP32 中执行，attention 最终返回模型的 FP16 dtype。
+该精度选择会改变舍入，可能改变 proposal 和接受率。设置 `float32` 可导出 FP32
+矩阵乘基线；两种配置都保留在 AIR/deployment manifest 的 graph metadata 中。
+`torch_npu` Draft 路径使用 FP32 矩阵乘，可继续作为对照。
+
+精度配置在导出时生效。每种配置使用独立、空的 `--bundle-dir`，分别执行第 8、9 步，
+并让第 11 步的 `infer-cpp --deployment-manifest` 指向对应 bundle。使用相同 prompt、
+EOS、生成长度和 `--trace-rounds` 比较 proposal、接受率及最终 token；允许 proposal
+变化，最终 token/EOS 仍须通过 ordinary 对照。C++ runner 和外部权重可复用。
 
 ## 8. 导出 AIR
 
@@ -373,9 +386,14 @@ verify 还生成 `air/target_verify/verify-discard-outputs.json`，
 
 编译流程使用 `atc --mode=0 --framework=1`，验证 AIR payload 后逐图编译。
 增量套件自动添加 `--precision_mode=must_keep_origin_dtype`，保留图中的 FP32
-归一化、RoPE、Softmax、attention matmul 和 GDR 累加。不能因为权重为 FP16，
-就把这些中间计算也降为 FP16。也支持显式传入 `--precision_mode_v2=origin`；
+归一化、RoPE、Softmax 和 GDR 状态边界，以及配置选定的 Draft MatMul 输入 dtype。
+Draft 的 FP16 选择通过图中显式 Cast 实现。也支持显式传入 `--precision_mode_v2=origin`；
 编译器拒绝同时指定两种精度参数或使用降精度模式。
+
+FP16 MatMul 后的 FP32 Cast 为 ATC 的 `MatmulCastFusionPass` 提供融合机会，
+但源码中的 Cast 不保证直接 FP32 输出；没有融合时会先得到经过 FP16 舍入的结果。
+在目标机检查编译后 MatMul/BatchMatMul 的输入 dtype 与实现，并用第 14 步的 Draft
+单步 msprof 采集核对 Cube 活动和时延。不能只凭 FP32 输出 dtype 判断累加精度。
 启动 ATC 前还会检查整组图的 `runtime_input_abi`：要求 `status=PASS`，实际 Data 绑定
 与公开输入的顺序、dtype、静态 shape 一致。缺少或不通过这项审计时，须重新导出到空的
 bundle 目录；只编辑 manifest 无法修正 AIR 中的输入顺序。

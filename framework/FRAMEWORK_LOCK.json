@@ -9,6 +9,9 @@
     "target": "W8A8 dynamic QLinear with FP16 output",
     "target_embedding": "INT8 weight times FP32 row scale to FP16",
     "draft": "FP16",
+    "draft_attention_matmul_dtype": "float16 by default; float32 reference via factory config",
+    "draft_attention_softmax_dtype": "float32",
+    "draft_attention_matmul_result": "cast to float32; direct FP32 accumulation/output and Cube execution require ATC/device verification",
     "lm_head": "Target W8A8; Draft FP16"
   },
   "input_identity": {

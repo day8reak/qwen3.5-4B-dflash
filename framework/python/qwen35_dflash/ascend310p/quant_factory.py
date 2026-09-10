@@ -231,12 +231,29 @@ def _rotate_half(value: Tensor) -> Tensor:
 
 
 class AirDFlashOps:
-    """Pure Tensor form of the quant branch's strict Ascend draft operations.
+    """Exportable Draft operations with selectable attention matmul inputs.
 
     Runtime-only finite checks intentionally stay outside the exported graph;
-    they would introduce host synchronization and graph breaks.  The formulas,
-    FP32 reduction/softmax boundaries, and argmax tie behavior are unchanged.
+    they would introduce host synchronization and graph breaks. FP16 matmul
+    inputs avoid the FP32 x FP32 Vector path on 310P. Score scaling, masking,
+    softmax and RMSNorm reductions remain FP32. Use float32 for the reference
+    attention formula when comparing proposal tokens and acceptance rates.
     """
+
+    def __init__(self, *, attention_matmul_dtype: str = "float16") -> None:
+        if attention_matmul_dtype not in ("float16", "float32"):
+            raise ValueError("draft_attention_matmul_dtype must be float16 or float32")
+        self.attention_matmul_dtype = getattr(torch, attention_matmul_dtype)
+
+    def _attention_matmul(self, left: Tensor, right: Tensor) -> Tensor:
+        # Cast operands, including FP32 softmax probabilities, before MatMul.
+        # The result Cast permits ATC MatmulCastFusionPass; FP32 accumulation
+        # and direct FP32 output still need compiled-kernel verification. An
+        # unfused FP16 result has already rounded before this FP32 Cast.
+        return torch.matmul(
+            left.to(self.attention_matmul_dtype),
+            right.to(self.attention_matmul_dtype),
+        ).float()
 
     def rms_norm(self, value: Tensor, weight: Tensor, eps: float) -> Tensor:
         value_fp32 = value.float()
@@ -275,12 +292,12 @@ class AirDFlashOps:
     ) -> Tensor:
         key = _repeat_kv(key, int(key_value_groups))
         value = _repeat_kv(value, int(key_value_groups))
-        scores = torch.matmul(query.float(), key.float().transpose(-2, -1))
+        scores = self._attention_matmul(query, key.transpose(-2, -1))
         scores = scores * float(scale)
         if attention_mask is not None:
             scores = scores.masked_fill(~attention_mask, float("-inf"))
         probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
-        return torch.matmul(probabilities, value.float()).to(query.dtype)
+        return self._attention_matmul(probabilities, value).to(query.dtype)
 
     def swiglu(self, gate: Tensor, up: Tensor) -> Tensor:
         return F.silu(gate) * up
@@ -465,6 +482,8 @@ def create_quant_recompute_graph(
     if dtype_name not in _DTYPES:
         raise ValueError("quant AIR export supports Target/Draft float16 only")
     dtype = _DTYPES[dtype_name]
+    draft_attention_matmul_dtype = config.get("draft_attention_matmul_dtype", "float16")
+    draft_ops = AirDFlashOps(attention_matmul_dtype=draft_attention_matmul_dtype)
     include_ordinary_decode = config.get("include_ordinary_decode", True)
     if type(include_ordinary_decode) is not bool:
         raise TypeError("include_ordinary_decode must be a bool")
@@ -567,7 +586,7 @@ def create_quant_recompute_graph(
                 setter(True)
     draft = DFlashDraftModel.from_pretrained(
         draft_dir,
-        ops=AirDFlashOps(),
+        ops=draft_ops,
         device=device,
         dtype=dtype,
     ).eval()
@@ -581,6 +600,9 @@ def create_quant_recompute_graph(
         "target_embedding": "INT8 weight * FP32 row scale -> FP16",
         "draft_precision": "FP16",
         "draft_dtype": dtype_name,
+        "draft_attention_matmul_dtype": draft_attention_matmul_dtype,
+        "draft_attention_softmax_dtype": "float32",
+        "draft_attention_matmul_result": "cast_to_float32_before_consumers",
         "dtype": dtype_name,
         "target_checkpoint_manifest_sha256": locked_inputs["group_sha256"][
             "target_checkpoint"

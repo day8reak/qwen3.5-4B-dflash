@@ -29,6 +29,11 @@ qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_graphs
 DFlash 部署需要 3 个 OM；加入普通模式对照后共 4 个。C++ 按模式加载所需模型，
 持久保存状态 buffer，并核对 manifest、OM hash 和有序 tensor ABI。
 
+OM Draft 的 QK/PV 矩阵乘默认使用 FP16 输入，缩放、Mask、Softmax 保持 FP32。
+`factory.json` 的 `draft_attention_matmul_dtype` 可设为 `float32` 导出对照组；
+配置变更需要重新导出 AIR 和编译 OM。逐轮 proposal 和接受率允许随精度变化，
+最终 token 仍按 ordinary 严格验证。Cube 路径和 FP32 累加/直接输出须在目标机确认。
+
 ## 3. 验证并采集
 
 1. 使用 `infer-cpp` 进行普通/DFlash 各 3 次预热和 10 次测量。

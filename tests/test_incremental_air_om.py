@@ -780,7 +780,22 @@ def test_attention_lengths_and_mask_preserve_runtime_prefix(rows, start, valid):
 def test_draft_graph_exports_with_dynamic_context_length():
     spec = next(s for s in specs() if s.name == "draft")
     with torch.inference_mode():
-        exported = torch.export.export(spec.model, spec.example_args).module()
+        program = torch.export.export(spec.model, spec.example_args).run_decompositions()
+        # Include projections and head as well as QK/PV: the complete Draft
+        # ATen graph must not contain FP32 x FP32 mm/bmm in the default mode.
+        matmuls = [n for n in program.graph.nodes if n.target in (
+            torch.ops.aten.mm.default, torch.ops.aten.bmm.default)]
+        bmms = [n for n in matmuls if n.target == torch.ops.aten.bmm.default]
+        assert len(bmms) == 2 * len(spec.model.propose.draft.layers)
+        assert len(matmuls) > len(bmms)
+        for node in matmuls:
+            assert node.args[0].meta["val"].dtype == torch.float16, node
+            assert node.args[1].meta["val"].dtype == torch.float16, node
+        softmaxes = [n for n in program.graph.nodes
+                     if n.target == torch.ops.aten._softmax.default]
+        assert len(softmaxes) == len(spec.model.propose.draft.layers)
+        assert all(n.args[0].meta["val"].dtype == torch.float32 for n in softmaxes)
+        exported = program.module()
         args = list(spec.example_args)
         args[2] = torch.tensor([37], dtype=torch.int16)
         for count in (1, 7, 15):

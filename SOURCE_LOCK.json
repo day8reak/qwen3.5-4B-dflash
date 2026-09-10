@@ -157,19 +157,19 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "92a8cc8b7ad388055571eda0d886e52b764bfb16c4fd743c864b731be6fbf1ca"
+        "source_sha256": "b9687bae23d7dad08576b65619b52f863ca2590476e83868f91e303b0c277676"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "65b551181011dbe3c57553df07b86f0be46c29f96b3c282dd8e2414000130206"
+        "source_sha256": "e519486cc7da5f5bb00ec338f0e4e50707c76d4474753f1a343a462c38ce4a4f"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
-        "source_sha256": "bb3ee7df982ee8364551cd2a6ea921653e0d871e947dd2713ba5340b48f75542"
+        "source_sha256": "003964efedd26c250102d97865a9e102a3276eff118261960db644d079459237"
       },
       {
         "source_file": "framework/README.md",
-        "source_sha256": "d0023a79c6e70caa5a043698bfb5fa1aff3307c228356a21edd77653d51b5dad"
+        "source_sha256": "668dec6dc3ae5eea3be15467f2ca7a7098d7b058b3ed14159757989ce37b4681"
       },
       {
         "source_file": "framework/abi/closed-runtime-baseline-v1.json",
@@ -249,7 +249,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/quant_factory.py",
-        "source_sha256": "0db8ad3d82acea26a7b30b8c8ffbbab094779b1952d8620600d09519e3d6a05a"
+        "source_sha256": "1500b59e9b0f662d31530811fee90f0a8947e150f189c40bbbea8469879406b8"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/recompute_backend.py",
@@ -357,7 +357,7 @@
       },
       {
         "source_file": "tests/test_incremental_air_om.py",
-        "source_sha256": "76fdffdedeb25897e4f11725772df337eb37e6ea73ab8dc5c256eb743d83f841"
+        "source_sha256": "77d0767aa16def1e41510527cc777764142549c96c20032edfb3e2c2af00b8a0"
       },
       {
         "source_file": "tests/test_msprof_stage_script.py",
@@ -369,7 +369,7 @@
       },
       {
         "source_file": "tests/test_quant_air_om_framework.py",
-        "source_sha256": "564ac347c0ed77ee90daebace44887617452392dc57a3a8a79959705f535d3c0"
+        "source_sha256": "12519cf71fc5d68608fb7eefdaa424ab37e1e622128b46773b8dc2d783e47594"
       },
       {
         "source_file": "tests/test_runtime_input_export.py",

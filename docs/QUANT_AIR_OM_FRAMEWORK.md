@@ -47,6 +47,7 @@ Draft 使用 FP16 embedding、LM head 和主体；公开 embedding getter 保留
 | `max_sequence_length` | 逻辑 KV 容量 C，64 的倍数，64..32704 |
 | `include_ordinary_decode` | `true` 导出 4 图；`false` 只导出 DFlash 3 图 |
 | `dtype` | `float16` |
+| `draft_attention_matmul_dtype` | 默认 `float16`：OM Draft 的 QK/PV 均用 FP16 输入；`float32` 用于精度/接受率基线对照 |
 | `device` | 例如 `npu:0` |
 | `adn_rms_norm_ge_op_type` | 默认 `RmsNorm`；也支持已注册的 `AdnRmsNorm` |
 
@@ -128,7 +129,13 @@ C++ 为每份 discard state 分配独立、持久的设备缓冲区，共 48 MiB
 用于 proposal 的 transient block KV 不作为 committed cache 输出。
 
 增量套件的 ATC 编译自动添加 `--precision_mode=must_keep_origin_dtype`，
-保留图中显式的 FP32 RMSNorm、RoPE、Softmax、注意力 matmul 和 GDR 状态计算。
+保留图中显式的 FP32 RMSNorm、RoPE、Softmax 和 GDR 状态计算，以及选定的 Draft
+MatMul 输入 dtype。Draft QK/PV 默认均使用 FP16 输入，结果 Cast 到 FP32，
+缩放、Mask、Softmax 保持 FP32，attention 返回 FP16。`float32` 配置恢复 FP32
+矩阵乘公式；配置值及 Softmax dtype 写入 graph metadata。此选项仅影响 OM Draft，
+native `torch_npu` 路径仍可提供 FP32 矩阵乘对照。
+FP16 MatMul + FP32 Cast 是否融合为直接 FP32 输出，以及是否走 Cube，须以 ATC
+编译图、算子实现和 msprof 为准。未融合时包含 FP16 结果舍入，接受率需实测。
 也可显式使用等价的 `--precision_mode_v2=origin`；两个参数不能同时使用。
 编译器拒绝对该套件使用降精度模式。FP16 checkpoint 不意味着全部中间计算都是 FP16。
 参数语义见 [ATC 精度模式说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta3/devaids/atctool/atlasatcparam_16_0068.html)。
