@@ -445,7 +445,7 @@
       },
       {
         "source_file": "tools/debug_draft_context/README.md",
-        "source_sha256": "d254e4c4fd7f150acb3babc5cb4c6577c16e96fcc2b29ee879c087c08816dbd5"
+        "source_sha256": "260dd8063b36969f6d09a9f20a1ee3182f5daf23a08f2051b4ff19a949bab45a"
       },
       {
         "source_file": "tests/test_debug_draft_context.py",
@@ -470,6 +470,14 @@
       {
         "source_file": "tools/debug_gdr/test_debug_gdr.py",
         "source_sha256": "696517a07441984d143af3637c126ff638e1bc766931260dcf9c195ef45fb86a"
+      },
+      {
+        "source_file": "tools/debug_draft_context/fc_determinism.py",
+        "source_sha256": "ca643be668775fa6ea1e648c37b41666fc7dfed5cdff3f8a6be62e16e0aa94d2"
+      },
+      {
+        "source_file": "tests/test_fc_determinism.py",
+        "source_sha256": "1a47664193b30e5c94f4450e6b2292b3b4c2d8270bfdd0db3cba849cfe637656"
       }
     ]
   }

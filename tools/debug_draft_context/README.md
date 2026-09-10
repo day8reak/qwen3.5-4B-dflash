@@ -5,11 +5,11 @@
 不加载整个 Target/Draft，不修改主模型，也不运行 msprof。
 调试结束后可移除此目录及对应测试；C++ 执行部分复用 `tools/debug_gdr/`。
 
-当前证据：用户的 `private.json` 离线分析显示，12 个 K/V 输出的有效区
+最初，用户的 `private.json` 离线分析显示，12 个 K/V 输出的有效区
 `[0,17)` 在 isolated 后续 19 轮均有变化，写入 padding `[17,64)` 和尾部
 `[64,576)` 保持稳定。第 0 层的 K/V 就出现小幅数值变化，因此优先检查
 所有 context K/V 共同经过的 FC、hidden_norm，以及后续投影。
-“改成 adn_rms_norm 后才出现”是重要的回归线索，尚不能据此确定具体 kernel。
+“改成 adn_rms_norm 后才出现”曾是回归线索；下面的最新对照已经将排查重点移到 FC。
 
 ## 比较内容
 
@@ -87,3 +87,68 @@ AIR 检查要求 adn 分支恰好包含一个对应 norm 节点、原 Tensor 分
 小图全部稳定不能排除完整 Draft OM 内的竞态或未初始化数据。
 
 本工具不宣称修复已完成，不放宽原 profiling/greedy 一致性检查，计时也不作为正式性能证据。
+
+## 最新结果：漂移在 FC 中独立复现
+
+用户返回的真实设备报告（`cpu_fallback=false`，20 次调用，以第 0 次为参考）：
+
+| 固定输入的小图 | Native 不一致轮数 | OM 不一致轮数 |
+|---|---:|---:|
+| FC | 19 | 19 |
+| 新 adn RMSNorm | 0 | 0 |
+| 原 Tensor RMSNorm | 0 | 0 |
+| 第 0 层 V 投影 | 0 | 0 |
+| FC → 新 norm → V，三个输出各自 | 18 | 19 |
+| FC → 原 norm → V，三个输出各自 | 19 | 19 |
+
+新旧 norm 对相同冻结输入的有效输出逐位相同。原 norm 组合链也从 FC 开始变化，
+因此这次复现不需要 adn RMSNorm，也不需要 msprof、共享工作区或整个 Draft 图。
+先前保留的“norm 算子造成漂移”假设优先级下降。
+
+FC 使用 FP16 `[64,20480] × [20480,2560]`。保存的首个 FC 差异样本只有少量
+元素变化，最大为 1 个 FP16 ULP；这不是所有调用的最大误差统计。
+浮点累加顺序变化是下一步假设。尚未取得 kernel/tiling 证据，不能断言是
+split-K、AtomicAdd 或某个特定实现。小幅 FC 变化经 norm、V 投影传播，与之前
+有效 KV 漂移相符；不应把 V 输出变化直接当作 V MatMul 自身不稳定。
+
+## FC 确定性开关对照
+
+设置 `FC_PROBE_DIR` 为上一次六图测试的输出目录，例如用户当前的
+`debug-draft-context-fmfxogyf`。复用其中的 AIR、冻结输入及权重来源：
+
+```bash
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/debug_draft_context/fc_determinism.py" all \
+  --run-dir "$AI_RUN_DIR" --probe-dir "$FC_PROBE_DIR" \
+  --device-id 0 --repetitions 20
+```
+
+不重新导出 AIR，不重编完整模型。只加载官方 `fc.weight` 做 native 重放，随后
+用同一份 FC AIR 编译两个小 OM。全部结果写到新的 `debug-fc-determinism-*`，
+原测试文件保持不变。如果 ATC/CANN 未在环境中声明，补充 `--atc "$ATC_BIN"`
+和 `--ascendcl-root "$CANN_ROOT"`。
+
+- Native：分别在新进程、首次 NPU 运算前设置
+  `torch.use_deterministic_algorithms(False/True, warn_only=False)`，记录 getter 状态和 PID。
+- OM：同一 AIR 分别加 `--deterministic=0`、`--deterministic=1`，每个 OM 在独立 ACL 进程重放。
+- FP16 输入、FP16 权重、矩阵乘法公式及 `must_keep_origin_dtype` 保持相同。
+
+ATC 的确定性开关及其对浮点累加顺序的影响见
+[官方 ATC 文档](https://www.hiascend.com/document/detail/zh/canncommercial/700/inferapplicationdev/atctool/atlasatc_16_0122.html)。
+Native 用法和“同一线程后续切换可能无效”的限制见
+[昇腾 PyTorch 文档](https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/PyTorchNativeapi/ptaoplist_000292.html)。
+这也是两个模式分别启动新进程的原因。开关或编译不受当前环境支持时直接报错，
+不会静默忽略，也不会改用 CPU。
+
+查看新目录 `summary.json` 的两个 case，分别比较 native 和 OM 的不一致轮数：
+
+| status | 含义 |
+|---|---|
+| `STABLE_WITH_DETERMINISTIC` | 关闭时至少一条路径复现变化，开启后 native 和 OM 均稳定 |
+| `VARIATION_WITH_DETERMINISTIC` | 开启后 native 或 OM 仍有变化，或 OM 出现非有限值 |
+| `BASELINE_NOT_REPRODUCED` | 本次关闭时也稳定，不能据此宣称开关修复了问题 |
+
+前两列原始不一致轮数仍需分别看：不能把只修复 native 的结果当作 OM 已修复。
+跨开关模式的固定舍入差异单独报告。native getter 只证明设置状态，不证明最终
+kernel 身份；稳定的 FC 对照也不代替完整 Draft 重放与 ordinary greedy 一致性验证。
+退出 0 表示流程完成且开启模式稳定，退出 1 表示开启模式仍有异常，退出 2 表示流程错误。
+确定性模式可能影响性能，主模型是否启用应在完整验证和重新测速后决定。
