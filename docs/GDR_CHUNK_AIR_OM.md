@@ -636,6 +636,7 @@ token、EOS 和停止原因一致。每次生成前重置请求缓存；一条�
 | `summary.md` / `summary.json` | 每条接受率、每轮产出、DFlash tok/s、相对普通速度、生成长度、停止原因和失败原因（完整字段见 JSON） |
 | `request.json` | prompt 原文及 token IDs、tokenizer 来源、OM/runner hash、Draft ATC 命令和测试参数 |
 | `runner-batch.json.cases/*.json` | 每条完整普通/DFlash 报告，包含每次测量和逐轮 trace |
+| `generations.txt` | 每条已保存的普通和 DFlash 生成文字（保留特殊 token）；parity 失败也保存，缺失输出明确标注 |
 | `runner-batch.json` / `runner.log` | 整批模型复用协议、加载时间和执行日志 |
 
 接受率按正式测量的 `accepted_draft_tokens / drafted_tokens` 计算。总接受率是总接受数
@@ -643,6 +644,39 @@ token、EOS 和停止原因一致。每次生成前重置请求缓存；一条�
 发出的已接受 token 和补充 token。速度比为普通与 DFlash 的模型总时延中位数之比，
 大于 1 才说明该条更快。失败条目保留在表中，总结只对通过的条目统计，整批仍标为失败。
 这组样本用来比较任务差异，不能证明所有 prompt 都有高接受率。
+
+`FAIL` 要看 `failure_stage`：`ordinary_dflash_parity` 表示两种模式各自正式测量的输出
+可重复，但两边 token 或停止原因不同。失败报告保留完整的 `ordinary`、`dflash` 和
+`ordinary_parity.first_difference`；后者定位首个分歧 token（下标从 0 开始）、正式测量
+第 0 轮中对应的生成 round 及前一个 round。普通每轮一个 token，DFlash 每轮可能多个，
+不能直接对齐 round 编号。两个内部 benchmark 的 `status=PASS` 只表示各自重复性，
+整个报告仍为 `FAIL`，失败样本的时延和接受率只供诊断，不进入通过样本的汇总。
+
+低显存模式切换时若加载失败，未执行的 DFlash 标为 `NOT_RUN`，保留已完成的 ordinary
+及加载错误；这与实际生成后的 parity 失败不同。两类情况都返回非零退出码。
+
+将 PROMPT_SUITE_DIR 设为脚本打印的 Output 目录。查看已有报告中的文字，无需加载 OM 或运行 NPU：
+
+```bash
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/decode_outputs.py" \
+  --model-dir "$TARGET_DIR" \
+  --report "$PROMPT_SUITE_DIR/runner-batch.json" \
+  --prompt-id zh_explain
+```
+
+`--report` 也接受单条 `.json`、`.ordinary.json` 或本次 `prompt-suite-*` 目录。使用生成时
+相同的 tokenizer；文字打印到标准输出，原报告保持原样。旧版本 parity 失败只保留一句
+错误时，可从同目录的 `.ordinary.json` 恢复普通输出，丢失的 DFlash token 无法还原。
+
+更新这项报告功能只需第 10 步重编 C++ runner，使用新的 build/report 路径；现有 OM 可复用。
+在上面的多 prompt 命令后追加 `--prompt-id zh_explain`，即可先重跑一条并生成完整两边文字。
+输出预算、EOS、精度和 3+10 检查保持相同。`summary.json` 也保留首分歧附近的文字和 token IDs；
+中文 token 可能只含部分 UTF-8 字节，应结合邻近完整文本判断，不能把单个 token 的解码等同于一个字。
+
+数值排查时，代码中的普通 GDR 是单行 `chunk_size=1`，verify 为 16 行、`chunk_size=64`。
+两者的计算顺序及状态回写边界不同，是待测因素；仅凭 parity 失败不能断言 chunk 算子精度更低。
+先定位分歧轮，再用相同 Q/K/V、g、beta 和初始状态对比一次多行与逐行执行，并保持真实
+状态回写 dtype。第一遍 verify 的完整 state 只作 discard，真正提交的仍是第二遍 accepted+1 状态。
 
 可通过 `--prompts "$AI_RUN_DIR/prompts.json"` 使用自己的测试集（最多 64 条）。文件格式：
 

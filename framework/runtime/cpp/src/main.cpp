@@ -426,6 +426,74 @@ void WriteDistribution(std::ostream& output, const Distribution& value) {
          << ",\"population_stdev\":" << value.population_stdev << '}';
 }
 
+void WriteRound(std::ostream& output, const qwen35::dflash::GenerationRound& round) {
+  output << "{\"committed_prefix_length\":" << round.committed_prefix_length
+         << ",\"stage\":\"" << JsonEscape(round.stage) << "\""
+         << ",\"proposed_token_ids\":";
+  WriteTokenIds(output, round.proposed_token_ids);
+  output << ",\"target_token_ids\":";
+  WriteTokenIds(output, round.target_token_ids);
+  output << ",\"accepted_draft_token_ids\":";
+  WriteTokenIds(output, round.accepted_draft_token_ids);
+  output << ",\"emitted_token_ids\":";
+  WriteTokenIds(output, round.emitted_token_ids);
+  output << ",\"fallback_token_id\":";
+  if (round.fallback_token_id < 0) output << "null";
+  else output << round.fallback_token_id;
+  output << '}';
+}
+
+// The final tokens are repeatable within each mode, but the proposal trace may
+// vary. Locate the first divergence in measurement 0, never align round numbers
+// across ordinary (one token) and DFlash (several tokens) execution.
+void WriteRoundLocation(std::ostream& output, const BenchmarkResult& result, std::size_t token_index) {
+  if (!result.measurements.empty()) {
+    const auto& rounds = result.measurements.front().rounds;
+    std::size_t offset = 0;
+    for (std::size_t i = 0; i < rounds.size(); ++i) {
+      if (token_index >= offset && token_index - offset < rounds[i].emitted_token_ids.size()) {
+        output << "{\"measurement_repetition\":0,\"round_index\":" << i
+               << ",\"emitted_index\":" << token_index - offset << ",\"round\":";
+        WriteRound(output, rounds[i]);
+        output << ",\"previous_round\":";
+        if (i) WriteRound(output, rounds[i - 1]);
+        else output << "null";
+        output << '}';
+        return;
+      }
+      offset += rounds[i].emitted_token_ids.size();
+    }
+  }
+  output << "null";
+}
+
+void WriteParityDifference(std::ostream& output, const PairedBenchmarkResult& result, std::size_t prompt_length) {
+  const auto& expected = result.ordinary.stable_generated_token_ids;
+  const auto& actual = result.dflash.stable_generated_token_ids;
+  for (std::size_t i = 0; i < std::max(expected.size(), actual.size()); ++i) {
+    if (i < expected.size() && i < actual.size() && expected[i] == actual[i]) continue;
+    output << "{\"field\":\"generated_token_ids\",\"index\":" << i
+           << ",\"absolute_token_position\":" << prompt_length + i
+           << ",\"ordinary_token_id\":";
+    if (i < expected.size()) output << expected[i]; else output << "null";
+    output << ",\"dflash_token_id\":";
+    if (i < actual.size()) output << actual[i]; else output << "null";
+    output << ",\"ordinary_location\":";
+    WriteRoundLocation(output, result.ordinary, i);
+    output << ",\"dflash_location\":";
+    WriteRoundLocation(output, result.dflash, i);
+    output << '}';
+    return;
+  }
+  if (result.eos_mismatches) {
+    output << "{\"field\":\"stop_reason\",\"ordinary\":\""
+           << JsonEscape(result.ordinary.stable_stop_reason) << "\",\"dflash\":\""
+           << JsonEscape(result.dflash.stable_stop_reason) << "\"}";
+  } else {
+    output << "null";
+  }
+}
+
 void WriteMeasurement(
     std::ostream& output,
     const GenerationMeasurement& value,
@@ -468,20 +536,7 @@ void WriteMeasurement(
     for (const auto& round : value.rounds) {
       if (!first_round) output << ',';
       first_round = false;
-      output << "{\"committed_prefix_length\":" << round.committed_prefix_length
-             << ",\"stage\":\"" << JsonEscape(round.stage) << "\""
-             << ",\"proposed_token_ids\":";
-      WriteTokenIds(output, round.proposed_token_ids);
-      output << ",\"target_token_ids\":";
-      WriteTokenIds(output, round.target_token_ids);
-      output << ",\"accepted_draft_token_ids\":";
-      WriteTokenIds(output, round.accepted_draft_token_ids);
-      output << ",\"emitted_token_ids\":";
-      WriteTokenIds(output, round.emitted_token_ids);
-      output << ",\"fallback_token_id\":";
-      if (round.fallback_token_id < 0) output << "null";
-      else output << round.fallback_token_id;
-      output << '}';
+      WriteRound(output, round);
     }
     output << ']';
   }
@@ -527,13 +582,15 @@ void WriteReport(
     double load_ms,
     double benchmark_wall_ms,
     const PairedBenchmarkResult& result,
-    double unload_ms = 0.0) {
+    double unload_ms = 0.0,
+    const std::string& error = {}) {
+  const bool pass = result.token_id_mismatches == 0 && result.eos_mismatches == 0;
   const double speedup = result.dflash.model_total_ms.median > 0.0
                              ? result.ordinary.model_total_ms.median /
                                    result.dflash.model_total_ms.median
                              : 0.0;
   output << std::setprecision(17)
-         << "{\"schema_version\":1,\"status\":\"PASS\","
+         << "{\"schema_version\":1,\"status\":\"" << (pass ? "PASS" : "FAIL") << "\","
          << "\"scope\":\"AscendCL C++ paired OM model loop\","
          << "\"runner_id\":\"qwen35-dflash-ascendcl-cpp-v1\","
          << "\"runner_version\":\""
@@ -576,11 +633,18 @@ void WriteReport(
   WriteBenchmark(output, result.ordinary);
   output << ",\"dflash\":";
   WriteBenchmark(output, result.dflash);
-  output << ",\"ordinary_parity\":{\"status\":\"PASS\","
+  if (!pass) {
+    output << ",\"failure_stage\":\"ordinary_dflash_parity\",\"formal_latency_evidence\":false,\"error\":\""
+           << JsonEscape(error.empty() ? "DFlash output differs from the ordinary greedy authority" : error) << '"';
+  }
+  output << ",\"ordinary_parity\":{\"status\":\"" << (pass ? "PASS" : "FAIL") << "\","
          << "\"token_id_mismatches\":" << result.token_id_mismatches
          << ",\"eos_mismatches\":" << result.eos_mismatches
-         << "},\"dflash_speedup_over_ordinary_model_total_median\":"
-         << speedup << '}';
+         << ",\"first_difference\":";
+  WriteParityDifference(output, result, arguments.prompt_token_ids.size());
+  output << "},\"dflash_speedup_over_ordinary_model_total_median\":";
+  if (pass) output << speedup; else output << "null";
+  output << '}';
 }
 
 void AtomicWrite(
@@ -621,6 +685,8 @@ bool RunPromptBatch(const Arguments& arguments, qwen35::dflash::GraphExecutor& e
     std::optional<BenchmarkResult> ordinary;
     std::optional<PairedBenchmarkResult> paired;
     std::string error;
+    std::string failure_stage;
+    bool not_run = false;
     double elapsed_ms = 0;
   };
   std::vector<Record> records(arguments.prompt_batch.size());
@@ -644,21 +710,43 @@ bool RunPromptBatch(const Arguments& arguments, qwen35::dflash::GraphExecutor& e
         records[i].paired = qwen35::dflash::BenchmarkPair(executor, item.tokens, options,
                                                         arguments.warmup, arguments.repetitions);
       }
+    } catch (qwen35::dflash::PairedBenchmarkMismatch& error) {
+      records[i].error = error.what();
+      records[i].failure_stage = "ordinary_dflash_parity";
+      records[i].paired = error.TakeResult();
+      std::cerr << "[prompt-batch] " << item.id << " FAIL: " << error.what() << '\n';
     } catch (const std::exception& error) {
       records[i].error = error.what();
+      records[i].failure_stage = arguments.low_memory ? "ordinary_benchmark" : "paired_benchmark";
       std::cerr << "[prompt-batch] " << item.id << " FAIL: " << error.what() << '\n';
     }
     records[i].elapsed_ms = elapsed(start);
   }
   double unload_ms = 0;
+  std::string batch_error;
   if (arguments.low_memory) {
     auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(executor);
     auto start = std::chrono::steady_clock::now();
-    chunk.UnloadModels();
-    unload_ms = elapsed(start);
-    start = std::chrono::steady_clock::now();
-    chunk.LoadMode("dflash");
-    load_ms += elapsed(start);
+    std::string switching_stage = "mode_switch_unload";
+    try {
+      chunk.UnloadModels();
+      unload_ms = elapsed(start);
+      start = std::chrono::steady_clock::now();
+      switching_stage = "load_dflash";
+      chunk.LoadMode("dflash");
+      load_ms += elapsed(start);
+    } catch (const std::exception& error) {
+      if (switching_stage == "load_dflash") load_ms += elapsed(start);
+      else unload_ms = elapsed(start);
+      batch_error = error.what();
+      std::cerr << "[prompt-batch] " << switching_stage << " FAIL: " << batch_error << '\n';
+      for (auto& record : records) {
+        if (!record.error.empty()) continue;
+        record.error = batch_error;
+        record.failure_stage = switching_stage;
+        record.not_run = true;
+      }
+    }
     for (std::size_t i = 0; i < records.size(); ++i) {
       if (!records[i].error.empty()) continue;
       const auto& item = arguments.prompt_batch[i];
@@ -668,8 +756,14 @@ bool RunPromptBatch(const Arguments& arguments, qwen35::dflash::GraphExecutor& e
         auto result = qwen35::dflash::Benchmark(executor, item.tokens, dflash, options,
                                                arguments.warmup, arguments.repetitions);
         records[i].paired = qwen35::dflash::PairBenchmarks(std::move(*records[i].ordinary), std::move(result));
+      } catch (qwen35::dflash::PairedBenchmarkMismatch& error) {
+        records[i].error = error.what();
+        records[i].failure_stage = "ordinary_dflash_parity";
+        records[i].paired = error.TakeResult();
+        std::cerr << "[prompt-batch] " << item.id << " FAIL: " << error.what() << '\n';
       } catch (const std::exception& error) {
         records[i].error = error.what();
+        records[i].failure_stage = "dflash_benchmark";
         std::cerr << "[prompt-batch] " << item.id << " FAIL: " << error.what() << '\n';
       }
       records[i].elapsed_ms += elapsed(start);
@@ -681,22 +775,31 @@ bool RunPromptBatch(const Arguments& arguments, qwen35::dflash::GraphExecutor& e
     const auto& item = arguments.prompt_batch[i];
     auto& record = records[i];
     const bool pass = record.error.empty() && record.paired.has_value();
+    const char* status = pass ? "PASS" : record.not_run ? "NOT_RUN" : "FAIL";
     ok = ok && pass;
     auto single = arguments;
     single.prompt_token_ids = item.tokens;
     single.output = directory / (item.id + ".json");
     std::ostringstream report;
-    if (pass) {
+    if (record.paired) {
       // Shared model-load accounting belongs to the batch index, not every prompt.
-      WriteReport(report, single, executor, 0, record.elapsed_ms, *record.paired);
+      WriteReport(report, single, executor, 0, record.elapsed_ms, *record.paired, 0, record.error);
     } else {
-      report << "{\"status\":\"FAIL\",\"error\":\"" << JsonEscape(record.error) << "\"}";
+      report << "{\"schema_version\":1,\"status\":\"" << status
+             << "\",\"failure_stage\":\"" << JsonEscape(record.failure_stage)
+             << "\",\"error\":\"" << JsonEscape(record.error)
+             << "\",\"ordinary_parity\":{\"status\":\"NOT_RUN\"},\"formal_latency_evidence\":false";
+      if (record.ordinary) {
+        report << ",\"ordinary\":";
+        WriteBenchmark(report, *record.ordinary);
+      }
+      report << '}';
     }
     AtomicWrite(single.output, report.str());
     if (i) cases << ',';
-    cases << "{\"id\":\"" << item.id << "\",\"status\":\"" << (pass ? "PASS" : "FAIL")
+    cases << "{\"id\":\"" << item.id << "\",\"status\":\"" << status
           << "\",\"report\":\"" << JsonEscape(std::filesystem::absolute(single.output).string()) << "\"}";
-    std::cerr << "[prompt-batch] " << item.id << ' ' << (pass ? "PASS" : "FAIL") << '\n';
+    std::cerr << "[prompt-batch] " << item.id << ' ' << status << '\n';
   }
   const bool fake = std::string(QWEN35_DFLASH_RUNNER_VERSION).find("fake-acl") != std::string::npos;
   std::ostringstream report;
@@ -708,7 +811,9 @@ bool RunPromptBatch(const Arguments& arguments, qwen35::dflash::GraphExecutor& e
          << "\",\"models_reused_across_prompts\":true,\"low_memory\":" << (arguments.low_memory ? "true" : "false")
          << ",\"order\":\"" << (arguments.low_memory ? "all ordinary prompts then all DFlash prompts" : "paired ordinary/DFlash per prompt")
          << "\",\"startup_ms\":{\"acl_and_model_load\":" << load_ms << ",\"mode_switch_unload\":" << unload_ms
-         << "},\"cases\":[" << cases.str() << "]}";
+         << "},\"cases\":[" << cases.str() << ']';
+  if (!batch_error.empty()) report << ",\"error\":\"" << JsonEscape(batch_error) << '"';
+  report << '}';
   dynamic_cast<qwen35::dflash::AclChunkExecutor&>(executor).Close();
   AtomicWrite(arguments.output, report.str());
   std::cout << report.str() << '\n';
@@ -796,26 +901,33 @@ int main(int argc, char** argv) {
       return 0;
     }
     PairedBenchmarkResult result;
+    std::string parity_error;
     double reload_ms = 0, unload_ms = 0;
-    if (arguments.low_memory) {
-      auto ordinary = qwen35::dflash::Benchmark(
-          *executor, arguments.prompt_token_ids, qwen35::dflash::GenerationMode::kOrdinary,
-          options, arguments.warmup, arguments.repetitions);
-      const auto unload_start = std::chrono::steady_clock::now();
-      auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(*executor);
-      chunk.UnloadModels();
-      const auto reload_start = std::chrono::steady_clock::now();
-      unload_ms = std::chrono::duration<double, std::milli>(reload_start - unload_start).count();
-      chunk.LoadMode("dflash");
-      reload_ms = std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - reload_start).count();
-      auto dflash = qwen35::dflash::Benchmark(
-          *executor, arguments.prompt_token_ids, qwen35::dflash::GenerationMode::kDFlash,
-          options, arguments.warmup, arguments.repetitions);
-      result = qwen35::dflash::PairBenchmarks(std::move(ordinary), std::move(dflash));
-    } else {
-      result = qwen35::dflash::BenchmarkPair(*executor, arguments.prompt_token_ids,
-          options, arguments.warmup, arguments.repetitions);
+    try {
+      if (arguments.low_memory) {
+        auto ordinary = qwen35::dflash::Benchmark(
+            *executor, arguments.prompt_token_ids, qwen35::dflash::GenerationMode::kOrdinary,
+            options, arguments.warmup, arguments.repetitions);
+        const auto unload_start = std::chrono::steady_clock::now();
+        auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(*executor);
+        chunk.UnloadModels();
+        const auto reload_start = std::chrono::steady_clock::now();
+        unload_ms = std::chrono::duration<double, std::milli>(reload_start - unload_start).count();
+        chunk.LoadMode("dflash");
+        reload_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - reload_start).count();
+        auto dflash = qwen35::dflash::Benchmark(
+            *executor, arguments.prompt_token_ids, qwen35::dflash::GenerationMode::kDFlash,
+            options, arguments.warmup, arguments.repetitions);
+        result = qwen35::dflash::PairBenchmarks(std::move(ordinary), std::move(dflash));
+      } else {
+        result = qwen35::dflash::BenchmarkPair(*executor, arguments.prompt_token_ids,
+            options, arguments.warmup, arguments.repetitions);
+      }
+    } catch (qwen35::dflash::PairedBenchmarkMismatch& error) {
+      parity_error = error.what();
+      result = error.TakeResult();
+      std::cerr << "qwen35_dflash_acl_runner: " << parity_error << '\n';
     }
     const auto benchmark_end = std::chrono::steady_clock::now();
     const double load_ms =
@@ -825,11 +937,11 @@ int main(int argc, char** argv) {
             benchmark_end - benchmark_start)
             .count() - reload_ms - unload_ms;
     std::ostringstream report;
-    WriteReport(report, arguments, *executor, load_ms, benchmark_ms, result, unload_ms);
+    WriteReport(report, arguments, *executor, load_ms, benchmark_ms, result, unload_ms, parity_error);
     if (auto* chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor*>(executor.get())) chunk->Close();
     AtomicWrite(arguments.output, report.str());
     std::cout << report.str() << '\n';
-    return 0;
+    return parity_error.empty() ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << "qwen35_dflash_acl_runner: " << error.what() << '\n';
     return 1;

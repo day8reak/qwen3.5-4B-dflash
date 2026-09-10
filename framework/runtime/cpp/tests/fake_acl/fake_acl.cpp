@@ -137,6 +137,12 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
     if (model.role == "target_verify") {
       if (valid > 16) return 25;
       for (int i = 0; i < 16; ++i) predictions[i] = (ids[i] + 1) % 64;
+      // Stable numerical-path disagreement, as distinct from repeatability or
+      // profiler faults. Keep the fused acceptance/state contract consistent.
+      if (const char* drift = std::getenv("QWEN35_FAKE_VERIFY_DRIFT_ROW")) {
+        const int row = std::atoi(drift);
+        if (row >= 0 && row < valid) predictions[row] = (predictions[row] + 7) % 64;
+      }
       // Only the output tail changes; all valid rows and acceptance stay exact.
       if (variation == "padding" && profiled)
         for (int i = valid; i < 16; ++i) predictions[i] = 43;

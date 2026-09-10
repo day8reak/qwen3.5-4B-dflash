@@ -15,6 +15,7 @@ from qwen35_dflash.ascend310p.cpp_runtime import validate_cpp_runner_report
 from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
 from qwen35_dflash.ascend310p.utils import sha256_file
 from tools import benchmark_prompts as suite
+from tools.decode_outputs import saved_cases
 
 pytestmark = pytest.mark.usefixtures("adn_rms_norm_cpu")
 
@@ -137,6 +138,9 @@ def test_weighted_acceptance_keeps_failures_and_empty_denominator_visible():
 
 def test_default_and_custom_prompts(tmp_path):
     assert len(suite.load_prompts(None)) == 8
+    assert [p["id"] for p in suite.load_prompts(None, ["code", "math"])] == ["math", "code"]
+    with pytest.raises(ValueError, match="unknown prompt"):
+        suite.load_prompts(None, ["absent"])
     custom = tmp_path / "custom.json"
     custom.write_text(json.dumps(["一个问题", {"id": "code", "prompt": "Write code", "category": "code"}]))
     result = suite.load_prompts(custom)
@@ -182,3 +186,138 @@ def test_wrapper_records_requests_and_rejects_fake_acl_as_device_evidence(chunk_
     assert summary["aggregate"]["failed_prompts"] == 2
     assert all("fake ACL" in r["error"] for r in summary["cases"])
     assert "| prompt_01 | FAIL |" in (root / "summary.md").read_text()
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_stable_parity_failure_keeps_both_outputs_and_locates_first_different_round(
+    chunk_bundle, tmp_path, monkeypatch, low_memory
+):
+    cleanup = tmp_path / "cleanup.json"
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_LOG", str(cleanup))
+    monkeypatch.setenv("QWEN35_FAKE_ACCEPT", "15")
+    monkeypatch.setenv("QWEN35_FAKE_VERIFY_DRIFT_ROW", "2")
+    command, output, plan = batch_command(chunk_bundle, tmp_path, [("p", [4, 5])], low_memory)
+    proc = subprocess.run(command, capture_output=True, text=True)
+    assert proc.returncode == 1, proc.stderr
+    index = json.loads(output.read_text())
+    assert index["status"] == "FAIL" and index["cases"][0]["status"] == "FAIL"
+    report = json.loads(Path(index["cases"][0]["report"]).read_text())
+    assert report["failure_stage"] == "ordinary_dflash_parity"
+    assert report["formal_latency_evidence"] is False
+    assert report["dflash_speedup_over_ordinary_model_total_median"] is None
+    assert report["ordinary_parity"]["token_id_mismatches"] > 0
+    for mode in ("ordinary", "dflash"):
+        assert report[mode]["status"] == "PASS"  # Within-mode repeatability only.
+        assert len(report[mode]["measurements"]) == 10
+        assert report[mode]["measurements"][0]["rounds"]
+    diff = report["ordinary_parity"]["first_difference"]
+    assert diff["index"] == 3 and diff["absolute_token_position"] == 5
+    assert diff["ordinary_token_id"] == 9 and diff["dflash_token_id"] == 16
+    assert diff["ordinary_location"]["round_index"] == 3
+    assert diff["dflash_location"]["round_index"] == 1
+    assert diff["dflash_location"]["emitted_index"] == 2
+    assert diff["dflash_location"]["round"]["accepted_draft_token_ids"] == [7, 8]
+    assert diff["dflash_location"]["previous_round"]["stage"] == "target_prefill"
+    assert "generated_index=3 ordinary=9 dflash=16" in proc.stderr
+    with pytest.raises(RuntimeError, match="passing known report"):
+        validate_cpp_runner_report(report, prompt_token_ids=[4, 5], om_sha256=sha256_file(plan),
+            device_id=0, max_new_tokens=20, max_draft_tokens=15, chunk_abi=True, low_memory=low_memory)
+    assert_cpp_resources_released(cleanup, proc.stderr)
+    # The single-prompt entry must preserve the same failure and still exit 1.
+    single = tmp_path / "single-failed.json"
+    single_cmd = [command[0], "--model-kind", "chunk", "--mode", "paired", "--model", str(plan),
+                  "--model-sha256", sha256_file(plan), "--prompt-token-ids", "4,5",
+                  "--output", str(single), "--max-new-tokens", "20", "--trace-rounds"]
+    if low_memory:
+        single_cmd.append("--low-memory")
+    proc = subprocess.run(single_cmd, capture_output=True, text=True)
+    assert proc.returncode == 1, proc.stderr
+    assert json.loads(single.read_text())["ordinary_parity"] == report["ordinary_parity"]
+    assert_cpp_resources_released(cleanup, proc.stderr)
+
+
+def test_mode_load_failure_reports_dflash_not_run_and_keeps_ordinary(chunk_bundle, tmp_path, monkeypatch):
+    cleanup = tmp_path / "cleanup.json"
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_LOG", str(cleanup))
+    monkeypatch.setenv("QWEN35_FAKE_FAIL_LOAD_GRAPH", "target_verify")
+    command, output, _ = batch_command(chunk_bundle, tmp_path, [("a", [4, 5]), ("b", [7, 8])], True)
+    proc = subprocess.run(command, capture_output=True, text=True)
+    assert proc.returncode == 1, proc.stderr
+    index = json.loads(output.read_text())
+    assert index["status"] == "FAIL" and "245000" in index["error"]
+    assert all(c["status"] == "NOT_RUN" for c in index["cases"])
+    for case in index["cases"]:
+        report = json.loads(Path(case["report"]).read_text())
+        assert report["failure_stage"] == "load_dflash"
+        assert report["ordinary_parity"]["status"] == "NOT_RUN"
+        assert len(report["ordinary"]["measurements"]) == 10
+        assert "dflash" not in report
+    assert "start mode=dflash" not in proc.stderr
+    assert_cpp_resources_released(cleanup, proc.stderr)
+
+
+class TextTokenizer:
+    def decode(self, tokens, *, skip_special_tokens):
+        assert skip_special_tokens is False
+        return "".join({1: "<think>", 2: "你好", 3: "世界", 4: "！"}[t] for t in tokens)
+
+
+def test_decoding_failed_pair_keeps_special_tokens_and_both_texts():
+    report = {"status": "FAIL", "ordinary": {"stable_generated_token_ids": [1, 2, 3]},
+              "dflash": {"stable_generated_token_ids": [1, 2, 4]},
+              "ordinary_parity": {"first_difference": {"field": "generated_token_ids", "index": 2,
+                  "ordinary_token_id": 3, "dflash_token_id": 4}}}
+    decoded = suite.decode_outputs(report, TextTokenizer())
+    assert decoded["ordinary"]["text"] == "<think>你好世界"
+    assert decoded["dflash"]["text"] == "<think>你好！"
+    assert decoded["dflash"]["difference_context"]["token_ids"] == [1, 2, 4]
+    row = dict(id="p", status="FAIL", first_difference=report["ordinary_parity"]["first_difference"],
+               decoded_outputs=decoded, error="parity failed", failure_stage="ordinary_dflash_parity")
+    text = suite.render_outputs([row])
+    assert "| FAIL" in text and "<think>你好世界" in text and "<think>你好！" in text
+    rows = [row, dict(id="missing", status="NOT_RUN", error="load failed", failure_stage="load_dflash")]
+    md = suite.markdown(dict(cases=rows, aggregate=suite.aggregate(rows)))
+    assert "failed: 1; not run: 1" in md and "| missing | NOT_RUN |" in md
+    assert "Each passing prompt" not in md and "Weighted acceptance: N/A" in md
+    assert "ordinary_dflash_parity" in md
+
+
+def test_legacy_error_report_decodes_only_saved_ordinary(tmp_path):
+    case = tmp_path / "p.json"
+    case.write_text(json.dumps(dict(status="FAIL", error="parity failed")))
+    ordinary = {"status": "PASS", "generation_mode": "ordinary-greedy", "stable_generated_token_ids": [1, 2]}
+    (tmp_path / "p.ordinary.json").write_text(json.dumps(ordinary))
+    (_, report), = saved_cases(case)
+    decoded = suite.decode_outputs(report, TextTokenizer())
+    assert decoded["ordinary"]["text"] == "<think>你好" and not decoded["dflash"]["available"]
+    text = suite.render_outputs([dict(status="FAIL", decoded_outputs=decoded)])
+    assert "dflash: output token IDs unavailable" in text
+    (_, report), = saved_cases(tmp_path / "p.ordinary.json")
+    assert suite.decode_outputs(report, TextTokenizer())["ordinary"]["available"]
+
+
+def test_decode_cli_selects_failed_batch_case_without_inference(tmp_path, monkeypatch, capsys):
+    from qwen35_dflash.ascend310p import workflow
+    from tools import decode_outputs as decoder
+
+    directory = tmp_path / "runner-batch.json.cases"
+    directory.mkdir()
+    index = tmp_path / "runner-batch.json"
+    report = {"status": "FAIL", "prompt_token_ids": [2], "error": "parity failed",
+              "ordinary": {"stable_generated_token_ids": [1, 2, 3]},
+              "dflash": {"stable_generated_token_ids": [1, 2, 4]}}
+    cases = []
+    for name in ("a", "b"):
+        path = directory / (name + ".json")
+        path.write_text(json.dumps(report))
+        cases.append(dict(id=name, status="FAIL", report=str(path)))
+    index.write_text(json.dumps(dict(status="FAIL", cases=cases)))
+    before = {p: p.read_bytes() for p in (index, *(directory.glob("*.json")))}
+    monkeypatch.setattr(workflow, "load_tokenizer", lambda **kwargs: (TextTokenizer(), "host-test"))
+    monkeypatch.setattr("sys.argv", ["decode_outputs.py", "--model-dir", str(tmp_path),
+                                    "--report", str(tmp_path), "--prompt-id", "b"])
+    assert decoder.main() == 0  # Text conversion, not a parity pass.
+    output = capsys.readouterr().out
+    assert "=== b | FAIL ===" in output and "=== a" not in output
+    assert "Prompt:\n你好" in output and "<think>你好世界" in output and "<think>你好！" in output
+    assert all(p.read_bytes() == content for p, content in before.items())

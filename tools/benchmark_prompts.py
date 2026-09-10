@@ -27,7 +27,7 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def load_prompts(path):
+def load_prompts(path, prompt_ids=None):
     values = json.loads(path.read_text()) if path else DEFAULT_PROMPTS
     if not isinstance(values, list) or not 1 <= len(values) <= 64:
         raise ValueError("prompts must be a JSON list of 1..64 strings or {id, prompt, category} objects")
@@ -43,7 +43,71 @@ def load_prompts(path):
             raise ValueError("each prompt needs nonempty text and a unique safe id")
         seen.add(name)
         result.append({"id": name, "category": str(item.get("category", "custom")), "prompt": prompt})
+    if prompt_ids:
+        unknown = set(prompt_ids) - seen
+        if unknown:
+            raise ValueError(f"unknown prompt id(s): {', '.join(sorted(unknown))}")
+        result = [item for item in result if item["id"] in prompt_ids]
     return result
+
+
+def decode_outputs(report, tokenizer):
+    """Decode saved tokens, including specials, without changing parity results."""
+    outputs = {}
+    for mode in ("ordinary", "dflash"):
+        benchmark = report.get(mode)
+        # Also accept a legacy per-mode *.ordinary.json or --mode report.
+        standalone = report.get("benchmark", report)
+        if benchmark is None and standalone.get("generation_mode", "").startswith(mode):
+            benchmark = standalone
+        tokens = benchmark.get("stable_generated_token_ids") if benchmark else None
+        if not isinstance(tokens, list):
+            outputs[mode] = {"available": False}
+            continue
+        if any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError("invalid saved generated token IDs")
+        outputs[mode] = {"available": True, "token_count": len(tokens),
+                         "stop_reason": benchmark.get("stable_stop_reason"),
+                         "text": tokenizer.decode(tokens, skip_special_tokens=False)}
+        difference = report.get("ordinary_parity", {}).get("first_difference")
+        if difference and difference.get("field") == "generated_token_ids":
+            index = difference["index"]
+            begin, end = max(0, index - 12), min(len(tokens), index + 13)
+            outputs[mode]["difference_context"] = {
+                "token_begin": begin, "token_end": end,
+                "token_ids": tokens[begin:end],
+                "text": tokenizer.decode(tokens[begin:end], skip_special_tokens=False),
+            }
+    return outputs
+
+
+def render_outputs(rows):
+    lines = []
+    for row in rows:
+        lines += [f"=== {row.get('id', 'report')} | {row.get('status', 'UNKNOWN')} ==="]
+        if row.get("prompt"):
+            lines += ["Prompt:", row["prompt"]]
+        if row.get("error"):
+            lines += ["Error: " + row["error"]]
+        difference = row.get("first_difference")
+        if difference:
+            if difference.get("field") == "generated_token_ids":
+                lines += [f"First different generated token (zero-based): {difference['index']}; "
+                          f"ordinary={difference['ordinary_token_id']}, dflash={difference['dflash_token_id']}"]
+            else:
+                lines += ["First difference: " + json.dumps(difference, ensure_ascii=False)]
+        for mode in ("ordinary", "dflash"):
+            value = row.get("decoded_outputs", {}).get(mode, {})
+            if not value.get("available"):
+                lines += [f"--- {mode}: output token IDs unavailable in saved report ---"]
+            else:
+                lines += [f"--- {mode}: {value['token_count']} tokens, stop={value['stop_reason']} ---", value["text"]]
+                context = value.get("difference_context")
+                if context:
+                    lines += [f"First-difference context, tokens [{context['token_begin']}, {context['token_end']}):",
+                              context["text"]]
+        lines += [""]
+    return "\n".join(lines) + "\n"
 
 
 def summarize_prompt(report):
@@ -80,7 +144,8 @@ def aggregate(rows):
     accepted = sum(r["accepted_draft_tokens"] for r in good)
     latency = sum(r["dflash_total_measured_ms"] for r in good)
     return {"scope": "passing prompts only; inspect failures before interpreting the suite",
-            "passed_prompts": len(good), "failed_prompts": len(rows) - len(good),
+            "passed_prompts": len(good), "failed_prompts": sum(r["status"] == "FAIL" for r in rows),
+            "not_run_prompts": sum(r["status"] == "NOT_RUN" for r in rows),
             "drafted_tokens": drafted, "accepted_draft_tokens": accepted,
             "weighted_acceptance_rate": accepted / drafted if drafted else None,
             "total_model_time_speedup": sum(r["ordinary_total_measured_ms"] for r in good) / latency if latency else None}
@@ -93,17 +158,24 @@ def markdown(summary):
              "|---|---|---:|---:|---:|---:|---:|"]
     for row in summary["cases"]:
         if row["status"] != "PASS":
-            lines.append(f"| {row['id']} | FAIL | — | — | — | — | — |")
+            lines.append(f"| {row['id']} | {row['status']} | — | — | — | — | — |")
         else:
             lines.append(f"| {row['id']} | PASS | {value(row['acceptance_rate'], True)} | "
                          f"{value(row['tokens_per_speculative_round'])} | {value(row['dflash_tokens_per_second'])} | "
                          f"{value(row['speedup'])}x | {row['generated_tokens']} |")
     totals = summary["aggregate"]
-    lines += ["", f"Passed: {totals['passed_prompts']}; failed: {totals['failed_prompts']}.",
+    lines += ["", f"Passed: {totals['passed_prompts']}; failed: {totals['failed_prompts']}; not run: {totals['not_run_prompts']}.",
               f"Weighted acceptance: {value(totals['weighted_acceptance_rate'], True)}.",
               "Acceptance = accepted draft tokens / proposed draft tokens; warmups excluded.",
-              "Speedup > 1 means faster than ordinary generation; acceptance alone does not establish speedup.",
-              "Each passing prompt passed token/EOS parity and the existing 3+10 repeatability gates."]
+              "Speedup > 1 means faster than ordinary generation; acceptance alone does not establish speedup."]
+    if totals["passed_prompts"]:
+        lines += ["Each passing prompt passed token/EOS parity and the existing 3+10 repeatability gates."]
+    else:
+        lines += ["No prompt has passed the complete checks; no validated acceptance or speedup is available."]
+    for row in summary["cases"]:
+        if row.get("error"):
+            lines += ["", f"- {row['id']} ({row.get('failure_stage', 'report_validation')}): "
+                      + row["error"].replace("\n", " ")]
     return "\n".join(lines) + "\n"
 
 
@@ -132,7 +204,7 @@ def run(args):
     os.environ["AI_RUN_DIR"] = str(run_dir)
     if args.device_id < 0 or not 1 <= args.max_draft_tokens <= 15 or args.max_new_tokens <= 0:
         raise ValueError("invalid device/token limits")
-    prompts = load_prompts(args.prompts)
+    prompts = load_prompts(args.prompts, getattr(args, "prompt_id", None))
     manifest = (args.deployment_manifest or run_dir / "artifacts/deployment-manifest.json").resolve()
     config = json.loads((args.runner_config or run_dir / "runner.json").read_text())
     identity = validate_cpp_runner_options(config, args.device_id)
@@ -196,8 +268,16 @@ def run(args):
             if path != (Path(str(index) + ".cases") / (prompt["id"] + ".json")).resolve():
                 raise ValueError("unexpected case report path")
             report = json.loads(path.read_text())
+            row.update(raw_report=str(path), decoded_outputs=decode_outputs(report, tokenizer))
             if case["status"] != "PASS":
-                raise RuntimeError(report.get("error", "C++ prompt failed"))
+                # Failed parity reports retain both mode measurements. They
+                # are diagnostic output, never feed them into PASS statistics.
+                row.update(status="NOT_RUN" if case["status"] == "NOT_RUN" else "FAIL",
+                    failure_stage=report.get("failure_stage", "unknown"),
+                    first_difference=report.get("ordinary_parity", {}).get("first_difference"),
+                    error=report.get("error", "C++ prompt failed"))
+                rows.append(row)
+                continue
             validate_cpp_runner_report(report, prompt_token_ids=prompt["prompt_token_ids"],
                 om_sha256=plan_hash, device_id=args.device_id, max_new_tokens=args.max_new_tokens,
                 max_draft_tokens=args.max_draft_tokens, chunk_abi=True, low_memory=args.low_memory)
@@ -220,8 +300,10 @@ def run(args):
         "scope": "This selected prompt suite; no general acceptance-rate or speedup claim beyond it."}
     atomic_write_json(root / "summary.json", summary)
     (root / "summary.md").write_text(markdown(summary))
+    (root / "generations.txt").write_text(render_outputs(rows), encoding="utf-8")
     print(markdown(summary), flush=True)
     print(f"Summary: {root / 'summary.json'}", flush=True)
+    print(f"Decoded outputs: {root / 'generations.txt'}", flush=True)
     return 0 if ok else 1
 
 
@@ -233,6 +315,7 @@ def main():
     parser.add_argument("--runner-config", type=Path)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--prompts", type=Path, help="optional JSON list; defaults to eight varied prompts")
+    parser.add_argument("--prompt-id", action="append", help="run only selected ID(s); repeatable")
     parser.add_argument("--chat", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eos-token-id", type=int, action="append", help="repeatable; default 248044")
     parser.add_argument("--device-id", type=int, default=0)

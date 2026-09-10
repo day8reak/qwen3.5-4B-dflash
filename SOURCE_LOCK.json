@@ -161,7 +161,7 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "58fbd80e2b033e99e86ff739547b7d4bf2c8715d2badde0ccf020fe6be2dc087"
+        "source_sha256": "9b2d9b8ada32ce7abc30f7ff5b307ceea99b5e7bf940298c96913fdcbd3c40e7"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -289,7 +289,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/generation.hpp",
-        "source_sha256": "1fa6b48fffc089e9aa8687329f94266fc5d1da396c10f987eae598c23455e353"
+        "source_sha256": "42271b7526bae17b3af737084a45e786c474077e777add726e2a96dca5639e26"
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/sha256.hpp",
@@ -313,11 +313,11 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/generation.cpp",
-        "source_sha256": "89c31a9fbf8e87be577fca5c9e9a3477cce0b6d0f5eacc4ba3aed1b60a1bdff4"
+        "source_sha256": "dd41cdababe21e1b843ce40e75633d396a1b86e4b1d5f11e57c68315fe65706e"
       },
       {
         "source_file": "framework/runtime/cpp/src/main.cpp",
-        "source_sha256": "90ca7c3fa1a98df723f57220d6047731cfc9f242c0909bfbfac31569f616fd2d"
+        "source_sha256": "4ca2fede53a12eeaf465aa6b35a2b30cabfd1e4d7522630c568ba6abfbe53960"
       },
       {
         "source_file": "framework/runtime/cpp/src/sha256.cpp",
@@ -333,7 +333,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/fake_acl.cpp",
-        "source_sha256": "281e13cf575a3dddee2753e866d892c7ae302d9b7cb70325349ee1399313a54a"
+        "source_sha256": "683dbd2bccb0d4ec4d7a0a3f5da0a5e3f6556cfedcf9a55aa6b12633e74ebf48"
       },
       {
         "source_file": "framework/runtime/cpp/tests/run_fake_runner.cmake",
@@ -341,7 +341,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/tests/test_generation.cpp",
-        "source_sha256": "432458de5ee61695ff441b330ac2dc05704cb101930fae1a528ca16ae0f7a717"
+        "source_sha256": "f5156d68fb9b2c481536c839d39b616b9baa303ecd0fc55db87c78bfebf028f5"
       },
       {
         "source_file": "framework/scripts/compare_cpp_closed_runtime.py",
@@ -481,15 +481,19 @@
       },
       {
         "source_file": "tools/benchmark_prompts.py",
-        "source_sha256": "c57f20925adc411d4e0db9f09b78ab429e8c876ea601ad4bc5dc897447718646"
+        "source_sha256": "06f4e9e6b784f34f888a1cb26b19c9384b3914793bd86079cde75e313e7a1ec6"
       },
       {
         "source_file": "tests/test_prompt_suite.py",
-        "source_sha256": "92b1c3b755da8b8a1982db05bf3f2ea60c3850ea419eee152d4f1af5b7e9035b"
+        "source_sha256": "97904324833df41673bb0a536384ed1d2043d2bab881f5d56c9501cc5151074e"
       },
       {
         "source_file": "tests/test_draft_compile_determinism.py",
         "source_sha256": "f01440f564935b1e0ddd2c890d6cbfa86f9ca3ba870ac76e9a01ac114c81ddf8"
+      },
+      {
+        "source_file": "tools/decode_outputs.py",
+        "source_sha256": "fcffba153571ccd020b50841ad4fd7e44c0b90c9a28c48b97e3f503d60afa924"
       }
     ]
   }

@@ -153,6 +153,31 @@ void TestSha256KnownVector() {
       "SHA-256 known vector differs");
 }
 
+void TestFailedParityPreservesEvidence() {
+  for (bool stop_only : {false, true}) {
+    qwen35::dflash::BenchmarkResult ordinary, draft;
+    ordinary.stable_generated_token_ids = {10, 11};
+    draft.stable_generated_token_ids = stop_only ? std::vector<std::int64_t>{10, 11}
+                                               : std::vector<std::int64_t>{10};
+    ordinary.stable_stop_reason = "max_new_tokens";
+    draft.stable_stop_reason = stop_only ? "eos" : "max_new_tokens";
+    bool failed = false;
+    try {
+      static_cast<void>(qwen35::dflash::PairBenchmarks(ordinary, draft));
+    } catch (qwen35::dflash::PairedBenchmarkMismatch& error) {
+      failed = true;
+      const auto result = error.TakeResult();
+      Require(result.token_id_mismatches == (stop_only ? 0 : 1), "length mismatch was lost");
+      Require(result.eos_mismatches == (stop_only ? 1 : 0), "stop mismatch was lost");
+      Require(result.ordinary.stable_generated_token_ids == ordinary.stable_generated_token_ids,
+              "ordinary evidence was lost");
+      Require(result.dflash.stable_generated_token_ids == draft.stable_generated_token_ids,
+              "DFlash evidence was lost");
+    }
+    Require(failed, "failed parity gate did not throw");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -162,6 +187,7 @@ int main() {
     TestEosStopsBothModesAtSameToken();
     TestCapacityGate();
     TestPairedBenchmarkIsStableAndExact();
+    TestFailedParityPreservesEvidence();
     TestSha256KnownVector();
     std::cout << "PASS: C++ scheduler, parity, EOS, capacity and SHA-256\n";
     return 0;

@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace qwen35::dflash {
@@ -106,6 +108,18 @@ struct PairedBenchmarkResult {
   BenchmarkResult dflash;
   std::size_t token_id_mismatches = 0;
   std::size_t eos_mismatches = 0;
+};
+
+// Keep the failed measurements available to the report writer without making
+// the strict parity gate optional. Callers must still return a failure status.
+class PairedBenchmarkMismatch : public std::runtime_error {
+ public:
+  PairedBenchmarkMismatch(PairedBenchmarkResult result, const std::string& message)
+      : std::runtime_error(message), result_(std::move(result)) {}
+  PairedBenchmarkResult TakeResult() { return std::move(result_); }
+
+ private:
+  PairedBenchmarkResult result_;
 };
 
 GenerationMeasurement GenerateOnce(

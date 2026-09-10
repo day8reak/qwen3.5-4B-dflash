@@ -384,8 +384,18 @@ PairedBenchmarkResult PairBenchmarks(BenchmarkResult ordinary, BenchmarkResult d
           ? 0
           : 1;
   if (result.token_id_mismatches != 0 || result.eos_mismatches != 0) {
-    throw std::runtime_error(
-        "DFlash output differs from the ordinary greedy authority");
+    std::string message = "DFlash output differs from the ordinary greedy authority";
+    for (std::size_t index = 0; index < width; ++index) {
+      if (index >= expected.size() || index >= actual.size() || expected[index] != actual[index]) {
+        message += "; generated_index=" + std::to_string(index) +
+            " ordinary=" + (index < expected.size() ? std::to_string(expected[index]) : "<end>") +
+            " dflash=" + (index < actual.size() ? std::to_string(actual[index]) : "<end>");
+        break;
+      }
+    }
+    message += "; ordinary_stop=" + result.ordinary.stable_stop_reason +
+               " dflash_stop=" + result.dflash.stable_stop_reason;
+    throw PairedBenchmarkMismatch(std::move(result), message);
   }
   return result;
 }
