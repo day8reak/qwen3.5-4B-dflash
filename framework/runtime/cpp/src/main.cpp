@@ -71,6 +71,7 @@ void Usage(std::ostream& stream) {
          << "  --profile-mode MODE         ordinary or dflash; use tools/run_msprof.sh --profile-backend cpp\n"
          << "  --profile-output PATH       new raw msprof directory (controller owned)\n"
          << "  --profile-warmup N          unprofiled fresh-state warmups; default 1\n"
+         << "  --profile-audit-draft-inputs true|false  hash Draft inputs outside capture; default false\n"
          << "  --profile-aic-metrics NAME  default PipeUtilization\n";
 }
 
@@ -253,6 +254,10 @@ Arguments ParseArguments(int argc, char** argv) {
   if (profile_warmup < 0) throw std::invalid_argument("profile-warmup must be non-negative");
   result.profile.warmup = static_cast<std::size_t>(profile_warmup);
   result.profile.device_id = result.device_id;
+  const auto audit_draft_inputs = TakeOptional(&values, "profile-audit-draft-inputs", "false");
+  if (audit_draft_inputs != "true" && audit_draft_inputs != "false")
+    throw std::invalid_argument("profile-audit-draft-inputs must be true or false");
+  result.profile.audit_draft_inputs = audit_draft_inputs == "true";
   if (!result.profile.stage.empty()) {
     if (result.model_kind != "chunk") throw std::invalid_argument("stage capture requires --model-kind chunk");
     if (result.mode != "paired" && result.mode != result.profile.mode) throw std::invalid_argument("mode disagrees with profile-mode");
@@ -261,8 +266,8 @@ Arguments ParseArguments(int argc, char** argv) {
     if (std::filesystem::exists(result.output) || std::filesystem::is_symlink(result.output)) {
       throw std::invalid_argument("profile report must be a new file");
     }
-  } else if (!result.profile.output.empty() || result.profile.mode != "dflash") {
-    throw std::invalid_argument("profile-output/profile-mode requires profile-stage");
+  } else if (!result.profile.output.empty() || result.profile.mode != "dflash" || result.profile.audit_draft_inputs) {
+    throw std::invalid_argument("profile-output/profile-mode/profile-audit-draft-inputs requires profile-stage");
   }
   if (!values.empty()) {
     throw std::invalid_argument("unknown option --" + values.begin()->first);

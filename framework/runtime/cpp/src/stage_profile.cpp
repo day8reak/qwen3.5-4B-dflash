@@ -54,6 +54,7 @@ struct Sample {
   std::size_t iteration = 0;
   bool measured = false;
   std::vector<std::int64_t> input, output, raw_output;
+  std::map<std::string, std::string> draft_input_hashes;
   std::optional<std::int64_t> accepted;
 };
 struct Difference {
@@ -61,6 +62,23 @@ struct Difference {
   std::size_t index = 0;
   std::optional<std::int64_t> reference, actual;
 };
+const char* InputStateComparison(const Sample& sample, const Sample* reference) {
+  if (sample.draft_input_hashes.empty()) return "NOT_RUN";
+  if (!reference) return "REFERENCE_SHA256";
+  return sample.draft_input_hashes == reference->draft_input_hashes
+      ? "MATCH_SHA256" : "DIFFERENT_SHA256";
+}
+std::string HashesJson(const std::map<std::string, std::string>& hashes) {
+  std::ostringstream out;
+  out << '{';
+  bool first = true;
+  for (const auto& item : hashes) {
+    if (!first) out << ',';
+    first = false;
+    out << Quote(item.first) << ':' << Quote(item.second);
+  }
+  return out.str() + '}';
+}
 Difference Compare(const Sample& reference, const Sample& actual) {
   for (bool input : {true, false}) {
     const auto& a = input ? reference.input : reference.output;
@@ -113,7 +131,9 @@ class IterationTrace {
         << ",\"verify_valid_rows\":" << (stage == "verify" ? std::to_string(sample.input.size()) : "null")
         << ",\"padding_output_rows\":" << sample.raw_output.size() - sample.output.size()
         << ",\"accepted_draft_tokens\":" << NumberJson(sample.accepted)
-        << ",\"input_state_comparison\":\"NOT_RUN\",\"check\":{\"status\":" << Quote(status)
+        << ",\"draft_input_sha256\":" << HashesJson(sample.draft_input_hashes)
+        << ",\"input_state_comparison\":" << Quote(InputStateComparison(sample, reference))
+        << ",\"check\":{\"status\":" << Quote(status)
         << ",\"reference_iteration\":" << (reference ? std::to_string(reference->iteration) : "null")
         << ",\"input_token_ids_match\":" << match(reference && sample.input == reference->input)
         << ",\"output_token_ids_match\":" << match(reference && sample.output == reference->output)
@@ -215,6 +235,8 @@ std::string Scope(const std::string& stage) {
 
 void ValidateProfileOptions(const ProfileOptions& p) {
   Require(p.mode == "ordinary" || p.mode == "dflash", "invalid profile mode");
+  Require(!p.audit_draft_inputs || (p.mode == "dflash" && (p.stage == "draft" || p.stage == "all")),
+          "profile-audit-draft-inputs requires dflash draft/all");
   const auto stages = Stages(p.mode);
   Require(p.stage == "all" ||
               std::find(stages.begin(), stages.end(), p.stage) != stages.end(),
@@ -326,6 +348,9 @@ std::string ProfileChunk(AclChunkExecutor& executor,
           sample.output = sample.raw_output;
         } else if (stage == "draft") {
           sample.input = {anchor};
+          // All D2H, host hashing and trace writes finish before msprof start.
+          if (p.audit_draft_inputs)
+            sample.draft_input_hashes = executor.DraftInputHashes(anchor, proposal_count);
           prepared();
           invoke(measured, [&] {
             sample.raw_output = executor.Propose(anchor, proposal_count);
@@ -384,6 +409,13 @@ std::string ProfileChunk(AclChunkExecutor& executor,
       }
       measured = once(true, p.warmup);
       check(measured);
+    } catch (const std::exception& error) {
+      // Report before Channel/executor destruction: model unloading can take
+      // time, and the controller may already be waiting for the next stage.
+      std::cerr << "[stage-profile] application_error stage=" << stage
+                << " message=" << error.what() << std::endl;
+      executor.Abort();
+      throw;
     } catch (...) {
       executor.Abort();
       throw;
@@ -415,7 +447,8 @@ std::string ProfileChunk(AclChunkExecutor& executor,
            << ",\"warmup_input_token_ids_match\":" << (p.warmup ? "true" : "null")
            << ",\"compared_output_rows\":" << measured.output.size()
            << ",\"output_comparison_scope\":\"valid rows only; padding retained in iteration trace\""
-           << ",\"input_state_comparison\":\"NOT_RUN\",\"iteration_trace\":" << Quote(trace.path.string())
+           << ",\"input_state_comparison\":" << Quote(InputStateComparison(measured, reference ? &*reference : nullptr))
+           << ",\"iteration_trace\":" << Quote(trace.path.string())
            << ",\"formal_latency_evidence\":false,\"correctness_gate\":{"
               "\"status\":\"NOT_RUN_STAGE_DIAGNOSTIC\"}}";
     reports.push_back(report.str());

@@ -202,6 +202,10 @@ class DynamicCapture:
         self.selector = selectors.DefaultSelector()
         self.control_buffer = bytearray()
         self.prof_buffer = bytearray()
+        self.application_output_tail = bytearray()
+        self.application_line_buffer = bytearray()
+        self.application_output_closed = False
+        self.last_stopped_stage = None
         self.messages = []
         self.control_closed = False
         self.evidence = {
@@ -243,6 +247,8 @@ class DynamicCapture:
                 if key.data == "control":
                     self.control_closed = True
                     self.event("application_control_closed")
+                elif key.data == "application":
+                    self.application_output_closed = True
                 continue
             if key.data == "control":
                 self.control_buffer.extend(data)
@@ -264,10 +270,51 @@ class DynamicCapture:
                     self.prof_buffer.extend(data)
                     if len(self.prof_buffer) > 1048576:
                         raise RuntimeError("msprof emitted excessive output without completing a command")
+                else:
+                    self.application_output_tail.extend(data)
+                    del self.application_output_tail[:-16384]
+                    self.application_line_buffer.extend(data)
+                    while b"\n" in self.application_line_buffer:
+                        line, _, rest = self.application_line_buffer.partition(b"\n")
+                        self.application_line_buffer = bytearray(rest)
+                        if line.startswith((b"[stage-profile] application_error ",
+                                            b"qwen35_dflash_acl_runner: ")):
+                            # Keep the original error even if lengthy GE/model
+                            # teardown logs push it out of the bounded tail.
+                            self.evidence["application_error"] = line[-16384:].decode("utf-8", errors="replace")
+                    del self.application_line_buffer[:-16384]
+
+    def application_failed(self, reason, waiting_event, deadline):
+        failure = {
+            "waiting_stage": self.current_stage, "waiting_event": waiting_event,
+            "last_stopped_stage": self.last_stopped_stage,
+            "exit_wait_timed_out": False,
+        }
+        self.evidence["application_failure"] = failure
+        self.event("application_exit_wait")
+        # A C++ stage socket closes during stack unwinding, before the executor
+        # unloads OMs and main prints its exception. Continue draining stdout
+        # until natural exit (bounded by the existing handshake deadline).
+        while self.app.poll() is None or not self.application_output_closed:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                failure["exit_wait_timed_out"] = True
+                break
+            self.pump(min(remaining, 0.2))
+        suffix = (
+            "timed out waiting for application exit/cleanup"
+            if failure["exit_wait_timed_out"] else f"exit={self.app.returncode}"
+        )
+        detail = self.evidence.get("application_error", "see application output above and iteration trace")
+        raise RuntimeError(
+            f"{reason}; waiting_stage={self.current_stage} waiting_event={waiting_event} "
+            f"last_stopped_stage={self.last_stopped_stage}; {suffix}; {detail}"
+        )
 
     def check_processes(self):
         if self.app.poll() is not None:
-            raise RuntimeError(f"application exited before handshake completed: {self.app.returncode}")
+            self.application_failed("application exited before handshake completed", "handshake",
+                                    monotonic() + self.args.timeout)
         if self.prof is not None and self.prof.poll() is not None:
             raise RuntimeError(f"msprof exited before handshake completed: {self.prof.returncode}")
         if self.FAILURE.search(self.prof_buffer):
@@ -277,7 +324,7 @@ class DynamicCapture:
         deadline = monotonic() + self.args.timeout
         while not self.messages:
             if self.control_closed:
-                raise RuntimeError(f"application control disconnected before {event}")
+                self.application_failed(f"application control disconnected before {event}", event, deadline)
             self.check_processes()
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -327,6 +374,8 @@ class DynamicCapture:
             self.pump(0.2)
         self.pump(0)
         if process.returncode != 0:
+            if process is self.app:
+                self.application_failed("application failed", "exit", deadline)
             raise RuntimeError(f"{description} failed: exit={process.returncode}")
 
     def run(self):
@@ -425,8 +474,10 @@ class DynamicCapture:
         self.prof = None
         self.prof_buffer.clear()
         self.send("stopped")
+        self.last_stopped_stage = stage
         if done.get("success") is not True:
-            raise RuntimeError("application did not complete a successful stage")
+            self.application_failed("application did not complete a successful stage", "exit",
+                                    monotonic() + self.args.timeout)
         if self.args.stage == "all":
             self.capture_evidence["capture_completed"] = True
 
@@ -457,6 +508,9 @@ class DynamicCapture:
         if self.terminal is not None:
             os.close(self.terminal)
         self.evidence["application_exit_code"] = None if self.app is None else self.app.returncode
+        if self.evidence["status"] == "FAIL":
+            self.evidence["application_output_tail"] = bytes(self.application_output_tail).decode(
+                "utf-8", errors="replace")
         if self.prof is not None:
             self.capture_evidence["msprof_exit_code"] = self.prof.returncode
         elif self.args.stage != "all":

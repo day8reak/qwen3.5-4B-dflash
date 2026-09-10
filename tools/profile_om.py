@@ -73,6 +73,8 @@ def parser(default_stage="all") -> argparse.ArgumentParser:
     result.add_argument("--max-new-tokens", type=int, default=32)
     result.add_argument("--max-draft-tokens", type=int, default=15)
     result.add_argument("--profile-warmup", type=int, default=1)
+    result.add_argument("--profile-audit-draft-inputs", action="store_true",
+                        help="For DFlash draft/all, hash features, KV and controls before capture (diagnostic only)")
     result.add_argument("--profile-timeout", type=int, default=600)
     result.add_argument("--aic-metrics", choices=("PipeUtilization", "Memory", "MemoryUB"),
                         default="PipeUtilization")
@@ -84,6 +86,8 @@ def run_profile(args: argparse.Namespace) -> Path:
     available = stages_for_mode(mode, "cpp")
     if stage != "all" and stage not in available:
         raise ValueError(f"{mode} stages: {', '.join((*available, 'all'))}")
+    if args.profile_audit_draft_inputs and (mode != "dflash" or stage not in {"draft", "all"}):
+        raise ValueError("--profile-audit-draft-inputs requires dflash draft/all")
     if args.max_new_tokens < (1 if stage == "prefill" else 2):
         raise ValueError("prefill needs max-new-tokens >= 1; decode/Draft/verify need >= 2")
     if args.run_dir is None or args.runner is None:
@@ -128,6 +132,7 @@ def run_profile(args: argparse.Namespace) -> Path:
         "eos_token_ids": [int(value) for value in eos.split(",")],
         "max_new_tokens": args.max_new_tokens, "max_draft_tokens": args.max_draft_tokens,
         "profile_warmup": args.profile_warmup, "aic_metrics": args.aic_metrics,
+        "profile_audit_draft_inputs": args.profile_audit_draft_inputs,
     }
     (output / "profile-request.json").write_text(json.dumps(request, indent=2) + "\n")
     subprocess.run([
@@ -149,6 +154,7 @@ def run_profile(args: argparse.Namespace) -> Path:
         "--model-sha256", digest, "--prompt-token-ids", prompt, "--eos-token-ids", eos,
         "--device-id", str(args.device_id), "--max-new-tokens", str(args.max_new_tokens),
         "--max-draft-tokens", str(args.max_draft_tokens),
+        *(["--profile-audit-draft-inputs", "true"] if args.profile_audit_draft_inputs else []),
     ], check=True, env=environment, cwd=REPOSITORY)
     print(f"\nSynchronized stage timing: {capture / (stage + '-stage-summary.csv')}")
     print(f"Per-stage operator timings: {capture / (stage + '-operator-types.csv')}")

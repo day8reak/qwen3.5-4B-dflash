@@ -149,6 +149,8 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
     if (out.count("features")) {
       std::memset(out.at("features")->data, 0, out.at("features")->size);
       *static_cast<std::uint16_t*>(out.at("features")->data) = static_cast<std::uint16_t>(start);
+      if (variation == "prefill_features" && model.role == "target_prefill" && call_number == 2)
+        static_cast<unsigned char*>(out.at("features")->data)[2] = 1;
     }
   }
   for (const auto& item : in) {
@@ -300,12 +302,18 @@ aclError aclrtMemcpyAsync(
     std::size_t destination_max,
     const void* source,
     std::size_t count,
-    aclrtMemcpyKind,
+    aclrtMemcpyKind kind,
     aclrtStream) {
   if (destination == nullptr || source == nullptr || count > destination_max) {
     return 1;
   }
   if (TouchesDiscard(source, count) || TouchesDiscard(destination, count)) return 34;
+  if (const auto* path = std::getenv("QWEN35_FAKE_COPY_LOG")) {
+    const auto* active = std::getenv("TEST_ACTIVE");
+    std::ofstream log(path, std::ios::app);
+    log << '[' << count << ',' << int(kind) << ','
+        << (active && std::filesystem::exists(active) ? "true" : "false") << "]\n";
+  }
   std::memcpy(destination, source, count);
   return ACL_SUCCESS;
 }

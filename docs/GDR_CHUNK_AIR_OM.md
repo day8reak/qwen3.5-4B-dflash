@@ -770,6 +770,61 @@ raw 目录直接是 `profile/msprof/<stage>/`。直接使用 `run_msprof.sh` 时
 `artifacts.iteration_trace` 都指向该记录。预热之间的差异也会保留记录并立即失败；
 关闭预热会失去此项检查，不能用于确认问题已修复。
 
+若 `all` 在 draft 的 stop/quit 成功后报
+`application control disconnected before ready`，表示应用在下一次 ready 前退出。
+控制器日志里的 `stage=verify` 是正在等待的阶段；只有出现 verify 的
+`application_ready`、`application_started`，才表示已进入它的采集窗口。
+例如 JSONL 最后一条是 draft 的 `check.status="FAIL"`，就应先查 draft 的差异。
+`application_done` 只表示窗口内执行完成，输出比较在 stop/quit 后进行。
+
+C++ 会在卸载模型前打印 `application_error stage=... message=...`。
+控制器收到断连后继续接收应用日志，等待其自然退出，等待时间受
+`--profile-timeout` 限制；超时才终止仍未退出的应用。
+`manifest/<label>-control.json` 中的 `application_failure` 记录
+`waiting_stage`、`waiting_event`、`last_stopped_stage` 和 `exit_wait_timed_out`；
+`application_error` 保留已识别的 C++ 异常，`application_output_tail` 保留日志尾部。
+所有要求的阶段未完成时，即使应用退出码为 0，整体也会 FAIL。
+
+`infer-cpp` 会丢弃预热结果，正式重复的稳定性检查比较最终生成 token 和停止原因，
+没有要求每轮全部 draft 候选一致。被 Target 拒绝的候选即使变化，最终结果也可能不变。
+stage profiling 则以第一次预热为参考，逐项比较后续预热和采集的有效候选。
+因此，正常生成通过、stage profiling 失败，并不能单凭这一点证明 msprof 改变了计算结果。
+
+需要判断 draft 差异是否来自输入时，开启额外检查：
+
+```bash
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/profile_om.py" \
+  --run-dir "$AI_RUN_DIR" --runner "$CPP_RUNNER" \
+  --deployment-manifest "$DEPLOYMENT_MANIFEST" \
+  --profile-mode dflash --profile-stage draft --device-id 0 \
+  --max-new-tokens "$MAX_NEW_TOKENS" --max-draft-tokens 15 \
+  --profile-warmup 3 --profile-audit-draft-inputs
+```
+
+也可保持 `--profile-stage all`，此时只对 draft 窗口增加检查。
+该开关默认关闭，普通模式不使用。C++ runner 直接接收的参数形式为
+`--profile-audit-draft-inputs true`，可放在 `run_msprof.sh` 的 `--` 后。
+这里使用 3 次预热，且每次都检查差异。若 `measured=false` 的预热记录已 FAIL，
+该 draft 采集窗口还未开始，说明差异在未启用该次采样时也存在；
+若预热全 PASS、只有 `measured=true` 失败，再结合下面的输入 hash 缩小范围。
+
+检查在每次 draft 预热/采集前读取 features、当前 Draft KV 的完整设备字节，
+并对即将上传的 `anchor`、`start_position`、`valid_rows`、`proposal_count`
+计算 SHA-256，写入同一 JSONL 的 `draft_input_sha256`。
+读回、计算 hash 和写记录都在 msprof start 前；它不增加 OM 调用，也不改变缓存提交。
+这是定位开关，额外读回会影响准备耗时和缓存热度，性能测量时保持关闭。
+
+| JSONL 结果 | 下一步检查 |
+|---|---|
+| `DIFFERENT_SHA256`，只有 `features` hash 不同 | 两次 prefill 交给 draft 的特征不同，即使 prefill top1 相同也不能视为相同输入 |
+| `DIFFERENT_SHA256`，`d0_key` 等 KV 或控制参数不同 | 核对缓存复位、长 prompt 的上下文追加和参数准备 |
+| `MATCH_SHA256`，有效候选仍不同 | 所检查的输入字节相同，继续检查 draft 图内部算子、工作内存及执行稳定性 |
+
+hash 检查覆盖图边界输入，包括物理填充区；它不读取权重、共享工作内存或层内张量。
+hash 差异仅作为诊断记录，不单独放宽或替代有效 token 的一致性检查。
+更新控制器和 C++ runner 即可使用上述诊断，已有 AIR/OM 无需重新生成；
+C++ 构建步骤见第 10 节。
+
 `operator-types.csv` 按 stage、原始 CSV、device/model、算子类型、任务类型、OP State、
 输入和输出 dtype 分组，包含 count、total_ms、mean_ms、max_ms。
 筛选 `op_type=CacheUpdate` 可查看缓存更新；筛选矩阵乘时，

@@ -115,7 +115,7 @@
     "stage_profiler_file": "models/dflash_v1/stage_profile.py",
     "msprof_controller_file": "models/dflash_v1/msprof_cli.py",
     "stage_profiler_sha256": "28024560c65bce1b3dd32289768a973d7efb86b6d08e679c13c379eb76d8e712",
-    "msprof_controller_sha256": "5c3e29216bb468ccfe7749667a67c0362610c2f37306b54139f369e4515df833"
+    "msprof_controller_sha256": "0574e0934e8d93c5851ed442900e6884a0b2e9ace2f3657caa69b70ffb4918eb"
   },
   "rollback_runtime": {
     "runner_file": "models/dflash_v1/run_rollback.py",
@@ -157,11 +157,11 @@
       },
       {
         "source_file": "docs/DFLASH_ARCHITECTURE.md",
-        "source_sha256": "74cf1e24e4d49aba5cfdf46cfa7d1977d574990471da227b7c2eb4aa142d2f88"
+        "source_sha256": "3c9bc7a422c8648253a948522cbfd09bffa8c590cd97a42d7c17a9667bdf488d"
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "fb38d52fdb168566e52aeffa205b53adbcefbdac50a030852a0c5d83c299ee1a"
+        "source_sha256": "3bb58455c20f449771a504008e8b5c0e431254b3be24cd8510f162e0edf00fe2"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -285,7 +285,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/chunk.hpp",
-        "source_sha256": "9124290b78907fe626b37dfba4cc243c4afcd5519cd376a37d8dace9758b264c"
+        "source_sha256": "6e0faf82a80e63358fa84bbbb2019075ae3dbf55a360e331c6fe6619ce984070"
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/generation.hpp",
@@ -297,11 +297,11 @@
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/stage_profile.hpp",
-        "source_sha256": "97b2b32bd8d05d7613848648ac31c09e6a8a1d375d7a10b730be5ba29aa62bc7"
+        "source_sha256": "c9165fd8b754e09bbd02156f2fd9e1ac9438db3995ebb3832319631240242387"
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_chunk.cpp",
-        "source_sha256": "15c9ef1525ba7e850020de10dffc546dcec537700fa81d5001c568349c40240d"
+        "source_sha256": "97cb151018cfd1460d208d3c32b55f5e76a2585b61fbf122b4ef1dff0ec2dbc1"
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_executor.cpp",
@@ -317,7 +317,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/main.cpp",
-        "source_sha256": "b8af54f439546410a0119182b1153155f8a609131ce8bbceae7d72781cc1edd7"
+        "source_sha256": "79f1601d725c59b7b7954823b06f3948d634937e439d42120ece9321a8e1d38e"
       },
       {
         "source_file": "framework/runtime/cpp/src/sha256.cpp",
@@ -325,7 +325,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/stage_profile.cpp",
-        "source_sha256": "30bdf438c4a7ea7946b1a49b407703e8c6f4a88378d74fa40212107443328299"
+        "source_sha256": "3f100cbf56771d72298f6acbd4bb1cc17f1d613456694d9543d4835ba7f70610"
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/acl/acl.h",
@@ -333,7 +333,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/fake_acl.cpp",
-        "source_sha256": "e34d36c9aedc72fc8fbd7dc75bfaf00e7ded535c80c87b07a721042a4f562779"
+        "source_sha256": "6c1e35a7632baa277047e51fe55022afd9e3081e1cebb0b15b3d1619ac821873"
       },
       {
         "source_file": "framework/runtime/cpp/tests/run_fake_runner.cmake",
@@ -353,7 +353,7 @@
       },
       {
         "source_file": "tests/test_cpp_stage_profile.py",
-        "source_sha256": "9caa0eed5b74a53d2156f0b6bac45705d5ff6da50d00d88c507fe3c75c5f927c"
+        "source_sha256": "60790f0186fcb5f40c72e44381cdf62c8060afa08ed32f8cdb56976cf0dd6827"
       },
       {
         "source_file": "tests/test_custom_op_export.py",
@@ -405,11 +405,11 @@
       },
       {
         "source_file": "tests/test_profile_verify_om.py",
-        "source_sha256": "3b54055cbe44967adf46581eecb8dbde7c6ecd1cac9edf641ea03b1bdf3eefd6"
+        "source_sha256": "bac4e0de668f108702e59da30524dedd45504c51a13ee2ebebd7085bb5513eb9"
       },
       {
         "source_file": "tools/profile_om.py",
-        "source_sha256": "1c052a920696d782b7b50c16b479955c4914a77aed0fbf6b5f20490357d12f65"
+        "source_sha256": "192e92084ef608c56638a7764f463bc53cdaaee43f1a3da2a8baf038e384943b"
       },
       {
         "source_file": "models/dflash_v1/msprof_summary.py",
@@ -422,6 +422,10 @@
       {
         "source_file": "tests/test_dflash_rms_norm.py",
         "source_sha256": "281096cd106be0d7ee5ddf3cb007bbea59bd51a7bbb3741d5e1096c40c275d2b"
+      },
+      {
+        "source_file": "tests/test_msprof_application_exit.py",
+        "source_sha256": "67d39dd82a183aae1a2e98ad1bac5b26a12759c24a3db1624eba32b828f6a9e7"
       }
     ]
   }

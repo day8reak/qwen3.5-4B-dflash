@@ -65,6 +65,9 @@ class AclChunkExecutor final : public ChunkExecutor {
   void UnloadModels();
   void LoadMode(const std::string& mode);
   void Synchronize();
+  // Diagnostic only: snapshot OM inputs before a Draft capture window.
+  std::map<std::string, std::string> DraftInputHashes(std::int64_t anchor,
+                                                    std::size_t proposal_count);
   std::size_t sequence_length() const noexcept override;
   std::int64_t vocabulary_size() const noexcept override;
   void Reset(std::int64_t) override;

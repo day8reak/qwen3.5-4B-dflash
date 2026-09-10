@@ -7,6 +7,7 @@ struct ProfileOptions {
   std::string stage, mode = "dflash", metrics = "PipeUtilization";
   std::filesystem::path output;
   std::size_t warmup = 1;
+  bool audit_draft_inputs = false;
   int device_id = 0;
 };
 // Standard POSIX socket barriers only; msprof CLI is owned by the parent.

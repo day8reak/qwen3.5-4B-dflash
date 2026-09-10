@@ -1,10 +1,12 @@
 """Real C++ socket barriers + real controller, fake ACL/msprof. No device evidence."""
 
 import csv
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import struct
 import sys
 
 import pytest
@@ -202,6 +204,7 @@ def test_shared_om_entry_builds_matching_plan_and_profiles_all(chunk_bundle, san
     ("decode", "target_decode_output", 1, 15, 32, "", "output_token_ids"),
     ("prefill", "target_prefill_output", 1, 15, 32, "", "output_token_ids"),
     ("draft", "draft_output", 1, 15, 32, "", "output_token_ids"),
+    ("all", "draft_output", 1, 15, 32, "", "output_token_ids"),
     ("verify", "padding", 0, 2, 32, "", None),
 ])
 def test_cpp_profile_checks_logical_outputs_and_records_differences(
@@ -252,6 +255,11 @@ def test_cpp_profile_checks_logical_outputs_and_records_differences(
             assert "msprof_start_sent" not in log
         if variation == "draft_input":
             assert failure["check"]["input_token_ids_match"] is False
+        if stage == "all":
+            assert failure["profile_stage"] == "draft"
+            assert log.index("application_error stage=draft") < log.index("cleanup_begin")
+            assert "cleanup_end" in log
+            assert "preparing dflash stage=verify" not in log
     else:
         measured = [r for r in completed if r["measured"]]
         assert len(measured) == (3 if stage == "all" else 1)
@@ -261,3 +269,48 @@ def test_cpp_profile_checks_logical_outputs_and_records_differences(
         assert verify["padding_output_rows"] == 13
         assert verify["raw_output_token_ids"][3:] == [43] * 13
         assert verify["check"]["padding_token_ids_match"] is (False if warmup else None)
+
+
+@pytest.mark.parametrize("variation", ["", "prefill_features", "draft_output"])
+def test_draft_input_audit_distinguishes_features_from_output_variation(chunk_bundle, sandbox, variation):
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER to the fake ACL runner")
+    root = sandbox["tmp"]
+    plan, _, _ = write_incremental_plan(chunk_bundle, root / "plan.txt", mode="dflash")
+    copies = root / "copies.jsonl"
+    sandbox["env"].update(QWEN35_FAKE_PROFILE_VARIATION=variation, QWEN35_FAKE_COPY_LOG=str(copies))
+    output = root / "profile-run"
+    result = subprocess.run([
+        "bash", str(SOURCE / "tools/run_msprof.sh"), "--label", "audit",
+        "--output-dir", str(output), "--python", sys.executable,
+        "--msprof-bin", sandbox["msprof"], "--profile-backend", "cpp",
+        "--profile-mode", "dflash", "--profile-stage", "draft", "--profile-warmup", "1",
+        "--profile-timeout", "5", "--", runner, "--model-kind", "chunk", "--model", str(plan),
+        "--model-sha256", sha256_file(plan), "--prompt-token-ids", ",".join(["4"] * 17),
+        "--eos-token-ids", "", "--max-draft-tokens", "15", "--max-new-tokens", "32",
+        "--profile-audit-draft-inputs", "true",
+    ], env=sandbox["env"], capture_output=True, text=True, timeout=40)
+    log = result.stdout + result.stderr
+    assert (result.returncode != 0) == (variation == "draft_output"), log
+    assert "cleanup_end" in log and "errors=0" in log
+    trace = output / "profile/msprof/audit.iterations.jsonl"
+    samples = [json.loads(line) for line in trace.read_text().splitlines()]
+    reference, measured = [s for s in samples if s["event"] == "completed"]
+    a, b = reference["draft_input_sha256"], measured["draft_input_sha256"]
+    assert a.keys() == b.keys() and "features" in a and any(k.startswith("d0_") for k in a)
+    for name, fmt, value in (("anchor", "q", 5), ("valid_rows", "h", 17),
+                             ("start_position", "q", 0), ("proposal_count", "h", 15)):
+        assert a[name] == b[name] == hashlib.sha256(struct.pack(fmt, value)).hexdigest()
+    assert reference["input_state_comparison"] == "REFERENCE_SHA256"
+    differences = [key for key in a if a[key] != b[key]]
+    assert differences == (["features"] if variation == "prefill_features" else [])
+    assert measured["input_state_comparison"] == (
+        "DIFFERENT_SHA256" if differences else "MATCH_SHA256")
+    assert measured["check"]["status"] == ("FAIL" if variation == "draft_output" else "PASS")
+    assert measured["check"]["input_token_ids_match"] is True
+    transfers = [json.loads(line) for line in copies.read_text().splitlines()]
+    # Normal stage I/O contains only small scalars/top1. The audit's tensor
+    # readbacks must all precede msprof start, even on the measured iteration.
+    tensor_readbacks = [t for t in transfers if t[0] > 120 and t[1] == 2]
+    assert tensor_readbacks and all(not t[2] for t in tensor_readbacks)

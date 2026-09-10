@@ -587,7 +587,7 @@ class AclChunkExecutor::Impl {
     }
     return token;
   }
-  std::vector<std::int64_t> Propose(std::int64_t anchor, std::size_t proposal_count) {
+  void PrepareDraft(std::int64_t anchor, std::size_t proposal_count) {
     Healthy();
     Require(proposal_count > 0 && proposal_count <= 15, "Draft proposal_count must be 1..15");
     Require(!pending && feature_rows > 0 && draft_cursor == feature_start &&
@@ -597,6 +597,33 @@ class AclChunkExecutor::Impl {
     Scalar("valid_rows", static_cast<std::int64_t>(feature_rows));
     Scalar("anchor", anchor);
     Scalar("proposal_count", static_cast<std::int64_t>(proposal_count));
+  }
+  std::map<std::string, std::string> DraftInputHashes(std::int64_t anchor,
+                                                    std::size_t proposal_count) {
+    PrepareDraft(anchor, proposal_count);
+    Check(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(input audit)");
+    const auto& inputs = plan.graphs.at("draft").inputs;
+    Memory scratch(cleanup);
+    for (const auto& spec : inputs) scratch.bytes = std::max(scratch.bytes, spec.bytes());
+    Check(aclrtMallocHost(&scratch.host, scratch.bytes), "aclrtMallocHost(input audit)");
+    std::map<std::string, std::string> hashes;
+    for (const auto& spec : inputs) {
+      auto& mem = Get(spec, "draft", false);
+      const void* data = mem.host;
+      if (!data) {
+        Check(aclrtMemcpyAsync(scratch.host, scratch.bytes, mem.device, mem.bytes,
+                               ACL_MEMCPY_DEVICE_TO_HOST, stream), "aclrtMemcpyAsync(input audit)");
+        Check(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(input audit)");
+        data = scratch.host;
+      }
+      // Control scalars are hashed from the exact host bytes Call() will upload;
+      // features/current KV are read from device. No output buffer is sampled.
+      hashes.emplace(spec.name, Sha256(std::string_view(static_cast<const char*>(data), mem.bytes)));
+    }
+    return hashes;
+  }
+  std::vector<std::int64_t> Propose(std::int64_t anchor, std::size_t proposal_count) {
+    PrepareDraft(anchor, proposal_count);
     Call("draft");
     Swap('d');
     draft_cursor = cursor;
@@ -698,6 +725,10 @@ std::int64_t AclChunkExecutor::Prefill(const std::vector<std::int64_t>& ids,
 }
 std::vector<std::int64_t> AclChunkExecutor::Propose(std::int64_t anchor, std::size_t count) {
   return impl_->Propose(anchor, count);
+}
+std::map<std::string, std::string> AclChunkExecutor::DraftInputHashes(
+    std::int64_t anchor, std::size_t count) {
+  return impl_->DraftInputHashes(anchor, count);
 }
 std::vector<std::int64_t> AclChunkExecutor::Verify(
     const std::vector<std::int64_t>& ids) {
