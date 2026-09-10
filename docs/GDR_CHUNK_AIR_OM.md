@@ -772,4 +772,18 @@ runner 在加载前通过 AscendCL 的
 释放内存后重跑推理即可。只测 verify 时使用第 14 步的 DFlash 采集命令，会加载三张 OM，
 无需重新导出即可省去普通 decode OM；`infer-cpp` 配对测量则需要同时驻留四张。
 
+runner 启动时还记录本进程 `pid`、`ppid`、可见的 `NSpid` 和 PID namespace。
+若 `npu-smi` 的 PID 在当前 shell 查不到，先确认是否位于容器中。特权容器内的
+`npu-smi` 显示宿主机 PID，可在宿主机用 `ps -fp <PID>` 和
+`rg '^NSpid:' /proc/<PID>/status` 找到任务及容器内 PID；详见
+[Ascend PID 对应关系](https://www.hiascend.com/document/detail/zh/mindstudio/830/T%26ITools/Profiling/atlasprofiling_16_0013.html)。
+不要仅凭容器内找不到进程判定为显存泄漏。其他用户的任务由其所有者处理。
+
+正常退出及 C++ 捕获异常时都会执行清理：同步、卸载已加载模型、释放 I/O buffer、
+销毁 stream/context、ResetDevice、Finalize。日志中的 `cleanup-error` 给出失败接口
+与返回码；`cleanup_end` 汇总成功卸载数量、已申请/已释放的 device buffer 字节数
+和错误数。`device-memory phase=after_release` 在卸载模型与释放 buffer 后采样，
+此时 context 尚未销毁。buffer 计数不包含 GE 内部权重与 workspace，也不证明驱动已完成回收。
+确认宿主机 PID 消失后仍持续占用时，应保留退出日志和驱动日志继续定位。
+
 命令参数和 tensor ABI 的集中说明见 [AIR/OM/C++ 接口参考](QUANT_AIR_OM_FRAMEWORK.md)。

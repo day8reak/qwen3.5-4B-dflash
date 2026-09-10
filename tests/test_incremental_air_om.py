@@ -6,6 +6,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -1002,6 +1003,18 @@ def test_cpp_four_om_roundtrip_with_fake_acl(
             assert emitted == row["generated_token_ids"]
 
 
+def assert_cpp_resources_released(path, stderr):
+    resources = json.loads(path.read_text())
+    # ACL test-double counters cover every managed device/host buffer, model,
+    # descriptor, dataset, stream and context, plus allocations during decoding.
+    assert resources and all(value == 0 for value in resources.values()), resources
+    match = re.search(
+        r"cleanup_end released_models=\d+ allocated_device_bytes=(\d+) "
+        r"freed_device_bytes=(\d+) errors=0", stderr,
+    )
+    assert match and match[1] == match[2], stderr
+
+
 @pytest.mark.parametrize(
     "failure", ["QWEN35_FAKE_FAIL_GRAPH", "QWEN35_FAKE_BAD_ACCEPT"]
 )
@@ -1016,6 +1029,8 @@ def test_cpp_rejects_failed_or_inconsistent_verify(
         pytest.skip("set QWEN35_CPP_TEST_RUNNER")
     plan, _, _ = write_incremental_plan(chunk_bundle, tmp_path / "plan.txt")
     monkeypatch.setenv(failure, "target_verify" if failure.endswith("GRAPH") else "1")
+    cleanup = tmp_path / "cleanup.json"
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_LOG", str(cleanup))
     output = tmp_path / "fail.json"
     result = subprocess.run(
         [
@@ -1038,6 +1053,7 @@ def test_cpp_rejects_failed_or_inconsistent_verify(
     )
     assert result.returncode != 0
     assert not output.exists()
+    assert_cpp_resources_released(cleanup, result.stderr)
     if failure == "QWEN35_FAKE_BAD_ACCEPT":
         assert "host acceptance disagrees" in result.stderr
 
@@ -1054,6 +1070,8 @@ def test_cpp_load_failure_reports_memory_before_any_execution(
         pytest.skip("set QWEN35_CPP_TEST_RUNNER")
     plan, _, _ = write_incremental_plan(chunk_bundle, tmp_path / "plan.txt")
     monkeypatch.setenv("QWEN35_FAKE_FAIL_LOAD_GRAPH", failed_graph)
+    cleanup = tmp_path / "cleanup.json"
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_LOG", str(cleanup))
     events = tmp_path / "execute.jsonl"
     monkeypatch.setenv("QWEN35_FAKE_EVENT_LOG", str(events))
     output = tmp_path / "failed.json"
@@ -1074,6 +1092,45 @@ def test_cpp_load_failure_reports_memory_before_any_execution(
         assert f"om-memory graph={name} query_status=0" in before_load
     assert "weight_bytes=5001682944 work_bytes=1048576" in before_load
     assert "pool=DDR query_status=0 free_bytes=unavailable" in result.stderr
+    assert_cpp_resources_released(cleanup, result.stderr)
+
+
+@pytest.mark.parametrize("operation", ["aclmdlUnload", "aclrtFree", "aclrtResetDevice"])
+def test_cpp_cleanup_logs_errors_and_continues_teardown(
+    chunk_bundle, tmp_path, monkeypatch, operation,
+):
+    from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
+    from qwen35_dflash.ascend310p.utils import sha256_file
+
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER")
+    plan, _, _ = write_incremental_plan(chunk_bundle, tmp_path / "plan.txt")
+    cleanup = tmp_path / "cleanup.json"
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_LOG", str(cleanup))
+    monkeypatch.setenv("QWEN35_FAKE_FAIL_LOAD_GRAPH", "target_verify")
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_FAIL", operation)
+    output = tmp_path / "failed.json"
+    result = subprocess.run(
+        [runner, "--model", str(plan), "--model-sha256", sha256_file(plan),
+         "--model-kind", "chunk", "--mode", "paired", "--prompt-token-ids", "4",
+         "--output", str(output)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0 and not output.exists()
+    assert "aclmdlLoadFromFile failed: 245000 graph=target_verify" in result.stderr
+    assert f"cleanup-error operation={operation} status=38" in result.stderr
+    assert re.search(r"cleanup_end .* errors=[1-9]\d*", result.stderr)
+    # Reaching fake aclFinalize after an unload/free/reset failure proves that
+    # cleanup attempts the remaining operations and preserves the initial error.
+    resources = json.loads(cleanup.read_text())
+    for name, count in resources.items():
+        if name == "live_models" and operation == "aclmdlUnload":
+            assert count == 3
+        elif name == "live_device_buffers" and operation == "aclrtFree":
+            assert count > 0
+        else:
+            assert count == 0, (name, count)
 
 
 @pytest.mark.parametrize("unavailable", [False, True])
@@ -1143,6 +1200,8 @@ def test_cpp_discard_buffers_are_private_device_only_and_never_committed(
     log = tmp_path / "memory.jsonl"
     monkeypatch.setenv("QWEN35_FAKE_MEMORY_LOG", str(log))
     monkeypatch.setenv("QWEN35_FAKE_ACCEPT", "7")
+    cleanup = tmp_path / "cleanup.json"
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_LOG", str(cleanup))
     report = tmp_path / "report.json"
     result = subprocess.run(
         [runner, "--model", str(plan), "--model-sha256", sha256_file(plan),
@@ -1167,6 +1226,7 @@ def test_cpp_discard_buffers_are_private_device_only_and_never_committed(
         assert f"verify_discard_buffer_bytes={expected_bytes}" in result.stderr
     payload = json.loads(report.read_text())
     assert payload["status"] == "PASS"
+    assert_cpp_resources_released(cleanup, result.stderr)
 
 
 @pytest.mark.parametrize("damage", ["missing", "dtype", "shape", "input", "order", "stale"])

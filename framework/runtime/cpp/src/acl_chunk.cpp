@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <unistd.h>
 
 #include "qwen35_dflash/chunk.hpp"
 
@@ -53,6 +55,34 @@ void LogDeviceMemory(const char* phase, const std::string& graph = "all") {
     std::cerr << '\n';
   }
 }
+
+void LogProcessIdentity() {
+  std::cerr << "[chunk-runtime] process pid=" << getpid() << " ppid=" << getppid();
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.rfind("NSpid:", 0) == 0) {
+      std::cerr << " nspid=" << std::quoted(line.substr(6));
+      break;
+    }
+  }
+  std::error_code error;
+  const auto ns = std::filesystem::read_symlink("/proc/self/ns/pid", error);
+  std::cerr << " pid_namespace=" << std::quoted(error ? "unavailable" : ns.string()) << '\n';
+}
+
+struct CleanupAudit {
+  std::size_t errors = 0, released_models = 0;
+  std::size_t allocated_device_bytes = 0, freed_device_bytes = 0;
+
+  void Check(aclError status, const char* operation) noexcept {
+    if (status != ACL_SUCCESS) {
+      ++errors;
+      std::cerr << "[chunk-runtime] cleanup-error operation=" << operation
+                << " status=" << status << '\n';
+    }
+  }
+};
 
 bool State(const std::string& name) {
   return name.size() > 2 && (name[0] == 't' || name[0] == 'd') &&
@@ -168,16 +198,27 @@ void ValidateModelIo(aclmdlDesc* desc, const ChunkGraph& graph) {
   }
 }
 struct Memory {
+  explicit Memory(CleanupAudit& audit) : audit(audit) {}
+  CleanupAudit& audit;
   void* device = nullptr;
   void* host = nullptr;
   std::size_t bytes = 0;
   TensorSpec spec;
   ~Memory() {
-    if (device) static_cast<void>(aclrtFree(device));
-    if (host) static_cast<void>(aclrtFreeHost(host));
+    if (device) {
+      const auto status = aclrtFree(device);
+      audit.Check(status, "aclrtFree");
+      if (status == ACL_SUCCESS) audit.freed_device_bytes += bytes;
+      else std::cerr << "[chunk-runtime] unreleased-buffer name=" << spec.name
+                     << " bytes=" << bytes << '\n';
+    }
+    if (host) audit.Check(aclrtFreeHost(host), "aclrtFreeHost");
   }
 };
 struct Loaded {
+  explicit Loaded(CleanupAudit& audit) : audit(audit) {}
+  CleanupAudit& audit;
+  std::string name;
   std::uint32_t id = 0;
   bool loaded = false;
   aclmdlDesc* desc = nullptr;
@@ -186,13 +227,19 @@ struct Loaded {
   std::vector<aclDataBuffer*> input_buffers, output_buffers;
   ~Loaded() {
     for (auto* data : input_buffers)
-      static_cast<void>(aclDestroyDataBuffer(data));
+      audit.Check(aclDestroyDataBuffer(data), "aclDestroyDataBuffer(input)");
     for (auto* data : output_buffers)
-      static_cast<void>(aclDestroyDataBuffer(data));
-    if (inputs) static_cast<void>(aclmdlDestroyDataset(inputs));
-    if (outputs) static_cast<void>(aclmdlDestroyDataset(outputs));
-    if (desc) static_cast<void>(aclmdlDestroyDesc(desc));
-    if (loaded) static_cast<void>(aclmdlUnload(id));
+      audit.Check(aclDestroyDataBuffer(data), "aclDestroyDataBuffer(output)");
+    if (inputs) audit.Check(aclmdlDestroyDataset(inputs), "aclmdlDestroyDataset(input)");
+    if (outputs) audit.Check(aclmdlDestroyDataset(outputs), "aclmdlDestroyDataset(output)");
+    if (desc) audit.Check(aclmdlDestroyDesc(desc), "aclmdlDestroyDesc");
+    if (loaded) {
+      const auto status = aclmdlUnload(id);
+      audit.Check(status, "aclmdlUnload");
+      if (status == ACL_SUCCESS) ++audit.released_models;
+      std::cerr << "[chunk-runtime] unload graph=" << name
+                << " model_id=" << id << " status=" << status << '\n';
+    }
   }
 };
 }  // namespace
@@ -203,6 +250,7 @@ class AclChunkExecutor::Impl {
       : plan(ReadChunkPlan(path, mode)), device_id(device) {
     Require(device >= 0, "negative device ID");
     try {
+      LogProcessIdentity();
       Check(aclInit(nullptr), "aclInit");
       initialized = true;
       Check(aclrtSetDevice(device), "aclrtSetDevice");
@@ -253,26 +301,33 @@ class AclChunkExecutor::Impl {
   ~Impl() { Cleanup(); }
 
   void Cleanup() noexcept {
-    if (context) static_cast<void>(aclrtSetCurrentContext(context));
-    if (stream) static_cast<void>(aclrtSynchronizeStream(stream));
+    std::cerr << "[chunk-runtime] cleanup_begin loaded_models=" << models.size()
+              << " device_buffers=" << memory.size() << '\n';
+    if (context) cleanup.Check(aclrtSetCurrentContext(context), "aclrtSetCurrentContext");
+    if (stream) cleanup.Check(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
     models.clear();
     memory.clear();
+    if (device_set) LogDeviceMemory("after_release");
     if (stream) {
-      static_cast<void>(aclrtDestroyStream(stream));
+      cleanup.Check(aclrtDestroyStream(stream), "aclrtDestroyStream");
       stream = nullptr;
     }
     if (context) {
-      static_cast<void>(aclrtDestroyContext(context));
+      cleanup.Check(aclrtDestroyContext(context), "aclrtDestroyContext");
       context = nullptr;
     }
     if (device_set) {
-      static_cast<void>(aclrtResetDevice(device_id));
+      cleanup.Check(aclrtResetDevice(device_id), "aclrtResetDevice");
       device_set = false;
     }
     if (initialized) {
-      static_cast<void>(aclFinalize());
+      cleanup.Check(aclFinalize(), "aclFinalize");
       initialized = false;
     }
+    std::cerr << "[chunk-runtime] cleanup_end released_models=" << cleanup.released_models
+              << " allocated_device_bytes=" << cleanup.allocated_device_bytes
+              << " freed_device_bytes=" << cleanup.freed_device_bytes
+              << " errors=" << cleanup.errors << '\n';
   }
 
   std::string Key(const TensorSpec& spec, const std::string& graph,
@@ -293,12 +348,13 @@ class AclChunkExecutor::Impl {
               "cross-graph tensor ABI mismatch");
       return *found->second;
     }
-    auto buffer = std::make_unique<Memory>();
+    auto buffer = std::make_unique<Memory>(cleanup);
     buffer->spec = spec;
     buffer->bytes = spec.bytes();
     Check(
         aclrtMalloc(&buffer->device, buffer->bytes, ACL_MEM_MALLOC_NORMAL_ONLY),
         "aclrtMalloc");
+    cleanup.allocated_device_bytes += buffer->bytes;
     // Discard outputs have private graph-scoped device allocations. No host
     // allocation means Call queues neither H2D nor D2H for them.
     if (!State(spec.name) && spec.name != "features" &&
@@ -310,8 +366,9 @@ class AclChunkExecutor::Impl {
   }
 
   void Load(const ChunkGraph& graph, const ModelMemory& requirement) {
-    auto owner = std::make_unique<Loaded>();
+    auto owner = std::make_unique<Loaded>(cleanup);
     auto& model = *owner;
+    model.name = graph.name;
     std::cerr << "[chunk-runtime] load graph=" << graph.name
               << " model=" << std::quoted(graph.model.string()) << '\n';
     LogDeviceMemory("before_load", graph.name);
@@ -531,6 +588,7 @@ class AclChunkExecutor::Impl {
   bool initialized = false, device_set = false, invalid = true;
   aclrtContext context = nullptr;
   aclrtStream stream = nullptr;
+  CleanupAudit cleanup;
   std::map<std::string, std::unique_ptr<Loaded>> models;
   std::map<std::string, std::unique_ptr<Memory>> memory;
   std::map<std::string, std::vector<double>> timings;

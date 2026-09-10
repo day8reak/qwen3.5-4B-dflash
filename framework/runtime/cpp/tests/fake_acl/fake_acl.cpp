@@ -40,7 +40,16 @@ struct FixtureModel {
 std::map<std::uint32_t, FixtureModel> fixtures;
 std::uint32_t next_id = 1;
 std::map<void*, std::size_t> device_allocations;
+std::set<void*> host_allocations;
 std::set<void*> discard_allocations;
+std::size_t live_contexts = 0, live_streams = 0, live_descs = 0;
+std::size_t live_datasets = 0, live_data_buffers = 0, allocations_after_execute = 0;
+bool executed = false;
+
+bool FailCleanup(const char* operation) {
+  const auto* failure = std::getenv("QWEN35_FAKE_CLEANUP_FAIL");
+  return failure && std::string(failure) == operation;
+}
 
 bool TouchesDiscard(const void* pointer, std::size_t bytes) {
   const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
@@ -160,19 +169,35 @@ aclError SetDims(aclmdlIODims* dimensions, std::int64_t width) {
 extern "C" {
 
 aclError aclInit(const char*) { return ACL_SUCCESS; }
-aclError aclFinalize() { return ACL_SUCCESS; }
+aclError aclFinalize() {
+  if (const auto* path = std::getenv("QWEN35_FAKE_CLEANUP_LOG")) {
+    std::ofstream log(path);
+    log << "{\"live_models\":" << fixtures.size()
+        << ",\"live_device_buffers\":" << device_allocations.size()
+        << ",\"live_host_buffers\":" << host_allocations.size()
+        << ",\"live_contexts\":" << live_contexts
+        << ",\"live_streams\":" << live_streams
+        << ",\"live_descs\":" << live_descs
+        << ",\"live_datasets\":" << live_datasets
+        << ",\"live_data_buffers\":" << live_data_buffers
+        << ",\"allocations_after_execute\":" << allocations_after_execute << "}\n";
+  }
+  return ACL_SUCCESS;
+}
 aclError aclrtSetDevice(int) { return ACL_SUCCESS; }
-aclError aclrtResetDevice(int) { return ACL_SUCCESS; }
+aclError aclrtResetDevice(int) { return FailCleanup("aclrtResetDevice") ? 38 : ACL_SUCCESS; }
 
 aclError aclrtCreateContext(aclrtContext* context, int) {
   if (context == nullptr) {
     return 1;
   }
   *context = new (std::nothrow) int(1);
+  if (*context) ++live_contexts;
   return *context == nullptr ? 1 : ACL_SUCCESS;
 }
 
 aclError aclrtDestroyContext(aclrtContext context) {
+  if (context) --live_contexts;
   delete static_cast<int*>(context);
   return ACL_SUCCESS;
 }
@@ -184,10 +209,12 @@ aclError aclrtCreateStream(aclrtStream* stream) {
     return 1;
   }
   *stream = new (std::nothrow) int(2);
+  if (*stream) ++live_streams;
   return *stream == nullptr ? 1 : ACL_SUCCESS;
 }
 
 aclError aclrtDestroyStream(aclrtStream stream) {
+  if (stream) --live_streams;
   delete static_cast<int*>(stream);
   return ACL_SUCCESS;
 }
@@ -208,6 +235,7 @@ aclError aclrtMallocHost(void** host_ptr, std::size_t size) {
     return 1;
   }
   *host_ptr = std::malloc(size);
+  if (*host_ptr) host_allocations.insert(*host_ptr);
   if (const auto* path = std::getenv("QWEN35_FAKE_MEMORY_LOG")) {
     std::ofstream log(path, std::ios::app);
     log << "[\"host_alloc\"," << size << "]\n";
@@ -216,6 +244,7 @@ aclError aclrtMallocHost(void** host_ptr, std::size_t size) {
 }
 
 aclError aclrtFreeHost(void* host_ptr) {
+  host_allocations.erase(host_ptr);
   std::free(host_ptr);
   return ACL_SUCCESS;
 }
@@ -225,11 +254,15 @@ aclError aclrtMalloc(void** device_ptr, std::size_t size, aclrtMemMallocPolicy) 
     return 1;
   }
   *device_ptr = std::malloc(size);
-  if (*device_ptr) device_allocations[*device_ptr] = size;
+  if (*device_ptr) {
+    device_allocations[*device_ptr] = size;
+    if (executed) ++allocations_after_execute;
+  }
   return *device_ptr == nullptr ? 1 : ACL_SUCCESS;
 }
 
 aclError aclrtFree(void* device_ptr) {
+  if (FailCleanup("aclrtFree")) return 38;
   discard_allocations.erase(device_ptr);
   device_allocations.erase(device_ptr);
   std::free(device_ptr);
@@ -319,11 +352,20 @@ aclError aclmdlLoadFromFile(const char* path, std::uint32_t* model_id) {
   return ACL_SUCCESS;
 }
 
-aclError aclmdlUnload(std::uint32_t id) { fixtures.erase(id); return ACL_SUCCESS; }
+aclError aclmdlUnload(std::uint32_t id) {
+  if (FailCleanup("aclmdlUnload")) return 38;
+  fixtures.erase(id);
+  return ACL_SUCCESS;
+}
 
-aclmdlDesc* aclmdlCreateDesc() { return new (std::nothrow) aclmdlDesc(); }
+aclmdlDesc* aclmdlCreateDesc() {
+  auto* desc = new (std::nothrow) aclmdlDesc();
+  if (desc) ++live_descs;
+  return desc;
+}
 
 aclError aclmdlDestroyDesc(aclmdlDesc* description) {
+  if (description) --live_descs;
   delete description;
   return ACL_SUCCESS;
 }
@@ -370,10 +412,13 @@ std::size_t aclmdlGetOutputSizeByIndex(aclmdlDesc* desc, std::size_t index) {
 }
 
 aclmdlDataset* aclmdlCreateDataset() {
-  return new (std::nothrow) aclmdlDataset();
+  auto* dataset = new (std::nothrow) aclmdlDataset();
+  if (dataset) ++live_datasets;
+  return dataset;
 }
 
 aclError aclmdlDestroyDataset(aclmdlDataset* dataset) {
+  if (dataset) --live_datasets;
   delete dataset;
   return ACL_SUCCESS;
 }
@@ -382,10 +427,13 @@ aclDataBuffer* aclCreateDataBuffer(void* data, std::size_t size) {
   if (data == nullptr || size == 0) {
     return nullptr;
   }
-  return new (std::nothrow) aclDataBuffer{data, size};
+  auto* buffer = new (std::nothrow) aclDataBuffer{data, size};
+  if (buffer) ++live_data_buffers;
+  return buffer;
 }
 
 aclError aclDestroyDataBuffer(aclDataBuffer* buffer) {
+  if (buffer) --live_data_buffers;
   delete buffer;
   return ACL_SUCCESS;
 }
@@ -404,6 +452,7 @@ aclError aclmdlExecuteAsync(
     const aclmdlDataset* input,
     aclmdlDataset* output,
     aclrtStream) {
+  executed = true;
   if (!fixtures.at(id).role.empty()) return ExecuteChunk(fixtures.at(id), input, output);
   if (input == nullptr || output == nullptr || input->buffers.size() != 2 ||
       output->buffers.size() != 2) {
