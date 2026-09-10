@@ -206,20 +206,21 @@ def test_shared_entry_defaults_and_compatibility():
     assert profile.run_profile is unified.run_profile
 
 
-@pytest.mark.parametrize("mode,stage", [("ordinary", "all"), ("dflash", "verify"), ("dflash", "prefill")])
+@pytest.mark.parametrize("mode,stage", [("ordinary", "all"), ("dflash", "prefill")])
 def test_draft_input_audit_rejects_other_stage_before_output(tmp_path, mode, stage):
     run, args = setup_run(tmp_path)
     args.profile_mode, args.profile_stage = mode, stage
     args.profile_audit_draft_inputs = True
-    with pytest.raises(ValueError, match="requires dflash draft/all"):
+    with pytest.raises(ValueError, match="requires dflash draft/verify/all"):
         unified.run_profile(args)
     assert not (run / "msprof").exists()
 
 
 @pytest.mark.parametrize("audit", [False, True])
-def test_profile_entry_forwards_opt_in_draft_audit_to_runner(tmp_path, monkeypatch, audit):
+@pytest.mark.parametrize("stage", ["draft", "verify", "all"])
+def test_profile_entry_forwards_opt_in_draft_audit_to_runner(tmp_path, monkeypatch, audit, stage):
     run, args = setup_run(tmp_path)
-    args.profile_stage, args.profile_audit_draft_inputs = "draft", audit
+    args.profile_stage, args.profile_audit_draft_inputs = stage, audit
     monkeypatch.delenv("ASCEND310P_SIMULATION_ONLY", raising=False)
     monkeypatch.setattr(unified.shutil, "which", lambda _: "/test/msprof")
     calls = []

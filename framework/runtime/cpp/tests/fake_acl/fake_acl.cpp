@@ -125,6 +125,10 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
     if ((variation == "draft_output" && profiled) ||
         (variation == "draft_input" && call_number == 2))
       proposals[0] = (proposals[0] + 7) % 64;
+    // A rejected candidate changes on the third unprofiled preparation call;
+    // accepted prefix/fallback can still match ordinary generation exactly.
+    if (variation == "draft_rejected_tail" && call_number == 3)
+      proposals[7] = (proposals[7] + 7) % 64;
   } else {
     auto* ids = static_cast<std::int64_t*>(in.at("input_ids")->data);
     auto* predictions = static_cast<std::int64_t*>(out.at("target_top1")->data);

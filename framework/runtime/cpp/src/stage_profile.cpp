@@ -55,6 +55,7 @@ struct Sample {
   bool measured = false;
   std::vector<std::int64_t> input, output, raw_output;
   std::map<std::string, std::string> draft_input_hashes;
+  std::string draft_input_scope;
   std::optional<std::int64_t> accepted;
 };
 struct Difference {
@@ -132,6 +133,7 @@ class IterationTrace {
         << ",\"padding_output_rows\":" << sample.raw_output.size() - sample.output.size()
         << ",\"accepted_draft_tokens\":" << NumberJson(sample.accepted)
         << ",\"draft_input_sha256\":" << HashesJson(sample.draft_input_hashes)
+        << ",\"draft_input_scope\":" << (sample.draft_input_scope.empty() ? "null" : Quote(sample.draft_input_scope))
         << ",\"input_state_comparison\":" << Quote(InputStateComparison(sample, reference))
         << ",\"check\":{\"status\":" << Quote(status)
         << ",\"reference_iteration\":" << (reference ? std::to_string(reference->iteration) : "null")
@@ -235,8 +237,9 @@ std::string Scope(const std::string& stage) {
 
 void ValidateProfileOptions(const ProfileOptions& p) {
   Require(p.mode == "ordinary" || p.mode == "dflash", "invalid profile mode");
-  Require(!p.audit_draft_inputs || (p.mode == "dflash" && (p.stage == "draft" || p.stage == "all")),
-          "profile-audit-draft-inputs requires dflash draft/all");
+  Require(!p.audit_draft_inputs || (p.mode == "dflash" &&
+              (p.stage == "draft" || p.stage == "verify" || p.stage == "all")),
+          "profile-audit-draft-inputs requires dflash draft/verify/all");
   const auto stages = Stages(p.mode);
   Require(p.stage == "all" ||
               std::find(stages.begin(), stages.end(), p.stage) != stages.end(),
@@ -341,6 +344,13 @@ std::string ProfileChunk(AclChunkExecutor& executor,
         token_ok(anchor);
         Require(!eos.count(anchor),
                 "prefill anchor is EOS; no decode round to profile");
+        if (p.audit_draft_inputs && (stage == "draft" || stage == "verify")) {
+          // Audit the Draft call used for verify preparation as well as the
+          // standalone Draft window. Neither readback belongs in a capture.
+          // These are Draft inputs, not the Target verify state tensors.
+          sample.draft_input_scope = stage == "draft" ? "draft_stage" : "verify_preparation";
+          sample.draft_input_hashes = executor.DraftInputHashes(anchor, proposal_count);
+        }
         if (stage == "decode") {
           sample.input = {anchor};
           prepared();
@@ -348,9 +358,6 @@ std::string ProfileChunk(AclChunkExecutor& executor,
           sample.output = sample.raw_output;
         } else if (stage == "draft") {
           sample.input = {anchor};
-          // All D2H, host hashing and trace writes finish before msprof start.
-          if (p.audit_draft_inputs)
-            sample.draft_input_hashes = executor.DraftInputHashes(anchor, proposal_count);
           prepared();
           invoke(measured, [&] {
             sample.raw_output = executor.Propose(anchor, proposal_count);
@@ -447,6 +454,7 @@ std::string ProfileChunk(AclChunkExecutor& executor,
            << ",\"warmup_input_token_ids_match\":" << (p.warmup ? "true" : "null")
            << ",\"compared_output_rows\":" << measured.output.size()
            << ",\"output_comparison_scope\":\"valid rows only; padding retained in iteration trace\""
+           << ",\"draft_input_scope\":" << (measured.draft_input_scope.empty() ? "null" : Quote(measured.draft_input_scope))
            << ",\"input_state_comparison\":" << Quote(InputStateComparison(measured, reference ? &*reference : nullptr))
            << ",\"iteration_trace\":" << Quote(trace.path.string())
            << ",\"formal_latency_evidence\":false,\"correctness_gate\":{"

@@ -338,8 +338,13 @@ C++ 在每个窗口外清零并重新准备请求，比较所有预热和采集�
 填充行保留用于诊断。有效差异会返回失败并记录首个不同位置。
 需要核对 draft 输入时，可加 `--profile-audit-draft-inputs`：在窗口外读取
 features、当前 Draft KV，并对这些字节和控制参数计算 SHA-256。
+它覆盖独立 draft 阶段，也覆盖 verify 准备时重新调用 Draft 的那一次；
+可用于 `draft`、`verify` 或 `all`。`draft_input_scope` 分别标记为
+`draft_stage`、`verify_preparation`。各阶段独立准备输入，verify 不复用前一个
+draft 采集窗口的候选，所以 draft 阶段通过不代表 verify 的准备输入也相同。
 记录中的 `MATCH_SHA256` / `DIFFERENT_SHA256` 用于区分边界输入是否变化；
-默认关闭时仍是 `NOT_RUN`。检查不覆盖图内工作内存，也不表示已通过完整生成正确性检查。
+verify 记录中的 hash 仍指准备阶段的 Draft 输入。默认关闭时是 `NOT_RUN`。
+检查不覆盖 Target verify 缓存或图内工作内存，也不表示已通过完整生成正确性检查。
 输出比较在 stop/quit 后进行，因此“已完成采集握手”不等于“输出检查已通过”。
 普通生成的重复检查只比较最终 token 和停止原因；被拒绝的 draft 候选即使变化，
 也可能不影响这两项结果。阶段采集逐项比较有效候选，可以发现这类差异。

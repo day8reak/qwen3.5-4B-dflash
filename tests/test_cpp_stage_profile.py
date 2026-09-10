@@ -314,3 +314,89 @@ def test_draft_input_audit_distinguishes_features_from_output_variation(chunk_bu
     # readbacks must all precede msprof start, even on the measured iteration.
     tensor_readbacks = [t for t in transfers if t[0] > 120 and t[1] == 2]
     assert tensor_readbacks and all(not t[2] for t in tensor_readbacks)
+
+
+@pytest.mark.parametrize("stage,variation,warmup", [
+    ("verify", "", 3),
+    ("verify", "prefill_features", 1),
+    ("verify", "draft_rejected_tail", 3),
+    ("all", "", 3),
+])
+def test_verify_preparation_draft_is_audited_outside_capture(
+    chunk_bundle, sandbox, stage, variation, warmup,
+):
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER to the fake ACL runner")
+    root = sandbox["tmp"]
+    plan, _, _ = write_incremental_plan(chunk_bundle, root / "plan.txt", mode="dflash")
+    copies, events = root / "copies.jsonl", root / "acl-audit-events.jsonl"
+    sandbox["env"].update(
+        QWEN35_FAKE_PROFILE_VARIATION=variation, QWEN35_FAKE_ACCEPT="7",
+        QWEN35_FAKE_COPY_LOG=str(copies), QWEN35_FAKE_EVENT_LOG=str(events),
+    )
+    output = root / "profile-run"
+    result = subprocess.run([
+        "bash", str(SOURCE / "tools/run_msprof.sh"), "--label", "audit",
+        "--output-dir", str(output), "--python", sys.executable,
+        "--msprof-bin", sandbox["msprof"], "--profile-backend", "cpp",
+        "--profile-mode", "dflash", "--profile-stage", stage,
+        "--profile-warmup", str(warmup), "--profile-timeout", "5", "--",
+        runner, "--model-kind", "chunk", "--model", str(plan),
+        "--model-sha256", sha256_file(plan), "--prompt-token-ids", ",".join(["4"] * 17),
+        "--eos-token-ids", "", "--max-draft-tokens", "15", "--max-new-tokens", "32",
+        "--profile-audit-draft-inputs", "true",
+    ], env=sandbox["env"], capture_output=True, text=True, timeout=40)
+    log = result.stdout + result.stderr
+    drift = variation == "draft_rejected_tail"
+    assert (result.returncode != 0) == drift, log
+    trace = output / "profile/msprof/audit.iterations.jsonl"
+    samples = [json.loads(line) for line in trace.read_text().splitlines()]
+    verify = [s for s in samples if s["profile_stage"] == "verify" and s["event"] == "completed"]
+    assert len(verify) == (3 if drift else warmup + 1)
+    reference = verify[0]
+    hashes = reference["draft_input_sha256"]
+    assert "features" in hashes and any(k.startswith("d0_") for k in hashes)
+    assert reference["input_state_comparison"] == "REFERENCE_SHA256"
+    assert all(s["draft_input_scope"] == "verify_preparation" for s in verify)
+    for sample in verify[1:]:
+        changed = [k for k in hashes if hashes[k] != sample["draft_input_sha256"][k]]
+        assert changed == (["features"] if variation == "prefill_features" else [])
+        assert sample["input_state_comparison"] == ("DIFFERENT_SHA256" if changed else "MATCH_SHA256")
+    for sample in samples:
+        expected_scope = {"prefill": None, "draft": "draft_stage", "verify": "verify_preparation"}
+        assert sample["draft_input_scope"] == expected_scope[sample["profile_stage"]]
+        if sample["profile_stage"] == "prefill":
+            assert sample["draft_input_sha256"] == {}
+        else:
+            assert sample["draft_input_sha256"].keys() == hashes.keys()
+    calls = [json.loads(line) for line in events.read_text().splitlines()]
+    captures = [role for role, active, *_ in calls if active]
+    if drift:
+        failure = verify[-1]
+        assert failure["iteration"] == 2 and failure["measured"] is False
+        assert failure["check"]["status"] == "FAIL"
+        assert failure["check"]["first_difference"]["field"] == "input_token_ids"
+        assert failure["check"]["first_difference"]["index"] == 8
+        assert failure["accepted_draft_tokens"] == reference["accepted_draft_tokens"] == 7
+        assert failure["output_token_ids"][:8] == reference["output_token_ids"][:8]
+        assert captures == []  # Third warmup failed before any verify capture.
+        assert not (output / "audit-stage-report.json").exists()
+    else:
+        assert all(s["check"]["status"] == "PASS" for s in verify[1:])
+        assert captures == (["target_prefill", "draft", "target_verify"] if stage == "all" else ["target_verify"])
+        report = json.loads((output / "audit-stage-report.json").read_text())
+        reports = report["captures"] if stage == "all" else [report]
+        verify_report = next(r for r in reports if r["profile_stage"] == "verify")
+        assert verify_report["draft_input_scope"] == "verify_preparation"
+        assert verify_report["input_state_comparison"] == verify[-1]["input_state_comparison"]
+    transfers = [json.loads(line) for line in copies.read_text().splitlines()]
+    # Verify normally reads back 16 int64 Top1 tokens (128 bytes) in-window.
+    # The feature/KV audit transfers in this fixture are larger than that.
+    readbacks = [t for t in transfers if t[0] > 16 * 8 and t[1] == 2]
+    assert readbacks and all(not t[2] for t in readbacks)
+    # Auditing must not add extra Draft/Target calls or skip fresh preparation.
+    iterations = sum(s["event"] == "completed" for s in samples)
+    assert sum(role == "target_prefill" for role, *_ in calls) == iterations
+    draft_iterations = sum(s["event"] == "completed" and s["profile_stage"] != "prefill" for s in samples)
+    assert sum(role == "draft" for role, *_ in calls) == draft_iterations

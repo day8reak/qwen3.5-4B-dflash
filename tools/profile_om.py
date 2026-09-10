@@ -74,7 +74,8 @@ def parser(default_stage="all") -> argparse.ArgumentParser:
     result.add_argument("--max-draft-tokens", type=int, default=15)
     result.add_argument("--profile-warmup", type=int, default=1)
     result.add_argument("--profile-audit-draft-inputs", action="store_true",
-                        help="For DFlash draft/all, hash features, KV and controls before capture (diagnostic only)")
+                        help="For DFlash draft/verify/all, hash Draft stage or verify-preparation "
+                             "Draft inputs outside capture (diagnostic only)")
     result.add_argument("--profile-timeout", type=int, default=600)
     result.add_argument("--aic-metrics", choices=("PipeUtilization", "Memory", "MemoryUB"),
                         default="PipeUtilization")
@@ -86,8 +87,8 @@ def run_profile(args: argparse.Namespace) -> Path:
     available = stages_for_mode(mode, "cpp")
     if stage != "all" and stage not in available:
         raise ValueError(f"{mode} stages: {', '.join((*available, 'all'))}")
-    if args.profile_audit_draft_inputs and (mode != "dflash" or stage not in {"draft", "all"}):
-        raise ValueError("--profile-audit-draft-inputs requires dflash draft/all")
+    if args.profile_audit_draft_inputs and (mode != "dflash" or stage not in {"draft", "verify", "all"}):
+        raise ValueError("--profile-audit-draft-inputs requires dflash draft/verify/all")
     if args.max_new_tokens < (1 if stage == "prefill" else 2):
         raise ValueError("prefill needs max-new-tokens >= 1; decode/Draft/verify need >= 2")
     if args.run_dir is None or args.runner is None:

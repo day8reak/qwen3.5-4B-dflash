@@ -790,28 +790,41 @@ C++ 会在卸载模型前打印 `application_error stage=... message=...`。
 stage profiling 则以第一次预热为参考，逐项比较后续预热和采集的有效候选。
 因此，正常生成通过、stage profiling 失败，并不能单凭这一点证明 msprof 改变了计算结果。
 
-需要判断 draft 差异是否来自输入时，开启额外检查：
+需要判断 draft 候选变化是否来自输入时，开启额外检查。
+若差异报在 verify 的 `input_token_ids`，可直接采集 verify：
 
 ```bash
 "$MODEL_PYTHON" -B "$REPO_ROOT/tools/profile_om.py" \
   --run-dir "$AI_RUN_DIR" --runner "$CPP_RUNNER" \
   --deployment-manifest "$DEPLOYMENT_MANIFEST" \
-  --profile-mode dflash --profile-stage draft --device-id 0 \
+  --profile-mode dflash --profile-stage verify --device-id 0 \
   --max-new-tokens "$MAX_NEW_TOKENS" --max-draft-tokens 15 \
   --profile-warmup 3 --profile-audit-draft-inputs
 ```
 
-也可保持 `--profile-stage all`，此时只对 draft 窗口增加检查。
-该开关默认关闭，普通模式不使用。C++ runner 直接接收的参数形式为
+也可选择 `--profile-stage draft`，或保持 `--profile-stage all`，同时检查
+独立 draft 阶段和 verify 准备阶段的 Draft 输入。
+每个阶段都会重新清零并准备请求；verify 会重新调用 Draft 生成候选，
+不复用独立 draft 窗口的输出。因此，draft 阶段全部 PASS 不能证明 verify
+准备时的候选或 Draft 输入相同。
+该开关默认关闭，普通模式和单独的 prefill 不使用。C++ runner 直接接收的参数形式为
 `--profile-audit-draft-inputs true`，可放在 `run_msprof.sh` 的 `--` 后。
 这里使用 3 次预热，且每次都检查差异。若 `measured=false` 的预热记录已 FAIL，
-该 draft 采集窗口还未开始，说明差异在未启用该次采样时也存在；
+当前阶段的采集窗口还未开始，说明差异在未启用该次采样时也存在；
 若预热全 PASS、只有 `measured=true` 失败，再结合下面的输入 hash 缩小范围。
 
-检查在每次 draft 预热/采集前读取 features、当前 Draft KV 的完整设备字节，
+检查在每次独立 draft 阶段的执行前，或 verify 准备时的 Draft 调用前，
+读取 features、当前 Draft KV 的完整设备字节，
 并对即将上传的 `anchor`、`start_position`、`valid_rows`、`proposal_count`
 计算 SHA-256，写入同一 JSONL 的 `draft_input_sha256`。
-读回、计算 hash 和写记录都在 msprof start 前；它不增加 OM 调用，也不改变缓存提交。
+`draft_input_scope="draft_stage"` 表示独立 draft 阶段；
+`draft_input_scope="verify_preparation"` 表示为 verify 生成候选的那次 Draft 调用。
+关闭检查或处于 prefill/decode 阶段时，这个字段为 `null`。
+verify 记录中的 `MATCH_SHA256` 比较的是准备阶段的 **Draft 输入**，
+不表示 Target verify 的全部缓存或图内张量已经比较过。
+读回、计算 hash 和写 `prepared` 记录都在 msprof start 前；
+`completed` 复用本次执行前的 hash，与参考迭代比较，并非执行后重新读回。
+检查不增加 OM 调用，也不改变缓存提交。
 这是定位开关，额外读回会影响准备耗时和缓存热度，性能测量时保持关闭。
 
 | JSONL 结果 | 下一步检查 |
@@ -822,7 +835,11 @@ stage profiling 则以第一次预热为参考，逐项比较后续预热和采�
 
 hash 检查覆盖图边界输入，包括物理填充区；它不读取权重、共享工作内存或层内张量。
 hash 差异仅作为诊断记录，不单独放宽或替代有效 token 的一致性检查。
-更新控制器和 C++ runner 即可使用上述诊断，已有 AIR/OM 无需重新生成；
+若 verify 的输入在下标 8 变化，对应的是第 8 个候选（下标 7），因为下标 0 是 anchor。
+候选不同后，Target 在这些候选之后算出的预测也可能不同；应先定位准备阶段的差异。
+当变化的候选原本就被拒绝时，接受数、fallback 和最终生成文本仍可能一致。
+检查后暂时稳定，也不能单凭这一点认定问题修复：额外读回和同步会改变执行条件。
+更新采集脚本和 C++ runner 即可使用上述诊断，已有 AIR/OM 无需重新生成；
 C++ 构建步骤见第 10 节。
 
 `operator-types.csv` 按 stage、原始 CSV、device/model、算子类型、任务类型、OP State、
