@@ -752,8 +752,24 @@ token 等价。固定 64 行 Draft gear、非末尾 prompt 块的 Draft KV 初�
 | TorchAir graph break/unsupported op | 首个失败算子的 schema、Fake/Meta、converter 和 GE 注册 |
 | fused attention 导出 | 长度专用 INT64 输入、空 `pse_shift`、运行时因果及有效前缀 mask |
 | ATC 编译 | `log/compile-om.log`、具体不支持节点及算子包 |
+| C++ 加载 OM 时 out of memory | 最后一条 `load graph`、各图的 `om-memory`、加载前后的 `device-memory` 和 `npu-smi info` 中的其他进程 |
 | C++ I/O 不匹配 | OM 和计划是否配套，实际 dtype/shape/字节数是否匹配 |
 | token 不一致 | 保留首个差异轮次、接受数、有效行数、GDN/conv/KV 状态；停止性能比较 |
 | msprof 等待或空 CSV | control JSON 的 ready/start/stop/quit 回执、目标 PID、runtime 日志及导出日志 |
+
+runner 在加载前通过 AscendCL 的
+[aclmdlQuerySize](https://www.hiascend.com/document/detail/zh/canncommercial/601/inferapplicationdev/aclcppdevg/aclcppdevg_03_0099.html)
+记录全部待加载 OM 的 `weight_bytes` 和 `work_bytes`，通过
+[aclrtGetMemInfo](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha002/apiref/appdevgapi/aclcppdevg_03_0107.html)
+记录加载前后的可用设备内存。HBM、DDR 查询可能指向同一物理内存，不能相加；
+不支持或失败的查询显示 `unavailable`，不会阻止正常加载。查询结果不包含全部运行时开销，
+不能作为峰值内存保证。这些诊断只在启动时执行，仍从计时中排除模型加载。
+
+若底层日志为 `MallocWeightsMem` / `InitWeightMem` 失败，申请的是该 OM 的权重内存，
+不能把它解释为 GDR state 输出的字节数。verify 的 24 个 discard FP32 state 输出共
+48 MiB，属于另行分配的 I/O buffer；加载该 OM 成功后才分配这些 buffer。
+用 `npu-smi info` 检查其他进程的占用，确认任务身份并正常退出不再需要的任务，
+释放内存后重跑推理即可。只测 verify 时使用第 14 步的 DFlash 采集命令，会加载三张 OM，
+无需重新导出即可省去普通 decode OM；`infer-cpp` 配对测量则需要同时驻留四张。
 
 命令参数和 tensor ABI 的集中说明见 [AIR/OM/C++ 接口参考](QUANT_AIR_OM_FRAMEWORK.md)。

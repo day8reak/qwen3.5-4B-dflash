@@ -251,6 +251,30 @@ aclError aclrtMemcpyAsync(
   return ACL_SUCCESS;
 }
 
+aclError aclrtGetMemInfo(aclrtMemAttr attr, std::size_t* free, std::size_t* total) {
+  if (!free || !total) return 1;
+  if (std::getenv("QWEN35_FAKE_MEM_INFO_FAIL")) return 35;
+  if (attr == ACL_DDR_MEM) {
+    *free = *total = 0;  // Unsupported pool must not look like available memory.
+  } else {
+    *total = 24ULL * 1024 * 1024 * 1024;
+    *free = *total - fixtures.size() * 1024 * 1024;
+    for (const auto& allocation : device_allocations) *free -= allocation.second;
+  }
+  return ACL_SUCCESS;
+}
+
+aclError aclmdlQuerySize(const char* path, std::size_t* work, std::size_t* weight) {
+  if (!work || !weight) return 1;
+  if (std::getenv("QWEN35_FAKE_QUERY_SIZE_FAIL")) return 36;
+  std::ifstream file(path);
+  std::string header, role;
+  if (!(file >> header >> role) || header != "FAKE_CHUNK") return 37;
+  *work = 1048576;
+  *weight = role == "target_verify" ? 5001682944ULL : 2097152;
+  return ACL_SUCCESS;
+}
+
 aclError aclmdlLoadFromFile(const char* path, std::uint32_t* model_id) {
   if (model_id == nullptr) {
     return 1;
@@ -261,6 +285,8 @@ aclError aclmdlLoadFromFile(const char* path, std::uint32_t* model_id) {
   std::string word;
   if (file >> word && word == "FAKE_CHUNK") {
     file >> model.role;
+    const auto* failure = std::getenv("QWEN35_FAKE_FAIL_LOAD_GRAPH");
+    if (failure && model.role == failure) return 245000;
     while (file >> word && (word == "I" || word == "O")) {
       FixtureTensor tensor;
       std::string dtype;

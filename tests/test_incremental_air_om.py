@@ -1042,7 +1042,44 @@ def test_cpp_rejects_failed_or_inconsistent_verify(
         assert "host acceptance disagrees" in result.stderr
 
 
-def test_pure_dflash_does_not_load_or_require_decode_om(chunk_bundle, tmp_path, monkeypatch):
+@pytest.mark.parametrize("failed_graph", ["draft", "target_verify"])
+def test_cpp_load_failure_reports_memory_before_any_execution(
+    chunk_bundle, tmp_path, monkeypatch, failed_graph,
+):
+    from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
+    from qwen35_dflash.ascend310p.utils import sha256_file
+
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER")
+    plan, _, _ = write_incremental_plan(chunk_bundle, tmp_path / "plan.txt")
+    monkeypatch.setenv("QWEN35_FAKE_FAIL_LOAD_GRAPH", failed_graph)
+    events = tmp_path / "execute.jsonl"
+    monkeypatch.setenv("QWEN35_FAKE_EVENT_LOG", str(events))
+    output = tmp_path / "failed.json"
+    result = subprocess.run(
+        [runner, "--model", str(plan), "--model-sha256", sha256_file(plan),
+         "--model-kind", "chunk", "--mode", "paired", "--prompt-token-ids", "4",
+         "--output", str(output)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert not output.exists() and not events.exists()
+    assert f"aclmdlLoadFromFile failed: 245000 graph={failed_graph}" in result.stderr
+    assert f"phase=load_failed graph={failed_graph}" in result.stderr
+    assert "loaded_models=" + ("0" if failed_graph == "draft" else "3") in result.stderr
+    # Even an OOM on the first model leaves the full selected set diagnosable.
+    before_load = result.stderr.split("[chunk-runtime] load graph=", 1)[0]
+    for name in ("draft", "target_decode", "target_prefill", "target_verify"):
+        assert f"om-memory graph={name} query_status=0" in before_load
+    assert "weight_bytes=5001682944 work_bytes=1048576" in before_load
+    assert "pool=DDR query_status=0 free_bytes=unavailable" in result.stderr
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_pure_dflash_does_not_load_or_require_decode_om(
+    chunk_bundle, tmp_path, monkeypatch, unavailable,
+):
     from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
     from qwen35_dflash.ascend310p.utils import sha256_file
 
@@ -1050,6 +1087,9 @@ def test_pure_dflash_does_not_load_or_require_decode_om(chunk_bundle, tmp_path, 
     if not runner:
         pytest.skip("set QWEN35_CPP_TEST_RUNNER")
     monkeypatch.setenv("QWEN35_FAKE_ACCEPT", "0")
+    if unavailable:
+        monkeypatch.setenv("QWEN35_FAKE_MEM_INFO_FAIL", "1")
+        monkeypatch.setenv("QWEN35_FAKE_QUERY_SIZE_FAIL", "1")
     plan, deployment, _ = write_incremental_plan(chunk_bundle, tmp_path / "plan.txt")
     decode = next(g for g in deployment["graphs"] if g["name"] == "target_decode")
     (chunk_bundle.parent / decode["om"]["path"]).unlink()
@@ -1075,6 +1115,11 @@ def test_pure_dflash_does_not_load_or_require_decode_om(chunk_bundle, tmp_path, 
     )
     assert result.returncode == 0, result.stderr
     assert "loaded_models=3" in result.stderr
+    assert "om-memory graph=target_decode" not in result.stderr
+    assert "selected_models=3" in result.stderr
+    if unavailable:
+        assert "query_status=36 weight_bytes=unavailable work_bytes=unavailable" in result.stderr
+        assert "pool=HBM query_status=35 free_bytes=unavailable" in result.stderr
     report = json.loads(output.read_text())
     assert report["ordinary_parity"]["status"] == "NOT_RUN"
     for row in report["benchmark"]["measurements"]:

@@ -32,6 +32,11 @@ typedef enum aclrtMemMallocPolicy {
   ACL_MEM_MALLOC_NORMAL_ONLY = 2,
 } aclrtMemMallocPolicy;
 
+typedef enum aclrtMemAttr {
+  ACL_DDR_MEM = 0,
+  ACL_HBM_MEM = 1,
+} aclrtMemAttr;
+
 typedef enum aclrtMemcpyKind {
   ACL_MEMCPY_HOST_TO_HOST = 0,
   ACL_MEMCPY_HOST_TO_DEVICE = 1,
@@ -72,6 +77,7 @@ aclError aclrtMalloc(
     std::size_t size,
     aclrtMemMallocPolicy policy);
 aclError aclrtFree(void* device_ptr);
+aclError aclrtGetMemInfo(aclrtMemAttr attr, std::size_t* free, std::size_t* total);
 aclError aclrtMemcpyAsync(
     void* destination,
     std::size_t destination_max,
@@ -81,6 +87,7 @@ aclError aclrtMemcpyAsync(
     aclrtStream stream);
 
 aclError aclmdlLoadFromFile(const char* model_path, std::uint32_t* model_id);
+aclError aclmdlQuerySize(const char* model_path, std::size_t* work, std::size_t* weight);
 aclError aclmdlUnload(std::uint32_t model_id);
 aclmdlDesc* aclmdlCreateDesc();
 aclError aclmdlDestroyDesc(aclmdlDesc* description);

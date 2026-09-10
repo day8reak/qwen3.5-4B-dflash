@@ -20,6 +20,40 @@ void Check(aclError code, const char* op) {
 void Require(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
 }
+struct ModelMemory {
+  aclError status = ACL_SUCCESS;
+  std::size_t work = 0, weight = 0;
+
+  std::string Describe() const {
+    std::ostringstream out;
+    out << "query_status=" << status;
+    if (status == ACL_SUCCESS)
+      out << " weight_bytes=" << weight << " work_bytes=" << work;
+    else
+      out << " weight_bytes=unavailable work_bytes=unavailable";
+    return out.str();
+  }
+};
+
+void LogDeviceMemory(const char* phase, const std::string& graph = "all") {
+  // These attributes may describe the same physical pool on some devices.
+  // Report them separately; never add them or use an unsupported query as zero
+  // available memory. Diagnostics must not reject an otherwise runnable model.
+  for (auto attr : {ACL_HBM_MEM, ACL_DDR_MEM}) {
+    std::size_t free = 0, total = 0;
+    const auto status = aclrtGetMemInfo(attr, &free, &total);
+    std::cerr << "[chunk-runtime] device-memory phase=" << phase
+              << " graph=" << graph
+              << " pool=" << (attr == ACL_HBM_MEM ? "HBM" : "DDR")
+              << " query_status=" << status;
+    if (status == ACL_SUCCESS && total > 0)
+      std::cerr << " free_bytes=" << free << " total_bytes=" << total;
+    else
+      std::cerr << " free_bytes=unavailable total_bytes=unavailable";
+    std::cerr << '\n';
+  }
+}
+
 bool State(const std::string& name) {
   return name.size() > 2 && (name[0] == 't' || name[0] == 'd') &&
          name[1] >= '0' && name[1] <= '9';
@@ -176,12 +210,30 @@ class AclChunkExecutor::Impl {
       Check(aclrtCreateContext(&context, device), "aclrtCreateContext");
       Check(aclrtSetCurrentContext(context), "aclrtSetCurrentContext");
       Check(aclrtCreateStream(&stream), "aclrtCreateStream");
+      std::vector<const ChunkGraph*> selected;
       for (const auto& item : plan.graphs) {
         if (mode == "dflash" && item.first == "target_decode") continue;
         if (mode == "ordinary" &&
             (item.first == "target_verify" || item.first == "draft"))
           continue;
-        Load(item.second);
+        selected.push_back(&item.second);
+      }
+      std::cerr << "[chunk-runtime] model-memory mode=" << mode
+                << " selected_models=" << selected.size()
+                << " allocation=independent_per_om\n";
+      LogDeviceMemory("before_models");
+      // Query every selected OM before any is loaded, so an OOM on an early
+      // model does not hide the requirements of the remaining graphs.
+      std::map<std::string, ModelMemory> requirements;
+      for (const auto* graph : selected) {
+        auto& requirement = requirements[graph->name];
+        requirement.status = aclmdlQuerySize(
+            graph->model.c_str(), &requirement.work, &requirement.weight);
+        std::cerr << "[chunk-runtime] om-memory graph=" << graph->name << ' '
+                  << requirement.Describe() << '\n';
+      }
+      for (const auto* graph : selected) {
+        Load(*graph, requirements.at(graph->name));
       }
       // Cross-graph state/feature shapes are checked by the shared pool.
       std::size_t bytes = 0, discard_bytes = 0;
@@ -257,13 +309,22 @@ class AclChunkExecutor::Impl {
     return *pointer;
   }
 
-  void Load(const ChunkGraph& graph) {
+  void Load(const ChunkGraph& graph, const ModelMemory& requirement) {
     auto owner = std::make_unique<Loaded>();
     auto& model = *owner;
     std::cerr << "[chunk-runtime] load graph=" << graph.name
               << " model=" << std::quoted(graph.model.string()) << '\n';
-    Check(aclmdlLoadFromFile(graph.model.c_str(), &model.id),
-          "aclmdlLoadFromFile");
+    LogDeviceMemory("before_load", graph.name);
+    const auto status = aclmdlLoadFromFile(graph.model.c_str(), &model.id);
+    if (status != ACL_SUCCESS) {
+      LogDeviceMemory("load_failed", graph.name);
+      throw std::runtime_error(
+          "aclmdlLoadFromFile failed: " + std::to_string(status) +
+          " graph=" + graph.name + " model=" + graph.model.string() +
+          " loaded_models=" + std::to_string(models.size()) + " " +
+          requirement.Describe() +
+          "; this model's I/O buffers have not been allocated and it has not executed");
+    }
     model.loaded = true;
     model.desc = aclmdlCreateDesc();
     Require(model.desc != nullptr, "aclmdlCreateDesc returned null");
@@ -287,6 +348,7 @@ class AclChunkExecutor::Impl {
       }
     }
     models.emplace(graph.name, std::move(owner));
+    LogDeviceMemory("after_load_and_io", graph.name);
   }
 
   void Reset(std::int64_t padding) {
