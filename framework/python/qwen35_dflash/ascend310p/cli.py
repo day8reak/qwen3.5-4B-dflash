@@ -240,6 +240,7 @@ def command_infer_cpp(args: argparse.Namespace) -> int:
         raw_output=raw_output,
         log_output=log_output,
         trace_rounds=getattr(args, "trace_rounds", False),
+        low_memory=getattr(args, "low_memory", False),
     )
     payload["control_plane"]["target_preflight"] = file_record(
         preflight_log, relative_to=run_root
@@ -296,6 +297,7 @@ def command_run_e2e_cpp(args: argparse.Namespace) -> int:
         atc_args=args.atc_arg,
         runner=args.runner,
         runner_options=_config(args.runner_config),
+        low_memory=getattr(args, "low_memory", False),
         report_dir=args.report_dir,
         prompt=args.prompt,
         chat=args.chat,
@@ -432,6 +434,8 @@ def build_parser() -> argparse.ArgumentParser:
     infer_cpp.add_argument("--max-draft-tokens", type=int, default=15)
     infer_cpp.add_argument("--trace-rounds", action="store_true",
                            help="record chunk proposal/verify/accepted/emitted tokens per round")
+    infer_cpp.add_argument("--low-memory", action="store_true",
+                           help="run ordinary then DFlash, unloading models between modes (chunk OM only)")
     infer_cpp.add_argument("--eos-token-id", action="append", type=int,
                            help="override tokenizer EOS; repeat for multiple IDs")
     infer_cpp.add_argument("--output", type=Path, required=True)
@@ -485,6 +489,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_e2e_cpp.add_argument("--device-id", type=int, default=0)
     run_e2e_cpp.add_argument("--max-new-tokens", type=int, default=32)
     run_e2e_cpp.add_argument("--max-draft-tokens", type=int, default=15)
+    run_e2e_cpp.add_argument("--low-memory", action="store_true",
+                            help="run ordinary then DFlash, unloading models between modes (chunk OM only)")
     run_e2e_cpp.add_argument("--report-dir", type=Path, required=True)
     run_e2e_cpp.set_defaults(handler=command_run_e2e_cpp, model_asset_id=None)
     return parser

@@ -42,6 +42,9 @@ DFlash 部署需要 3 个 OM；加入普通模式对照后共 4 个。C++ 按模
 
 `infer-cpp --trace-rounds` 记录每轮 proposal、Target 验证、接受前缀和实际输出，
 `--eos-token-id` 可对齐 NPU 的 EOS 策略。
+`infer-cpp --low-memory` 先测试普通模式、卸载模型后再测试 DFlash，
+最多同时驻留三张 OM；两组均执行 3+10，报告保留严格 token/EOS 对照及分组顺序。
+`run-e2e-cpp` 和直接 C++ paired 入口同样支持。chunk 模式还会复用串行工作内存。
 `python -m qwen35_dflash.ascend310p.compare_rounds` 按相同的已提交前缀比较两份报告；
 最终 token 一致与每轮一致分别检查。逐轮记录用于诊断，性能基线不启用该参数。
 

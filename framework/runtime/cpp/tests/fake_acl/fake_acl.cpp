@@ -36,6 +36,8 @@ struct FixtureTensor {
 struct FixtureModel {
   std::string role;
   std::vector<FixtureTensor> inputs, outputs;
+  void* workspace = nullptr;
+  std::size_t workspace_size = 0;
 };
 std::map<std::uint32_t, FixtureModel> fixtures;
 std::uint32_t next_id = 1;
@@ -44,7 +46,7 @@ std::set<void*> host_allocations;
 std::set<void*> discard_allocations;
 std::size_t live_contexts = 0, live_streams = 0, live_descs = 0;
 std::size_t live_datasets = 0, live_data_buffers = 0, allocations_after_execute = 0;
-bool executed = false;
+bool executed = false, initialized_once = false;
 
 bool FailCleanup(const char* operation) {
   const auto* failure = std::getenv("QWEN35_FAKE_CLEANUP_FAIL");
@@ -168,7 +170,12 @@ aclError SetDims(aclmdlIODims* dimensions, std::int64_t width) {
 
 extern "C" {
 
-aclError aclInit(const char*) { return ACL_SUCCESS; }
+aclError aclInit(const char*) {
+  // Model-set changes must retain the same runtime/context.
+  if (initialized_once) return 43;
+  initialized_once = true;
+  return ACL_SUCCESS;
+}
 aclError aclFinalize() {
   if (const auto* path = std::getenv("QWEN35_FAKE_CLEANUP_LOG")) {
     std::ofstream log(path);
@@ -263,6 +270,8 @@ aclError aclrtMalloc(void** device_ptr, std::size_t size, aclrtMemMallocPolicy) 
 
 aclError aclrtFree(void* device_ptr) {
   if (FailCleanup("aclrtFree")) return 38;
+  for (const auto& item : fixtures)
+    if (item.second.workspace == device_ptr) return 39;
   discard_allocations.erase(device_ptr);
   device_allocations.erase(device_ptr);
   std::free(device_ptr);
@@ -303,7 +312,7 @@ aclError aclmdlQuerySize(const char* path, std::size_t* work, std::size_t* weigh
   std::ifstream file(path);
   std::string header, role;
   if (!(file >> header >> role) || header != "FAKE_CHUNK") return 37;
-  *work = 1048576;
+  *work = role == "target_prefill" ? 3145728 : 1048576;
   *weight = role == "target_verify" ? 5001682944ULL : 2097152;
   return ACL_SUCCESS;
 }
@@ -352,9 +361,31 @@ aclError aclmdlLoadFromFile(const char* path, std::uint32_t* model_id) {
   return ACL_SUCCESS;
 }
 
+aclError aclmdlLoadFromFileWithMem(const char* path, std::uint32_t* model_id,
+                                 void* work, std::size_t work_size,
+                                 void* weight, std::size_t weight_size) {
+  if (!work || !device_allocations.count(work) ||
+      device_allocations.at(work) < work_size || weight || weight_size) return 40;
+  std::size_t required_work = 0, required_weight = 0;
+  if (aclmdlQuerySize(path, &required_work, &required_weight) != ACL_SUCCESS ||
+      work_size < required_work) return 41;
+  const auto status = aclmdlLoadFromFile(path, model_id);
+  if (status != ACL_SUCCESS) return status;
+  auto& model = fixtures.at(*model_id);
+  model.workspace = work;
+  model.workspace_size = work_size;
+  if (const auto* log_path = std::getenv("QWEN35_FAKE_WORKSPACE_LOG")) {
+    std::ofstream log(log_path, std::ios::app);
+    log << "[\"" << model.role << "\"," << reinterpret_cast<std::uintptr_t>(work)
+        << ',' << work_size << ',' << fixtures.size() << "]\n";
+  }
+  return ACL_SUCCESS;
+}
+
 aclError aclmdlUnload(std::uint32_t id) {
   if (FailCleanup("aclmdlUnload")) return 38;
   fixtures.erase(id);
+  if (fixtures.empty()) executed = false;  // Loading another mode is outside its model loop.
   return ACL_SUCCESS;
 }
 
@@ -453,6 +484,9 @@ aclError aclmdlExecuteAsync(
     aclmdlDataset* output,
     aclrtStream) {
   executed = true;
+  const auto& model = fixtures.at(id);
+  if (model.workspace && (!device_allocations.count(model.workspace) ||
+      device_allocations.at(model.workspace) < model.workspace_size)) return 42;
   if (!fixtures.at(id).role.empty()) return ExecuteChunk(fixtures.at(id), input, output);
   if (input == nullptr || output == nullptr || input->buffers.size() != 2 ||
       output->buffers.size() != 2) {

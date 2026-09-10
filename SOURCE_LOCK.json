@@ -157,11 +157,11 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "c6575b3afa1942e21163a8d2fe8b2847e9e351d86b6a0dc2b03c88925cd06db0"
+        "source_sha256": "92a8cc8b7ad388055571eda0d886e52b764bfb16c4fd743c864b731be6fbf1ca"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "70af0399e8fbb6abe58c4daf46b43e578327d037fc79aacf3b8045ec0304f111"
+        "source_sha256": "65b551181011dbe3c57553df07b86f0be46c29f96b3c282dd8e2414000130206"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
@@ -169,7 +169,7 @@
       },
       {
         "source_file": "framework/README.md",
-        "source_sha256": "5db7f930757cc8b195a5c1089041ea633a6d948528baed0087d6ef0a19f6d8df"
+        "source_sha256": "d0023a79c6e70caa5a043698bfb5fa1aff3307c228356a21edd77653d51b5dad"
       },
       {
         "source_file": "framework/abi/closed-runtime-baseline-v1.json",
@@ -205,7 +205,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/cli.py",
-        "source_sha256": "a2c98a7a58b65de00c41ae1b68fb78e3de5766313dc771b249de5ced09f7242f"
+        "source_sha256": "00236906e72678d0f7725820bd2233e0cfdb93a64373355e076ac612f0bc2dbd"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/compiler.py",
@@ -217,7 +217,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/cpp_runtime.py",
-        "source_sha256": "066f0e07a10904b7f877a517875e20ca23d29dbf3928856ee25a0b07b1f8e01c"
+        "source_sha256": "b01df3bce273e5ae625d68ab370fd02ea88fdeea008d7c8af89a5f0bba163e07"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/custom_op_export.py",
@@ -269,7 +269,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/workflow.py",
-        "source_sha256": "de2379f7c28f244472e6a04dd0d23752093cdc481f7e96ae38b1dee296037f40"
+        "source_sha256": "62be5b0a3750928d54ccfb3896a012b9c6b9c12acd0730e8bc3f1454f9a04dbe"
       },
       {
         "source_file": "framework/runtime/cpp/CMakeLists.txt",
@@ -281,11 +281,11 @@
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/chunk.hpp",
-        "source_sha256": "a381869fb3f39416c3fee6e6b7ebba9500974a1814d155b17f395e0b37c643a4"
+        "source_sha256": "9124290b78907fe626b37dfba4cc243c4afcd5519cd376a37d8dace9758b264c"
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/generation.hpp",
-        "source_sha256": "a8aff6fe318595257531eecfc3447d4bd0a5fc3faa7604b3e0186745a6fd5a64"
+        "source_sha256": "1fa6b48fffc089e9aa8687329f94266fc5d1da396c10f987eae598c23455e353"
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/sha256.hpp",
@@ -297,7 +297,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_chunk.cpp",
-        "source_sha256": "f0ca608c7f297fb037e80087ae4457de1f0ecd216c7281cbcda5fe6a2a7c40fe"
+        "source_sha256": "15c9ef1525ba7e850020de10dffc546dcec537700fa81d5001c568349c40240d"
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_executor.cpp",
@@ -309,11 +309,11 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/generation.cpp",
-        "source_sha256": "5e8d84b0fc24c7dc20bc107ddd5a92a655eb0743f8142e3261d962afb0382294"
+        "source_sha256": "89c31a9fbf8e87be577fca5c9e9a3477cce0b6d0f5eacc4ba3aed1b60a1bdff4"
       },
       {
         "source_file": "framework/runtime/cpp/src/main.cpp",
-        "source_sha256": "7b3adf09d22cf9b3a236faca890ed50fc8baa74f4857232806ec8470c5ae3d7e"
+        "source_sha256": "b8af54f439546410a0119182b1153155f8a609131ce8bbceae7d72781cc1edd7"
       },
       {
         "source_file": "framework/runtime/cpp/src/sha256.cpp",
@@ -325,11 +325,11 @@
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/acl/acl.h",
-        "source_sha256": "bf995068671a151a70b9c9da7b66ac7798bb11793e9a8cef7280cc8f80ce7de4"
+        "source_sha256": "4206fdb78138483332db4a2a4bdf4d879576ca6d1bd789769fe4a9f78af1aaf6"
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/fake_acl.cpp",
-        "source_sha256": "1634077ce450683cf4b49031ca60b1ca8a582c125f22b4da0cac5a639d319d5f"
+        "source_sha256": "6850f112f9f70ff397026a2aae937f5233891151bad5ec56ba2d9e09ae190f58"
       },
       {
         "source_file": "framework/runtime/cpp/tests/run_fake_runner.cmake",
@@ -357,7 +357,7 @@
       },
       {
         "source_file": "tests/test_incremental_air_om.py",
-        "source_sha256": "61a9eed7576d757a8d8bd3fba63e6d80485e103a947527dfcba6cc5509d286b0"
+        "source_sha256": "76fdffdedeb25897e4f11725772df337eb37e6ea73ab8dc5c256eb743d83f841"
       },
       {
         "source_file": "tests/test_msprof_stage_script.py",

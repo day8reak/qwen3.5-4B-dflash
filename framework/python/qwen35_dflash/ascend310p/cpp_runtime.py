@@ -299,6 +299,7 @@ def validate_cpp_runner_report(
     max_new_tokens: int,
     max_draft_tokens: int,
     chunk_abi: bool = False,
+    low_memory: bool = False,
 ) -> None:
     if report.get("status") != "PASS" or report.get("runner_id") != CPP_RUNNER_ID:
         raise RuntimeError("C++ ACL runner did not produce a passing known report")
@@ -319,6 +320,14 @@ def validate_cpp_runner_report(
     protocol = report.get("protocol", {})
     if protocol.get("warmup") != 3 or protocol.get("repetitions") != 10:
         raise RuntimeError("C++ runner protocol is not the locked 3+10")
+    if protocol.get("low_memory", False) is not low_memory:
+        raise RuntimeError("C++ runner low-memory mode differs from the request")
+    if low_memory and (
+        not chunk_abi
+        or protocol.get("order") != "ordinary then DFlash with model unload between modes"
+        or protocol.get("max_resident_models") != 3
+    ):
+        raise RuntimeError("C++ runner low-memory protocol differs")
     abi = report.get("abi", {})
     if chunk_abi and (abi.get("id") != "qwen35-dflash-chunk-v3" or abi.get("graph_count") != 4):
         raise RuntimeError("C++ runner incremental ABI differs")
@@ -366,6 +375,7 @@ def run_cpp_pair(
     raw_output: str | Path,
     log_output: str | Path,
     trace_rounds: bool = False,
+    low_memory: bool = False,
     execute: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     """Run paired ordinary/DFlash generation entirely inside one C++ process."""
@@ -380,6 +390,8 @@ def run_cpp_pair(
     chunk = any(g.get("metadata", {}).get("incremental_contract") for g in deployment.get("graphs", []))
     if trace_rounds and not chunk:
         raise ValueError("round tracing requires an incremental chunk OM bundle")
+    if low_memory and not chunk:
+        raise ValueError("low-memory mode requires an incremental chunk OM bundle")
     if chunk:
         from .incremental_plan import write_incremental_plan
         om_path, deployment, contract = write_incremental_plan(
@@ -425,6 +437,8 @@ def run_cpp_pair(
         command.extend(("--model-kind", "chunk"))
     if trace_rounds:
         command.append("--trace-rounds")
+    if low_memory:
+        command.append("--low-memory")
     start_ns = time.perf_counter_ns()
     result = execute(
         command,
@@ -453,6 +467,7 @@ def run_cpp_pair(
         max_new_tokens=max_new_tokens,
         max_draft_tokens=max_draft_tokens,
         chunk_abi=chunk,
+        low_memory=low_memory,
     )
     run_root = Path(os.environ["AI_RUN_DIR"]).expanduser().resolve()
     air_record = deployment.get("air_manifest")
@@ -525,7 +540,8 @@ def write_cpp_prompt_report(
     result["claim_boundary"] = (
         "C++ removes Python from the OM generation hot path and reports paired "
         "synchronized model-loop latency. Comparable closed-runtime latency still "
-        "requires same-device A/B evidence and may require incremental target/draft state."
+        "requires same-device A/B evidence. Preserve protocol.order when comparing "
+        "grouped low-memory measurements with alternating measurements."
     )
     target = require_run_output(output)
     atomic_write_json(target, result)

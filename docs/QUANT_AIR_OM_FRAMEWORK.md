@@ -17,7 +17,7 @@ Target + Draft checkpoint + W8A8 输入 + receiver 加载器
 ```
 
 单模式 DFlash 加载 `target_prefill`、`target_verify`、`draft`；普通运行加载
-`target_prefill`、`target_decode`；paired 加载四个。
+`target_prefill`、`target_decode`；默认 paired 同时加载四个，低显存 paired 最多同时加载三个。
 prefill 共用，verify 内部完成接受判断与状态提交。
 
 ## 2. 输入和导出配置
@@ -257,6 +257,11 @@ ATC 的 `--soc-version` 同样要求设备支持的精确型号。
 | 5 | `prepare-chunk-plan` | `--deployment-manifest`、`--mode ordinary\|dflash\|paired`、`--output` | 单模式或配对计划 |
 
 `infer-cpp` 还支持 `--max-new-tokens`、`--max-draft-tokens`、`--device-id`。
+`--low-memory` 用于四图 chunk bundle：先完成普通模式的 3+10，再卸载模型和缓冲区，
+加载三图 DFlash 完成 3+10，最后执行相同的严格 token/EOS 对照。
+`run-e2e-cpp` 和直接 C++ 的 `--model-kind chunk --mode paired` 也支持该参数。
+报告记录 `protocol.low_memory=true`、分组顺序和 `max_resident_models=3`；
+加载/组间卸载时间单独记录，不进入模型循环时延。无需重新生成 AIR/OM。
 `--eos-token-id` 可重复传入，用于覆盖 tokenizer 的 EOS 并对齐 NPU 报告。
 `--trace-rounds` 为 chunk bundle 记录每轮的 proposal、Target token、接受前缀和输出；
 直接 C++ 入口也支持此开关。记录位于每条 measurement 的 `rounds` 中，
@@ -270,15 +275,18 @@ paired 推理，runner 须已构建。两者都应显式传入本参考第 2 节
 
 ## 7. 状态、正确性和计时
 
-C++ 只加载所选模式的模型一次，持久保留 current/next device buffer。
+C++ 在每组测试前加载所选模型，持久保留 current/next device buffer。
+chunk 模式将各 OM 的临时工作内存从分别申请改为申请最大值、串行复用；
+权重保持独立，所有使用者卸载后才释放共享工作内存。查询不可用时使用每模型独立分配。
 verify 完成后，主机复核接受数并统一发布状态；异常使本次请求失效，清零后才能继续。
 correction 或 bonus 成为下一轮 anchor，本轮不提前把它写入已提交状态。
 零接受后关闭 Draft，后续轮次优先使用已加载的 `target_decode`；
-只加载三图的 DFlash 模式使用 `target_verify` 的 `valid_rows=1`。
+只加载三图的 DFlash 模式（含低显存 paired 的 DFlash 组）使用 `target_verify` 的 `valid_rows=1`。
 报告的 `speculation_disable_events`、`target_only_fallback_rounds` 与 `stage_ms`
 分别记录关闭事件、后备轮数和实际调用图。
 
-paired 运行按模式交错执行 3 次预热和 10 次测量，要求普通/DFlash token、EOS 和停止原因
+默认 paired 运行按模式交错执行 3 次预热和 10 次测量，低显存模式按组执行；
+两者均要求普通/DFlash token、EOS 和停止原因
 一致。还需与 Python NPU ordinary 比较，覆盖零/部分/全接受、跨 64 行块、长 prompt 和重复
 请求，才能排除两个 OM 路径共有的导出误差。
 

@@ -361,14 +361,15 @@ PairedBenchmarkResult BenchmarkPair(
     }
   }
 
-  PairedBenchmarkResult result{
+  return PairBenchmarks(
       FinalizeBenchmark(
           GenerationMode::kOrdinary, warmup, std::move(ordinary)),
       FinalizeBenchmark(
-          GenerationMode::kDFlash, warmup, std::move(dflash)),
-      0,
-      0,
-  };
+          GenerationMode::kDFlash, warmup, std::move(dflash)));
+}
+
+PairedBenchmarkResult PairBenchmarks(BenchmarkResult ordinary, BenchmarkResult dflash) {
+  PairedBenchmarkResult result{std::move(ordinary), std::move(dflash), 0, 0};
   const auto& expected = result.ordinary.stable_generated_token_ids;
   const auto& actual = result.dflash.stable_generated_token_ids;
   const std::size_t width = std::max(expected.size(), actual.size());

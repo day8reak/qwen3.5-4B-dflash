@@ -88,6 +88,9 @@ aclError aclrtMemcpyAsync(
 
 aclError aclmdlLoadFromFile(const char* model_path, std::uint32_t* model_id);
 aclError aclmdlQuerySize(const char* model_path, std::size_t* work, std::size_t* weight);
+aclError aclmdlLoadFromFileWithMem(const char* model_path, std::uint32_t* model_id,
+                                 void* work, std::size_t work_size,
+                                 void* weight, std::size_t weight_size);
 aclError aclmdlUnload(std::uint32_t model_id);
 aclmdlDesc* aclmdlCreateDesc();
 aclError aclmdlDestroyDesc(aclmdlDesc* description);

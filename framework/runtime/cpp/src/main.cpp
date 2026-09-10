@@ -42,6 +42,7 @@ struct Arguments {
   std::size_t warmup = 3;
   std::size_t repetitions = 10;
   bool trace_rounds = false;
+  bool low_memory = false;
   int device_id = 0;
   std::string model_kind = "recompute";
   std::string mode = "paired";
@@ -55,6 +56,7 @@ void Usage(std::ostream& stream) {
       << "  --model-sha256 HEX           expected OM SHA-256\n"
       << "  --model-kind TYPE            recompute or chunk (model is a loading plan)\n"
       << "  --mode MODE                  paired, ordinary or dflash; default paired\n"
+      << "  --low-memory                 chunk paired: measure ordinary, unload, then DFlash\n"
       << "  --output PATH                paired JSON report\n"
       << "  --prompt-token-ids CSV       non-empty pretokenized prompt\n"
       << "  --eos-token-ids CSV          optional EOS token IDs\n"
@@ -154,8 +156,8 @@ std::map<std::string, std::string> ParseOptions(int argc, char** argv) {
     const std::size_t equals = argument.find('=');
     std::string name;
     std::string value;
-    if (argument == "--trace-rounds") {
-      name = "trace-rounds";
+    if (argument == "--trace-rounds" || argument == "--low-memory") {
+      name = argument.substr(2);
       value = "true";
     } else if (equals != std::string::npos) {
       name = argument.substr(2, equals - 2);
@@ -216,6 +218,10 @@ Arguments ParseArguments(int argc, char** argv) {
   if (trace_rounds != "true" && trace_rounds != "false")
     throw std::invalid_argument("trace-rounds must be true or false");
   result.trace_rounds = trace_rounds == "true";
+  const auto low_memory = TakeOptional(&values, "low-memory", "false");
+  if (low_memory != "true" && low_memory != "false")
+    throw std::invalid_argument("low-memory must be true or false");
+  result.low_memory = low_memory == "true";
   if (result.trace_rounds && result.model_kind != "chunk")
     throw std::invalid_argument("trace-rounds requires --model-kind chunk");
   result.output = TakeRequired(&values, "output");
@@ -261,6 +267,8 @@ Arguments ParseArguments(int argc, char** argv) {
   if (!values.empty()) {
     throw std::invalid_argument("unknown option --" + values.begin()->first);
   }
+  if (result.low_memory && (result.model_kind != "chunk" || result.mode != "paired"))
+    throw std::invalid_argument("low-memory requires chunk paired mode without profiling");
   if (result.pad_token_id < 0) {
     throw std::invalid_argument("pad-token-id must be non-negative");
   }
@@ -451,7 +459,8 @@ void WriteReport(
     const qwen35::dflash::GraphExecutor& executor,
     double load_ms,
     double benchmark_wall_ms,
-    const PairedBenchmarkResult& result) {
+    const PairedBenchmarkResult& result,
+    double unload_ms = 0.0) {
   const double speedup = result.dflash.model_total_ms.median > 0.0
                              ? result.ordinary.model_total_ms.median /
                                    result.dflash.model_total_ms.median
@@ -477,7 +486,12 @@ void WriteReport(
          << executor.draft_width() << "},\"protocol\":{\"warmup\":"
          << arguments.warmup << ",\"repetitions\":"
          << arguments.repetitions
-         << ",\"order\":\"alternating ordinary/DFlash in one loaded process\","
+         << ",\"order\":\"" << (arguments.low_memory
+              ? "ordinary then DFlash with model unload between modes"
+              : "alternating ordinary/DFlash in one loaded process") << "\","
+         << "\"low_memory\":" << (arguments.low_memory ? "true" : "false") << ','
+         << "\"max_resident_models\":" << (arguments.model_kind == "chunk"
+              ? (arguments.low_memory ? 3 : 4) : 1) << ','
          << "\"synchronization\":\"one aclrtSynchronizeStream after queued H2D, execute, D2H\","
          << "\"model_load_excluded_from_latency\":true,"
          << "\"round_trace_enabled\":" << (arguments.trace_rounds ? "true" : "false") << ","
@@ -490,6 +504,7 @@ void WriteReport(
          << arguments.max_new_tokens << ",\"max_draft_tokens\":"
          << arguments.max_draft_tokens << "},\"startup_ms\":{\"acl_and_model_load\":"
          << load_ms << ",\"paired_benchmark_wall\":" << benchmark_wall_ms
+         << ",\"mode_switch_unload\":" << unload_ms
          << "},\"ordinary\":";
   WriteBenchmark(output, result.ordinary);
   output << ",\"dflash\":";
@@ -544,7 +559,8 @@ int main(int argc, char** argv) {
     const auto load_start = std::chrono::steady_clock::now();
     std::unique_ptr<qwen35::dflash::GraphExecutor> executor;
     if (arguments.model_kind == "chunk") {
-      executor = std::make_unique<qwen35::dflash::AclChunkExecutor>(arguments.model, arguments.device_id, arguments.mode);
+      executor = std::make_unique<qwen35::dflash::AclChunkExecutor>(
+          arguments.model, arguments.device_id, arguments.low_memory ? "ordinary" : arguments.mode);
     } else {
       executor = std::make_unique<qwen35::dflash::AclExecutor>(arguments.model, arguments.device_id);
     }
@@ -561,6 +577,7 @@ int main(int argc, char** argv) {
       report.pop_back();
       report += ",\"runner_version\":\"" + JsonEscape(QWEN35_DFLASH_RUNNER_VERSION) +
           "\",\"model_sha256\":\"" + arguments.model_sha256 + "\"}";
+      chunk.Close();
       AtomicWrite(arguments.output, report);
       std::cout << report << '\n';
       return 0;
@@ -578,25 +595,43 @@ int main(int argc, char** argv) {
       report << ",\"ordinary_parity\":{\"status\":\"NOT_RUN\"},\"benchmark\":";
       WriteBenchmark(report, result);
       report << '}';
+      if (auto* chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor*>(executor.get())) chunk->Close();
       AtomicWrite(arguments.output, report.str());
       std::cout << report.str() << '\n';
       return 0;
     }
-    const PairedBenchmarkResult result = qwen35::dflash::BenchmarkPair(
-        *executor,
-        arguments.prompt_token_ids,
-        options,
-        arguments.warmup,
-        arguments.repetitions);
+    PairedBenchmarkResult result;
+    double reload_ms = 0, unload_ms = 0;
+    if (arguments.low_memory) {
+      auto ordinary = qwen35::dflash::Benchmark(
+          *executor, arguments.prompt_token_ids, qwen35::dflash::GenerationMode::kOrdinary,
+          options, arguments.warmup, arguments.repetitions);
+      const auto unload_start = std::chrono::steady_clock::now();
+      auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(*executor);
+      chunk.UnloadModels();
+      const auto reload_start = std::chrono::steady_clock::now();
+      unload_ms = std::chrono::duration<double, std::milli>(reload_start - unload_start).count();
+      chunk.LoadMode("dflash");
+      reload_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - reload_start).count();
+      auto dflash = qwen35::dflash::Benchmark(
+          *executor, arguments.prompt_token_ids, qwen35::dflash::GenerationMode::kDFlash,
+          options, arguments.warmup, arguments.repetitions);
+      result = qwen35::dflash::PairBenchmarks(std::move(ordinary), std::move(dflash));
+    } else {
+      result = qwen35::dflash::BenchmarkPair(*executor, arguments.prompt_token_ids,
+          options, arguments.warmup, arguments.repetitions);
+    }
     const auto benchmark_end = std::chrono::steady_clock::now();
     const double load_ms =
-        std::chrono::duration<double, std::milli>(load_end - load_start).count();
+        std::chrono::duration<double, std::milli>(load_end - load_start).count() + reload_ms;
     const double benchmark_ms =
         std::chrono::duration<double, std::milli>(
             benchmark_end - benchmark_start)
-            .count();
+            .count() - reload_ms - unload_ms;
     std::ostringstream report;
-    WriteReport(report, arguments, *executor, load_ms, benchmark_ms, result);
+    WriteReport(report, arguments, *executor, load_ms, benchmark_ms, result, unload_ms);
+    if (auto* chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor*>(executor.get())) chunk->Close();
     AtomicWrite(arguments.output, report.str());
     std::cout << report.str() << '\n';
     return 0;

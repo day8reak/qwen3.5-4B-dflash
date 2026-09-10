@@ -10,8 +10,9 @@
 | `target_verify.om` | 16 行，有效 1..16 | verify、Top1、接受判断、第二次 GDR 和 committed state |
 | `draft.om` | 64 行特征＋16 行 block | 特征投影、Draft KV 追加、一次 1..15 token proposal |
 
-下面配置导出四个 OM，便于普通/DFlash 对照。paired 运行加载四个；单模式 DFlash 运行
-只加载 prefill、verify、draft 三个，普通运行只加载 prefill、decode 两个。
+下面配置导出四个 OM，便于普通/DFlash 对照。默认 paired 运行同时加载四个；
+低显存 paired 模式分组测试，最多同时加载三个。单模式 DFlash 运行只加载
+prefill、verify、draft 三个，普通运行只加载 prefill、decode 两个。
 两种模式共用同一个 prefill OM。
 verify 包含状态提交计算，没有独立 commit OM。
 
@@ -445,7 +446,7 @@ export CPP_RUNNER="$AI_RUN_DIR/build/cpp/qwen35_dflash_acl_runner"
 
 需要生成 `qwen35_dflash_acl_runner`；名字带 `_fake` 的程序只用于主机测试。
 构建日志在 `$AI_RUN_DIR/log/dflash-cpp-build/`，编译身份及 runner hash 在 `cpp-build.json`。
-C++ 加载模型一次，持久保存 device buffer，循环使用 AscendCL 执行 OM。
+C++ 在每组测试前加载所需模型，持久保存 device buffer，循环使用 AscendCL 执行 OM。
 加载 paired/DFlash 模式时，日志应包含
 `verify_discard_buffer_bytes=50331648`，表示第一遍 GDR 的 24 份独立 FP32
 输出缓冲区；普通模式该值为 0。discard state 不分配 host buffer、不做 D2H，
@@ -488,6 +489,42 @@ PY
 报告的 `output.text` 是生成文本，`ordinary`、`dflash` 保存完整 token 和时延分布。
 `--eos-token-id` 与第 6 步 NPU 报告的 `request.eos_token_ids` 保持一致；多个 EOS 可以
 重复传入该参数。不传时使用 tokenizer 的 EOS，它可能与 Draft checkpoint 的 EOS 不同。
+
+显存紧张时使用 `--low-memory`：
+
+```bash
+"$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p infer-cpp \
+  --deployment-manifest "$AI_RUN_DIR/artifacts/deployment-manifest.json" \
+  --runner "$CPP_RUNNER" --runner-config "$AI_RUN_DIR/runner.json" \
+  --model-dir "$TARGET_DIR" --prompt "$(cat "$AI_RUN_DIR/prompt.txt")" --chat \
+  --max-new-tokens "$MAX_NEW_TOKENS" --max-draft-tokens 15 --device-id 0 \
+  --eos-token-id 248044 --low-memory \
+  --output "$AI_RUN_DIR/reports/cpp-paired-low-memory.json"
+```
+
+普通模式先用 prefill/decode 完成 3 次预热、10 次测量；随后卸载这两张 OM，
+释放对应缓冲区，再加载 prefill/draft/verify 完成 DFlash 的 3+10。
+切换保留同一个 ACL runtime、context 和 stream，生成循环内不加载或卸载模型。
+报告仍检查两种模式的 token、EOS 和停止原因，`protocol.low_memory=true`、
+`max_resident_models=3`；`protocol.order` 明确记录分组顺序。
+加载时间计入 `startup_ms.acl_and_model_load`，组间卸载时间单独记录在
+`startup_ms.mode_switch_unload`，均不计入模型循环时延。
+分组测量的设备温度、频率和其他任务负载可能与交错测量不同，比较性能时保留该协议区别。
+
+DFlash 组不加载 decode OM；零接受关闭 Draft 后，使用 verify 的 `valid_rows=1`
+继续生成。这会影响低接受率请求的时延，应查看实际 `stage_ms`。
+`run-e2e-cpp` 同样支持此参数；直接 C++ 使用 `--model-kind chunk --mode paired --low-memory`。
+单模式和 msprof 已按模式选择所需 OM，不接收此配对测量参数。
+切换低显存模式不改变 AIR/OM 或 tensor ABI，已有匹配的四图 bundle 可以直接使用。
+
+所有 chunk 模式默认复用串行执行的工作内存：查询各 OM 的 `work_bytes` 后，
+分配一块大小为最大值的设备缓冲区，由所有已加载 OM 共用，权重仍各自独立。
+该方式使用 AscendCL 的
+[aclmdlLoadFromFileWithMem](https://www.hiascend.com/document/detail/zh/canncommercial/601/inferapplicationdev/aclcppdevg/aclcppdevg_03_0092.html)，
+每次执行都在同一 stream 同步后才调用下一张图。全部模型卸载后才释放共享工作内存。
+日志 `workspace policy=shared_serial` 给出 `shared_bytes`、`separate_sum_bytes`
+及两者差额 `saved_work_bytes`；这是工作内存申请量的差额，实际峰值仍需设备测量。
+查询不可用时记录 `policy=per_model`，按每张 OM 独立管理工作内存。
 
 C++ 会在执行推理前逐项比较 OM 描述与 chunk plan。若失败，Python 异常会附带第一项
 差异，例如 `graph=draft input[1] expected={...} actual={...}`；其中显示张量名、dtype、
@@ -735,7 +772,7 @@ decode 或 paired。不同 OM 不会自动共享权重，设备显存要覆盖�
 状态语义与开销：Target verify 用本轮初始 recurrent state 做两次 GDR，第二次
 `effective_length=accepted+1`；C++ 核对接受数后统一发布第二遍状态，
 第一遍的 raw FP32 state 仅保留设备输出缓冲区。零接受后关闭 Draft，以
-已加载的 `target_decode` 执行后续单 token 生成。单模式 DFlash 只加载三个 OM，
+已加载的 `target_decode` 执行后续单 token 生成。单模式 DFlash 和低显存 paired 的 DFlash 组只加载三个 OM，
 继续使用 verify 的 `valid_rows=1`，其物理图仍为 16 行。
 `speculation_disable_events` 和 `target_only_fallback_rounds` 记录关闭 Draft 及后续轮数；
 `stage_ms` 显示实际调用了 decode 还是 verify。两种后备路径都需要与 ordinary 检查
@@ -763,14 +800,14 @@ runner 在加载前通过 AscendCL 的
 [aclrtGetMemInfo](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/81RC1alpha002/apiref/appdevgapi/aclcppdevg_03_0107.html)
 记录加载前后的可用设备内存。HBM、DDR 查询可能指向同一物理内存，不能相加；
 不支持或失败的查询显示 `unavailable`，不会阻止正常加载。查询结果不包含全部运行时开销，
-不能作为峰值内存保证。这些诊断只在启动时执行，仍从计时中排除模型加载。
+不能作为峰值内存保证。这些诊断在模型加载和释放时执行，从模型循环计时中排除。
 
 若底层日志为 `MallocWeightsMem` / `InitWeightMem` 失败，申请的是该 OM 的权重内存，
 不能把它解释为 GDR state 输出的字节数。verify 的 24 个 discard FP32 state 输出共
 48 MiB，属于另行分配的 I/O buffer；加载该 OM 成功后才分配这些 buffer。
 用 `npu-smi info` 检查其他进程的占用，确认任务身份并正常退出不再需要的任务，
 释放内存后重跑推理即可。只测 verify 时使用第 14 步的 DFlash 采集命令，会加载三张 OM，
-无需重新导出即可省去普通 decode OM；`infer-cpp` 配对测量则需要同时驻留四张。
+无需重新导出即可省去普通 decode OM；`infer-cpp --low-memory` 配对测量最多同时驻留三张。
 
 runner 启动时还记录本进程 `pid`、`ppid`、可见的 `NSpid` 和 PID namespace。
 若 `npu-smi` 的 PID 在当前 shell 查不到，先确认是否位于容器中。特权容器内的
@@ -779,11 +816,13 @@ runner 启动时还记录本进程 `pid`、`ppid`、可见的 `NSpid` 和 PID na
 [Ascend PID 对应关系](https://www.hiascend.com/document/detail/zh/mindstudio/830/T%26ITools/Profiling/atlasprofiling_16_0013.html)。
 不要仅凭容器内找不到进程判定为显存泄漏。其他用户的任务由其所有者处理。
 
-正常退出及 C++ 捕获异常时都会执行清理：同步、卸载已加载模型、释放 I/O buffer、
+正常退出及 C++ 捕获异常时都会执行清理：同步、卸载已加载模型、释放共享工作内存和 I/O buffer、
 销毁 stream/context、ResetDevice、Finalize。日志中的 `cleanup-error` 给出失败接口
 与返回码；`cleanup_end` 汇总成功卸载数量、已申请/已释放的 device buffer 字节数
 和错误数。`device-memory phase=after_release` 在卸载模型与释放 buffer 后采样，
-此时 context 尚未销毁。buffer 计数不包含 GE 内部权重与 workspace，也不证明驱动已完成回收。
+此时 context 尚未销毁。buffer 计数包含 runner 分配的共享工作内存，不包含 GE 内部申请，
+也不证明驱动已完成回收。低显存组间卸载失败会阻止下一组加载；
+正常完成推理后如清理接口报错，runner 返回失败且不写入 PASS 报告。
 确认宿主机 PID 消失后仍持续占用时，应保留退出日志和驱动日志继续定位。
 
 命令参数和 tensor ABI 的集中说明见 [AIR/OM/C++ 接口参考](QUANT_AIR_OM_FRAMEWORK.md)。

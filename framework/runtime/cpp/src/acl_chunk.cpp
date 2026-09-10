@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "qwen35_dflash/chunk.hpp"
+#include "qwen35_dflash/sha256.hpp"
 
 namespace qwen35::dflash {
 namespace {
@@ -247,7 +248,7 @@ struct Loaded {
 class AclChunkExecutor::Impl {
  public:
   Impl(const std::filesystem::path& path, int device, const std::string& mode)
-      : plan(ReadChunkPlan(path, mode)), device_id(device) {
+      : plan(ReadChunkPlan(path, mode)), plan_path(path), plan_sha256(Sha256File(path)), device_id(device) {
     Require(device >= 0, "negative device ID");
     try {
       LogProcessIdentity();
@@ -258,41 +259,7 @@ class AclChunkExecutor::Impl {
       Check(aclrtCreateContext(&context, device), "aclrtCreateContext");
       Check(aclrtSetCurrentContext(context), "aclrtSetCurrentContext");
       Check(aclrtCreateStream(&stream), "aclrtCreateStream");
-      std::vector<const ChunkGraph*> selected;
-      for (const auto& item : plan.graphs) {
-        if (mode == "dflash" && item.first == "target_decode") continue;
-        if (mode == "ordinary" &&
-            (item.first == "target_verify" || item.first == "draft"))
-          continue;
-        selected.push_back(&item.second);
-      }
-      std::cerr << "[chunk-runtime] model-memory mode=" << mode
-                << " selected_models=" << selected.size()
-                << " allocation=independent_per_om\n";
-      LogDeviceMemory("before_models");
-      // Query every selected OM before any is loaded, so an OOM on an early
-      // model does not hide the requirements of the remaining graphs.
-      std::map<std::string, ModelMemory> requirements;
-      for (const auto* graph : selected) {
-        auto& requirement = requirements[graph->name];
-        requirement.status = aclmdlQuerySize(
-            graph->model.c_str(), &requirement.work, &requirement.weight);
-        std::cerr << "[chunk-runtime] om-memory graph=" << graph->name << ' '
-                  << requirement.Describe() << '\n';
-      }
-      for (const auto* graph : selected) {
-        Load(*graph, requirements.at(graph->name));
-      }
-      // Cross-graph state/feature shapes are checked by the shared pool.
-      std::size_t bytes = 0, discard_bytes = 0;
-      for (const auto& item : memory) {
-        bytes += item.second->bytes;
-        if (IsVerifyDiscardState(item.second->spec.name))
-          discard_bytes += item.second->bytes;
-      }
-      std::cerr << "[chunk-runtime] loaded_models=" << models.size()
-                << " persistent_buffer_bytes=" << bytes
-                << " verify_discard_buffer_bytes=" << discard_bytes << '\n';
+      LoadMode(mode);
     } catch (...) {
       Cleanup();
       throw;
@@ -300,12 +267,95 @@ class AclChunkExecutor::Impl {
   }
   ~Impl() { Cleanup(); }
 
+  void LoadMode(const std::string& mode) {
+    Require(!cleaned && !cleanup.errors && models.empty() && memory.empty() && !workspace,
+            "unload models before changing mode");
+    std::vector<const ChunkGraph*> selected;
+    for (const auto& item : plan.graphs) {
+      if (mode == "dflash" && item.first == "target_decode") continue;
+      if (mode == "ordinary" &&
+          (item.first == "target_verify" || item.first == "draft"))
+        continue;
+      selected.push_back(&item.second);
+    }
+    std::cerr << "[chunk-runtime] model-memory mode=" << mode
+              << " selected_models=" << selected.size()
+              << " weights=independent_per_om\n";
+    LogDeviceMemory("before_models");
+    // Query every selected OM before any is loaded, so an OOM on an early
+    // model does not hide the requirements of the remaining graphs.
+    std::map<std::string, ModelMemory> requirements;
+    for (const auto* graph : selected) {
+      auto& requirement = requirements[graph->name];
+      requirement.status = aclmdlQuerySize(
+          graph->model.c_str(), &requirement.work, &requirement.weight);
+      std::cerr << "[chunk-runtime] om-memory graph=" << graph->name << ' '
+                << requirement.Describe() << '\n';
+    }
+    std::size_t total_work = 0, maximum_work = 0;
+    const bool queried_all = std::all_of(
+        requirements.begin(), requirements.end(), [](const auto& item) {
+          return item.second.status == ACL_SUCCESS;
+        });
+    if (queried_all) {
+      for (const auto& item : requirements) {
+        total_work += item.second.work;
+        maximum_work = std::max(maximum_work, item.second.work);
+      }
+      if (maximum_work > 0) {
+        workspace = std::make_unique<Memory>(cleanup);
+        workspace->spec.name = "shared_workspace";
+        workspace->bytes = maximum_work;
+        Check(aclrtMalloc(&workspace->device, maximum_work,
+                          ACL_MEM_MALLOC_NORMAL_ONLY), "aclrtMalloc(shared_workspace)");
+        cleanup.allocated_device_bytes += maximum_work;
+      }
+      std::cerr << "[chunk-runtime] workspace policy=shared_serial"
+                << " shared_bytes=" << maximum_work
+                << " separate_sum_bytes=" << total_work
+                << " saved_work_bytes=" << total_work - maximum_work << '\n';
+    } else {
+      std::cerr << "[chunk-runtime] workspace policy=per_model"
+                << " reason=memory_query_unavailable\n";
+    }
+    for (const auto* graph : selected) {
+      Load(*graph, requirements.at(graph->name));
+    }
+    // Cross-graph state/feature shapes are checked by the shared pool.
+    std::size_t bytes = 0, discard_bytes = 0;
+    for (const auto& item : memory) {
+      bytes += item.second->bytes;
+      if (IsVerifyDiscardState(item.second->spec.name))
+        discard_bytes += item.second->bytes;
+    }
+    std::cerr << "[chunk-runtime] loaded_models=" << models.size()
+              << " persistent_buffer_bytes=" << bytes
+              << " verify_discard_buffer_bytes=" << discard_bytes << '\n';
+  }
+
+  void UnloadModels() {
+    Require(!cleaned && !pending, "mode change requires a completed request");
+    Check(aclrtSetCurrentContext(context), "aclrtSetCurrentContext(mode change)");
+    Check(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream(mode change)");
+    invalid = true;
+    models.clear();
+    workspace.reset();
+    memory.clear();
+    LogDeviceMemory("after_mode_unload");
+    if (cleanup.errors)
+      throw std::runtime_error("model unload failed; refusing to load the next mode");
+  }
+
   void Cleanup() noexcept {
+    if (cleaned) return;
+    cleaned = true;
     std::cerr << "[chunk-runtime] cleanup_begin loaded_models=" << models.size()
               << " device_buffers=" << memory.size() << '\n';
     if (context) cleanup.Check(aclrtSetCurrentContext(context), "aclrtSetCurrentContext");
     if (stream) cleanup.Check(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
     models.clear();
+    // Every model must be unloaded before its borrowed work memory is freed.
+    workspace.reset();
     memory.clear();
     if (device_set) LogDeviceMemory("after_release");
     if (stream) {
@@ -372,11 +422,17 @@ class AclChunkExecutor::Impl {
     std::cerr << "[chunk-runtime] load graph=" << graph.name
               << " model=" << std::quoted(graph.model.string()) << '\n';
     LogDeviceMemory("before_load", graph.name);
-    const auto status = aclmdlLoadFromFile(graph.model.c_str(), &model.id);
+    // Call() uses one stream and synchronizes every execute. Temporary work
+    // memory can therefore be shared; weights keep independent GE ownership.
+    const auto* operation = workspace ? "aclmdlLoadFromFileWithMem" : "aclmdlLoadFromFile";
+    const auto status = workspace
+        ? aclmdlLoadFromFileWithMem(graph.model.c_str(), &model.id,
+                                   workspace->device, workspace->bytes, nullptr, 0)
+        : aclmdlLoadFromFile(graph.model.c_str(), &model.id);
     if (status != ACL_SUCCESS) {
       LogDeviceMemory("load_failed", graph.name);
       throw std::runtime_error(
-          "aclmdlLoadFromFile failed: " + std::to_string(status) +
+          std::string(operation) + " failed: " + std::to_string(status) +
           " graph=" + graph.name + " model=" + graph.model.string() +
           " loaded_models=" + std::to_string(models.size()) + " " +
           requirement.Describe() +
@@ -584,11 +640,14 @@ class AclChunkExecutor::Impl {
   }
 
   ChunkPlan plan;
+  std::filesystem::path plan_path;
+  std::string plan_sha256;
   int device_id;
-  bool initialized = false, device_set = false, invalid = true;
+  bool initialized = false, device_set = false, invalid = true, cleaned = false;
   aclrtContext context = nullptr;
   aclrtStream stream = nullptr;
   CleanupAudit cleanup;
+  std::unique_ptr<Memory> workspace;
   std::map<std::string, std::unique_ptr<Loaded>> models;
   std::map<std::string, std::unique_ptr<Memory>> memory;
   std::map<std::string, std::vector<double>> timings;
@@ -601,6 +660,21 @@ AclChunkExecutor::AclChunkExecutor(const std::filesystem::path& plan,
                                    int device, const std::string& mode)
     : impl_(std::make_unique<Impl>(plan, device, mode)) {}
 AclChunkExecutor::~AclChunkExecutor() = default;
+void AclChunkExecutor::Close() {
+  impl_->Cleanup();
+  if (impl_->cleanup.errors)
+    throw std::runtime_error("chunk runner cleanup failed; see cleanup-error log");
+}
+void AclChunkExecutor::UnloadModels() { impl_->UnloadModels(); }
+void AclChunkExecutor::LoadMode(const std::string& mode) {
+  Require(!impl_->cleaned && impl_->models.empty() && impl_->memory.empty(),
+          "unload models before changing mode");
+  Require(Sha256File(impl_->plan_path) == impl_->plan_sha256,
+          "chunk plan changed between modes");
+  // Recheck hashes for the new mode's OMs before allocating device memory.
+  impl_->plan = ReadChunkPlan(impl_->plan_path, mode);
+  impl_->LoadMode(mode);
+}
 void AclChunkExecutor::Synchronize() {
   Check(aclrtSetCurrentContext(impl_->context),
         "aclrtSetCurrentContext(profile)");

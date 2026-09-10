@@ -131,6 +131,9 @@ PairedBenchmarkResult BenchmarkPair(
     std::size_t warmup,
     std::size_t repetitions);
 
+// Apply the same strict token/EOS gate to independently measured mode groups.
+PairedBenchmarkResult PairBenchmarks(BenchmarkResult ordinary, BenchmarkResult dflash);
+
 Distribution Summarize(const std::vector<double>& values);
 const char* ModeName(GenerationMode mode) noexcept;
 

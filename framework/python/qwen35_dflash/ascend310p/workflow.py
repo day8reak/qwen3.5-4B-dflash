@@ -500,6 +500,7 @@ def run_cpp_target_pipeline(
     device_id: int = 0,
     max_new_tokens: int = 32,
     max_draft_tokens: int = 15,
+    low_memory: bool = False,
     model_dir: str | Path | None = None,
     model_asset_id: str | None = None,
 ) -> dict[str, Any]:
@@ -558,6 +559,7 @@ def run_cpp_target_pipeline(
         max_draft_tokens=max_draft_tokens,
         raw_output=report_root / "runner-raw.json",
         log_output=run_root / "log" / "dflash-cpp-runner.log",
+        low_memory=low_memory,
     )
     payload["control_plane"]["target_preflight"] = file_record(
         preflight_log, relative_to=run_root

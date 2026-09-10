@@ -946,8 +946,9 @@ def test_cpp_reports_actual_om_descriptors_before_execute(
 
 
 @pytest.mark.parametrize("accepted,eos", [(0, []), (3, []), (15, []), (15, [7])])
+@pytest.mark.parametrize("low_memory", [False, True])
 def test_cpp_four_om_roundtrip_with_fake_acl(
-    chunk_bundle, tmp_path, monkeypatch, accepted, eos
+    chunk_bundle, tmp_path, monkeypatch, accepted, eos, low_memory
 ):
     from qwen35_dflash.ascend310p.cpp_runtime import run_cpp_pair
 
@@ -955,6 +956,10 @@ def test_cpp_four_om_roundtrip_with_fake_acl(
     if not runner:
         pytest.skip("set QWEN35_CPP_TEST_RUNNER to the CMake fake ACL executable")
     monkeypatch.setenv("QWEN35_FAKE_ACCEPT", str(accepted))
+    workspace = tmp_path / "workspace.jsonl"
+    cleanup = tmp_path / "cleanup.json"
+    monkeypatch.setenv("QWEN35_FAKE_WORKSPACE_LOG", str(workspace))
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_LOG", str(cleanup))
     result = run_cpp_pair(
         deployment_manifest=chunk_bundle,
         runner=runner,
@@ -973,16 +978,41 @@ def test_cpp_four_om_roundtrip_with_fake_acl(
         raw_output=tmp_path / "cpp.json",
         log_output=tmp_path / "cpp.log",
         trace_rounds=True,
+        low_memory=low_memory,
     )
     assert result["ordinary_parity"]["token_id_mismatches"] == 0
     assert result["abi"]["graph_count"] == 4
+    assert result["protocol"]["low_memory"] is low_memory
+    assert result["protocol"]["max_resident_models"] == (3 if low_memory else 4)
+    assert result["protocol"]["order"] == (
+        "ordinary then DFlash with model unload between modes" if low_memory
+        else "alternating ordinary/DFlash in one loaded process"
+    )
+    log = (tmp_path / "cpp.log").read_text()
+    assert_cpp_resources_released(cleanup, log)
+    loaded = [json.loads(line) for line in workspace.read_text().splitlines()]
+    assert [r[0] for r in loaded] == (
+        ["target_decode", "target_prefill", "draft", "target_prefill", "target_verify"]
+        if low_memory else ["draft", "target_decode", "target_prefill", "target_verify"]
+    )
+    assert [r[3] for r in loaded] == ([1, 2, 1, 2, 3] if low_memory else [1, 2, 3, 4])
+    groups = [loaded[:2], loaded[2:]] if low_memory else [loaded]
+    for group in groups:
+        assert len({r[1] for r in group}) == 1  # All models borrow one work buffer.
+        assert {r[2] for r in group} == {3145728}  # Maximum, not sum.
+    if low_memory:
+        assert log.index("unload graph=target_prefill") < log.index("load graph=draft")
+        assert result["startup_ms"]["mode_switch_unload"] > 0
+    else:
+        assert result["startup_ms"]["mode_switch_unload"] == 0
     for row in result["dflash"]["measurements"]:
-        assert ("target_decode" in row["stage_ms"]) == (accepted == 0)
+        assert ("target_decode" in row["stage_ms"]) == (accepted == 0 and not low_memory)
         assert "target_verify" in row["stage_ms"]
         assert row["counters"]["speculation_disable_events"] == (accepted == 0)
         if accepted == 0:
-            assert len(row["stage_ms"]["target_verify"]) == 1
-            assert len(row["stage_ms"]["target_decode"]) == 38
+            assert len(row["stage_ms"]["target_verify"]) == (39 if low_memory else 1)
+            if not low_memory:
+                assert len(row["stage_ms"]["target_decode"]) == 38
             assert row["counters"]["target_only_fallback_rounds"] == 38
     assert result["protocol"]["round_trace_enabled"] is True
     for mode in ("ordinary", "dflash"):
@@ -1083,7 +1113,7 @@ def test_cpp_load_failure_reports_memory_before_any_execution(
     )
     assert result.returncode != 0
     assert not output.exists() and not events.exists()
-    assert f"aclmdlLoadFromFile failed: 245000 graph={failed_graph}" in result.stderr
+    assert f"aclmdlLoadFromFileWithMem failed: 245000 graph={failed_graph}" in result.stderr
     assert f"phase=load_failed graph={failed_graph}" in result.stderr
     assert "loaded_models=" + ("0" if failed_graph == "draft" else "3") in result.stderr
     # Even an OOM on the first model leaves the full selected set diagnosable.
@@ -1118,7 +1148,7 @@ def test_cpp_cleanup_logs_errors_and_continues_teardown(
         capture_output=True, text=True,
     )
     assert result.returncode != 0 and not output.exists()
-    assert "aclmdlLoadFromFile failed: 245000 graph=target_verify" in result.stderr
+    assert "aclmdlLoadFromFileWithMem failed: 245000 graph=target_verify" in result.stderr
     assert f"cleanup-error operation={operation} status=38" in result.stderr
     assert re.search(r"cleanup_end .* errors=[1-9]\d*", result.stderr)
     # Reaching fake aclFinalize after an unload/free/reset failure proves that
@@ -1127,6 +1157,8 @@ def test_cpp_cleanup_logs_errors_and_continues_teardown(
     for name, count in resources.items():
         if name == "live_models" and operation == "aclmdlUnload":
             assert count == 3
+        elif name == "live_device_buffers" and operation == "aclmdlUnload":
+            assert count == 1  # The fake driver refuses to free borrowed work memory.
         elif name == "live_device_buffers" and operation == "aclrtFree":
             assert count > 0
         else:
@@ -1227,6 +1259,37 @@ def test_cpp_discard_buffers_are_private_device_only_and_never_committed(
     payload = json.loads(report.read_text())
     assert payload["status"] == "PASS"
     assert_cpp_resources_released(cleanup, result.stderr)
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+@pytest.mark.parametrize("operation", ["aclmdlUnload", "aclrtFree", "aclrtResetDevice"])
+def test_cpp_cleanup_failure_never_publishes_passing_benchmark(
+    chunk_bundle, tmp_path, monkeypatch, low_memory, operation,
+):
+    from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
+    from qwen35_dflash.ascend310p.utils import sha256_file
+
+    runner = os.environ.get("QWEN35_CPP_TEST_RUNNER")
+    if not runner:
+        pytest.skip("set QWEN35_CPP_TEST_RUNNER")
+    plan, _, _ = write_incremental_plan(chunk_bundle, tmp_path / "plan.txt")
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_FAIL", operation)
+    output = tmp_path / "report.json"
+    command = [
+        runner, "--model", str(plan), "--model-sha256", sha256_file(plan),
+        "--model-kind", "chunk", "--prompt-token-ids", "4",
+        "--max-new-tokens", "8", "--output", str(output),
+    ]
+    if low_memory:
+        command.append("--low-memory")
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0 and not output.exists()
+    assert f"cleanup-error operation={operation} status=38" in result.stderr
+    if low_memory and operation != "aclrtResetDevice":
+        assert "refusing to load the next mode" in result.stderr
+        assert "[chunk-runtime] load graph=draft" not in result.stderr
+    else:
+        assert "chunk runner cleanup failed" in result.stderr
 
 
 @pytest.mark.parametrize("damage", ["missing", "dtype", "shape", "input", "order", "stale"])

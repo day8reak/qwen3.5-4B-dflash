@@ -61,6 +61,9 @@ class AclChunkExecutor final : public ChunkExecutor {
                             int device_id = 0,
                             const std::string& mode = "paired");
   ~AclChunkExecutor() override;
+  void Close();
+  void UnloadModels();
+  void LoadMode(const std::string& mode);
   void Synchronize();
   std::size_t sequence_length() const noexcept override;
   std::int64_t vocabulary_size() const noexcept override;
