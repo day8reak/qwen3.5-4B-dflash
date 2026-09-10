@@ -438,6 +438,38 @@
       {
         "source_file": "tools/analyze_draft_replay.py",
         "source_sha256": "63e9224e0cf2bac10e95efc626c44fc2a18461a08c339d51a64f6f2fea433ead"
+      },
+      {
+        "source_file": "tools/debug_draft_context/run.py",
+        "source_sha256": "3b41b637acc8c9d987f0bf25ab9ff270d50a7e91158e57ec2c4e4b4f02c8a807"
+      },
+      {
+        "source_file": "tools/debug_draft_context/README.md",
+        "source_sha256": "d254e4c4fd7f150acb3babc5cb4c6577c16e96fcc2b29ee879c087c08816dbd5"
+      },
+      {
+        "source_file": "tests/test_debug_draft_context.py",
+        "source_sha256": "9b247093122f46755e02b0af0876d387193de1991fb4778d19d41fbe88bb65c8"
+      },
+      {
+        "source_file": "tools/debug_gdr/runner.cpp",
+        "source_sha256": "40e90c2cfec8132ca02a2931bfc30e185176c88999f4187a865c4dae82d8c2c2"
+      },
+      {
+        "source_file": "tools/debug_gdr/fake_acl_test.cpp",
+        "source_sha256": "06fe3128bb62be66ff867c0812cf8e1dfba3ab2f574446aa116e5a8f486adeb3"
+      },
+      {
+        "source_file": "tools/debug_gdr/CMakeLists.txt",
+        "source_sha256": "08f1eeabad3e58ad9a32623b1c735ebb655020ea361fb5ac67845d29ba7b96ff"
+      },
+      {
+        "source_file": "tools/debug_gdr/run.py",
+        "source_sha256": "fbf176c3ec191a5a615523531f6f21a7484fb92b63564b5ef1f234020da34c07"
+      },
+      {
+        "source_file": "tools/debug_gdr/test_debug_gdr.py",
+        "source_sha256": "696517a07441984d143af3637c126ff638e1bc766931260dcf9c195ef45fb86a"
       }
     ]
   }

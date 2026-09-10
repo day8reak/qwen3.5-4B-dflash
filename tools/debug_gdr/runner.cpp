@@ -1,4 +1,4 @@
-// Temporary single-GDR ACL runner. No Python ACL dependency or profiling API.
+// Temporary GDR / Draft-context probe ACL runner. No Python ACL dependency.
 #include <acl/acl.h>
 #include "qwen35_dflash/sha256.hpp"
 #include <sys/socket.h>
@@ -54,17 +54,50 @@ struct Spec {
 };
 struct Plan {
   std::string model, output, profile, metrics;
+  bool draft_probe = false;
   int device = -1, warmup = 0, repetitions = 0;
   std::vector<Spec> inputs, outputs;
   explicit Plan(const char* path) {
     std::ifstream in(path);
     std::string version; in >> version;
-    Require(version == "GDR_DEBUG_V1", "invalid plan version");
+    draft_probe = version == "DRAFT_CONTEXT_PROBE_V1";
+    Require(draft_probe || version == "GDR_DEBUG_V1", "invalid plan version");
     in >> std::quoted(model) >> std::quoted(output) >> device >> warmup >> repetitions
        >> std::quoted(profile) >> std::quoted(metrics);
     Require(device >= 0 && warmup >= 0 && warmup <= 10000 && repetitions > 0 && repetitions <= 10000,
             "invalid invocation counts or device");
     Require(metrics == "PipeUtilization" || metrics == "Memory" || metrics == "MemoryUB", "invalid metrics");
+    if (draft_probe) {
+      const auto profiling_mode = std::getenv("PROFILING_MODE");
+      Require(profile.empty() && (!profiling_mode || !*profiling_mode),
+              "Draft context replay must run outside msprof");
+      auto tensor = [&](bool input) {
+        Spec s; std::size_t rank = 0;
+        in >> std::quoted(s.name) >> s.dtype >> s.bytes >> rank;
+        Require(rank == 3 && s.dtype == ACL_FLOAT16, "probe expects FP16 B,S,F");
+        s.dims.resize(rank); for (auto& d : s.dims) in >> d;
+        Require(s.dims[0] == 1 && s.dims[1] == 64 && s.dims[2] > 0 && s.dims[2] <= 32768 &&
+                s.bytes == 128 * static_cast<std::size_t>(s.dims[2]), "invalid probe shape/bytes");
+        if (input) {
+          in >> std::quoted(s.file);
+          Require(s.name == "input" && fs::file_size(s.file) == s.bytes, "invalid probe input");
+        } else {
+          in >> s.valid_bytes;
+          Require(s.name == "fc_output" || s.name == "norm_output" || s.name == "v_output",
+                  "invalid probe output name");
+          Require(s.valid_bytes > 0 && s.valid_bytes <= s.bytes &&
+                  s.valid_bytes % (2 * static_cast<std::size_t>(s.dims[2])) == 0,
+                  "invalid probe valid rows");
+          for (const auto& previous : outputs)
+            Require(s.name != previous.name, "duplicate probe output name");
+        }
+        return s;
+      };
+      std::size_t count = 0; in >> count; Require(count == 1, "expected one probe input");
+      inputs.push_back(tensor(true));
+      in >> count; Require(count >= 1 && count <= 3, "expected one to three probe outputs");
+      for (std::size_t i = 0; i < count; ++i) outputs.push_back(tensor(false));
+    } else {
     std::size_t n = 0; in >> n; Require(n == 7, "expected seven GDR inputs");
     const std::vector<std::string> names{"query","key","value","g","beta","initial_state","effective_length"};
     const std::vector<int> types{1,1,1,0,1,0,6};
@@ -95,6 +128,7 @@ struct Plan {
               s.valid_bytes == (core ? std::size_t(length)*32*128*2 : 2097152u), "wrong output contract");
       if (n == 2) Require(core == (i == 0), "wrong output ordering");
       outputs.push_back(s);
+    }
     }
     Require(bool(in), "truncated plan");
     std::string extra; Require(!(in >> extra), "trailing plan fields");
@@ -153,6 +187,7 @@ struct Buffer {
   void *host = nullptr, *device = nullptr;
   aclDataBuffer* descriptor = nullptr;
   std::vector<char> original, reference;
+  bool difference_saved = false;
   std::string actual_name;
   std::vector<std::int64_t> actual_dims;
   ~Buffer() {
@@ -249,14 +284,23 @@ class Runtime {
     ACL(aclrtSynchronizeStream(stream));
     for (auto& b : inputs)
       Require(std::memcmp(b->host,b->original.data(),b->original.size()) == 0,
-              "GDR modified declared read-only input: " + b->spec.name);
+              "operator modified declared read-only input: " + b->spec.name);
     bool stable = true; hashes = "{";
     for (std::size_t i=0; i<outputs.size(); ++i) {
       auto& b = outputs[i];
       const auto* bytes = static_cast<char*>(b->host);
       if (measured) {
-        if (b->reference.empty()) b->reference.assign(bytes,bytes+b->spec.valid_bytes);
-        stable = stable && std::memcmp(bytes,b->reference.data(),b->spec.valid_bytes) == 0;
+        const bool first = b->reference.empty();
+        if (first) b->reference.assign(bytes,bytes+b->spec.valid_bytes);
+        const bool equal = std::memcmp(bytes,b->reference.data(),b->spec.valid_bytes) == 0;
+        stable = stable && equal;
+        if (p.draft_probe && (first || (!equal && !b->difference_saved))) {
+          const auto name = b->spec.name + (first ? "-reference.bin" : "-first-diff.bin");
+          std::ofstream saved(fs::path(p.output)/name, std::ios::binary);
+          saved.write(bytes, static_cast<std::streamsize>(b->spec.bytes));
+          Require(bool(saved), "probe snapshot write failed");
+          if (!first) b->difference_saved = true;
+        }
         if (i) hashes += ",";
         hashes += Quote(b->spec.name)+":"+Quote(qwen35::dflash::Sha256(std::string_view(bytes,b->spec.valid_bytes)));
         std::ofstream out(fs::path(p.output)/(b->spec.name+".bin"),std::ios::binary);
@@ -319,7 +363,7 @@ int main(int argc,char** argv) {
            << ",\"model_sha256\":" << Quote(qwen35::dflash::Sha256File(p.model))
            << ",\"tensors\":" << runtime.Metadata()
            << ",\"timing_scope\":\"aclmdlExecuteAsync plus stream synchronization; persistent buffers; transfers/checks excluded\"}\n";
-    Require(bool(report),"report write failed"); return 0;
+    Require(bool(report),"report write failed"); return p.draft_probe && !all_stable ? 2 : 0;
   } catch (const std::exception& e) {
     std::cerr << "gdr_debug_runner: " << e.what() << '\n'; return 1;
   }
