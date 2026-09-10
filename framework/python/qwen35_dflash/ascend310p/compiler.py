@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import os
 import re
 import subprocess
+import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
 from .runtime_input_export import validated_runtime_input_abi
@@ -129,6 +131,23 @@ def _chunk_precision_args(arguments: Sequence[str], *, incremental: bool) -> lis
         )
     if not precision:
         result.append("--precision_mode=must_keep_origin_dtype")
+    return result
+
+
+def _graph_atc_args(arguments: Sequence[str], *, name: str, incremental: bool) -> list[str]:
+    """Default to deterministic Draft execution, preserving Target compilation.
+
+    The real FP16 context FC varies with identical inputs in both native and
+    OM; deterministic=1 removed that variation in the isolated 20-call probe.
+    Full-Draft stability and greedy parity remain independent device gates.
+    Explicit 0 is retained for diagnostic A/B, never silently substituted.
+    """
+    result = list(arguments)
+    settings = [s for s in result if s.split("=", 1)[0] == "--deterministic"]
+    if len(settings) > 1 or (settings and settings[0] not in {"--deterministic=0", "--deterministic=1"}):
+        raise ValueError("use exactly one --deterministic=0 or --deterministic=1")
+    if incremental and name == "draft" and not settings:
+        result.append("--deterministic=1")
     return result
 
 
@@ -269,6 +288,76 @@ def _validated_standard_op_overrides(graph: Mapping[str, Any]) -> list[dict[str,
     return [dict(item)]
 
 
+def _compile_air_graph(
+    graph: Mapping[str, Any], *, root: Path, om_root: Path, log_root: Path,
+    atc_path: Path, exact_soc_version: str, arguments: Sequence[str],
+    execute: Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Shared audited graph compile for complete builds and Draft-only rebuilds."""
+    run_dir = Path(os.environ["AI_RUN_DIR"]).expanduser().resolve()
+    if not isinstance(graph, Mapping):
+        raise TypeError("AIR graph manifest entry must be an object")
+    name = str(graph["name"])
+    custom_op_audit = _validated_custom_op_audit(graph)
+    air_record = graph["air"]
+    payload_records = graph.get("payload_files")
+    if not isinstance(payload_records, list) or not payload_records:
+        raise ValueError(f"AIR graph has no payload manifest: {name}")
+    for record in payload_records:
+        payload_path = contained_path(root, str(record["path"]))
+        if not payload_path.is_file():
+            raise FileNotFoundError(f"AIR payload is missing: {payload_path}")
+        if payload_path.stat().st_size != int(record["bytes"]):
+            raise ValueError(f"AIR payload size mismatch before ATC: {record['path']}")
+        if sha256_file(payload_path) != record["sha256"]:
+            raise ValueError(f"AIR payload hash mismatch before ATC: {record['path']}")
+    air_path = contained_path(root, str(air_record["path"]))
+    if not air_path.is_file():
+        raise FileNotFoundError(f"AIR graph is missing: {air_path}")
+    actual_hash = sha256_file(air_path)
+    if actual_hash != air_record["sha256"]:
+        raise ValueError(f"AIR graph hash mismatch before ATC: {name}")
+
+    output_prefix = om_root / name
+    command = [
+        str(atc_path),
+        "--mode=0",
+        "--framework=1",
+        f"--model={air_path}",
+        f"--output={output_prefix}",
+        f"--soc_version={exact_soc_version}",
+        *arguments,
+    ]
+    result = execute(command, air_path.parent)
+    log_path = log_root / f"{name}.log"
+    log_path.write_text(result.stdout or "", encoding="utf-8")
+    om_path = Path(str(output_prefix) + ".om")
+    if result.returncode != 0:
+        raise AtcCompileError(
+            f"ATC failed for {name!r} with exit {result.returncode}; log={log_path}"
+            + _atc_failure_detail(result.stdout or "", graph)
+        )
+    if not om_path.is_file() or om_path.stat().st_size == 0:
+        raise AtcCompileError(
+            f"ATC returned success but produced no non-empty OM for {name!r}; log={log_path}"
+        )
+    return {
+        "name": name,
+        "role": graph["role"],
+        "metadata": dict(graph.get("metadata", {})),
+        "input_names": list(graph.get("input_names", [])),
+        "output_names": list(graph.get("output_names", [])),
+        "custom_op_audit": custom_op_audit,
+        "standard_op_overrides": _validated_standard_op_overrides(graph),
+        **({"runtime_input_abi": graph["runtime_input_abi"]}
+           if "runtime_input_abi" in graph else {}),
+        "air": dict(air_record),
+        "om": file_record(om_path, relative_to=root),
+        "atc_command": command,
+        "atc_log": str(log_path.relative_to(run_dir)),
+    }
+
+
 def compile_air_bundle(
     air_manifest_path: str | Path,
     *,
@@ -312,6 +401,10 @@ def compile_air_bundle(
     arguments = _chunk_precision_args(
         _validate_extra_args(extra_args), incremental=incremental is not None,
     )
+    graph_arguments = {
+        graph["name"]: _graph_atc_args(arguments, name=graph["name"], incremental=incremental is not None)
+        for graph in graphs
+    }
     execute = runner or _default_runner
     om_root = root / "om"
     if om_root.exists() and any(om_root.iterdir()):
@@ -321,71 +414,14 @@ def compile_air_bundle(
     log_root = run_dir / "log" / "dflash-atc"
     log_root.mkdir(parents=True, exist_ok=True)
 
-    compiled: list[dict[str, Any]] = []
-    for graph in graphs:
-        if not isinstance(graph, Mapping):
-            raise TypeError("AIR graph manifest entry must be an object")
-        name = str(graph["name"])
-        custom_op_audit = _validated_custom_op_audit(graph)
-        air_record = graph["air"]
-        payload_records = graph.get("payload_files")
-        if not isinstance(payload_records, list) or not payload_records:
-            raise ValueError(f"AIR graph has no payload manifest: {name}")
-        for record in payload_records:
-            payload_path = contained_path(root, str(record["path"]))
-            if not payload_path.is_file():
-                raise FileNotFoundError(f"AIR payload is missing: {payload_path}")
-            if payload_path.stat().st_size != int(record["bytes"]):
-                raise ValueError(f"AIR payload size mismatch before ATC: {record['path']}")
-            if sha256_file(payload_path) != record["sha256"]:
-                raise ValueError(f"AIR payload hash mismatch before ATC: {record['path']}")
-        air_path = contained_path(root, str(air_record["path"]))
-        if not air_path.is_file():
-            raise FileNotFoundError(f"AIR graph is missing: {air_path}")
-        actual_hash = sha256_file(air_path)
-        if actual_hash != air_record["sha256"]:
-            raise ValueError(f"AIR graph hash mismatch before ATC: {name}")
-
-        output_prefix = om_root / name
-        command = [
-            str(atc_path),
-            "--mode=0",
-            "--framework=1",
-            f"--model={air_path}",
-            f"--output={output_prefix}",
-            f"--soc_version={exact_soc_version}",
-            *arguments,
-        ]
-        result = execute(command, air_path.parent)
-        log_path = log_root / f"{name}.log"
-        log_path.write_text(result.stdout or "", encoding="utf-8")
-        om_path = Path(str(output_prefix) + ".om")
-        if result.returncode != 0:
-            raise AtcCompileError(
-                f"ATC failed for {name!r} with exit {result.returncode}; log={log_path}"
-                + _atc_failure_detail(result.stdout or "", graph)
-            )
-        if not om_path.is_file() or om_path.stat().st_size == 0:
-            raise AtcCompileError(
-                f"ATC returned success but produced no non-empty OM for {name!r}; log={log_path}"
-            )
-        compiled.append(
-            {
-                "name": name,
-                "role": graph["role"],
-                "metadata": dict(graph.get("metadata", {})),
-                "input_names": list(graph.get("input_names", [])),
-                "output_names": list(graph.get("output_names", [])),
-                "custom_op_audit": custom_op_audit,
-                "standard_op_overrides": _validated_standard_op_overrides(graph),
-                **({"runtime_input_abi": graph["runtime_input_abi"]}
-                   if "runtime_input_abi" in graph else {}),
-                "air": dict(air_record),
-                "om": file_record(om_path, relative_to=root),
-                "atc_command": command,
-                "atc_log": str(log_path.relative_to(run_dir)),
-            }
+    compiled = [
+        _compile_air_graph(
+            graph, root=root, om_root=om_root, log_root=log_root, atc_path=atc_path,
+            exact_soc_version=exact_soc_version, arguments=graph_arguments[graph["name"]],
+            execute=execute,
         )
+        for graph in graphs
+    ]
 
     deployment = {
         "schema_version": 1,
@@ -401,10 +437,115 @@ def compile_air_bundle(
             "identity": atc_identity or _atc_identity(atc_path),
             "framework": 1,
             "extra_args": arguments,
+            "graph_extra_args": graph_arguments,
             "precision_policy": "preserve_graph_dtypes" if incremental else "explicit_args_or_atc_default",
         },
         "graphs": compiled,
     }
     output = atomic_write_json(root / "deployment-manifest.json", deployment)
     deployment["manifest_path"] = str(output)
+    return deployment
+
+
+def recompile_draft_om(
+    deployment_manifest_path: str | Path, *, output: str | Path,
+    atc_bin: str | Path | None = None,
+    runner: Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]] | None = None,
+    atc_identity: str | None = None,
+) -> dict[str, Any]:
+    """Recompile only Draft with deterministic=1, retaining the Target OMs.
+
+    The new manifest shares its parent's bundle root so existing hash-locked
+    AIR payloads and Target OMs need neither copies nor path/ABI changes.
+    The old deployment remains usable for rollback and paired comparisons.
+    """
+    from .incremental_plan import validate_incremental_bundle
+
+    source = Path(deployment_manifest_path).expanduser().resolve()
+    root = require_run_output(source.parent)
+    destination = require_run_output(output)
+    if destination.parent != root:
+        raise ValueError("new deployment manifest must be beside the existing manifest")
+    if destination.exists():
+        raise FileExistsError(destination)
+    parent_record = file_record(source, relative_to=root)
+    deployment = load_json_object(source)
+    if (deployment.get("status") != "PASS"
+            or deployment.get("artifact_kind") != "qwen35-dflash-ascend310p-om-bundle"):
+        raise ValueError("Draft recompilation requires a passing deployment bundle")
+    graphs = deployment["graphs"]
+    contract = validate_incremental_bundle(graphs)
+    if contract is None:
+        raise ValueError("Draft recompilation requires an incremental chunk bundle")
+    soc = validate_soc_version(deployment["target"]["soc_version"])
+    air_record = deployment["air_manifest"]
+    air_path = contained_path(root, air_record["path"])
+    if air_path.parent != root or sha256_file(air_path) != air_record["sha256"]:
+        raise ValueError("AIR manifest path/hash differs from deployment")
+    air = load_json_object(air_path)
+    if (air.get("status") != "PASS" or air.get("artifact_kind") != "qwen35-dflash-torchair-bundle"
+            or validate_incremental_bundle(air["graphs"]) != contract):
+        raise ValueError("AIR bundle contract differs from deployment")
+    air_by_name = {graph["name"]: graph for graph in air["graphs"]}
+    if set(air_by_name) != {graph["name"] for graph in graphs}:
+        raise ValueError("AIR and deployment graph sets differ")
+    for graph in graphs:
+        exported = air_by_name[graph["name"]]
+        for key in ("role", "metadata", "input_names", "output_names", "air", "runtime_input_abi"):
+            if graph.get(key) != exported.get(key):
+                raise ValueError(f"AIR/deployment {key} differs: {graph['name']}")
+        if graph.get("custom_op_audit", []) != _validated_custom_op_audit(exported):
+            raise ValueError("AIR/deployment custom-operator audit differs")
+        if graph.get("standard_op_overrides", []) != _validated_standard_op_overrides(exported):
+            raise ValueError("AIR/deployment standard-operator audit differs")
+        validated_runtime_input_abi(exported, required=True, allow_test_double=runner is not None)
+        old_om = contained_path(root, graph["om"]["path"])
+        if file_record(old_om, relative_to=root) != graph["om"]:
+            raise ValueError(f"OM integrity check failed: {graph['name']}")
+
+    previous_draft = next(graph for graph in graphs if graph["name"] == "draft")
+    old_command = previous_draft["atc_command"]
+    if (not isinstance(old_command, list) or len(old_command) < 2
+            or not all(isinstance(value, str) for value in old_command)):
+        raise ValueError("missing original Draft ATC command")
+    # Preserve the actual old Draft flags, not only the bundle's common flags.
+    core = {"--mode", "--framework", "--model", "--output", "--soc_version"}
+    inherited = _validate_extra_args([
+        value for value in old_command[1:]
+        if value.split("=", 1)[0] not in core
+    ])
+    _graph_atc_args(inherited, name="draft", incremental=True)  # Reject malformed/duplicate flags.
+    inherited = [value for value in inherited if value.split("=", 1)[0] != "--deterministic"]
+    arguments = _graph_atc_args(_chunk_precision_args(inherited, incremental=True), name="draft", incremental=True)
+    atc_path = resolve_atc_executable(atc_bin or os.environ.get("ASCEND310P_ATC_BIN") or old_command[0])
+    stage = Path(tempfile.mkdtemp(prefix="draft-deterministic-", dir=root))
+    log_root = stage / "log"
+    log_root.mkdir()
+    compiled = _compile_air_graph(
+        air_by_name["draft"], root=root, om_root=stage, log_root=log_root,
+        atc_path=atc_path, exact_soc_version=soc, arguments=arguments,
+        execute=runner or _default_runner,
+    )
+    # Publish only after ATC succeeded and the reused authority still matches.
+    if file_record(source, relative_to=root) != parent_record or sha256_file(air_path) != air_record["sha256"]:
+        raise ValueError("source manifests changed during Draft compilation")
+    for graph in graphs:
+        if file_record(contained_path(root, graph["om"]["path"]), relative_to=root) != graph["om"]:
+            raise ValueError(f"original OM changed during Draft compilation: {graph['name']}")
+    deployment["graphs"] = [compiled if graph["name"] == "draft" else graph for graph in graphs]
+    deployment["recompilation"] = {
+        "parent_manifest": parent_record,
+        "graphs": ["draft"],
+        "reason": "FC deterministic=1 stable in isolated native/OM probe; full Draft validation pending",
+        "compiler": {"path": str(atc_path), "identity": atc_identity or _atc_identity(atc_path),
+                     "extra_args": arguments},
+        "ordinary_parity": "NOT_RUN", "formal_latency_evidence": False,
+    }
+    # Common compiler metadata describes the original build. Graph commands
+    # and this override record describe the changed artifact precisely.
+    deployment["compiler"].setdefault("graph_extra_args", {})["draft"] = arguments
+    deployment.pop("manifest_path", None)
+    with destination.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(deployment, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    deployment["manifest_path"] = str(destination)
     return deployment

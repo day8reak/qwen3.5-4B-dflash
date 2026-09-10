@@ -151,4 +151,19 @@ Native 用法和“同一线程后续切换可能无效”的限制见
 跨开关模式的固定舍入差异单独报告。native getter 只证明设置状态，不证明最终
 kernel 身份；稳定的 FC 对照也不代替完整 Draft 重放与 ordinary greedy 一致性验证。
 退出 0 表示流程完成且开启模式稳定，退出 1 表示开启模式仍有异常，退出 2 表示流程错误。
-确定性模式可能影响性能，主模型是否启用应在完整验证和重新测速后决定。
+确定性模式可能影响性能，需要对新 OM 重新测速。
+
+2026-09-10 用户回传的 `debug-fc-determinism-h2t9fpe9` 结果：
+
+| FC 模式 | Native 变化次数 / 20 | OM 变化次数 / 20 | Native 与 OM 有效输出 |
+|---|---:|---:|---|
+| `deterministic=0` | 19 | 19 | 首次对照有少量 1 ULP 差异 |
+| `deterministic=1` | 0 | 0 | 逐位一致 |
+
+两张 OM 使用同一 AIR `6bdac289c5e477bb17ebeb830e1750584dc4877ea70fd27d7185fdf23f4afd8a`
+和冻结输入 `d93cec20f36f2c515cff4e0a8ab02a596dca916c69dba27db2b08b87a3e3f006`。
+这支持将确定性开关用于完整 Draft 的下一轮验证，仍不能识别具体 split-K/atomic kernel。
+编译器现在默认只给增量 Draft 加 `--deterministic=1`；已有 AIR/OM 可用部署手册的
+[`recompile-draft-om`](../../docs/GDR_CHUNK_AIR_OM.md#只重编已有套件的-draft启用确定性计算)
+入口只重编 Draft，保留三个 Target OM。随后运行完整 Draft 重放和多 prompt 配对测试。
+编译成功或该 FC 对照通过，都不代替完整 Draft 与普通生成的一致性检查。

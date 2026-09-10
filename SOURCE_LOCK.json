@@ -157,11 +157,11 @@
       },
       {
         "source_file": "docs/DFLASH_ARCHITECTURE.md",
-        "source_sha256": "e6c396c0fd0b24b4ade94f60d30b8cc67e985bc2381ec34381e851b94e9466af"
+        "source_sha256": "243c57e529c63e5deb6befde367ed18471ed71ce018dd9d618fd353ed88434a8"
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "c948411c6e9bcfde773c4b93c49aaa06ede65c5546b80cae3dfbc635e077c5f7"
+        "source_sha256": "58fbd80e2b033e99e86ff739547b7d4bf2c8715d2badde0ccf020fe6be2dc087"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -209,11 +209,11 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/cli.py",
-        "source_sha256": "00236906e72678d0f7725820bd2233e0cfdb93a64373355e076ac612f0bc2dbd"
+        "source_sha256": "87534fdcdb3d4b10745a967743ee7f31a05f367d451b141fbea192df4a8726e5"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/compiler.py",
-        "source_sha256": "b5726181fe01d7dfa0dc065ea20ed5e7cfbf14bf25e38d7b4e60f26ffcd67911"
+        "source_sha256": "e72d035b77683dbd67aba48e462c6024b3bd1e768d9faf91a37eaf8b857b9fa4"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/contracts.py",
@@ -317,7 +317,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/main.cpp",
-        "source_sha256": "3a6ce713ae5cbec7e830cbdfcd792c1e5b9a88b04ab65fea2d5d1ac1998673e0"
+        "source_sha256": "90ca7c3fa1a98df723f57220d6047731cfc9f242c0909bfbfac31569f616fd2d"
       },
       {
         "source_file": "framework/runtime/cpp/src/sha256.cpp",
@@ -445,7 +445,7 @@
       },
       {
         "source_file": "tools/debug_draft_context/README.md",
-        "source_sha256": "260dd8063b36969f6d09a9f20a1ee3182f5daf23a08f2051b4ff19a949bab45a"
+        "source_sha256": "2ae191e329f85e2c4250315bcf23381200546f219ea4256c05aeaaa0106235c7"
       },
       {
         "source_file": "tests/test_debug_draft_context.py",
@@ -478,6 +478,18 @@
       {
         "source_file": "tests/test_fc_determinism.py",
         "source_sha256": "1a47664193b30e5c94f4450e6b2292b3b4c2d8270bfdd0db3cba849cfe637656"
+      },
+      {
+        "source_file": "tools/benchmark_prompts.py",
+        "source_sha256": "c57f20925adc411d4e0db9f09b78ab429e8c876ea601ad4bc5dc897447718646"
+      },
+      {
+        "source_file": "tests/test_prompt_suite.py",
+        "source_sha256": "92b1c3b755da8b8a1982db05bf3f2ea60c3850ea419eee152d4f1af5b7e9035b"
+      },
+      {
+        "source_file": "tests/test_draft_compile_determinism.py",
+        "source_sha256": "f01440f564935b1e0ddd2c890d6cbfa86f9ca3ba870ac76e9a01ac114c81ddf8"
       }
     ]
   }

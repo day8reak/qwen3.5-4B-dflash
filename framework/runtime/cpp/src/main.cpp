@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -30,11 +31,18 @@ using qwen35::dflash::Distribution;
 using qwen35::dflash::GenerationMeasurement;
 using qwen35::dflash::PairedBenchmarkResult;
 
+struct PromptCase {
+  std::string id;
+  std::vector<std::int64_t> tokens;
+};
+
 struct Arguments {
   std::filesystem::path model;
   std::string model_sha256;
   std::filesystem::path output;
   std::vector<std::int64_t> prompt_token_ids;
+  std::vector<PromptCase> prompt_batch;
+  std::string prompt_batch_sha256;
   std::vector<std::int64_t> eos_token_ids;
   std::int64_t pad_token_id = 0;
   std::size_t max_new_tokens = 32;
@@ -62,6 +70,8 @@ void Usage(std::ostream& stream) {
       << "  --low-memory                 chunk paired: measure ordinary, unload, then DFlash\n"
       << "  --output PATH                paired JSON report\n"
       << "  --prompt-token-ids CSV       non-empty pretokenized prompt\n"
+      << "  --prompt-batch PATH          chunk paired: run all prompts in one loaded process\n"
+      << "  --prompt-batch-sha256 HEX    expected batch file hash; replaces --prompt-token-ids\n"
       << "  --eos-token-ids CSV          optional EOS token IDs\n"
       << "  --pad-token-id ID            default 0\n"
       << "  --max-new-tokens N           default 32\n"
@@ -232,8 +242,32 @@ Arguments ParseArguments(int argc, char** argv) {
   if (result.trace_rounds && result.model_kind != "chunk")
     throw std::invalid_argument("trace-rounds requires --model-kind chunk");
   result.output = TakeRequired(&values, "output");
-  result.prompt_token_ids = ParseTokenIds(
-      TakeRequired(&values, "prompt-token-ids"), false, "prompt-token-ids");
+  const auto batch_path = TakeOptional(&values, "prompt-batch", "");
+  result.prompt_batch_sha256 = TakeOptional(&values, "prompt-batch-sha256", "");
+  if (batch_path.empty()) {
+    if (!result.prompt_batch_sha256.empty()) throw std::invalid_argument("batch hash requires --prompt-batch");
+    result.prompt_token_ids = ParseTokenIds(
+        TakeRequired(&values, "prompt-token-ids"), false, "prompt-token-ids");
+  } else {
+    if (values.count("prompt-token-ids")) throw std::invalid_argument("prompt-batch and prompt-token-ids are exclusive");
+    if (qwen35::dflash::Sha256File(batch_path) != result.prompt_batch_sha256)
+      throw std::invalid_argument("prompt batch SHA-256 differs");
+    std::ifstream input(batch_path);
+    std::string header, line;
+    std::getline(input, header);
+    if (header != "QWEN35_PROMPT_BATCH_V1") throw std::invalid_argument("unsupported prompt batch format");
+    std::map<std::string, bool> ids;
+    while (std::getline(input, line)) {
+      std::istringstream row(line);
+      std::string id, csv, extra;
+      if (!(row >> id >> std::quoted(csv)) || (row >> extra) || id.empty() || id.size() > 64 ||
+          id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos ||
+          !ids.emplace(id, true).second || result.prompt_batch.size() >= 64)
+        throw std::invalid_argument("invalid/duplicate prompt batch row");
+      result.prompt_batch.push_back({id, ParseTokenIds(csv, false, "batch tokens")});
+    }
+    if (result.prompt_batch.empty()) throw std::invalid_argument("prompt batch is empty");
+  }
   result.eos_token_ids = ParseTokenIds(
       TakeOptional(&values, "eos-token-ids", ""), true, "eos-token-ids");
   result.pad_token_id = ParseInt64(
@@ -299,6 +333,9 @@ Arguments ParseArguments(int argc, char** argv) {
   }
   if (result.low_memory && (result.model_kind != "chunk" || result.mode != "paired"))
     throw std::invalid_argument("low-memory requires chunk paired mode without profiling");
+  if (!result.prompt_batch.empty() && (result.model_kind != "chunk" || result.mode != "paired" ||
+      result.debug_draft_replay || !result.profile.stage.empty()))
+    throw std::invalid_argument("prompt batch requires chunk paired mode without debug replay/profiling");
   if (result.pad_token_id < 0) {
     throw std::invalid_argument("pad-token-id must be non-negative");
   }
@@ -573,6 +610,111 @@ void AtomicWrite(
   std::filesystem::rename(temporary, absolute);
 }
 
+bool RunPromptBatch(const Arguments& arguments, qwen35::dflash::GraphExecutor& executor,
+                    const qwen35::dflash::GenerationOptions& options, double load_ms) {
+  const auto directory = std::filesystem::path(arguments.output.string() + ".cases");
+  if (std::filesystem::exists(arguments.output) || std::filesystem::is_symlink(arguments.output) ||
+      std::filesystem::exists(directory) || std::filesystem::is_symlink(directory))
+    throw std::invalid_argument("batch output and cases directory must be new");
+  std::filesystem::create_directories(directory);
+  struct Record {
+    std::optional<BenchmarkResult> ordinary;
+    std::optional<PairedBenchmarkResult> paired;
+    std::string error;
+    double elapsed_ms = 0;
+  };
+  std::vector<Record> records(arguments.prompt_batch.size());
+  const auto elapsed = [](const auto& start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  };
+  const auto ordinary = qwen35::dflash::GenerationMode::kOrdinary;
+  const auto dflash = qwen35::dflash::GenerationMode::kDFlash;
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    const auto& item = arguments.prompt_batch[i];
+    std::cerr << "[prompt-batch] " << item.id << " start mode=" << (arguments.low_memory ? "ordinary" : "paired") << '\n';
+    const auto start = std::chrono::steady_clock::now();
+    try {
+      if (arguments.low_memory) {
+        records[i].ordinary = qwen35::dflash::Benchmark(executor, item.tokens, ordinary, options,
+                                                       arguments.warmup, arguments.repetitions);
+        std::ostringstream saved;
+        WriteBenchmark(saved, *records[i].ordinary);
+        AtomicWrite(directory / (item.id + ".ordinary.json"), saved.str());
+      } else {
+        records[i].paired = qwen35::dflash::BenchmarkPair(executor, item.tokens, options,
+                                                        arguments.warmup, arguments.repetitions);
+      }
+    } catch (const std::exception& error) {
+      records[i].error = error.what();
+      std::cerr << "[prompt-batch] " << item.id << " FAIL: " << error.what() << '\n';
+    }
+    records[i].elapsed_ms = elapsed(start);
+  }
+  double unload_ms = 0;
+  if (arguments.low_memory) {
+    auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(executor);
+    auto start = std::chrono::steady_clock::now();
+    chunk.UnloadModels();
+    unload_ms = elapsed(start);
+    start = std::chrono::steady_clock::now();
+    chunk.LoadMode("dflash");
+    load_ms += elapsed(start);
+    for (std::size_t i = 0; i < records.size(); ++i) {
+      if (!records[i].error.empty()) continue;
+      const auto& item = arguments.prompt_batch[i];
+      std::cerr << "[prompt-batch] " << item.id << " start mode=dflash\n";
+      start = std::chrono::steady_clock::now();
+      try {
+        auto result = qwen35::dflash::Benchmark(executor, item.tokens, dflash, options,
+                                               arguments.warmup, arguments.repetitions);
+        records[i].paired = qwen35::dflash::PairBenchmarks(std::move(*records[i].ordinary), std::move(result));
+      } catch (const std::exception& error) {
+        records[i].error = error.what();
+        std::cerr << "[prompt-batch] " << item.id << " FAIL: " << error.what() << '\n';
+      }
+      records[i].elapsed_ms += elapsed(start);
+    }
+  }
+  bool ok = true;
+  std::ostringstream cases;
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    const auto& item = arguments.prompt_batch[i];
+    auto& record = records[i];
+    const bool pass = record.error.empty() && record.paired.has_value();
+    ok = ok && pass;
+    auto single = arguments;
+    single.prompt_token_ids = item.tokens;
+    single.output = directory / (item.id + ".json");
+    std::ostringstream report;
+    if (pass) {
+      // Shared model-load accounting belongs to the batch index, not every prompt.
+      WriteReport(report, single, executor, 0, record.elapsed_ms, *record.paired);
+    } else {
+      report << "{\"status\":\"FAIL\",\"error\":\"" << JsonEscape(record.error) << "\"}";
+    }
+    AtomicWrite(single.output, report.str());
+    if (i) cases << ',';
+    cases << "{\"id\":\"" << item.id << "\",\"status\":\"" << (pass ? "PASS" : "FAIL")
+          << "\",\"report\":\"" << JsonEscape(std::filesystem::absolute(single.output).string()) << "\"}";
+    std::cerr << "[prompt-batch] " << item.id << ' ' << (pass ? "PASS" : "FAIL") << '\n';
+  }
+  const bool fake = std::string(QWEN35_DFLASH_RUNNER_VERSION).find("fake-acl") != std::string::npos;
+  std::ostringstream report;
+  report << std::setprecision(17) << "{\"schema_version\":1,\"status\":\"" << (ok ? "PASS" : "FAIL")
+         << "\",\"runner_version\":\"" << JsonEscape(QWEN35_DFLASH_RUNNER_VERSION)
+         << "\",\"fake_acl\":" << (fake ? "true" : "false")
+         << ",\"prompt_batch_sha256\":\"" << arguments.prompt_batch_sha256
+         << "\",\"model_sha256\":\"" << arguments.model_sha256
+         << "\",\"models_reused_across_prompts\":true,\"low_memory\":" << (arguments.low_memory ? "true" : "false")
+         << ",\"order\":\"" << (arguments.low_memory ? "all ordinary prompts then all DFlash prompts" : "paired ordinary/DFlash per prompt")
+         << "\",\"startup_ms\":{\"acl_and_model_load\":" << load_ms << ",\"mode_switch_unload\":" << unload_ms
+         << "},\"cases\":[" << cases.str() << "]}";
+  dynamic_cast<qwen35::dflash::AclChunkExecutor&>(executor).Close();
+  AtomicWrite(arguments.output, report.str());
+  std::cout << report.str() << '\n';
+  return ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -602,6 +744,10 @@ int main(int argc, char** argv) {
     options.max_draft_tokens = arguments.max_draft_tokens;
     options.eos_token_ids = arguments.eos_token_ids;
     options.trace_rounds = arguments.trace_rounds;
+    if (!arguments.prompt_batch.empty()) {
+      return RunPromptBatch(arguments, *executor, options,
+          std::chrono::duration<double, std::milli>(load_end - load_start).count()) ? 0 : 1;
+    }
     if (arguments.debug_draft_replay) {
       auto& chunk = dynamic_cast<qwen35::dflash::AclChunkExecutor&>(*executor);
       const auto output = std::filesystem::absolute(arguments.output);

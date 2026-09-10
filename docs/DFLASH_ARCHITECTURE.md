@@ -154,6 +154,11 @@ flowchart TB
 同一份经过 FC 和 norm 的特征送给各层各自的 K/V 投影；当前 block hidden 则逐层更新。
 上下文与本块 K/V 在 attention 中共同参与计算。
 
+当前 OM 编译默认给 Draft 加 `--deterministic=1`，用于消除已复现的 FC 重复计算漂移。
+它不改变上述结构、权重或 FP16 输入类型；Target 的编译默认保持原样。
+FC 单图开启后已在设备上重复稳定，完整 Draft 的稳定性、接受率和速度仍需单独验证。
+部署手册的多 prompt 测试会一次汇总 8 类请求，逐条比较普通与 DFlash 的最终输出及速度。
+
 Draft 持久 KV 只保存已提交 Target 特征的投影结果。MASK block 的临时 K/V 不跨轮保留。
 不足 15 个候选时，所有层都会屏蔽多余 block key，包括最后的非因果层，
 以免填充位置影响有效候选。

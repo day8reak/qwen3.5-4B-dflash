@@ -14,6 +14,7 @@ import torch
 from .cpp_runtime import build_cpp_runner, run_cpp_pair, write_cpp_prompt_report
 from .compiler import (
     compile_air_bundle,
+    recompile_draft_om,
     resolve_atc_executable,
     validate_soc_version,
 )
@@ -64,6 +65,11 @@ def command_compile(args: argparse.Namespace) -> int:
         extra_args=args.atc_arg,
     )
     _print(payload)
+    return 0
+
+
+def command_recompile_draft(args: argparse.Namespace) -> int:
+    _print(recompile_draft_om(args.deployment_manifest, output=args.output, atc_bin=args.atc))
     return 0
 
 
@@ -358,6 +364,14 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--air-manifest", type=Path, required=True)
     _add_atc_arguments(compile_parser)
     compile_parser.set_defaults(handler=command_compile)
+
+    recompile = subparsers.add_parser(
+        "recompile-draft-om", help="enable deterministic Draft compilation and reuse hash-locked Target OMs"
+    )
+    recompile.add_argument("--deployment-manifest", type=Path, required=True)
+    recompile.add_argument("--output", type=Path, required=True, help="new manifest beside the existing one")
+    recompile.add_argument("--atc", type=Path, default=os.environ.get("ASCEND310P_ATC_BIN"))
+    recompile.set_defaults(handler=command_recompile_draft)
 
     build = subparsers.add_parser("build-om", help="export AIR and compile every graph")
     build.add_argument("--factory", required=True, help="module:function graph factory")

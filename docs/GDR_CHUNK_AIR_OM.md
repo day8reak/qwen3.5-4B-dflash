@@ -412,6 +412,12 @@ verify 还生成 `air/target_verify/verify-discard-outputs.json`，
 Draft 的 FP16 选择通过图中显式 Cast 实现。也支持显式传入 `--precision_mode_v2=origin`；
 编译器拒绝同时指定两种精度参数或使用降精度模式。
 
+增量套件的 `draft` 图默认额外使用 `--deterministic=1`，三个 Target 图的默认参数不变。
+这是根据同一份 FC AIR 的设备对照加入的：关闭时 native/OM 均有 19/20 次输出变化，
+开启后两条路径均为 0/20，且有效输出逐位相同。完整 Draft 仍需重放、普通生成对照和重新测速。
+各图实际命令保存在 `graphs[].atc_command`，额外参数保存在 `compiler.graph_extra_args`。
+显式 `--atc-arg=--deterministic=0` 可用于对照实验；该公共参数会传给所有待编译图。
+
 FP16 MatMul 后的 FP32 Cast 为 ATC 的 `MatmulCastFusionPass` 提供融合机会，
 但源码中的 Cast 不保证直接 FP32 输出；没有融合时会先得到经过 FP16 舍入的结果。
 在目标机检查编译后 MatMul/BatchMatMul 的输入 dtype 与实现，并用第 14 步的 Draft
@@ -471,6 +477,26 @@ for graph in report["graphs"]:
 print("OM files: PASS")
 PY
 ```
+
+### 只重编已有套件的 Draft，启用确定性计算
+
+已有正确的 AIR 和四图 deployment 时，从 ATC 这一步开始即可。复用原 Draft AIR 及其
+精度参数，只替换确定性选项为 1；三个 Target OM 保持原文件和 SHA-256。
+
+```bash
+"$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p recompile-draft-om \
+  --deployment-manifest "$AI_RUN_DIR/artifacts/deployment-manifest.json" \
+  --output "$AI_RUN_DIR/artifacts/deployment-manifest-deterministic.json" \
+  --atc "$ATC_BIN"
+
+export DEPLOYMENT_MANIFEST="$AI_RUN_DIR/artifacts/deployment-manifest-deterministic.json"
+```
+
+新 manifest 必须位于原 manifest 所在目录，并使用尚不存在的文件名。新 Draft OM 和日志
+写到同级的 `draft-deterministic-*`，旧 manifest/OM 保留。AIR、权重 payload、旧 OM 的
+hash 或 ABI 审计不一致时直接停止。新 manifest 编译成功不等于完整模型验证通过。
+后续命令的 `--deployment-manifest` 要使用上述新变量。
+如果运行 Draft 冻结输入重放，请重新生成快照，不要传旧的 `--inputs`：快照绑定旧 Draft OM hash。
 
 ## 10. 编译 C++ AscendCL runner
 
@@ -579,6 +605,58 @@ cat "$AI_RUN_DIR/log/cpp-paired-cpp-runner.log"
 不要更改控制张量 dtype 或取消校验来绕过错误。新 bundle 路径要同时用于
 `compile-om --air-manifest` 和 `infer-cpp --deployment-manifest`；重试报告使用新的
 `--output` 文件名，例如 `cpp-paired-io.json`，避免覆盖失败日志。
+
+### 一次测试多个 prompt 和接受率
+
+更新源码并按第 10 步构建新的 runner 后，运行：
+
+```bash
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/benchmark_prompts.py" \
+  --run-dir "$AI_RUN_DIR" --runner "$CPP_RUNNER" \
+  --deployment-manifest "$DEPLOYMENT_MANIFEST" \
+  --runner-config "$AI_RUN_DIR/runner.json" --model-dir "$TARGET_DIR" \
+  --device-id 0 --max-new-tokens 128 --max-draft-tokens 15 \
+  --eos-token-id 248044 --low-memory
+```
+
+默认有 8 条：中文解释、学习计划、数学、代码、翻译、摘要、英文解释和故事创作。
+每条均使用 chat 模板，普通与 DFlash 各做 3 次预热、10 次正式测量，结束时检查输出
+token、EOS 和停止原因一致。每次生成前重置请求缓存；一条失败会记录原因并继续其余条目。
+普通生成本身的稳定性和两种模式的精确一致性检查沿用原 runner，不放宽阈值。
+
+整批只启动一个 C++ 进程：去掉 `--low-memory` 时四图加载一次，逐 prompt 交错跑两种模式；
+加上时先跑完全部普通 prompt，再统一卸载、加载 DFlash 所需三图，跑完全部 DFlash prompt。
+两种协议都复用加载的模型。低显存模式的分组顺序可能受温度和外部负载变化影响，报告会明确记录。
+模型加载、模式切换和请求重置均排除在模型循环时延之外。
+
+脚本打印本次 `Output` 目录 `$AI_RUN_DIR/prompt-suite-*`，其中：
+
+| 文件 | 内容 |
+|---|---|
+| `summary.md` / `summary.json` | 每条接受率、每轮产出、DFlash tok/s、相对普通速度、生成长度、停止原因和失败原因（完整字段见 JSON） |
+| `request.json` | prompt 原文及 token IDs、tokenizer 来源、OM/runner hash、Draft ATC 命令和测试参数 |
+| `runner-batch.json.cases/*.json` | 每条完整普通/DFlash 报告，包含每次测量和逐轮 trace |
+| `runner-batch.json` / `runner.log` | 整批模型复用协议、加载时间和执行日志 |
+
+接受率按正式测量的 `accepted_draft_tokens / drafted_tokens` 计算。总接受率是总接受数
+除以总候选数，不是简单平均每条的百分比；没有候选时显示 N/A。每轮产出包括该轮实际
+发出的已接受 token 和补充 token。速度比为普通与 DFlash 的模型总时延中位数之比，
+大于 1 才说明该条更快。失败条目保留在表中，总结只对通过的条目统计，整批仍标为失败。
+这组样本用来比较任务差异，不能证明所有 prompt 都有高接受率。
+
+可通过 `--prompts "$AI_RUN_DIR/prompts.json"` 使用自己的测试集（最多 64 条）。文件格式：
+
+```json
+[
+  {"id": "math_01", "category": "数学", "prompt": "计算 37 × 28，并解释步骤。"},
+  {"id": "code_01", "category": "代码", "prompt": "写一个 Python 函数统计单词频率。"}
+]
+```
+
+也可直接使用字符串数组。`id` 只能包含字母、数字、下划线或连字符且不能重复。
+默认最多生成 128 个新 token，遇到 EOS 可提前结束；JSON 同时记录实际长度和停止原因。
+prompt 加输出预算超出 OM 的固定上下文容量时提前报错，可减小 `--max-new-tokens` 或缩短 prompt。
+这项测试直接测模型循环，不套 msprof；算子分析仍使用第 14 步的独立采集入口。
 
 ## 12. 检查 token 一致性和时延范围
 
