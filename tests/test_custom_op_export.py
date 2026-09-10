@@ -50,6 +50,7 @@ from qwen35_dflash.ascend310p.contracts import CustomOpExportSpec
 from qwen35_dflash.ascend310p.compiler import _validated_custom_op_audit
 from qwen35_dflash.ascend310p.quant_factory import (
     _target_custom_op_exports, _enable_target_quant_matmul_export_mode,
+    _incremental_cache_update,
 )
 from qwen35_dflash.ascend310p.exporter import export_air_bundle
 
@@ -112,6 +113,7 @@ def _quant_incremental_specs(monkeypatch):
         target, draft_model(), capacity=128, metadata=metadata,
         gdr=operations["npu_chunk_gated_delta_rule"],
         attention=operations["adn_fused_infer_attention"], rotary=rotary,
+        cache_update=_incremental_cache_update,
         custom_ops=contracts, include_ordinary_decode=True)
 
 
@@ -166,10 +168,27 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
         exported = ta.captures[name]
         nodes = list(exported.graph.nodes)
         cache_writes = [node for node in nodes if str(node.target) == "aten.scatter.src"]
-        assert len(cache_writes) == (4 if name == "draft" else 2)
+        assert len(cache_writes) == (4 if name == "draft" else 0)
         # Cache indices use static Tile repeats, matching the receiver-tested
         # quant branch and avoiding dynamic BroadcastTo auto-tiling failures.
         assert all(str(node.args[2].target) == "aten.repeat.default" for node in cache_writes)
+        native_writes = [node for node in nodes if
+                         str(node.target) == "qwen35_dflash.npu_cache_update.default"]
+        expected_writes = 0 if name == "draft" else 32 if name == "target_verify" else 2
+        assert len(native_writes) == expected_writes
+        for node in native_writes:
+            assert node.args[1].meta["val"].shape[0] == (64 if name == "target_prefill" else 1)
+            assert node.args[2].meta["val"].dtype == torch.int32
+            assert node.args[2].meta["val"].shape == (1,)
+            assert node.args[3].meta["val"].dtype == torch.int32
+            assert node.args[3].meta["val"].shape == ()
+        # The custom write takes paged KV directly. No full-cache layout clone
+        # or functional ScatterElements may remain in any Target gear.
+        cache_shapes = {tuple(t["shape"]) for t in
+                        graph["metadata"]["incremental_contract"]["target_states"]
+                        if t["name"].endswith(("_key", "_value"))}
+        assert not any(str(node.target) == "aten.clone.default" and
+                       tuple(node.meta["val"].shape) in cache_shapes for node in nodes)
         scans = [node for node in nodes if str(node.target) == "aten.cumsum.default"]
         assert len(scans) == (1 if name == "target_verify" else 0)
         assert all(node.meta["val"].dtype == torch.int32 for node in scans)
@@ -183,7 +202,9 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
                             and node.meta["val"].ndim == 5]
             assert len(head_repeats) == 4
         else:
-            assert len(audit) == 5
+            assert len(audit) == 6
+            cache_audit = next(item for item in audit if item["ge_op_type"] == "CacheUpdate")
+            assert cache_audit["minimum_occurrences"] == expected_writes
             assert len(calls) == (2 if name == "target_verify" else 1)
             rows = 1 if name == "target_decode" else 16 if name == "target_verify" else 64
             assert all(node.args[0].meta["val"].shape[1] == rows for node in calls)
@@ -342,8 +363,13 @@ def _ensure_cache_update_cpu_impl() -> None:
         target_block: torch.Tensor,
         offset_in_block: torch.Tensor,
     ) -> torch.Tensor:
-        del target_block, offset_in_block
-        input.copy_(updates)
+        if input.ndim == 4 and updates.ndim == 3:
+            block, row = int(target_block.item()), int(offset_in_block.item())
+            assert 0 <= block < input.shape[0]
+            assert 0 <= row < row + updates.shape[0] <= input.shape[2]
+            input[block, :, row : row + updates.shape[0], :] = updates.transpose(0, 1)
+        else:
+            input.copy_(updates)
         return input
 
     library.impl("npu_cache_update_", cache_update)
@@ -1134,6 +1160,49 @@ def test_quant_matmul_meta_rejects_flattened_batch_times_m_scale() -> None:
             ),
             output_dtype=torch.float16,
         )
+
+
+def test_incremental_paged_cache_update_aot_keeps_runtime_positions(monkeypatch):
+    from qwen35_dflash.ascend310p.incremental import update_paged
+
+    native_op = _ensure_target_test_schema("npu_cache_update_")
+    _ensure_cache_update_cpu_impl()
+    prepare_custom_op_export(
+        CustomOpExportSpec(FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP,
+                           NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE),
+        _FakeTorchAir(),
+    )
+    fake_npu = ModuleType("torch_npu")
+    fake_npu.__spec__ = importlib.machinery.ModuleSpec("torch_npu", loader=None)
+    fake_npu.npu_cache_update_ = native_op
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_npu)
+    modeling = importlib.import_module("models.modeling_qwen3_5_hiai_nd")
+    monkeypatch.setattr(modeling, "torch_npu", fake_npu)
+
+    class Writer(nn.Module):
+        def forward(self, cache, values, start):
+            rows = values.shape[1]
+            return update_paged(
+                cache, values, start + torch.arange(rows),
+                cache_update=_incremental_cache_update, aligned_prefill=rows == 64,
+            )
+
+    for rows in (1, 16, 64):
+        cache = torch.randn(3, 2, 64, 16).half()
+        values = torch.randn(1, rows, 2, 16).half()
+        original = cache.clone()
+        exported = torch.export.export(
+            Writer(), (cache, values, torch.zeros(1, dtype=torch.long)), strict=True,
+        ).run_decompositions({})
+        # The graph was captured at start=0. Test changed block/offset values,
+        # including a verify spanning two pages and the reserved scratch tail.
+        starts = (0, 64, 128) if rows == 64 else (0, 63, 192 - rows)
+        module = exported.module()
+        for start in starts:
+            actual = module(cache, values, torch.tensor([start]))
+            expected = update_paged(cache, values, torch.arange(start, start + rows))
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(cache, original, rtol=0, atol=0)
 
 
 def test_native_cache_update_uses_copy_free_frontend_for_air_export(

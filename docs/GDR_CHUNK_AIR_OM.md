@@ -90,12 +90,19 @@ import torch_npu
 required = (
     "npu_chunk_gated_delta_rule", "adn_fused_infer_attention",
     "adn_rms_norm", "npu_dynamic_quant", "npu_quant_matmul",
+    "npu_cache_update_",
 )
 missing = [name for name in required if not callable(getattr(torch_npu, name, None))]
 assert not missing, f"缺少 NPU 算子: {missing}"
 print("Target operator symbols: PASS")
 PY
 ```
+
+三个 Target OM 使用 `CacheUpdate` 写入 paged KV：prefill 按对齐的 64 行块写入，
+decode 写一行，verify 逐行写入 16 行。块号和块内偏移均为 INT32，
+verify 跨块时逐行重算位置。Draft 的 dense KV 使用 `ScatterElements`。
+导出检查同时核对 dispatcher/Meta 和 GE 节点，不能只凭 Python 接口存在判断注册完整。
+四张图的接口和状态提交规则见[模型结构与运行流程](DFLASH_ARCHITECTURE.md)。
 
 `npu_chunk_gated_delta_rule` 必须接受 `effective_length: INT16[B]`，含义是本次调用的有效行数。
 接口形式为：
@@ -333,19 +340,22 @@ Draft 的公开输入顺序固定为 `features, start_position, valid_rows, anch
 每个图必须只完成一次输入规范化，并保持公开输入的静态 shape；未知的运行时输入或
 捕获中丢失的公开输入会使导出失败。
 三个 Target 图均检查 `RmsNorm/AdnRmsNorm`、`DynamicQuant`、
-`QuantBatchMatmulV4444`、`ChunkGatedDeltaRule`、`AdnFusedInferAttention`，
+`QuantBatchMatmulV4444`、`ChunkGatedDeltaRule`、`AdnFusedInferAttention`、`CacheUpdate`，
 以及 `SoftplusV2`。Draft 使用 Tensor 算子，不要求出现 Target 自定义节点。
 量化 matmul 在 AIR 捕获时使用专用前端，保留 FP32 weight/per-token scale 和 FP16 输出；
 普通 NPU 推理仍调用同一套 receiver 量化接口。
 每张 Target 图的 QuantBatchMatmulV4444 节点数不能少于加载器记录的
 QLinear 数量；标准 4B Target 为 249，包含词表输出 head。该检查用于发现启用了量化前端、
 但部分量化模块没有进入导出图的情况。
+`CacheUpdate` 的最低节点数分别为 prefill 16、decode 16、verify 256；
+verify 的计数包含每层 K/V 的 16 次单行写入。这些是 AIR 节点检查，
+目标机的实际任务耗时通过本文后面的分阶段 msprof 测量。
 保留整个 AIR 目录，不要只复制 `.air` 文件。
 
 卷积历史窗口通过切片加 `stack` 导出，保持每个有效前缀的状态。
 verify 接受长度使用 INT32 `Cumsum → Equal → ReduceSum`，最后输出 INT64 接受数；
 短块的 padding 不参与接受判断，第二次 GDR 提交 `accepted_count+1` 行。
-缓存写入索引与 Draft 的 KV head 复制使用静态 `repeat/Tile`。
+Draft 缓存写入索引与 KV head 复制使用静态 `repeat/Tile`。
 Target attention 使用 `all_seq_lengths_q=[C+64]`、
 `actual_seq_lengths_q=[当前物理行数]` 和 `actual_seq_lengths_kv=[C+64]`；
 这三个前端长度列表分别映射为 INT64 GE 输入。运行时因果 mask 同时排除

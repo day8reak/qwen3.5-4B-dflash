@@ -162,14 +162,30 @@ InferShape/InferDataType 和 ATC 的实际编译结果。ATC 失败时异常附�
 | 三个 Target 图 | `npu::npu_chunk_gated_delta_rule` | `ChunkGatedDeltaRule`；Meta 覆盖 R=1/16/64，保留两个输出和 FP32 recurrent state |
 | 三个 Target 图 | `npu::adn_fused_infer_attention` | `AdnFusedInferAttention`；保留 paged KV、mask、block table 和长度输入 |
 | 三个 Target 图 | `aten::softplus` | `SoftplusV2`；保留 beta/threshold 属性 |
-| 完整前缀图的缓存路径 | `qwen35_dflash::npu_cache_update` | `CacheUpdate`；功能化前端输出更新后的缓存，供 attention 消费 |
+| 三个 Target 图及完整前缀图 | `qwen35_dflash::npu_cache_update` | `CacheUpdate`；功能化捕获前端直接接收 paged KV，输出供 attention 消费 |
 | 完整前缀图的可选 scatter 路径 | `npu::npu_scatter_nd_update_` | `ScatterNdUpdate`；验证别名/Meta，保留内置 converter |
 
-增量四图的缓存写入使用函数式 `scatter`，由 TorchAir 映射到 `ScatterElements`，
-不要求 `CacheUpdate` 或 `ScatterNdUpdate` 节点。Target 在展平的 paged KV 第 0 维写入，
-Draft 在 `[B,H,C,D]` 的第 2 维写入；位置索引用静态 `repeat/Tile` 复制到更新值的形状，
-输入缓存保持不变。索引重复因子来自固定形状，不构造动态 `BroadcastTo` shape 输入。
-写入位置由连续且不重复的 token 位置构造，结果与整行 `index_copy` 相同。
+三个 Target 图的 K/V 都调用 `CacheUpdate`，直接更新
+`[blocks,H*D/16,64,16]` 布局，只打包本次新增的行，避免为写入而展平、转置整份缓存。
+前端使用无别名的功能化 schema 供 PyTorch/AOT 捕获，GE converter 保留独立
+`CacheUpdate` 节点；生产导出缺少该算子会报错，不切换到 Tensor 缓存写入。
+
+| Target 图 | 每份 K/V 的写入 | 8 个 attention 层合计的 AIR 节点数 |
+|---|---|---|
+| `target_prefill` | C++ 从 0 开始、步长 64；一次写入同一块的 64 行 | 16 个 `CacheUpdate` |
+| `target_decode` | 按当前位置写 1 行 | 16 个 `CacheUpdate` |
+| `target_verify` | 16 次单行写入，逐行计算块号和块内偏移，支持跨块 | 256 个 `CacheUpdate` |
+
+`targetBlock` 为 INT32[1]，`offsetInBlock` 为 INT32 标量。
+prefill 的末块和 verify 的填充行只占用未提交位置；物理缓存保留 64 行 scratch。
+attention 的 mask 只允许有效行，verify 的逻辑长度仍只推进 `accepted_count+1`。
+各图按上述最低次数审计 AIR 中的 GE 节点。C++ 的 current/next 状态缓冲区和提交方式
+保持相同，不能由此认定所有图边界复制都已消除；最终任务数和耗时以 OM/msprof 为准。
+
+Draft 的缓存是 `[B,H,C,D]`，在第 2 维使用 `scatter → ScatterElements`，
+六层 K/V 共 12 处写入。位置索引用静态 `repeat/Tile` 复制到更新值的形状，
+不构造动态 `BroadcastTo` shape 输入。写入位置连续且不重复，结果与整行
+`index_copy` 相同。它不直接使用 Target 的 paged `CacheUpdate` 接口。
 Draft 的 GQA 在新插入的 group 维使用 `repeat/Tile`，head 顺序为
 `[h0,h0,...,h1,h1,...]`，不重复整个 head 序列。
 Draft 图使用 Tensor 算子。完整前缀工厂按其实际缓存路径声明算子依赖。

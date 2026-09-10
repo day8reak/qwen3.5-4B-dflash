@@ -428,14 +428,23 @@ def _target_custom_op_exports(
                            minimum_occurrences=qlinear_count),
         CustomOpExportSpec(NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP, NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE),
         CustomOpExportSpec(ADN_FUSED_INFER_ATTENTION_TORCH_OP, ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE),
+        CustomOpExportSpec(FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP, NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE),
     ]
     if not incremental:
         operators.extend((
-            CustomOpExportSpec(FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP, NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE),
             CustomOpExportSpec(NPU_SCATTER_ND_UPDATE_TORCH_OP, NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
                                minimum_occurrences=0),
         ))
     return tuple(operators)
+
+
+def _incremental_cache_update(cache, updates, target_block, offset):
+    """Capture the receiver CacheUpdate through its AOT-safe GE frontend."""
+    from models.modeling_qwen3_5_hiai_nd import _npu_cache_update
+
+    return _npu_cache_update(
+        cache, updates, target_block, offset, use_export_frontend=True,
+    )
 
 
 def _prepare_quant_export(config: Mapping[str, Any], torchair_module: Any,
@@ -541,7 +550,7 @@ def create_quant_recompute_graph(
     except ImportError as error:
         raise RuntimeError("torch_npu is required for quant AIR export") from error
     if _incremental:
-        missing = [name for name in ("npu_chunk_gated_delta_rule", "adn_fused_infer_attention")
+        missing = [name for name in ("npu_chunk_gated_delta_rule", "adn_fused_infer_attention", "npu_cache_update_")
                    if not callable(getattr(npu_module, name, None))]
         if missing:
             raise RuntimeError("incremental AIR export needs receiver NPU operations: " + ", ".join(missing))
@@ -660,6 +669,7 @@ def create_quant_recompute_graph(
         return incremental_graph_specs(target, draft, capacity=max_sequence_length,
             metadata=metadata, gdr=torch_npu.npu_chunk_gated_delta_rule,
             attention=torch_npu.adn_fused_infer_attention, rotary=apply_rotary_pos_emb,
+            cache_update=_incremental_cache_update,
             custom_ops=custom_op_exports, include_ordinary_decode=include_ordinary_decode)
     enable_padded_draft_context(draft)
     target_adapter = QuantFullPrefixExportTarget(target).eval()

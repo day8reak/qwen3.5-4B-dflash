@@ -173,6 +173,8 @@
     ],
     "optional_ordinary_om": "target_decode",
     "om_limit": 4,
+    "target_kv_update": "CacheUpdate_paged_aligned_prefill_per_row_decode_verify",
+    "draft_kv_update": "ScatterElements_dense_context",
     "commit": "acceptance and accepted+1 second GDR are internal to target_verify",
     "state": "explicit FP16 persistent GDN/conv/KV; FP32 GDR accumulator; current/next device banks and logical cursor",
     "verify_state_output_policy": "raw_fp32_device_only_discard_first_pass_commit_second_pass",
@@ -210,6 +212,11 @@
         "pse_shift": "absent; reserved for optional FP16 bias",
         "all_seq_lengths_q": "SymInt[] frontend -> INT64 GE length input; static cache capacity for incremental graphs",
         "logical_prefix": "runtime causal mask and key_position < start_position + valid_rows"
+      },
+      {
+        "torch_target": "qwen35_dflash.npu_cache_update.default",
+        "ge_op_type": "CacheUpdate",
+        "minimum_air_occurrences": {"target_prefill": 16, "target_decode": 16, "target_verify": 256}
       }
     ],
     "draft_custom_operators": [],

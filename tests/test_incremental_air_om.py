@@ -210,7 +210,19 @@ def draft_model():
     return draft
 
 
-def specs(include_ordinary_decode=True):
+def cache_update_reference(cache, updates, target_block, offset):
+    """CPU model of the receiver's single-page ABI, not an NPU fallback."""
+    assert target_block.dtype == torch.int32 and target_block.shape == (1,)
+    assert offset.dtype == torch.int32 and offset.shape == ()
+    block, row = int(target_block.item()), int(offset.item())
+    assert 0 <= block < cache.shape[0]
+    assert 0 <= row < row + updates.shape[0] <= cache.shape[2]
+    result = cache.clone()
+    result[block, :, row : row + updates.shape[0], :] = updates.transpose(0, 1)
+    return result
+
+
+def specs(include_ordinary_decode=True, cache_update=None):
     torch.manual_seed(42)
     target, draft = TinyTarget().eval(), draft_model()
     return incremental_graph_specs(
@@ -221,6 +233,7 @@ def specs(include_ordinary_decode=True):
         gdr=gdr,
         attention=attention_op,
         rotary=rotary,
+        cache_update=cache_update,
         include_ordinary_decode=include_ordinary_decode,
     )
 
@@ -302,8 +315,12 @@ def test_exactly_four_graphs_and_complete_signatures():
     "valid_rows,accepted",
     [(16, 0), (16, 3), (16, 15), (1, 0), (4, 0), (4, 1), (4, 3)],
 )
-def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(valid_rows, accepted):
-    values = {s.name: s for s in specs()}
+@pytest.mark.parametrize("cache_update", [None, cache_update_reference], ids=["scatter", "CacheUpdate"])
+@pytest.mark.parametrize("start", [0, 63])
+def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(
+    valid_rows, accepted, cache_update, start,
+):
+    values = {s.name: s for s in specs(cache_update=cache_update)}
     verify, decode = values["target_verify"], values["target_decode"]
     initial = tuple(t.clone() for t in verify.example_args[3:])
     ids = [4]
@@ -313,7 +330,7 @@ def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(valid_rows, ac
         for i in range(15):
             out = decode.model(
                 torch.tensor([[ids[-1]]]),
-                torch.tensor([i]),
+                torch.tensor([start + i]),
                 torch.tensor([1], dtype=torch.int16),
                 *state,
             )
@@ -326,18 +343,21 @@ def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(valid_rows, ac
         ids[valid_rows:] = [63] * (16 - valid_rows)
         out = verify.model(
             torch.tensor([ids]),
-            torch.tensor([0]),
+            torch.tensor([start]),
             torch.tensor([valid_rows], dtype=torch.int16),
             *initial,
         )
         assert int(out[1][0]) == accepted
         # A fresh compact call over exactly anchor + accepted proposals is the
         # reference for the committed scalar GDN state and visible KV prefix.
-        reference = copy.copy(decode.model)
+        reference = copy.deepcopy(decode.model)
         reference.rows = accepted + 1
+        for block in reference.blocks:
+            if hasattr(block, "cache_update"):
+                block.cache_update = None
         ref = reference(
             torch.tensor([ids[: accepted + 1]]),
-            torch.tensor([0]),
+            torch.tensor([start]),
             torch.tensor([accepted + 1], dtype=torch.int16),
             *initial,
         )
@@ -345,12 +365,23 @@ def test_fused_verify_accepts_prefix_and_commits_only_that_prefix(valid_rows, ac
         torch.testing.assert_close(out[4], ref[2], atol=2e-3, rtol=2e-3)
         # Remaining outputs after the four cache tensors are discard-only.
         for actual, expected in zip(out[5:7], ref[3:]):
+            actual = actual.permute(0, 2, 1, 3).flatten(0, 1)
+            expected = expected.permute(0, 2, 1, 3).flatten(0, 1)
             torch.testing.assert_close(
-                actual[:, :, : accepted + 1],
-                expected[:, :, : accepted + 1],
+                actual[: start + accepted + 1],
+                expected[: start + accepted + 1],
                 atol=2e-3,
                 rtol=2e-3,
             )
+        # Rejected physical KV rows remain present but invisible. A subsequent
+        # decode must overwrite the next slot and match the compact reference.
+        next_ids = out[0][:, accepted : accepted + 1]
+        next_args = (next_ids, torch.tensor([start + accepted + 1]),
+                     torch.tensor([1], dtype=torch.int16))
+        reference.rows = 1
+        actual_next = decode.model(*next_args, *out[3:7])
+        expected_next = reference(*next_args, *ref[1:])
+        torch.testing.assert_close(actual_next[0], expected_next[0], rtol=0, atol=0)
     for actual, expected in zip(initial, verify.example_args[3:]):
         torch.testing.assert_close(actual, expected)
 
@@ -484,6 +515,61 @@ def test_cache_write_crosses_block_boundary_without_touching_prefix():
         flattened[:63], old.permute(0, 2, 1, 3).reshape(192, 2, 16)[:63]
     )
     torch.testing.assert_close(cache, old)
+
+
+@pytest.mark.parametrize("rows,start", [(1, 0), (1, 63), (1, 191),
+                                      (16, 0), (16, 63), (16, 176),
+                                      (64, 0), (64, 64), (64, 128)])
+def test_cache_update_matches_scatter_with_page_boundaries_and_scratch(rows, start):
+    generator = torch.Generator().manual_seed(813)
+    cache = torch.randn(3, 2, 64, 16, generator=generator).half()
+    original = cache.clone()
+    # RoPE K arrives transposed, V is contiguous: test both packing paths.
+    values = torch.randn(1, 2, rows, 16, generator=generator).half().transpose(1, 2)
+    positions = torch.arange(start, start + rows)
+    calls = []
+
+    def operation(cache, updates, target_block, offset):
+        calls.append((int(target_block.item()), int(offset.item()), updates.shape[0]))
+        return cache_update_reference(cache, updates, target_block, offset)
+
+    expected = update_paged(cache, values, positions)
+    actual = update_paged(cache, values, positions, cache_update=operation,
+                          aligned_prefill=rows == 64)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(cache, original, rtol=0, atol=0)
+    assert calls == ([(start // 64, 0, 64)] if rows == 64 else
+                     [(p // 64, p % 64, 1) for p in range(start, start + rows)])
+
+
+@pytest.mark.parametrize("valid_rows", [1, 17, 64])
+def test_cache_update_prefill_padding_matches_reference_and_next_decode(valid_rows):
+    values = {s.name: s for s in specs(cache_update=cache_update_reference)}
+    prefill, decode = values["target_prefill"], values["target_decode"]
+    reference = copy.deepcopy(prefill.model)
+    for block in reference.blocks:
+        if hasattr(block, "cache_update"):
+            block.cache_update = None
+    # Two aligned chunks exercise prefix preservation and a short final gear.
+    state, reference_state = prefill.example_args[3:], prefill.example_args[3:]
+    with torch.inference_mode():
+        for start, valid in [(0, 64), (64, valid_rows)]:
+            ids = torch.arange(64)[None] % 63
+            args = (ids, torch.tensor([start]), torch.tensor([valid], dtype=torch.int16))
+            out = prefill.model(*args, *state)
+            ref = reference(*args, *reference_state)
+            for actual, expected in zip(out, ref):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            state, reference_state = out[2:], ref[2:]
+        reference = copy.deepcopy(decode.model)
+        for block in reference.blocks:
+            if hasattr(block, "cache_update"):
+                block.cache_update = None
+        args = (out[0], torch.tensor([64 + valid_rows]), torch.ones(1, dtype=torch.int16))
+        out = decode.model(*args, *state)
+        ref = reference(*args, *reference_state)
+        for actual, expected in zip(out, ref):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("proposal_count", [1, 2, 7, 13, 15])

@@ -24,10 +24,13 @@
   "proposal_count": "INT16[1], 1..15; C++ sends min(max_draft_tokens, remaining_output_tokens, 15)",
   "draft_outputs": ["draft_top1 INT64[1,15], first K valid, unused tail zero", "six-layer committed-context KV"],
   "cache_policy": "logical capacity C, multiple of 64, 64 <= C <= 32704; physical C+64 reserves scratch; prompt_length+max_new_tokens <= C",
+  "target_kv_update": "CacheUpdate in paged layout; prefill one aligned 64-row page; decode one row; verify 16 chained single-row writes with per-row block/offset",
+  "target_cache_update_air_nodes": {"target_prefill": 16, "target_decode": 16, "target_verify": 256},
+  "draft_kv_update": "ScatterElements in dense [B,H,C,D] context cache; 12 writes",
   "runtime_policy": "load selected models once; persistent current/next device banks; complete verify before atomic host publication; errors invalidate request until reset",
   "single_mode_loading": {"dflash": ["target_prefill", "target_verify", "draft"], "ordinary": ["target_prefill", "target_decode"]},
   "ordered_tensor_shapes": "derived from loaded modules; frozen in AIR metadata.tensor_abi and deployment-manifest.json",
   "runtime_input_abi": "public-tensor-storage-identity-v1; normalize GE Data.index and physical Data order; require PASS audit with static serialized shapes before ATC",
   "target_gates": ["receiver all_seq_lengths_q INT64 static capacity, absent pse_shift, and runtime causal/valid-prefix mask", "custom GE operators and exact Ascend310P ATC variant available", "real AIR/OM hashes", "native ordinary vs OM ordinary vs DFlash zero token-ID/EOS mismatches", "zero/partial/all acceptance, valid_rows=1, long prompt, cross-block cache", "ten stable successful target repetitions after three warmups"],
-  "performance_limitations": ["fixed gears execute padding", "early prompt chunks run Draft for KV initialization and discard proposals", "functional paged KV update can copy full caches", "separate OMs do not automatically share weight allocations"]
+  "performance_limitations": ["fixed gears execute padding", "early prompt chunks run Draft for KV initialization and discard proposals", "Draft dense scatter and current/next OM state buffers can still involve full-cache copies", "verify uses per-row CacheUpdate until multi-row cross-page ABI is validated", "separate OMs do not automatically share weight allocations"]
 }

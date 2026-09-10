@@ -124,6 +124,12 @@ flowchart TB
 `valid_rows` 和 mask 限制有效范围。例如提出 7 个候选时，verify 的有效长度是 `1+7=8`，
 物理输入仍为 16 行；填充行不属于已提交上下文。
 
+三张 Target OM 使用自定义 `CacheUpdate` 写入 paged KV：prefill 每次写一块 64 行，
+decode 写一行，verify 逐行写入 16 行并处理跨块位置。这样无需为了更新少量 token
+而转换整份 KV 的布局，普通模式和 DFlash 都能减少这部分开销。
+Draft 的上下文缓存采用另一种布局，仍使用 `ScatterElements`。
+是否带来端到端提速，需要结合目标机上的算子耗时、接受率和整轮耗时测量。
+
 ## 4. 一次请求怎样运行
 
 下图展示 Draft 保持启用时的生成循环：

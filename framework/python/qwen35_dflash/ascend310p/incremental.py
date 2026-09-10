@@ -8,6 +8,7 @@ remain graph intermediates; first-pass states never become cache inputs.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Callable
 
 import torch
@@ -83,13 +84,46 @@ def copy_cache_rows(cache: Tensor, dim: int, positions: Tensor, values: Tensor) 
     return torch.scatter(cache, dim, indices, values)
 
 
-def update_paged(cache: Tensor, values: Tensor, positions: Tensor) -> Tensor:
-    """Functional row writes in the receiver's [blocks,H*D/16,64,16] layout.
+def update_paged(
+    cache: Tensor,
+    values: Tensor,
+    positions: Tensor,
+    *,
+    cache_update: Callable | None = None,
+    aligned_prefill: bool = False,
+) -> Tensor:
+    """Write rows in the receiver's [blocks,H*D/16,64,16] layout.
 
     Padded rows can overwrite only uncommitted slots. Capacity includes a
     private 64-row scratch tail, so even the final short gear stays in bounds.
+    The supplied operation determines aliasing; the AIR frontend is functional,
+    while the native eager receiver writes in place.
     """
     blocks, width, block_size, tile = cache.shape
+    if cache_update is not None:
+        # CacheUpdate consumes the receiver's paged layout directly. Only the
+        # new rows need packing; never flatten/transpose the complete cache.
+        updates = values.reshape(values.shape[1], width, tile).contiguous()
+        if aligned_prefill:
+            # C++ Prefill starts at 0 and advances by 64. The final short
+            # chunk still writes a complete physical gear into scratch slots;
+            # only valid_rows become visible. This call never crosses a page.
+            if updates.shape[0] != block_size:
+                raise ValueError("aligned CacheUpdate prefill requires one complete page")
+            target_block = (positions[:1] // block_size).to(torch.int32)
+            offset = torch.zeros((), dtype=torch.int32, device=positions.device)
+            return cache_update(cache, updates, target_block, offset)
+        # Decode/verify can start at any offset. Use the receiver's supported
+        # single-row calls rather than assuming multi-row cross-page support.
+        # The output dataflow chains the writes before fused attention.
+        for row in range(updates.shape[0]):
+            position = positions[row]
+            target_block = (position // block_size).reshape(1).to(torch.int32)
+            offset = (position % block_size).to(torch.int32)
+            cache = cache_update(cache, updates[row : row + 1], target_block, offset)
+        return cache
+    # Explicit CPU/Tensor reference used by contract tests. Production NPU
+    # factories always supply CacheUpdate and must fail if it is unavailable.
     rows = cache.permute(0, 2, 1, 3).reshape(blocks * block_size, width, tile)
     values = values.reshape(values.shape[1], width, tile)
     rows = copy_cache_rows(rows, 0, positions, values)
@@ -101,9 +135,13 @@ def update_paged(cache: Tensor, values: Tensor, positions: Tensor) -> Tensor:
 class AirTargetAttention(nn.Module):
     """Receiver projections/RoPE/fused attention with explicit KV outputs."""
 
-    def __init__(self, base: nn.Module, operation: Callable, rotary: Callable):
+    def __init__(
+        self, base: nn.Module, operation: Callable, rotary: Callable,
+        *, cache_update: Callable | None = None, aligned_prefill: bool = False,
+    ):
         super().__init__()
         self.base, self.operation, self.apply_rotary = base, operation, rotary
+        self.cache_update, self.aligned_prefill = cache_update, aligned_prefill
 
     def forward(self, x, key_cache, value_cache, positions, mask):
         base = self.base
@@ -119,8 +157,14 @@ class AirTargetAttention(nn.Module):
         query, key = self.apply_rotary(
             query.transpose(1, 2), key.transpose(1, 2), cosine, sine
         )
-        key_cache = update_paged(key_cache, key.transpose(1, 2), positions)
-        value_cache = update_paged(value_cache, value, positions)
+        key_cache = update_paged(
+            key_cache, key.transpose(1, 2), positions,
+            cache_update=self.cache_update, aligned_prefill=self.aligned_prefill,
+        )
+        value_cache = update_paged(
+            value_cache, value, positions,
+            cache_update=self.cache_update, aligned_prefill=self.aligned_prefill,
+        )
         query = query.contiguous()
         query_shape = query.shape
         query_nz = base.transform_nd_2_nz(query).reshape(
@@ -227,6 +271,7 @@ class TargetRowsGraph(nn.Module):
         gdr: Callable,
         attention: Callable,
         rotary: Callable,
+        cache_update: Callable | None = None,
     ):
         super().__init__()
         model = target.dflash_execution_model
@@ -246,7 +291,10 @@ class TargetRowsGraph(nn.Module):
             [
                 AirGdn(layer.linear_attn, gdr)
                 if layer.block_type == "linear_attention"
-                else AirTargetAttention(layer.self_attn, attention, rotary)
+                else AirTargetAttention(
+                    layer.self_attn, attention, rotary,
+                    cache_update=cache_update, aligned_prefill=rows == 64,
+                )
                 for layer in self.body.layers
             ]
         )
@@ -518,6 +566,7 @@ def incremental_graph_specs(
     gdr: Callable,
     attention: Callable,
     rotary: Callable,
+    cache_update: Callable | None = None,
     custom_ops: tuple[CustomOpExportSpec, ...] = (),
     include_ordinary_decode: bool = True,
 ):
@@ -595,6 +644,11 @@ def incremental_graph_specs(
         "attention_export": ATTENTION_EXPORT_POLICY,
         "draft_length_policy": DRAFT_LENGTH_POLICY,
         "single_row_policy": "ordinary_decode1_chunk1; speculative_fallback_verify16_valid1",
+        "target_kv_update": (
+            "CacheUpdate_paged_aligned_prefill_per_row_decode_verify"
+            if cache_update is not None else "functional_scatter_reference"
+        ),
+        "draft_kv_update": "ScatterElements_dense_context",
         "commit_capsules": "internal_to_target_verify_not_external_OM_IO",
     }
     contract["verify_discard_states"] = verify_discard_descriptors(contract)
@@ -609,6 +663,13 @@ def incremental_graph_specs(
                 "outputs": [tensor_spec(n, t) for n, t in zip(outputs, output_tensors)],
             },
         }
+        if ops:
+            meta["custom_op_export_contracts"] = [
+                {"torch_target": op.torch_target, "ge_op_type": op.ge_op_type,
+                 "minimum_occurrences": op.minimum_occurrences,
+                 "preservation": "one registered GE operator; no Tensor decomposition"}
+                for op in ops
+            ]
         if not ops:
             meta.pop("custom_op_export_contract", None)
             meta.pop("custom_op_export_contracts", None)
@@ -663,6 +724,12 @@ def incremental_graph_specs(
             gdr=gdr,
             attention=attention,
             rotary=rotary,
+            cache_update=cache_update,
+        )
+        graph_ops = tuple(
+            replace(op, minimum_occurrences=len(kv_names) * (1 if rows == 64 else rows))
+            if cache_update is not None and op.ge_op_type == "CacheUpdate"
+            else op for op in custom_ops
         )
         add(
             name,
@@ -671,7 +738,7 @@ def incremental_graph_specs(
             ("input_ids", "start_position", "valid_rows", *names),
             out_names,
             out_tensors,
-            custom_ops,
+            graph_ops,
         )
     embedding = (
         target.get_input_embeddings()
