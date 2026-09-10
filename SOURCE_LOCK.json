@@ -149,11 +149,15 @@
     "files": [
       {
         "source_file": "README.md",
-        "source_sha256": "6fceecd3e2bc5b0f4d4535050d04a98f8ca1b952a59e61c0fa6a42e66d9a20bb"
+        "source_sha256": "6f9841e14c1baac976dffcdc3263300398da3edd9f5c7d241d581afb9b3a084d"
       },
       {
         "source_file": "config/gdr_chunk_air_om_factory.example.json",
         "source_sha256": "a1b2ad21b909f0b3d7888f3260f639942b47b7f8464e48e665f9adac81dea05b"
+      },
+      {
+        "source_file": "docs/DFLASH_ARCHITECTURE.md",
+        "source_sha256": "79c849a0f58d8f881cb69913565e0234af8825dada92ea5005661abebb79aa96"
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
@@ -169,7 +173,7 @@
       },
       {
         "source_file": "framework/README.md",
-        "source_sha256": "668dec6dc3ae5eea3be15467f2ca7a7098d7b058b3ed14159757989ce37b4681"
+        "source_sha256": "585e7ca62b78d954ae373a0ae0a46f0bd61f57027eb923d1c0e97fa5883b13fb"
       },
       {
         "source_file": "framework/abi/closed-runtime-baseline-v1.json",

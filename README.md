@@ -25,7 +25,7 @@ Qwen3.5-4B-DFlash checkpoint，以 FP16 执行。
 
 ## 3. OM 划分
 
-| OM | 功能 | 普通模式 | DFlash 模式 |
+| OM | 功能 | 单独普通模式 | 单独 DFlash 模式 |
 |---|---|---|---|
 | `target_prefill.om` | 64 行物理 gear 的 prompt 分块，输出特征和状态 | 加载 | 加载 |
 | `target_decode.om` | 真正的一行 Target decode | 加载 | 不加载 |
@@ -64,7 +64,7 @@ Ascend 310P 性能仍需目标机验证。主机测试不提供真实 OM 产物�
 
 | 文档 | 内容 |
 |---|---|
-| [DFlash 架构](docs/DFLASH_ARCHITECTURE.md) | token、feature、cache、state 与接受/提交语义 |
+| [DFlash 架构](docs/DFLASH_ARCHITECTURE.md) | 为什么能加速、模型结构、四张 OM 的运行流程、状态提交、精度和显存 |
 | [自定义算子](docs/DFLASH_OPERATORS.md) | 必需 ABI、Tensor 实现与性能候选 |
 | [AIR/OM/C++ 接口](docs/QUANT_AIR_OM_FRAMEWORK.md) | factory、manifest、tensor ABI、CLI 与计时范围 |
 | [DFlash 源码索引](models/dflash_v1/README.md) | 命令、调度、Target、Draft、量化与 profiling 文件 |
