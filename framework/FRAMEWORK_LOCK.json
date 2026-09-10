@@ -76,14 +76,14 @@
         "input shape/dtype/device",
         "input.shape[:-1] + [1], float32, input device"
       ],
-      "default_ge_op_type": "RmsNorm",
+      "default_ge_op_type": "AdnRmsNorm",
       "lowering": "one registered GE operator; no Tensor decomposition",
       "preservation_gate": "converter call count must be positive and dynamo.pbtxt GE-node count must cover every converter call",
       "required_operators": [
         {
           "torch_target": "npu.adn_rms_norm.default",
-          "ge_op_type": "RmsNorm",
-          "alternative_ge_op_type": "AdnRmsNorm"
+          "ge_op_type": "AdnRmsNorm",
+          "alternative_ge_op_type": "RmsNorm"
         },
         {
           "torch_target": "npu.npu_dynamic_quant.default",
@@ -183,8 +183,13 @@
     "target_custom_operators": [
       {
         "torch_target": "npu.adn_rms_norm.default",
-        "ge_op_type": "RmsNorm",
-        "alternative_ge_op_type": "AdnRmsNorm"
+        "ge_op_type": "AdnRmsNorm",
+        "alternative_ge_op_type": "RmsNorm",
+        "minimum_air_occurrences": {
+          "target_prefill": 105,
+          "target_decode": 105,
+          "target_verify": 105
+        }
       },
       {
         "torch_target": "npu.npu_dynamic_quant.default",
@@ -223,7 +228,17 @@
         }
       }
     ],
-    "draft_custom_operators": [],
+    "draft_custom_operators": [
+      {
+        "torch_target": "npu.adn_rms_norm.default",
+        "ge_op_type": "AdnRmsNorm",
+        "alternative_ge_op_type": "RmsNorm",
+        "minimum_air_occurrences": {
+          "draft": 32
+        },
+        "precision_policy": "FP32 input/unit gamma; normalize, cast to input dtype, multiply effective weight"
+      }
+    ],
     "draft_length_policy": "runtime proposal_count=K, every attention layer masks block keys after anchor+K, unused output tail zero"
   },
   "profiling": {

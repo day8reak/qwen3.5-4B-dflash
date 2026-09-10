@@ -32,6 +32,9 @@ from qwen35_dflash.ascend310p.quant_factory import AirDFlashOps, _repeat_kv
 from models.dflash_v1.dflash_config import Qwen35DFlashConfig
 from models.dflash_v1.modeling_dflash import DFlashDraftModel, DFlashRMSNorm
 from models.dflash_v1.dflash_ops import TorchDFlashOps
+from rms_norm_test_support import adn_rms_norm_cpu  # noqa: F401
+
+pytestmark = pytest.mark.usefixtures("adn_rms_norm_cpu")
 
 
 @pytest.fixture(autouse=True)

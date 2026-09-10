@@ -49,7 +49,7 @@ Draft 使用 FP16 embedding、LM head 和主体；公开 embedding getter 保留
 | `dtype` | `float16` |
 | `draft_attention_matmul_dtype` | 默认 `float16`：OM Draft 的 QK/PV 均用 FP16 输入；`float32` 用于精度/接受率基线对照 |
 | `device` | 例如 `npu:0` |
-| `adn_rms_norm_ge_op_type` | 默认 `RmsNorm`；也支持已注册的 `AdnRmsNorm` |
+| `adn_rms_norm_ge_op_type` | 默认自定义 `AdnRmsNorm`，用于 Target 和 Draft；仅在环境明确要求时显式选择 `RmsNorm` |
 
 外部输入不能是 symlink；输入 manifest 冻结后不得修改对应内容。导出器在加载模型前检查
 输入 hash 和仓库 `SOURCE_LOCK.json`。物理 KV 容量为 C+64，额外行作为 scratch；
@@ -156,7 +156,7 @@ InferShape/InferDataType 和 ATC 的实际编译结果。ATC 失败时异常附�
 
 | AIR 路径 | PyTorch 前端 | GE 节点与导出处理 |
 |---|---|---|
-| 三个 Target 图 | `npu::adn_rms_norm` | `RmsNorm` 或 `AdnRmsNorm`；按注册类型使用输入名 `x` 或 `self` |
+| 三个 Target 图及 Draft 图 | `npu::adn_rms_norm` | 默认 `AdnRmsNorm`，输入名 `self`；显式选择 `RmsNorm` 时使用 `x` |
 | 三个 Target 图 | `npu::npu_dynamic_quant` | `DynamicQuant`；保留 TorchAir 内置 converter，审计 GE 节点 |
 | 三个 Target 图 | `qwen35_dflash::npu_quant_matmul_v4444` | `QuantBatchMatmulV4444`；专用捕获前端避免覆盖 TorchAir 的量化 matmul converter |
 | 三个 Target 图 | `npu::npu_chunk_gated_delta_rule` | `ChunkGatedDeltaRule`；Meta 覆盖 R=1/16/64，保留两个输出和 FP32 recurrent state |
@@ -188,7 +188,8 @@ Draft 的缓存是 `[B,H,C,D]`，在第 2 维使用 `scatter → ScatterElements
 `index_copy` 相同。它不直接使用 Target 的 paged `CacheUpdate` 接口。
 Draft 的 GQA 在新插入的 group 维使用 `repeat/Tile`，head 顺序为
 `[h0,h0,...,h1,h1,...]`，不重复整个 head 序列。
-Draft 图使用 Tensor 算子。完整前缀工厂按其实际缓存路径声明算子依赖。
+Draft 的 RMSNorm 使用同一个自定义前端，其余计算使用 Tensor 算子。
+完整前缀工厂按其实际缓存路径声明算子依赖。
 本分支的 verify 和 commit 都使用 `ChunkGatedDeltaRule`，不依赖 `GatedDeltaRuleMTP`。
 
 卷积状态窗口使用静态切片加 `stack`，不调用 TorchAir 尚未实现 GE converter 的
@@ -211,6 +212,19 @@ W8A8 的量化 activation/weight 保持 INT8，weight scale 和 per-token scale 
 matmul 输出为 FP16。专用前端仅在工厂启用的 AIR 捕获期间生效。普通 NPU 推理的量化
 调用不变。RMSNorm 的两个输出分别为同 input shape/dtype 的 Tensor，以及
 `[*input.shape[:-1],1] FP32` 的 rstd。
+
+普通 Target 和 DFlash Target 的常规 norm 使用 FP32 输入和 `1 + weight`；
+GDN gated norm 使用 FP32 输入和有效 `weight`，随后乘 `SiLU(gate)`。
+Draft 的 NPU 和 AIR 路径共用归一化实现：FP32 输入、FP32 全 1 gamma 进入
+`adn_rms_norm`，输出先转回输入 dtype，再乘有效 `weight`。
+这保留 `weight * FP16(normalize(FP32(x)))` 的舍入顺序，也不把 Target 的
+`1 + weight` 规则套到 Draft 上。CPU reference 仍使用张量公式；NPU/导出缺少注册时报错。
+
+增量套件按模型结构审计节点下限：标准 32 层 Target 每图为
+`32*2 + 24 + 8*2 + 1 = 105`，6 层 Draft 为 `6*5 + 2 = 32`。
+Draft 的计数包括上下文特征投影和 proposal 两部分；导出图缺少调用会直接失败。
+这些是 AIR 保留检查，OM 的任务数量及耗时以目标机 msprof 为准。
+`factory.json` 显式配置优先于默认值；改变 GE 类型需要重新导出 AIR 并编译 OM。
 
 GDR 的 `effective_length: INT16[1]` 表示本次有效行数。
 Target attention 的三个长度专用输入分别是：

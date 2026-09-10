@@ -256,11 +256,9 @@ class AirDFlashOps:
         ).float()
 
     def rms_norm(self, value: Tensor, weight: Tensor, eps: float) -> Tensor:
-        value_fp32 = value.float()
-        normalized = value_fp32 * torch.rsqrt(
-            value_fp32.square().mean(dim=-1, keepdim=True) + float(eps)
-        )
-        return weight * normalized.to(value.dtype)
+        from models.dflash_v1.dflash_ascend310p_ops import _adn_rms_norm
+
+        return _adn_rms_norm(value, weight, eps)
 
     def linear(self, value: Tensor, weight: Tensor) -> Tensor:
         return F.linear(value, weight)
@@ -456,7 +454,8 @@ def _prepare_quant_export(config: Mapping[str, Any], torchair_module: Any,
         for spec in _target_custom_op_exports(config, incremental=incremental)
     ]
     return {
-        "operators": [{"torch_target": s.spec.torch_target, "torch_schema": s.schema,
+        "operators": [{"torch_target": s.spec.torch_target, "ge_op_type": s.spec.ge_op_type,
+                       "torch_schema": s.schema,
                        "fake_kernel": s.fake_kernel, "converter_policy": s.converter_policy}
                       for s in sessions],
         "ge_prototypes": [
@@ -549,11 +548,14 @@ def create_quant_recompute_graph(
         npu_module = importlib.import_module("torch_npu")
     except ImportError as error:
         raise RuntimeError("torch_npu is required for quant AIR export") from error
-    if _incremental:
-        missing = [name for name in ("npu_chunk_gated_delta_rule", "adn_fused_infer_attention", "npu_cache_update_")
-                   if not callable(getattr(npu_module, name, None))]
-        if missing:
-            raise RuntimeError("incremental AIR export needs receiver NPU operations: " + ", ".join(missing))
+    required_operations = ("adn_rms_norm",) + (
+        ("npu_chunk_gated_delta_rule", "adn_fused_infer_attention", "npu_cache_update_")
+        if _incremental else ()
+    )
+    missing = [name for name in required_operations
+               if not callable(getattr(npu_module, name, None))]
+    if missing:
+        raise RuntimeError("quant AIR export needs receiver NPU operations: " + ", ".join(missing))
 
     from models.dflash_v1.modeling_dflash import DFlashDraftModel
     from models.internal_dflash_bridge import load_qwen35_target, load_qwen35_rollback_target
@@ -612,6 +614,9 @@ def create_quant_recompute_graph(
         "draft_attention_matmul_dtype": draft_attention_matmul_dtype,
         "draft_attention_softmax_dtype": "float32",
         "draft_attention_matmul_result": "cast_to_float32_before_consumers",
+        "rms_norm_torch_op": ADN_RMS_NORM_TORCH_OP,
+        "adn_rms_norm_ge_op_type": custom_op_exports[0].ge_op_type,
+        "draft_rms_norm_policy": "adn_rms_norm_fp32_unit_gamma_then_input_dtype_then_effective_weight",
         "dtype": dtype_name,
         "target_checkpoint_manifest_sha256": locked_inputs["group_sha256"][
             "target_checkpoint"

@@ -293,16 +293,20 @@ config = {
     "max_sequence_length": int(os.environ["MAX_SEQUENCE_LENGTH"]),
     "include_ordinary_decode": True,
     "draft_attention_matmul_dtype": "float16",
-    "dtype": "float16", "device": "npu:0", "adn_rms_norm_ge_op_type": "RmsNorm",
+    "dtype": "float16", "device": "npu:0", "adn_rms_norm_ge_op_type": "AdnRmsNorm",
 }
 (run / "factory.json").write_text(json.dumps(config, indent=2) + "\n")
 PY
 ```
 
 导出前会再次检查外部输入和 `SOURCE_LOCK.json`。冻结输入后不要增加、删除或修改文件。
-`RmsNorm` 必须是目标环境注册的 GE type；自定义包注册的是 `AdnRmsNorm` 时，填写
-`"adn_rms_norm_ge_op_type": "AdnRmsNorm"`。两者的 GE 输入名分别为 `x` 和 `self`，
-导出器按所选类型处理，不接受任意 GE 名称。
+`adn_rms_norm_ge_op_type` 默认填写 `AdnRmsNorm`，对应自定义 GE 算子，输入名为
+`self` 和 `gamma`。普通 Target、DFlash Target 和 Draft 共用这个选择。
+只有环境明确要求 GE `RmsNorm` 时才显式填写 `RmsNorm`，其输入名为 `x` 和 `gamma`。
+PyTorch 调用了 `adn_rms_norm` 并不表示 OM 的 GE 节点一定叫 `AdnRmsNorm`；节点类型
+由这个配置决定。已有 `factory.json` 中的显式值不会被默认值覆盖。
+更改此值后，使用独立、空的 bundle 执行第 8、9 步，再按第 11、12 步验证；
+C++ runner 和输入权重可复用。msprof 的 OP Type 应与所选 GE 类型一致。
 
 `draft_attention_matmul_dtype` 默认 `float16`，控制 OM Draft attention 的 QK 和 PV
 两次矩阵乘：Q/K/V 和 Softmax 概率在进入 MatMul 前转为 FP16，结果转为 FP32；
@@ -339,9 +343,14 @@ TorchDynamo 的捕获顺序；形状相同的多个 KV 状态也必须按张量�
 Draft 的公开输入顺序固定为 `features, start_position, valid_rows, anchor, proposal_count, ...KV states`。
 每个图必须只完成一次输入规范化，并保持公开输入的静态 shape；未知的运行时输入或
 捕获中丢失的公开输入会使导出失败。
-三个 Target 图均检查 `RmsNorm/AdnRmsNorm`、`DynamicQuant`、
+三个 Target 图均检查 `AdnRmsNorm`（或显式选择的 `RmsNorm`）、`DynamicQuant`、
 `QuantBatchMatmulV4444`、`ChunkGatedDeltaRule`、`AdnFusedInferAttention`、`CacheUpdate`，
-以及 `SoftplusV2`。Draft 使用 Tensor 算子，不要求出现 Target 自定义节点。
+以及 `SoftplusV2`。Draft 的 RMSNorm 也使用并审计 `AdnRmsNorm`，其余计算使用
+Tensor 算子，不要求出现 GDR 等 Target 专用节点。
+标准 4B Target 的 prefill、decode、verify 图各至少保留 105 个 RMSNorm 节点，
+6 层 Draft 图至少保留 32 个；数量按加载的模型层数计算并写入导出合同。
+Draft 用 FP32 输入和全 1 的 gamma 调用自定义 RMSNorm，将归一化结果转回 FP16，
+再乘 checkpoint 中的有效权重；保留其归一化后先舍入、再缩放的顺序。
 量化 matmul 在 AIR 捕获时使用专用前端，保留 FP32 weight/per-token scale 和 FP16 输出；
 普通 NPU 推理仍调用同一套 receiver 量化接口。
 每张 Target 图的 QuantBatchMatmulV4444 节点数不能少于加载器记录的

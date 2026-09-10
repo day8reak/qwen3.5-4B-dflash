@@ -106,6 +106,13 @@ flowchart TB
 当前 block 的 hidden 则顺序经过 6 个 Draft block。两路数据在 attention 中汇合。
 持久缓存只接收已提交 Target 特征产生的 K/V；当前 MASK block 的临时 K/V 不保留到下一轮。
 
+普通 Target、DFlash Target 和 Draft 都使用自定义 RMSNorm；AIR 默认映射到
+`AdnRmsNorm`，把求均方、开平方倒数和归一化保留在一个算子中。
+Target 常规 norm 的缩放系数是 `1 + weight`；Draft 使用有效 `weight`，并保持
+“FP32 归一化 → 转回 FP16 → 乘权重”的顺序。两者不能互换。
+标准增量套件中，每张 Target AIR 应保留 105 个 RMSNorm 节点，Draft 为 32 个。
+这是导出时的完整性检查；实际性能由目标机分阶段 msprof 和整轮时延确定。
+
 ## 3. 为什么只需要四张 OM
 
 同一套部署共有四张图，状态通过显式输入/输出在设备上衔接。

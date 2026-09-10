@@ -194,8 +194,10 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
         assert all(node.meta["val"].dtype == torch.int32 for node in scans)
         calls = [node for node in nodes if str(node.target) == "npu.npu_chunk_gated_delta_rule.default"]
         if name == "draft":
-            assert audit == [] and not calls
-            assert "custom_op_export_contracts" not in graph["metadata"]
+            assert len(audit) == 1 and not calls
+            assert audit[0]["torch_target"] == "npu.adn_rms_norm.default"
+            assert audit[0]["ge_op_type"] == "AdnRmsNorm"
+            assert audit[0]["minimum_occurrences"] == audit[0]["ge_node_occurrences"] == 12
             assert graph["standard_op_overrides"] == []
             # Each of the two fixture layers repeats both K and V heads.
             head_repeats = [node for node in nodes if str(node.target) == "aten.repeat.default"
@@ -203,6 +205,8 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
             assert len(head_repeats) == 4
         else:
             assert len(audit) == 6
+            rms = next(item for item in audit if item["ge_op_type"] == "AdnRmsNorm")
+            assert rms["minimum_occurrences"] == rms["ge_node_occurrences"] == 8
             cache_audit = next(item for item in audit if item["ge_op_type"] == "CacheUpdate")
             assert cache_audit["minimum_occurrences"] == expected_writes
             assert len(calls) == (2 if name == "target_verify" else 1)
@@ -1548,7 +1552,7 @@ def test_all_target_custom_ops_have_exact_meta_and_lowering_policy() -> None:
     )
     assert rms_call[1] == ()
     assert rms_call[2] == {
-        "inputs": {"x": rms_input, "gamma": rms_gamma},
+        "inputs": {"self": rms_input, "gamma": rms_gamma},
         "outputs": ["y", "rstd"],
         "attrs": {"epsilon": ("float", 1e-6)},
     }

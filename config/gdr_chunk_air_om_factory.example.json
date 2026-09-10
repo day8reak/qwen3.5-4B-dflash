@@ -8,5 +8,5 @@
   "include_ordinary_decode": true,
   "dtype": "float16",
   "device": "npu:0",
-  "adn_rms_norm_ge_op_type": "RmsNorm"
+  "adn_rms_norm_ge_op_type": "AdnRmsNorm"
 }

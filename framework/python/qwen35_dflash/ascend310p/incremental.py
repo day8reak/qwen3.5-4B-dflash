@@ -673,6 +673,7 @@ def incremental_graph_specs(
         if not ops:
             meta.pop("custom_op_export_contract", None)
             meta.pop("custom_op_export_contracts", None)
+        if not ops or name == "draft":
             meta.pop("standard_op_export_contracts", None)
         specs.append(
             AirGraphSpec(
@@ -726,7 +727,12 @@ def incremental_graph_specs(
             rotary=rotary,
             cache_update=cache_update,
         )
+        # Every layer calls input/post norm, plus GDN gated norm or attention
+        # Q/K norms; all gears also call the final norm (105 for the 4B Target).
+        norm_count = 2 * len(layers) + len(gdn_names) // 2 + len(kv_names) + 1
         graph_ops = tuple(
+            replace(op, minimum_occurrences=norm_count)
+            if op.torch_op == "npu::adn_rms_norm" else
             replace(op, minimum_occurrences=len(kv_names) * (1 if rows == 64 else rows))
             if cache_update is not None and op.ge_op_type == "CacheUpdate"
             else op for op in custom_ops
@@ -746,6 +752,12 @@ def incremental_graph_specs(
     features = torch.zeros(
         (1, 64, draft.config.feature_size), dtype=torch.float16, device=device
     )
+    # Context projection: one norm + one K norm per layer. Proposal: four
+    # norms per layer + final norm. Both branches are live in the single OM.
+    draft_ops = tuple(
+        replace(op, minimum_occurrences=5 * len(draft.layers) + 2)
+        for op in custom_ops if op.torch_op == "npu::adn_rms_norm"
+    )
     add(
         "draft",
         DraftGraph(draft, embedding, target.get_output_embeddings()),
@@ -754,5 +766,6 @@ def incremental_graph_specs(
         ("features", "start_position", "valid_rows", "anchor", "proposal_count", *draft_names),
         ("draft_top1", *draft_names),
         (torch.zeros((1, 15), dtype=torch.long, device=device), *draft_state),
+        draft_ops,
     )
     return tuple(specs)

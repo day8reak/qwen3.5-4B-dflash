@@ -40,6 +40,9 @@ from qwen35_dflash.ascend310p.quant_factory import (
 from qwen35_dflash.ascend310p.utils import sha256_file
 from qwen35_dflash.ascend310p.workflow import DEFAULT_GRAPH_FACTORY
 from models.dflash_v1 import dflash_ascend310p_ops as golden_ops
+from rms_norm_test_support import adn_rms_norm_cpu  # noqa: F401
+
+pytestmark = pytest.mark.usefixtures("adn_rms_norm_cpu")
 
 
 _TEST_OPERATOR_LIBRARIES: list[torch.library.Library] = []
@@ -107,7 +110,7 @@ class _FakeTorchAir:
         root = Path(export_path)
         (root / f"{export_name}.air").write_bytes(b"air")
         (root / "dynamo.pbtxt").write_text(
-            'op {\n  name: "rms"\n  type: "RmsNorm"\n}\n',
+            'op {\n  name: "rms"\n  type: "' + self.ge.calls[-1][0] + '"\n}\n',
             encoding="utf-8",
         )
 
@@ -278,10 +281,10 @@ def test_air_export_audits_retained_adn_rms_norm(
     assert result["schema_version"] == 2
     assert audit["status"] == "PASS"
     assert audit["torch_target"] == "npu.adn_rms_norm.default"
-    assert audit["ge_op_type"] == "RmsNorm"
+    assert audit["ge_op_type"] == "AdnRmsNorm"
     assert audit["converter_calls"] == 1
     assert audit["ge_node_occurrences"] == 1
-    assert torchair.ge.calls[0][0] == "RmsNorm"
+    assert torchair.ge.calls[0][0] == "AdnRmsNorm"
     assert any(
         item["path"].endswith("dynamo.pbtxt")
         for item in graph["payload_files"]
@@ -760,7 +763,9 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
             else real_torch_device(value)
         ),
     )
-    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    fake_npu = ModuleType("torch_npu")
+    fake_npu.adn_rms_norm = torch.ops.npu.adn_rms_norm.default
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_npu)
     specs = create_quant_recompute_graph(
         {
             "target_dir": str(target_dir),
@@ -792,7 +797,7 @@ def test_quant_factory_builds_graph_from_quant_branch_loader(
     assert spec.metadata["target_checkpoint_manifest_sha256"]
     assert len(spec.custom_ops) == 7
     assert spec.custom_ops[0].torch_target == "npu.adn_rms_norm.default"
-    assert spec.custom_ops[0].ge_op_type == "RmsNorm"
+    assert spec.custom_ops[0].ge_op_type == "AdnRmsNorm"
     assert {item.torch_target for item in spec.custom_ops} == {
         "npu.adn_rms_norm.default", "npu.npu_dynamic_quant.default",
         "qwen35_dflash.npu_quant_matmul_v4444.default",

@@ -1,8 +1,8 @@
 """Correctness-first DFlash V1 primitives for an Ascend 310P overlay.
 
 The public functions in this module intentionally match :class:`DFlashOps`.
-They are a decomposed PyTorch candidate for replacing the six internal
-operators while bringing up the complete V1 flow.  In particular, attention
+RMSNorm uses the receiver AdnRmsNorm on NPU; CPU remains a decomposed reference.
+Other operations use device Tensor computations. In particular, attention
 does not call SDPA or a flash-attention implementation: it executes QK matmul,
 boolean masking, FP32 softmax, and probability/value matmul explicitly.
 
@@ -121,6 +121,26 @@ def _repeat_kv(states: Tensor, repetitions: int) -> Tensor:
     return expanded.reshape(batch, heads * repetitions, sequence, head_dim)
 
 
+def _adn_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    """Shared native/export lowering, preserving Draft's cast-before-scale.
+
+    The receiver multiplies gamma inside its FP32 result. Using the checkpoint
+    weight there would move Draft's FP16 rounding boundary. Normalize with unit
+    gamma, cast, then apply the stored effective scale (not 1 + weight).
+    """
+    try:
+        operation = torch.ops.npu.adn_rms_norm.default
+    except AttributeError as error:
+        raise RuntimeError(
+            "Draft requires the receiver npu::adn_rms_norm; load its torch_npu "
+            "registration before inference/export. No NPU Tensor fallback is used."
+        ) from error
+    normalized = operation(
+        x.float(), torch.ones_like(weight, dtype=torch.float32), float(eps),
+    )[0]
+    return weight * normalized.to(dtype=x.dtype)
+
+
 def rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     """Apply the checkpoint's RMSNorm precision boundary.
 
@@ -146,11 +166,15 @@ def rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     _require_finite("rms_norm x", x)
     _require_finite("rms_norm weight", weight)
 
-    x_fp32 = x.float()
-    normalized = x_fp32 * torch.rsqrt(
-        x_fp32.square().mean(dim=-1, keepdim=True) + eps_value
-    )
-    output = weight * normalized.to(dtype=x.dtype)
+    if x.device.type == "npu":
+        output = _adn_rms_norm(x, weight, eps_value)
+    else:
+        # CPU reference/simulation only; the NPU branch never falls back here.
+        x_fp32 = x.float()
+        normalized = x_fp32 * torch.rsqrt(
+            x_fp32.square().mean(dim=-1, keepdim=True) + eps_value
+        )
+        output = weight * normalized.to(dtype=x.dtype)
     return _checked_output("rms_norm", output, x.dtype)
 
 

@@ -32,6 +32,10 @@ qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_graphs
 DFlash 部署需要 3 个 OM；加入普通模式对照后共 4 个。C++ 按模式加载所需模型，
 持久保存状态 buffer，并核对 manifest、OM hash 和有序 tensor ABI。
 
+Target 和 Draft 的 RMSNorm 默认导出为自定义 `AdnRmsNorm`；标准 4B 的三张
+Target AIR 各检查至少 105 个节点，Draft 检查 32 个。已有 factory 配置若显式
+选择 `RmsNorm`，需改为 `AdnRmsNorm` 后重新导出 AIR、编译 OM，才能使用这个 GE 类型。
+
 OM Draft 的 QK/PV 矩阵乘默认使用 FP16 输入，缩放、Mask、Softmax 保持 FP32。
 `factory.json` 的 `draft_attention_matmul_dtype` 可设为 `float32` 导出对照组；
 配置变更需要重新导出 AIR 和编译 OM。逐轮 proposal 和接受率允许随精度变化，
@@ -50,7 +54,7 @@ OM Draft 的 QK/PV 矩阵乘默认使用 FP16 输入，缩放、Mask、Softmax �
 `all` 在一个 C++ 进程中为各阶段分别创建一次采集窗口。全部命令、参数和报告路径均在
 [完整手册](../docs/GDR_CHUNK_AIR_OM.md)中。
 每阶段自动生成算子类型汇总、单任务明细和慢算子排序，FP16/FP32 输入分开统计，
-用于检查 CacheUpdate、GDR、矩阵乘耗时；Python NPU 的 wrapper 同样提供这些报告。
+用于检查 AdnRmsNorm、CacheUpdate、GDR、矩阵乘耗时；Python NPU 的 wrapper 同样提供这些报告。
 
 `infer-cpp --trace-rounds` 记录每轮 proposal、Target 验证、接受前缀和实际输出，
 `--eos-token-id` 可对齐 NPU 的 EOS 策略。

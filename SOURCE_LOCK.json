@@ -100,7 +100,7 @@
     "hiai_runtime_sha256": "46b95a67e2cb74b98e6d3964153fee31b5134b2c27a316c991bc83f41d120d4a",
     "hiai_runtime_policy": "legacy ModelOutput sidecar compatibility only; direct HIAI Tensor/tuple source must not import it",
     "ascend_ops_file": "models/dflash_v1/dflash_ascend310p_ops.py",
-    "ascend_ops_sha256": "c75d7ffaba6cbaca46582be8eaa966c4d30798b5759e0af24dd56bdd3be22e8a",
+    "ascend_ops_sha256": "6fa99587a9131ad30d418b046b1519d845476257a8d321c4a4d37b55a8da18e6",
     "target_quant_contract_file": "models/dflash_v1/target_quant.py",
     "target_quant_contract_sha256": "5a0b6d6158eb1f492510d52ec50de588e5b77b055e9f185215a8702f13615c45",
     "original_quant_file": "models/dflash_v1/original_quant.py",
@@ -140,7 +140,7 @@
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "b5fdd64b1eaea44b3f53452bc260cf62de53ca38b1fcd8699bf4f9e358d99c76",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "789f3b2a108c6b52272dcd670ee1e0fab3b9b4bee2f6c61f62e8a6a4296dd973",
+    "documentation_sha256": "d6766fcf39a58535b3f15bab016cbd8f5ab0530126b546ecf9a3cfc56f3d4194",
     "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks and rollback verify/accepted+1 commit uses two original-GDR chunk calls; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback; native msprof dynamic CLI single-stage and all-stage diagnostics with one loaded application, independent fresh-state warmups and one acknowledged window per stage; verify collects the first original chunk GDR pass, accept-commit includes the mandatory accepted+1 second GDR pass even at zero acceptance, and decode-round collects both; per-window GDR verify/commit layer counters and nonempty operator exports are required; separate raw directories and synchronized timing CSV; no pyACL and no formal latency or strict-greedy accuracy claim from stage diagnostics; ordinary Python and C++ prefill/decode/all windows; C++ DFlash prefill/draft/fused-verify/all windows; native C++ socket barriers and standard-library Python controller; actual graph-call counts checked; no device-performance claim from host fixtures; shared per-stage operator type/task reports grouped by input/output dtype, device/model and original CSV; general OM profiling entry prepares a fresh mode-specific plan from the selected deployment manifest"
   },
   "incremental_om_framework": {
@@ -153,27 +153,27 @@
       },
       {
         "source_file": "config/gdr_chunk_air_om_factory.example.json",
-        "source_sha256": "a1b2ad21b909f0b3d7888f3260f639942b47b7f8464e48e665f9adac81dea05b"
+        "source_sha256": "85b3b72909e6227dfa5f4581aed26dd828117b43a0500f0f6a042164932e4ab2"
       },
       {
         "source_file": "docs/DFLASH_ARCHITECTURE.md",
-        "source_sha256": "30021763c3eff3c8173a7e44c23a855b06c5ad2738a8e71b77d17372c55f6962"
+        "source_sha256": "a810e3e2385606e6a5604e4a3a0be18a8ca56da1a85d9252540d3a557fab3573"
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "cdbc87646620991d235a98cdf17adc6aebe3004dfb9c6f8158f2b7b2aeb5889b"
+        "source_sha256": "f29020115b6c87041c0c1587c464a58db6b452edb9f4f002c22e48dfa8755d76"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "0eefb5dde36f8157638ce2331b105beadeca57cc846c72bbce3a218aaf45dda5"
+        "source_sha256": "2e7ebc2dea8b9d09b73d0f90718930c9c23df9581708456d03f0d45884508e9a"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
-        "source_sha256": "ee053a01221e1c9fc5d049d0effb7d6d3325c1b0ab021a5709b822763289550d"
+        "source_sha256": "558c639aef2c3fb2b0fb8e8df5f2d1ac52900cf685e5197f0f3eaf4a5b70e133"
       },
       {
         "source_file": "framework/README.md",
-        "source_sha256": "6ab8194a841e22db77d1e6335a1e5ba335019f1cbbf6b581944baf17e11218b7"
+        "source_sha256": "887c0ee6a67b102d881f718a2a3ce3d393b3ad5af0f0a812e2540cfb3690ff1f"
       },
       {
         "source_file": "framework/abi/closed-runtime-baseline-v1.json",
@@ -225,7 +225,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/custom_op_export.py",
-        "source_sha256": "913d49885bb3fac921a2a7ce854bbafbb7ca9b1d2d66a839967f9632e6eab8c1"
+        "source_sha256": "403e9e92253cd1299f02d9f347e29feb086fa72569a1ada4741cd2ec6f5b608a"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/exporter.py",
@@ -237,7 +237,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/incremental.py",
-        "source_sha256": "62265fdc3f8482d73c9d690680e7f7ddf375b0d436d50974b2315a01ac3a674d"
+        "source_sha256": "36e295ed60c0164f73cc0ab6a7a286f927f125361ad6575deb7d06b85fc17a33"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/incremental_plan.py",
@@ -253,7 +253,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/quant_factory.py",
-        "source_sha256": "508ce333323bddd91c5b65f8fd8b840d7fc5fc9862c67f3469f33ef4ae5a35e2"
+        "source_sha256": "7de1e665fa64f32ea4e5bcf635d43ef702e93815661e442ff3c83245eb6d6a43"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/recompute_backend.py",
@@ -357,11 +357,11 @@
       },
       {
         "source_file": "tests/test_custom_op_export.py",
-        "source_sha256": "91861b4365459ad90c4459dc8c894e2a8e150ae629bea21ff3aea76b93db1214"
+        "source_sha256": "ea65b630cf27af9341ccf810c046719597c287f3f596daf5b56be4bdff96f12d"
       },
       {
         "source_file": "tests/test_incremental_air_om.py",
-        "source_sha256": "f90b6d022132ba53ca2dcef3fff26bba5d309b2aab56c065216f0520626c153c"
+        "source_sha256": "c7db45fc36a93c8f8ccb60837271e24c92d24330f8b0ad920ab41dd2bb80d515"
       },
       {
         "source_file": "tests/test_msprof_stage_script.py",
@@ -373,7 +373,7 @@
       },
       {
         "source_file": "tests/test_quant_air_om_framework.py",
-        "source_sha256": "12519cf71fc5d68608fb7eefdaa424ab37e1e622128b46773b8dc2d783e47594"
+        "source_sha256": "20bb238a793f971691577688d0708adb28f15dbe78f002ecb653b9a76de1a527"
       },
       {
         "source_file": "tests/test_runtime_input_export.py",
@@ -414,6 +414,14 @@
       {
         "source_file": "models/dflash_v1/msprof_summary.py",
         "source_sha256": "8addd6f898f099a0989038a665164fcc095f1425782dd15ec60b041db30c9b7f"
+      },
+      {
+        "source_file": "tests/rms_norm_test_support.py",
+        "source_sha256": "807f4c7797065c0043c369d3ed00d6f1f9ffa528db710c45235446fe09fcbc2e"
+      },
+      {
+        "source_file": "tests/test_dflash_rms_norm.py",
+        "source_sha256": "281096cd106be0d7ee5ddf3cb007bbea59bd51a7bbb3741d5e1096c40c275d2b"
       }
     ]
   }

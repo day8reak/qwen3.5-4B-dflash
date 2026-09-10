@@ -61,7 +61,7 @@ print("device:", torch.npu.get_device_name(0))
 PY
 ```
 
-按自定义算子包的安装说明完成注册后，检查 Target 所需接口：
+按自定义算子包的安装说明完成注册后，检查 Target 和 Draft 所需接口：
 
 ```bash
 "$MODEL_PYTHON" -B - <<'PY'
@@ -72,9 +72,14 @@ required = (
 )
 missing = [name for name in required if not callable(getattr(torch_npu, name, None))]
 assert not missing, f"缺少 NPU 算子: {missing}"
-print("Target operator symbols: PASS")
+print("Target/Draft operator symbols: PASS")
 PY
 ```
+
+普通 Target 和 DFlash Target 的 norm 均调用 `adn_rms_norm`，Draft 的 NPU 路径同样调用它。
+Draft 保留 FP32 归一化、转回 FP16 后再乘有效权重的顺序；CPU reference 使用张量公式。
+缺少自定义注册时，NPU 路径报错，不自动回退。AIR/OM 的 GE 节点类型由
+`factory.json` 的 `adn_rms_norm_ge_op_type` 决定，默认 `AdnRmsNorm`。
 
 `npu_chunk_gated_delta_rule` 必须接受 `effective_length: INT16[B]`，含义是本次调用的有效行数。
 接口形式为：
