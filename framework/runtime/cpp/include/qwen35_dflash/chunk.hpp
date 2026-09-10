@@ -71,7 +71,7 @@ class AclChunkExecutor final : public ChunkExecutor {
   std::map<std::string, std::string> DraftInputHashes(std::int64_t anchor,
                                                     std::size_t proposal_count);
   // Temporary diagnostic: frozen inputs, no Draft output publication, no msprof.
-  // Returns {stable_valid_tokens_and_readonly_inputs, JSON report}.
+  // Returns {stable_valid_tokens_and_logical_KV_and_readonly_inputs, JSON report}.
   std::pair<bool, std::string> DebugDraftReplay(
       const std::vector<std::int64_t>& prompt, std::int64_t pad,
       std::size_t proposal_count, std::size_t repetitions,

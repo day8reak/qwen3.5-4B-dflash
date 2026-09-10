@@ -915,13 +915,14 @@ ACL 执行错误则立即退出并保留已有 trace 和日志，不发布成功
 | token 相同、`full_output_hash_mismatch_iterations` 非零 | 检查 KV 输出；完整 hash 包含物理填充区，不能直接等同有效缓存错误 |
 | 全部通过 | 本次扰动下未复现，保留原故障为待定位，不能宣布修复 |
 
-`PASS_REPLAY_CHECKS` 只表示有效 token 重复一致、恢复后的输入正确且调用未改写输入；
-完整输出字节一致性另外报告。`distinct_workspace_policies_exercised=false` 表示没有完成
+`PASS_REPLAY_CHECKS` 表示有效 token 和逻辑 KV 重复一致、恢复后的输入正确且调用未改写输入；
+物理填充区的变化另外报告。`distinct_workspace_policies_exercised=false` 表示没有完成
 真正的共享/独立对照，例如工作内存查询失败导致共享侧回退。主机 fake ACL 报告明确标记
 `fake_acl=true`，不能作为 NPU 证据。
 
-对照还检查两个进程的参考候选是否一致（`reference_tokens_match_across_processes`）；
-即使各自重复稳定，只要同一快照在两个进程输出不同，对照仍返回失败。
+对照还检查两个进程的参考候选（`reference_tokens_match_across_processes`）和有效 KV
+（`reference_valid_kv_match_across_processes`）是否一致；即使各自重复稳定，
+只要这两项有一项不同，对照仍返回失败。完整输出 hash 另外保留，不把填充字节当作有效缓存。
 
 只跑一个内存策略可用 `--workspace shared` 或 `private`；复用已有快照加
 `--inputs "<上一份报告的 input_directory>"`。直接调用 runner 的临时参数为
@@ -935,6 +936,86 @@ ACL 执行错误则立即退出并保留已有 trace 和日志，不发布成功
 `--deterministic=1`；默认是 0。这需要重新编译受测 OM，并记录新 hash，
 不能靠 C++ 环境变量宣称旧 OM 已确定。该选项是否覆盖实际出问题的算子仍需设备实测。
 仅降低到 FP16 不足以解释同输入为什么变化，不能在没有中间结果证据时认定精度是根因。
+
+### 15.2 共享和独立工作内存都复现：按 KV 行定位
+
+2026-09-10 用户返回的真实设备回放中，固定输入的检查结果如下。本地未执行该 NPU 实验。
+
+| 工作内存 | 只重复 Draft | Prefill 与 Draft 交替 | 输入恢复/执行后变化 |
+|---|---|---|---|
+| 共享 | 20 次中 11 次候选不同 | 20 次中 5 次候选不同 | 均为 0 |
+| 各 OM 独立 | 20 次中 10 次候选不同 | 20 次中 10 次候选不同 | 均为 0 |
+
+这说明 msprof、跨图交替以及跨模型共享工作内存都不是复现所必需的条件，
+不能据此排除 OM 内部中间张量、workspace、权重或短暂写入等问题。
+两个进程的参考候选相同，但 `d0_value` 等输出的完整 hash 不同。
+`full_output_hash_mismatch_iterations=19` 表示 19 次调用中至少一个输出不同，
+不表示每一个 KV tensor 都变化 19 次。
+
+源码中的 context KV 路径为：
+
+```text
+features → fc → hidden_norm → 各层 K/V 投影 → K norm/RoPE（仅 K）→ ScatterElements → dN_key/value
+```
+
+六层 context K/V 投影使用同一份 projected features；不是逐层 attention 的输出。
+提议阶段的 QK/PV BatchMatMul 不在这些 context KV 的上游数据依赖上。
+因此，若有效 KV 重复变化，应先检查这条投影和写出路径，同时保留内存破坏的可能；
+单凭完整 hash 不能认定 V 投影、RMSNorm、ScatterElements 或某个计算精度就是根因。
+
+现在回放会把每个 `[B,H,S,D]` FP16 KV 输出拆成三个行区间。对于当前
+`start_position=0, valid_rows=17` 的案例，源码为 512 的逻辑容量多留 64 行，
+Draft KV 实际 `S=576`（用户的全零输入 hash 与 `[1,8,576,128]` FP16 对应）：
+
+| 报告区间 | 行范围，左闭右开 | 含义 |
+|---|---|---|
+| `valid_prefix` | `[0,17)` | 应供后续 Draft 读取的逻辑缓存；变化会使回放失败 |
+| `written_padding` | `[17,64)` | 固定 64 行图实际写出、但不在本轮逻辑前缀内的部分 |
+| `untouched_tail` | `[64,576)` | Scatter 写入区以外，应该保留输入字节的部分 |
+
+物理长度始终读取 OM tensor ABI，不能用逻辑容量代替。所有区间都逐个 batch/head 取 `S` 维切片。不能把整个 buffer 的前
+`valid_rows * heads * head_dim` 个元素当作有效区。长 prompt 的 `valid_prefix`
+还包含已提交的旧前缀；分析另外检查 `[0,start_position)` 和未写尾部是否保持原输入。
+
+只需重新编译 C++ runner，继续复用当前 OM 和旧输入快照。构建使用新目录，
+然后将 `DRAFT_INPUT_SNAPSHOT` 指向上一份报告的 `input_directory`：
+
+```bash
+"$MODEL_PYTHON" -B -m qwen35_dflash.ascend310p build-cpp \
+  --build-dir "$AI_RUN_DIR/build/cpp-draft-kv-audit" \
+  --ascendcl-root "$CANN_ROOT" \
+  --output "$AI_RUN_DIR/reports/cpp-build-draft-kv-audit.json"
+export CPP_RUNNER="$AI_RUN_DIR/build/cpp-draft-kv-audit/qwen35_dflash_acl_runner"
+
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/debug_draft_om.py" \
+  --run-dir "$AI_RUN_DIR" --runner "$CPP_RUNNER" \
+  --deployment-manifest "$DEPLOYMENT_MANIFEST" \
+  --inputs "$DRAFT_INPUT_SNAPSHOT" --workspace private \
+  --repetitions 20 --device-id 0 --max-draft-tokens 15
+```
+
+已经确认独立工作内存也复现，本轮可以只跑 `private`。工具自动生成
+`private-kv-analysis.json`，无需再跑 msprof。重点查看：
+
+- `phase_counts`：各 tensor/区间的变化次数，以及有效 KV 变化次数。
+- `examples[].comparison`：第一个差异的 `[batch,head,row,channel]` 坐标、
+  FP16 原始位值、变化元素数、最大/平均绝对误差和最大 FP16 ULP 距离。
+- `reference_outside_write_vs_input` 和 `examples[].outside_write_vs_input`：
+  原输入的旧前缀和未写尾部是否被破坏，包括第 0 次参考输出。
+
+`<report>.replay/outputs/reference/` 保存参考输出，`outputs/differences/` 保存
+每个 KV tensor/区间的第一个变化样本，同一次调用的样本文件复用。
+最多保留每个 KV tensor 三份变化样本及一份参考，而不是每轮保存整个输出。
+数值误差是这些样本的误差，不是所有调用的最大值；非有限数单独计数，不参与误差平均。
+读取二进制前验证 SHA256、形状和区间，结果可以在主机上重新分析：
+
+```bash
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/analyze_draft_replay.py" "$DRAFT_REPLAY_REPORT"
+```
+
+旧报告没有输出二进制，无法从 hash 还原数值，必须用新 runner 再回放一次。
+此改动只增加诊断，不修改现有 OM、模型精度、正常生成或 msprof 的检查门槛，
+也不宣称已修复当前设备上的不稳定问题。
 
 ## 16. 单模式运行和部署容量
 

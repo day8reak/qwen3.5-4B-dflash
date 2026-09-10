@@ -113,6 +113,15 @@ def replay(args: argparse.Namespace) -> tuple[Path, bool]:
         row = {"requested_workspace": policy, "exit_code": proc.returncode, "report": str(report)}
         if report.is_file():
             data = json.loads(report.read_text())
+            from analyze_draft_replay import analyze
+
+            analysis_path = output / f"{policy}-kv-analysis.json"
+            analysis_path.write_text(json.dumps(analyze(report), indent=2, allow_nan=False) + "\n")
+            row["kv_analysis"] = str(analysis_path)
+            row["reference_valid_kv_sha256"] = {
+                name: regions["valid_prefix"]
+                for name, regions in data["kv_output_audit"]["reference_region_sha256"].items()
+            }
             row.update({key: data[key] for key in (
                 "status", "actual_workspace_policy", "snapshot_sha256", "phases", "fake_acl",
                 "reference_token_ids", "reference_output_sha256",
@@ -120,6 +129,7 @@ def replay(args: argparse.Namespace) -> tuple[Path, bool]:
             if inputs is None:
                 inputs = Path(data["input_directory"])
             print(f"{policy}: {data['status']}; trace={data['trace']}", flush=True)
+            print(f"KV row/element analysis: {analysis_path}", flush=True)
         else:
             row["status"] = "ERROR"
             print(f"{policy}: runner failed before report; inspect {output / (policy + '.log')}", flush=True)
@@ -137,8 +147,10 @@ def replay(args: argparse.Namespace) -> tuple[Path, bool]:
                              if paired else None)
     same_reference_outputs = (results[0]["reference_output_sha256"] == results[1]["reference_output_sha256"]
                               if paired else None)
+    same_reference_kv = (results[0]["reference_valid_kv_sha256"] == results[1]["reference_valid_kv_sha256"]
+                         if paired else None)
     if args.workspace == "both":
-        ok = ok and paired and identical_inputs and distinct_policies and same_reference_tokens
+        ok = ok and paired and identical_inputs and distinct_policies and same_reference_tokens and same_reference_kv
     summary = {
         "schema_version": 1, "status": "PASS_REPLAY_CHECKS" if ok else "FAIL_OR_INCOMPLETE",
         "formal_latency_evidence": False, "ordinary_parity": "NOT_RUN", "runs": results,
@@ -146,8 +158,9 @@ def replay(args: argparse.Namespace) -> tuple[Path, bool]:
         "distinct_workspace_policies_exercised": distinct_policies,
         "reference_tokens_match_across_processes": same_reference_tokens,
         "reference_full_output_bytes_match_across_processes": same_reference_outputs,
+        "reference_valid_kv_match_across_processes": same_reference_kv,
         "note": "Input readback/synchronization changes timing. PASS does not rule out the original defect. "
-                "Full output hashes include padding and are reported separately from valid tokens.",
+                "Logical KV and physical padding are compared separately; numerical examples are in kv_analysis.",
     }
     (output / "comparison.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(f"Comparison: {output / 'comparison.json'}", flush=True)

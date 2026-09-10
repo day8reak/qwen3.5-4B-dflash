@@ -7,11 +7,13 @@ import subprocess
 import sys
 
 import pytest
+import numpy as np
 
 from test_incremental_air_om import chunk_bundle, assert_cpp_resources_released  # noqa: F401
 from rms_norm_test_support import adn_rms_norm_cpu  # noqa: F401
 from qwen35_dflash.ascend310p.incremental_plan import write_incremental_plan
 from qwen35_dflash.ascend310p.utils import sha256_file
+from tools.analyze_draft_replay import analyze, metrics
 
 SOURCE = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.usefixtures("adn_rms_norm_cpu")
@@ -67,6 +69,7 @@ def test_replay_freezes_boundary_never_commits_outputs(replay_case, policy, prom
         assert row["status"] == "PASS" and row["inputs_unchanged"]
         assert row["input_sha256"] == row["input_after_sha256"] == data["snapshot_sha256"]
         assert row["valid_tokens_match"] and row["all_output_bytes_match"]
+        assert row["valid_kv_matches"]
         assert len(row["output_token_ids"]) == count
         assert row["first_token_difference"] is None and not row["profiled"]
         for name, address in row["input_device_addresses"].items():
@@ -77,6 +80,15 @@ def test_replay_freezes_boundary_never_commits_outputs(replay_case, policy, prom
     snapshot = Path(data["input_directory"])
     for name, digest in data["snapshot_sha256"].items():
         assert hashlib.sha256((snapshot / (name + ".bin")).read_bytes()).hexdigest() == digest
+    audit = data["kv_output_audit"]
+    assert audit["layout"] == "B,H,S,D" and audit["saved_differences"] == []
+    assert audit["row_regions"]["valid_prefix"] == [0, prompt_count]
+    # This fixture's request capacity is 128; physical KV has an extra 64 rows.
+    assert audit["row_regions"]["untouched_tail"][1] == 192
+    report = snapshot.parent.with_suffix("")
+    analysis = analyze(report)
+    assert analysis["examples"] == [] and analysis["fake_acl"]
+    assert all(phase["valid_kv_mismatch_iterations"] == 0 for phase in analysis["phase_counts"])
     calls = [json.loads(line) for line in events.read_text().splitlines()]
     assert not any(row[1] or row[0] in ("target_verify", "target_decode") for row in calls)
     # Interleaved setup runs Prefill again; a long prompt also initializes old Draft KV.
@@ -88,14 +100,17 @@ def test_replay_freezes_boundary_never_commits_outputs(replay_case, policy, prom
 @pytest.mark.parametrize("variation,field", [
     ("draft_rejected_tail", "token_mismatch_iterations"),
     ("draft_input_mutation", "input_mutation_iterations"),
-    ("draft_output_bytes", "full_output_hash_mismatch_iterations"),
+    ("draft_output_bytes", "valid_kv_mismatch_iterations"),
+    ("draft_output_padding", "full_output_hash_mismatch_iterations"),
+    ("draft_output_tail", "full_output_hash_mismatch_iterations"),
 ])
 def test_replay_retains_drift_and_runs_remaining_iterations(replay_case, monkeypatch, variation, field):
     invoke, _, cleanup = replay_case
     monkeypatch.setenv("QWEN35_FAKE_PROFILE_VARIATION", variation)
     proc, data, rows = invoke()
-    # Full physical output bytes are evidence, not a valid-row correctness gate.
-    assert proc.returncode == (0 if variation == "draft_output_bytes" else 1), proc.stderr
+    # Valid KV drift fails even with identical tokens. Padding remains diagnostic.
+    padding_only = variation in ("draft_output_padding", "draft_output_tail")
+    assert proc.returncode == (0 if padding_only else 1), proc.stderr
     completed = [r for r in rows if r["event"] == "completed"]
     assert len(completed) == 8
     assert completed[2]["input_matches_snapshot"]
@@ -107,6 +122,33 @@ def test_replay_retains_drift_and_runs_remaining_iterations(replay_case, monkeyp
     elif variation == "draft_input_mutation":
         assert not completed[2]["inputs_unchanged"]
         assert completed[3]["inputs_unchanged"]  # Restored, not carried into next call.
+    else:
+        region, row, channel = {
+            "draft_output_bytes": ("valid_prefix", 0, 1),
+            "draft_output_padding": ("written_padding", 17, 0),
+            "draft_output_tail": ("untouched_tail", 64, 0),
+        }[variation]
+        assert completed[2]["valid_tokens_match"] and completed[2]["inputs_unchanged"]
+        assert completed[2]["valid_kv_matches"] is padding_only
+        changes = data["phases"][0]["kv_region_mismatch_iterations"]
+        assert changes["d0_key"] == {r: int(r == region) for r in data["kv_output_audit"]["row_regions"]}
+        report = Path(data["trace"]).parent.parent / "report.json"
+        analysis = analyze(report)
+        assert len(analysis["examples"]) == 1
+        example = analysis["examples"][0]
+        assert example["region"] == region
+        diff = example["comparison"]
+        assert diff["changed_elements"] == 1 and diff["max_fp16_ulp_finite"] == 1
+        assert diff["max_abs_finite"] == 2 ** -24
+        assert diff["first_difference"]["coordinate_bhsd"] == [0, 0, row, channel]
+        assert example["outside_write_vs_input"]["untouched_tail"]["changed_elements"] == int(row == 64)
+        # Evidence is hash locked; corruption must not yield numerical results.
+        saved = Path(data["trace"]).parent / example["path"]
+        raw = bytearray(saved.read_bytes())
+        raw[0] ^= 1
+        saved.write_bytes(raw)
+        with pytest.raises(ValueError, match="hash mismatch"):
+            analyze(report)
     assert_cpp_resources_released(cleanup, proc.stderr)
 
 
@@ -150,7 +192,8 @@ def test_debug_cannot_relax_benchmark_or_mix_with_profiler(replay_case, extra):
 
 
 @pytest.mark.parametrize("variation,query_fail", [
-    ("", False), ("draft_rejected_tail", False), ("draft_private_output", False), ("", True),
+    ("", False), ("draft_rejected_tail", False), ("draft_private_output", False),
+    ("draft_private_kv", False), ("", True),
 ])
 def test_wrapper_compares_same_snapshot_in_two_processes(
     chunk_bundle, tmp_path, monkeypatch, variation, query_fail,
@@ -182,12 +225,53 @@ def test_wrapper_compares_same_snapshot_in_two_processes(
     assert comparison["same_frozen_inputs_across_processes"]
     assert comparison["distinct_workspace_policies_exercised"] is (not query_fail)
     assert comparison["reference_tokens_match_across_processes"] is (variation != "draft_private_output")
-    if variation == "draft_private_output":
+    assert comparison["reference_valid_kv_match_across_processes"] is (variation != "draft_private_kv")
+    if variation in ("draft_private_output", "draft_private_kv"):
         # Both processes are internally stable, but disagree for identical inputs.
         assert all(row["status"] == "PASS_REPLAY_CHECKS" for row in comparison["runs"])
         assert comparison["status"] == "FAIL_OR_INCOMPLETE"
     for row in comparison["runs"]:
         assert row["fake_acl"] is True
+        assert json.loads(Path(row["kv_analysis"]).read_text())["fake_acl"] is True
         report = json.loads(Path(row["report"]).read_text())
         trace = [json.loads(line) for line in Path(report["trace"]).read_text().splitlines()]
         assert len([r for r in trace if r["event"] == "completed"]) == 8
+
+
+def test_kv_metrics_slice_each_head_and_keep_physical_coordinates():
+    reference = np.zeros((2, 3, 80, 4), dtype="<f2")
+    actual = reference.copy()
+    actual[0, 0, 60, 0] = 10  # Outside [5,17), despite a small flat offset.
+    actual[1, 2, 9, 3] = 1
+    result = metrics(reference, actual, 5, 17)
+    assert result["elements"] == 2 * 3 * 12 * 4
+    assert result["changed_elements"] == 1 and result["max_abs_finite"] == 1
+    assert result["mean_abs_finite"] == 1 / result["elements"]
+    assert result["first_difference"]["coordinate_bhsd"] == [1, 2, 9, 3]
+    empty = metrics(reference, actual, 17, 17)
+    assert empty["elements"] == 0 and empty["first_difference"] is None
+    assert empty["max_abs_finite"] is None
+
+
+def test_kv_metrics_fp16_bit_distance_and_nonfinite_json():
+    reference = np.array([1, -1, 0, 0], dtype="<f2").reshape(1, 1, 1, 4)
+    actual = np.nextafter(reference, np.float16(np.inf))
+    actual[0, 0, 0, 3] = -0.0
+    result = metrics(reference, actual, 0, 1)
+    assert result["changed_elements"] == 4 and result["max_fp16_ulp_finite"] == 1
+    assert result["max_abs_finite"] == 2 ** -10
+    reference.fill(np.inf)
+    actual.fill(np.nan)
+    result = metrics(reference, actual, 0, 1)
+    assert result["reference_nonfinite_elements"] == result["actual_nonfinite_elements"] == 4
+    assert result["first_difference"]["reference"] is None
+    assert result["first_difference"]["actual"] is None
+    assert result["max_abs_finite"] is None and result["max_fp16_ulp_finite"] is None
+    json.dumps(result, allow_nan=False)
+
+
+def test_analyzer_requires_output_evidence(tmp_path):
+    report = tmp_path / "old.json"
+    report.write_text('{"schema_version": 1}')
+    with pytest.raises(ValueError, match="no KV output snapshots"):
+        analyze(report)

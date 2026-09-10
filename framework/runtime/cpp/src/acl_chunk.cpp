@@ -772,12 +772,73 @@ class AclChunkExecutor::Impl {
       return result;
     };
 
+
+    // Draft KV is B,H,S,D. Logical rows are strided across heads, so never
+    // treat valid_rows * H * D as one flat prefix in the physical buffer.
+    std::int64_t kv_start_signed = 0;
+    std::int16_t kv_valid_signed = 0;
+    Require(frozen.at("start_position").size() == sizeof(kv_start_signed) &&
+                frozen.at("valid_rows").size() == sizeof(kv_valid_signed),
+            "debug KV scalar ABI mismatch");
+    std::memcpy(&kv_start_signed, frozen.at("start_position").data(), sizeof(kv_start_signed));
+    std::memcpy(&kv_valid_signed, frozen.at("valid_rows").data(), sizeof(kv_valid_signed));
+    std::size_t kv_capacity = 0;
+    for (const auto& spec : graph.outputs) {
+      if (!State(spec.name) || spec.name[0] != 'd') continue;
+      Require(spec.dtype == "float16" && spec.shape.size() == 4 && spec.shape[2] > 0,
+              "debug KV expects FP16 B,H,S,D");
+      if (!kv_capacity) kv_capacity = static_cast<std::size_t>(spec.shape[2]);
+      Require(kv_capacity == static_cast<std::size_t>(spec.shape[2]),
+              "debug KV physical capacities differ");
+    }
+    // Physical Draft KV includes a guard block beyond the request capacity.
+    Require(kv_start_signed >= 0 && kv_valid_signed > 0 && kv_valid_signed <= 64 &&
+                static_cast<std::size_t>(kv_start_signed) + 64 <= kv_capacity,
+            "invalid debug KV row bounds");
+    const auto kv_end = static_cast<std::size_t>(kv_start_signed + kv_valid_signed);
+    const auto physical_end = static_cast<std::size_t>(kv_start_signed) + 64;
+    const std::map<std::string, std::pair<std::size_t, std::size_t>> kv_regions{
+        {"valid_prefix", {0, kv_end}},
+        {"written_padding", {kv_end, physical_end}},
+        {"untouched_tail", {physical_end, kv_capacity}}};
+    auto region_hash = [&](const TensorSpec& spec, const std::string& bytes,
+                           std::size_t begin, std::size_t end) {
+      Require(spec.dtype == "float16" && spec.shape.size() == 4 &&
+                  spec.shape[2] == static_cast<std::int64_t>(kv_capacity) &&
+                  bytes.size() == spec.bytes(), "debug KV expects FP16 B,H,S,D");
+      std::string packed;
+      const auto row_bytes = static_cast<std::size_t>(spec.shape[3]) * 2;
+      const auto heads = static_cast<std::size_t>(spec.shape[0] * spec.shape[1]);
+      packed.reserve(heads * (end - begin) * row_bytes);
+      for (std::size_t head = 0; head < heads; ++head)
+        packed.append(bytes, (head * kv_capacity + begin) * row_bytes, (end - begin) * row_bytes);
+      return Sha256(packed);
+    };
+    std::map<std::string, std::map<std::string, std::string>> reference_kv_regions;
+    std::map<std::string, std::size_t> saved_region_differences;
+    std::map<std::string, bool> saved_output_files;
+    std::ostringstream saved_differences;
+    std::filesystem::create_directories(output_directory / "outputs/reference");
+    std::filesystem::create_directories(output_directory / "outputs/differences");
+    std::ostringstream kv_abi, kv_bounds;
+    for (const auto& spec : graph.outputs) {
+      if (!State(spec.name) || spec.name[0] != 'd') continue;
+      if (kv_abi.tellp() > 0) kv_abi << ',';
+      kv_abi << DebugQuote(spec.name) << ":{\"dtype\":" << DebugQuote(spec.dtype)
+             << ",\"shape\":" << DebugTokens(spec.shape) << '}';
+    }
+    for (const auto& region : kv_regions) {
+      if (kv_bounds.tellp() > 0) kv_bounds << ',';
+      kv_bounds << DebugQuote(region.first) << ":[" << region.second.first << ',' << region.second.second << ']';
+    }
     bool stable = true;
     std::vector<std::int64_t> reference;
     std::map<std::string, std::string> reference_outputs;
     std::ostringstream phases;
     for (const std::string phase : {"isolated", "interleaved_prefill"}) {
       std::size_t token_mismatches = 0, restore_mismatches = 0, input_mutations = 0, output_hash_mismatches = 0;
+      std::size_t valid_kv_mismatches = 0;
+      std::map<std::string, std::map<std::string, std::size_t>> phase_kv_changes;
       if (phase != "isolated") phases << ',';
       for (std::size_t iteration = 0; iteration < repetitions; ++iteration) {
         if (phase == "interleaved_prefill") {
@@ -804,10 +865,59 @@ class AclChunkExecutor::Impl {
         auto tokens = Tokens("draft", "draft_top1");
         Require(tokens.size() >= proposal_count, "debug Draft token output too short");
         tokens.resize(proposal_count);
-        const auto after = hashes(false), outputs = hashes(true);
+        const auto after = hashes(false);
+        std::map<std::string, std::string> output_bytes, outputs;
+        for (const auto& spec : graph.outputs) {
+          output_bytes[spec.name] = read_device(Get(spec, "draft", true));
+          outputs[spec.name] = Sha256(output_bytes.at(spec.name));
+        }
         if (phase == "isolated" && iteration == 0) {
           reference = tokens;
           reference_outputs = outputs;
+          for (const auto& item : output_bytes)
+            write_file(output_directory / "outputs/reference" / (item.first + ".bin"), item.second);
+        }
+
+        std::map<std::string, std::map<std::string, std::string>> kv_hashes;
+        bool valid_kv_match = true;
+        for (const auto& spec : graph.outputs) {
+          if (!State(spec.name) || spec.name[0] != 'd') continue;
+          for (const auto& region : kv_regions) {
+            const auto digest = region_hash(spec, output_bytes.at(spec.name),
+                                            region.second.first, region.second.second);
+            kv_hashes[spec.name][region.first] = digest;
+            if (phase == "isolated" && iteration == 0)
+              reference_kv_regions[spec.name][region.first] = digest;
+            auto& mismatches = phase_kv_changes[spec.name][region.first];
+            if (digest == reference_kv_regions.at(spec.name).at(region.first)) continue;
+            ++mismatches;
+            if (region.first == "valid_prefix") valid_kv_match = false;
+            // Save only the first example per tensor/region, sharing the same
+            // file when several regions differ in this call. Bounded by 3 KV
+            // snapshots per tensor, plus one complete reference.
+            const auto key = spec.name + "." + region.first;
+            if (saved_region_differences.count(key)) continue;
+            saved_region_differences[key] = iteration;
+            const auto path = "outputs/differences/" + spec.name + "-" + phase + "-" +
+                              std::to_string(iteration) + ".bin";
+            if (!saved_output_files[path]) {
+              write_file(output_directory / path, output_bytes.at(spec.name));
+              saved_output_files[path] = true;
+            }
+            if (saved_differences.tellp() > 0) saved_differences << ',';
+            saved_differences << "{\"tensor\":" << DebugQuote(spec.name)
+                              << ",\"region\":" << DebugQuote(region.first)
+                              << ",\"phase\":" << DebugQuote(phase)
+                              << ",\"iteration\":" << iteration
+                              << ",\"path\":" << DebugQuote(path)
+                              << ",\"sha256\":" << DebugQuote(outputs.at(spec.name)) << '}';
+          }
+        }
+        if (!valid_kv_match) ++valid_kv_mismatches;
+        std::ostringstream kv_hash_json;
+        for (const auto& item : kv_hashes) {
+          if (kv_hash_json.tellp() > 0) kv_hash_json << ',';
+          kv_hash_json << DebugQuote(item.first) << ':' << DebugMap(item.second);
         }
         const bool input_match = before == frozen_hashes;
         const bool readonly = before == after;
@@ -819,7 +929,7 @@ class AclChunkExecutor::Impl {
         if (!readonly) ++input_mutations;
         if (!token_match || !tokens_valid) ++token_mismatches;
         if (outputs != reference_outputs) ++output_hash_mismatches;
-        const bool ok = input_match && readonly && token_match && tokens_valid;
+        const bool ok = input_match && readonly && token_match && tokens_valid && valid_kv_match;
         stable = stable && ok;
         trace << "{\"event\":\"completed\",\"phase\":" << DebugQuote(phase)
               << ",\"iteration\":" << iteration << ",\"profiled\":false"
@@ -827,6 +937,8 @@ class AclChunkExecutor::Impl {
               << ",\"input_sha256\":" << DebugMap(before)
               << ",\"input_after_sha256\":" << DebugMap(after)
               << ",\"output_sha256\":" << DebugMap(outputs)
+              << ",\"kv_region_sha256\":{" << kv_hash_json.str() << '}'
+              << ",\"valid_kv_matches\":" << (valid_kv_match ? "true" : "false")
               << ",\"input_device_addresses\":" << DebugMap(addresses(false))
               << ",\"output_device_addresses\":" << DebugMap(addresses(true))
               << ",\"input_matches_snapshot\":" << (input_match ? "true" : "false")
@@ -846,19 +958,40 @@ class AclChunkExecutor::Impl {
         trace.flush();
         std::cerr << "[draft-replay] phase=" << phase << " iteration=" << iteration
                   << " input_match=" << input_match << " readonly=" << readonly
-                  << " tokens_match=" << token_match << '\n';
+                  << " tokens_match=" << token_match << " valid_kv_match=" << valid_kv_match << '\n';
+      }
+
+      std::ostringstream kv_counts;
+      for (const auto& tensor : phase_kv_changes) {
+        if (kv_counts.tellp() > 0) kv_counts << ',';
+        kv_counts << DebugQuote(tensor.first) << ":{";
+        bool first = true;
+        for (const auto& region : tensor.second) {
+          if (!first) kv_counts << ',';
+          first = false;
+          kv_counts << DebugQuote(region.first) << ':' << region.second;
+        }
+        kv_counts << '}';
       }
       phases << "{\"phase\":" << DebugQuote(phase) << ",\"iterations\":" << repetitions
              << ",\"token_mismatch_iterations\":" << token_mismatches
              << ",\"input_restore_mismatch_iterations\":" << restore_mismatches
              << ",\"input_mutation_iterations\":" << input_mutations
-             << ",\"full_output_hash_mismatch_iterations\":" << output_hash_mismatches << '}';
+             << ",\"full_output_hash_mismatch_iterations\":" << output_hash_mismatches
+             << ",\"valid_kv_mismatch_iterations\":" << valid_kv_mismatches
+             << ",\"kv_region_mismatch_iterations\":{" << kv_counts.str() << "}}";
     }
     // This diagnostic leaves no cache branch eligible for continued generation.
     invalid = true;
+
+    std::ostringstream reference_kv_json;
+    for (const auto& item : reference_kv_regions) {
+      if (reference_kv_json.tellp() > 0) reference_kv_json << ',';
+      reference_kv_json << DebugQuote(item.first) << ':' << DebugMap(item.second);
+    }
     std::ostringstream report;
     report << "{\"schema_version\":1,\"status\":" << DebugQuote(stable ? "PASS_REPLAY_CHECKS" : "FAIL_REPLAY_CHECKS")
-           << ",\"scope\":\"frozen Draft OM input replay; valid tokens and readonly inputs\""
+           << ",\"scope\":\"frozen Draft OM replay; valid tokens, logical KV and readonly inputs\""
            << ",\"formal_latency_evidence\":false,\"ordinary_parity\":\"NOT_RUN\""
            << ",\"profiled\":false,\"draft_outputs_committed\":false"
            << ",\"requested_workspace\":" << DebugQuote(share_workspace ? "shared" : "private")
@@ -869,8 +1002,12 @@ class AclChunkExecutor::Impl {
            << ",\"snapshot_sha256\":" << DebugMap(frozen_hashes)
            << ",\"reference_token_ids\":" << DebugTokens(reference)
            << ",\"reference_output_sha256\":" << DebugMap(reference_outputs)
+           << ",\"kv_output_audit\":{\"version\":1,\"layout\":\"B,H,S,D\",\"abi\":{" << kv_abi.str()
+           << "},\"row_regions\":{" << kv_bounds.str()
+           << "},\"reference_region_sha256\":{" << reference_kv_json.str()
+           << "},\"saved_differences\":[" << saved_differences.str() << "]}"
            << ",\"phases\":[" << phases.str() << "]"
-           << ",\"note\":\"All output hashes include physical padding; inspect them separately. "
+           << ",\"note\":\"Logical KV is checked separately from physical padding. "
               "Restores, readbacks and synchronization perturb execution. A passing replay does not close the original instability.\"}";
     return {stable, report.str()};
   }

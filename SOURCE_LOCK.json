@@ -161,7 +161,7 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "0528cb12ad3c889cef1b640ae04beeedbb68d7392e4c6d78abe64448f87e9622"
+        "source_sha256": "c948411c6e9bcfde773c4b93c49aaa06ede65c5546b80cae3dfbc635e077c5f7"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -285,7 +285,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/chunk.hpp",
-        "source_sha256": "52215e67728826e633e84e5a835c709f50be5a876c9ccf29e54ab45adaaf5559"
+        "source_sha256": "004b2a3b49a401163902021f76b7d2afca51e858a35bd363190c8994993f6875"
       },
       {
         "source_file": "framework/runtime/cpp/include/qwen35_dflash/generation.hpp",
@@ -301,7 +301,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_chunk.cpp",
-        "source_sha256": "1f8df950ca523d30f635873763c1c7f0d1f784a503845ab97d9c9d95d0c7e4cb"
+        "source_sha256": "7b9ac359521e4108a564ece3082ead83806182c9d17bdfcfbfdd3e6ca7238252"
       },
       {
         "source_file": "framework/runtime/cpp/src/acl_executor.cpp",
@@ -333,7 +333,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/fake_acl.cpp",
-        "source_sha256": "d72bf7119864503d8bef5194aa5772d8fa53a2cd231253ec4e20088081c2cb1d"
+        "source_sha256": "281e13cf575a3dddee2753e866d892c7ae302d9b7cb70325349ee1399313a54a"
       },
       {
         "source_file": "framework/runtime/cpp/tests/run_fake_runner.cmake",
@@ -429,11 +429,15 @@
       },
       {
         "source_file": "tools/debug_draft_om.py",
-        "source_sha256": "227d82c4a8d42f961aae5a03aa77d1ed537cf1e202a657f43d875e77b0999793"
+        "source_sha256": "6ef553613a761bd3e320b7235c0f7a702b3922b5701d0d07f937c253035635b4"
       },
       {
         "source_file": "tests/test_debug_draft_om.py",
-        "source_sha256": "3038f7c8468c5df0f4a9fd6092e4a4f9d450559db2f7ae5672f4f81cfadda19f"
+        "source_sha256": "ec51665bb1f59705aa2fc9185c2dc32b0c8b8dd750b0ae3b6caa5225d46efdfc"
+      },
+      {
+        "source_file": "tools/analyze_draft_replay.py",
+        "source_sha256": "63e9224e0cf2bac10e95efc626c44fc2a18461a08c339d51a64f6f2fea433ead"
       }
     ]
   }

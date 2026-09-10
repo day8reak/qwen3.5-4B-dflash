@@ -173,7 +173,18 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
       static_cast<unsigned char*>(in.at("d0_key")->data)[2] ^= 1;
     if (variation == "draft_output_bytes")
       static_cast<unsigned char*>(out.at("d0_key")->data)[2] ^= 1;
+    if (variation == "draft_output_padding" || variation == "draft_output_tail") {
+      const auto spec = std::find_if(model.outputs.begin(), model.outputs.end(),
+                                    [](const auto& t) { return t.name == "d0_key"; });
+      const auto row = start + (variation == "draft_output_padding" ? valid : 64);
+      if (spec == model.outputs.end() || spec->shape.size() != 4 || row >= spec->shape[2]) return 33;
+      // Change a sequence row, not a flat prefix of a B,H,S,D cache.
+      const auto offset = static_cast<std::size_t>(row * spec->shape[3]) * 2;
+      static_cast<unsigned char*>(out.at("d0_key")->data)[offset] ^= 1;
+    }
   }
+  if (model.role == "draft" && variation == "draft_private_kv" && !model.workspace)
+    static_cast<unsigned char*>(out.at("d0_key")->data)[2] ^= 1;
   return ACL_SUCCESS;
 }
 
