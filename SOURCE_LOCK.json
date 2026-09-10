@@ -149,7 +149,7 @@
     "files": [
       {
         "source_file": "README.md",
-        "source_sha256": "6f9841e14c1baac976dffcdc3263300398da3edd9f5c7d241d581afb9b3a084d"
+        "source_sha256": "a2e13f939b8524ed8e54d1768519379f9bd368e3cb34eb81702f075a898c3487"
       },
       {
         "source_file": "config/gdr_chunk_air_om_factory.example.json",
@@ -157,11 +157,11 @@
       },
       {
         "source_file": "docs/DFLASH_ARCHITECTURE.md",
-        "source_sha256": "a810e3e2385606e6a5604e4a3a0be18a8ca56da1a85d9252540d3a557fab3573"
+        "source_sha256": "74cf1e24e4d49aba5cfdf46cfa7d1977d574990471da227b7c2eb4aa142d2f88"
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "8911042fe758c8dffbe3a16d99aefd28047a6a7364b2e5c60dc344984be5ebaa"
+        "source_sha256": "fb38d52fdb168566e52aeffa205b53adbcefbdac50a030852a0c5d83c299ee1a"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -173,7 +173,7 @@
       },
       {
         "source_file": "framework/README.md",
-        "source_sha256": "fa7fc99b7d5cfd87c1a042a7a5bb94ef98cbfbd97909a80e39bd647dc52a0f78"
+        "source_sha256": "d2ec12f72b5f15e0149fb4c577fcef0b79f442982fa651da8dfa143d4d7f0de8"
       },
       {
         "source_file": "framework/abi/closed-runtime-baseline-v1.json",

@@ -3,6 +3,9 @@
 按本文顺序完成环境准备、输入检查、模型导出、转换、C++ 执行和性能采集。
 支持 batch=1、strict greedy、W8A8 Target＋FP16 Draft。
 
+模型结构、逐轮接受示例、状态提交和加速条件见
+[DFlash 结构与生成流程](DFLASH_ARCHITECTURE.md)。
+
 | OM | 物理输入 | 职责 |
 |---|---:|---|
 | `target_prefill.om` | 64 行，有效 1..64 | prompt 分块、末行 Top1、Target 特征和状态 |

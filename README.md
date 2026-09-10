@@ -4,6 +4,9 @@
 支持 batch=1、strict greedy、FP16 Target 或 W8A8 Target。Draft 使用官方
 Qwen3.5-4B-DFlash checkpoint，以 FP16 执行。
 
+先看 [DFlash 结构与生成流程](docs/DFLASH_ARCHITECTURE.md)：从整体流程和逐轮例子，
+理解 Target/Draft、三张 DFlash OM、状态提交，以及获得加速的条件。
+
 ## 1. 选择运行方式
 
 | 方式 | 适用场景 | 完整操作手册 |
@@ -64,7 +67,7 @@ Ascend 310P 性能仍需目标机验证。主机测试不提供真实 OM 产物�
 
 | 文档 | 内容 |
 |---|---|
-| [DFlash 架构](docs/DFLASH_ARCHITECTURE.md) | 为什么能加速、模型结构、四张 OM 的运行流程、状态提交、精度和显存 |
+| [DFlash 结构与生成流程](docs/DFLASH_ARCHITECTURE.md) | 整体流程、逐轮 token 与缓存、两遍 GDR、加速条件、算子精度、显存和采集范围 |
 | [自定义算子](docs/DFLASH_OPERATORS.md) | 必需 ABI、Tensor 实现与性能候选 |
 | [AIR/OM/C++ 接口](docs/QUANT_AIR_OM_FRAMEWORK.md) | factory、manifest、tensor ABI、CLI 与计时范围 |
 | [DFlash 源码索引](models/dflash_v1/README.md) | 命令、调度、Target、Draft、量化与 profiling 文件 |

@@ -3,8 +3,8 @@
 将 Qwen3.5-4B W8A8 Target 和 FP16 DFlash 导出为静态 AIR，经 ATC 编译成 OM，
 由 C++17/AscendCL 完成 ordinary greedy 或 strict-greedy DFlash 生成。
 
-先了解模型结构、四张 OM 如何配合以及 DFlash 为什么能加速，见
-[结构与运行流程](../docs/DFLASH_ARCHITECTURE.md)。
+先了解 Target/Draft 结构、各张 OM 如何配合、token 与缓存如何推进，以及加速条件，
+见 [结构与生成流程](../docs/DFLASH_ARCHITECTURE.md)。
 
 ## 1. 准备环境和输入
 
