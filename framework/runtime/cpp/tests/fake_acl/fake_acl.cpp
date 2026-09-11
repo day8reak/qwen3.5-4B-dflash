@@ -119,7 +119,13 @@ aclError ExecuteChunk(const FixtureModel& model, const aclmdlDataset* input, acl
     }
     auto* proposals = static_cast<std::int64_t*>(out.at("draft_top1")->data);
     const char* requested = std::getenv("QWEN35_FAKE_ACCEPT");
-    const int accepted = requested ? std::atoi(requested) : 15;
+    int accepted = requested ? std::atoi(requested) : 15;
+    // Repeatable zero-then-recovery schedule independent of warmup call count.
+    if (const char* rejected = std::getenv("QWEN35_FAKE_REJECT_ANCHORS")) {
+      const std::string anchors = "," + std::string(rejected) + ",";
+      if (anchors.find("," + std::to_string(anchor) + ",") != std::string::npos)
+        accepted = 0;
+    }
     for (int i = 0; i < 15; ++i)
       proposals[i] = i < proposal_count ? (anchor + i + 1 + (i == accepted ? 7 : 0)) % 64 : 0;
     if ((variation == "draft_output" && profiled) ||

@@ -16,6 +16,7 @@ from models.dflash_v1.dflash_ascend310p_ops import (
 )
 from models.dflash_v1.dflash_config import Qwen35DFlashConfig
 from models.dflash_v1.dflash_rollback_adapter import Qwen35DFlashRollbackAdapter
+from models.dflash_v1.dflash_rollback_decode import dflash_rollback_greedy, ordinary_incremental_greedy
 from models.dflash_v1.modeling_dflash import (
     DFlashDraftKVCache,
     DFlashDraftModel,
@@ -383,6 +384,34 @@ class DFlashRuntimeOptimizationTest(unittest.TestCase):
             self.assertTrue(exhaustive_value_checks_enabled("cpu"))
         with patch.dict(os.environ, {EXHAUSTIVE_CHECKS_ENV: "1"}):
             self.assertTrue(exhaustive_value_checks_enabled("npu:0"))
+
+    def test_zero_acceptance_scheduler_preserves_real_draft_context(self) -> None:
+        torch.manual_seed(20260911)
+        target = TinyTransactionalTarget().eval()
+        adapter = Qwen35DFlashRollbackAdapter(
+            target, initialized_tiny_model(), require_official_config=False)
+        ordinary = ordinary_incremental_greedy(adapter, [1, 2, 3], max_new_tokens=6)
+        propose = adapter.propose_rollback
+
+        def reject_first(prefix, limit):
+            proposals = propose(prefix, limit).clone()  # Exercise actual Draft KV updates.
+            expected = target._output(prefix[:, -1:])["logits"].argmax(-1).item()
+            proposals[0, 0] = (int(expected) + 1) % 32
+            return proposals
+
+        with patch.object(adapter, "propose_rollback", side_effect=reject_first):
+            result = dflash_rollback_greedy(adapter, [1, 2, 3], max_new_tokens=6, block_size=4)
+        self.assertEqual(result.generated_token_ids, ordinary.generated_token_ids)
+        self.assertEqual(result.stats.draft_calls, 5)
+        self.assertEqual(result.stats.accepted_draft_tokens, 0)
+        self.assertEqual(result.stats.speculation_disable_events, 0)
+        audit = adapter.dflash_draft_cache_audit
+        self.assertFalse(audit["drafting_disabled"])
+        self.assertEqual(audit["committed_length"], 7)
+        self.assertEqual(audit["pending_projected_tokens"], 1)
+        stats = adapter.snapshot_rollback_stats()
+        self.assertEqual(stats.draft_kv_cache_rounds, 5)
+        self.assertEqual(stats.draft_feature_tokens_projected, 8)
 
 
 if __name__ == "__main__":

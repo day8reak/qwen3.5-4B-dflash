@@ -634,7 +634,7 @@ class Qwen35DFlashRollbackAdapter(Qwen35DFlashFullPrefixAdapter):
         return proposed
 
     def disable_speculation(self) -> None:
-        """Stop maintaining Draft-only feature state after a zero-accept round."""
+        """Explicitly stop Draft state maintenance; zero acceptance does not call this."""
 
         self._drafting_disabled = True
         self._rollback_pending_projected_features = None

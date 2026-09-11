@@ -114,16 +114,16 @@
     "target_quant_policy": "the CLI mirrors inference.py with --config and --quant_mode enable; the packaged original utils conversion is fail-closed and every pre-conversion nn.Linear path must become the original HIAI QLinear with exact K-by-N shape/device buffers; Draft-facing embedding and LM head remain FP16; every prompt chunk, decode row, and verify block indexes the YAML-declared INT8 embedding and FP32 scale artifacts",
     "stage_profiler_file": "models/dflash_v1/stage_profile.py",
     "msprof_controller_file": "models/dflash_v1/msprof_cli.py",
-    "stage_profiler_sha256": "28024560c65bce1b3dd32289768a973d7efb86b6d08e679c13c379eb76d8e712",
+    "stage_profiler_sha256": "c464812d51f4003a6bf58b0794ed0508d117a1bd972ce1ea9cb80432071295dd",
     "msprof_controller_sha256": "0574e0934e8d93c5851ed442900e6884a0b2e9ace2f3657caa69b70ffb4918eb"
   },
   "rollback_runtime": {
     "runner_file": "models/dflash_v1/run_rollback.py",
     "runner_sha256": "0da383f29389e2e0a181b6ebf0589f6fc50e9217ec7e282f9bd0798ffbb091b1",
     "adapter_file": "models/dflash_v1/dflash_rollback_adapter.py",
-    "adapter_sha256": "4cdb4489e9ed7345914ffc025804abfafe431326a1701e32540354de33069643",
+    "adapter_sha256": "c105de644318356ec10c70b5ca44a4549bc138415891a3aefb3410743656c5e0",
     "scheduler_file": "models/dflash_v1/dflash_rollback_decode.py",
-    "scheduler_sha256": "a2ee1b6306bd377d8da833c06059ab6fcd16df53a69d6f86dd1fb0ef6a86de79",
+    "scheduler_sha256": "3e117dd5819724c7ef368b014e37eacc4e9fa8f617b0d5c1308fdf3b3e5a906e",
     "hiai_modeling_file": "models/modeling_qwen3_5_hiai_nd_dflash_rollback.py",
     "hiai_modeling_sha256": "0f12ab5efc6635fbaf8c718f664cca5dd116d57507bc9130d3c36ce56f77201e",
     "wrapper_file": "models/export_model_wrapper_qwen3_5_dflash_rollback.py",
@@ -157,15 +157,15 @@
       },
       {
         "source_file": "docs/DFLASH_ARCHITECTURE.md",
-        "source_sha256": "243c57e529c63e5deb6befde367ed18471ed71ce018dd9d618fd353ed88434a8"
+        "source_sha256": "25c7f61d676178d5e0bfbac05e04fb243fcaf79a2994dcbd300e867a351cc1f8"
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "48ebb285957f38cf5bb3a5d239e6a265fe83923629988271f9e567e1d32e2907"
+        "source_sha256": "fa9893a4307546f3e31f75fccd17f9938e7fd117f31e879bf12c46dfbab0588a"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
-        "source_sha256": "2e7ebc2dea8b9d09b73d0f90718930c9c23df9581708456d03f0d45884508e9a"
+        "source_sha256": "900a9afb92a2095d1a785de2d4f8098fb2cf8a38e1d62fa2d2b65d9aa288a909"
       },
       {
         "source_file": "framework/FRAMEWORK_LOCK.json",
@@ -309,7 +309,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/chunk.cpp",
-        "source_sha256": "c8b888ca38585677821ad6ad0d0c6fe030fb851afcadd880833e8c648b89a5a4"
+        "source_sha256": "537403ec14072a9d674a4747cde6ce39b2a75d30fb51c1dc4f973351189d1c50"
       },
       {
         "source_file": "framework/runtime/cpp/src/generation.cpp",
@@ -317,7 +317,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/src/main.cpp",
-        "source_sha256": "4ca2fede53a12eeaf465aa6b35a2b30cabfd1e4d7522630c568ba6abfbe53960"
+        "source_sha256": "6fec53416d87399beb02a406e069f6cdfc2a23afafcc8d00e455797222a0652b"
       },
       {
         "source_file": "framework/runtime/cpp/src/sha256.cpp",
@@ -333,7 +333,7 @@
       },
       {
         "source_file": "framework/runtime/cpp/tests/fake_acl/fake_acl.cpp",
-        "source_sha256": "683dbd2bccb0d4ec4d7a0a3f5da0a5e3f6556cfedcf9a55aa6b12633e74ebf48"
+        "source_sha256": "356809a4483e4db4860fb96d7a2061100d7955e32d7df07975b4a70cb474eddf"
       },
       {
         "source_file": "framework/runtime/cpp/tests/run_fake_runner.cmake",
@@ -361,7 +361,7 @@
       },
       {
         "source_file": "tests/test_incremental_air_om.py",
-        "source_sha256": "c7db45fc36a93c8f8ccb60837271e24c92d24330f8b0ad920ab41dd2bb80d515"
+        "source_sha256": "9c3db086553c088ba8996631df4add1faf40a720fc8a9630b710bedaa3329150"
       },
       {
         "source_file": "tests/test_msprof_stage_script.py",
@@ -385,7 +385,7 @@
       },
       {
         "source_file": "tests/test_stage_profile.py",
-        "source_sha256": "6e0a443827e7fb0b31cc23c410e71c70bd4c86e983cc9302b5c40415f190a312"
+        "source_sha256": "0715263be4cd2215567b12ce1fc01d660234a020570f39fd1ca11f9863756f72"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/compare_rounds.py",
@@ -481,11 +481,11 @@
       },
       {
         "source_file": "tools/benchmark_prompts.py",
-        "source_sha256": "6548626e586639e59aba439a87dc21e874fd4b1d1049b0ec57bfd5cafe59d9c0"
+        "source_sha256": "e420af1c14248ae4edb4d6313be2f70071b2f0fea9c5d19e21cfdb5adbab39d1"
       },
       {
         "source_file": "tests/test_prompt_suite.py",
-        "source_sha256": "609ade6cce19626e5b1f06cb59a11b751b8673e3355a9876f31490f42e430b20"
+        "source_sha256": "c426f1a9955e9cd84973f86761694527151392c8ee4b948b5fe7d04787f358f6"
       },
       {
         "source_file": "tests/test_draft_compile_determinism.py",

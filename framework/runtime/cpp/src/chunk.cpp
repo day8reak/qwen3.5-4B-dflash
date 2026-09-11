@@ -173,7 +173,6 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
       round.fallback_token_id = anchor;
       result.rounds.push_back(std::move(round));
     }
-    bool speculation = mode == GenerationMode::kDFlash;
     while (!eos.count(anchor) &&
            result.generated_token_ids.size() < options.max_new_tokens) {
       const auto start = Clock::now();
@@ -183,10 +182,7 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
       GenerationRound round;
       if (options.trace_rounds)
         round.committed_prefix_length = prompt.size() + result.generated_token_ids.size();
-      const bool target_only = mode == GenerationMode::kDFlash && !speculation;
-      if (target_only) ++result.counters.target_only_fallback_rounds;
-      if (mode == GenerationMode::kOrdinary ||
-          (target_only && executor.HasOrdinaryDecode())) {
+      if (mode == GenerationMode::kOrdinary) {
         emitted.push_back(executor.Decode(anchor));
         if (options.trace_rounds) {
           round.stage = "target_decode";
@@ -195,18 +191,14 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
         }
       } else {
         std::vector<std::int64_t> proposals;
-        if (speculation) {
-          const auto proposal_count =
-              std::min({remaining, options.max_draft_tokens, executor.draft_width()});
-          const auto raw = executor.Propose(anchor, proposal_count);
-          Require(raw.size() == executor.draft_width(), "draft width mismatch");
-          for (std::size_t i = 0;
-               i < proposal_count;
-               ++i) {
-            valid_token(raw[i]);
-            proposals.push_back(raw[i]);
-            if (eos.count(raw[i])) break;
-          }
+        const auto proposal_count =
+            std::min({remaining, options.max_draft_tokens, executor.draft_width()});
+        const auto raw = executor.Propose(anchor, proposal_count);
+        Require(raw.size() == executor.draft_width(), "draft width mismatch");
+        for (std::size_t i = 0; i < proposal_count; ++i) {
+          valid_token(raw[i]);
+          proposals.push_back(raw[i]);
+          if (eos.count(raw[i])) break;
         }
         std::vector<std::int64_t> block{anchor};
         block.insert(block.end(), proposals.begin(), proposals.end());
@@ -221,10 +213,8 @@ GenerationMeasurement GenerateChunk(ChunkExecutor& executor,
         executor.Commit(
             accepted +
             1);  // publish/ack the fused OM result; no second OM call
-        if (!proposals.empty() && accepted == 0) {
-          speculation = false;
-          ++result.counters.speculation_disable_events;
-        }
+        // A zero-accept round still commits its anchor. Keep drafting from the
+        // Target correction on the next round, with the updated context.
         emitted.assign(proposals.begin(), proposals.begin() + accepted);
         if (emitted.empty() ||
             (!eos.count(emitted.back()) && emitted.size() < remaining))

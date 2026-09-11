@@ -317,10 +317,10 @@ chunk 模式将各 OM 的临时工作内存从分别申请改为申请最大值�
 权重保持独立，所有使用者卸载后才释放共享工作内存。查询不可用时使用每模型独立分配。
 verify 完成后，主机复核接受数并统一发布状态；异常使本次请求失效，清零后才能继续。
 correction 或 bonus 成为下一轮 anchor，本轮不提前把它写入已提交状态。
-零接受后关闭 Draft，后续轮次优先使用已加载的 `target_decode`；
-只加载三图的 DFlash 模式（含低显存 paired 的 DFlash 组）使用 `target_verify` 的 `valid_rows=1`。
-报告的 `speculation_disable_events`、`target_only_fallback_rounds` 与 `stage_ms`
-分别记录关闭事件、后备轮数和实际调用图。
+零接受后仍保留 Draft 上下文，提交 1 行 anchor 状态，下一轮继续 Draft/verify。
+此策略同样用于只加载三图的 DFlash 模式（含低显存 paired 的 DFlash 组）。
+报告的 `speculation_disable_events`、`target_only_fallback_rounds` 保留为兼容字段，
+当前持续投机策略下均为 0；`stage_ms` 记录实际调用图。
 
 默认 paired 运行按模式交错执行 3 次预热和 10 次测量，低显存模式按组执行；
 两者均要求普通/DFlash token、EOS 和停止原因

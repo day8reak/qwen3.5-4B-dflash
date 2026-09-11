@@ -97,9 +97,10 @@ Target Top1      [A,      B, C, …, …]
 旧 anchor，输出的最后一项是新 anchor。全部候选接受时，Target 最后一行 Top1
 可再提供一个 bonus token；碰到 EOS 或输出预算时，尾轮可能少输出这一项。
 
-当前 C++ 调度中，某轮有候选但 `a=0` 时，本请求后续关闭 Draft。
-若已加载 `target_decode.om`，就继续单 token decode；单独 DFlash 没有加载它时，
-使用 `target_verify.om` 的一行有效输入继续生成。
+当前 C++ 和 Python 调度会持续投机，直到 EOS 或输出预算耗尽。
+某轮 `a=0` 时，只提交旧 anchor 对应的 1 行状态；Target 的补充 token
+作为下一轮 anchor，更新 Draft 上下文后再次提出候选。连续多轮零接受也不会关闭 Draft。
+接受率与速度要重新测量；持续开启不代表一定更快，也不取消与普通模型的 token 一致性检查。
 
 ## 3. Target 和 Draft 内部是什么结构
 

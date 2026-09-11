@@ -243,7 +243,7 @@ QLinear 对齐。
 以下内容默认留在 scheduler/runtime：
 
 - longest-prefix accept 的请求级控制流；
-- EOS、max-new-tokens、zero-accept Target-only fallback；
+- EOS、max-new-tokens、连续零接受后继续投机及后续接受恢复；
 - 24 层 recurrent、24 层 conv、8 层 KV、feature、position 的原子 commit/abort；
 - sampling 的随机流、概率比 rejection 和 residual correction；
 - ordinary/DFlash correctness gate 和报告。

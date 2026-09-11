@@ -614,6 +614,7 @@ void WriteReport(
               ? "ordinary then DFlash with model unload between modes"
               : "alternating ordinary/DFlash in one loaded process") << "\","
          << "\"low_memory\":" << (arguments.low_memory ? "true" : "false") << ','
+         << "\"dflash_speculation_policy\":\"always_on\","
          << "\"max_resident_models\":" << (arguments.model_kind == "chunk"
               ? (arguments.low_memory ? 3 : 4) : 1) << ','
          << "\"synchronization\":\"one aclrtSynchronizeStream after queued H2D, execute, D2H\","
@@ -809,6 +810,7 @@ bool RunPromptBatch(const Arguments& arguments, qwen35::dflash::GraphExecutor& e
          << ",\"prompt_batch_sha256\":\"" << arguments.prompt_batch_sha256
          << "\",\"model_sha256\":\"" << arguments.model_sha256
          << "\",\"models_reused_across_prompts\":true,\"low_memory\":" << (arguments.low_memory ? "true" : "false")
+         << ",\"dflash_speculation_policy\":\"always_on\""
          << ",\"order\":\"" << (arguments.low_memory ? "all ordinary prompts then all DFlash prompts" : "paired ordinary/DFlash per prompt")
          << "\",\"startup_ms\":{\"acl_and_model_load\":" << load_ms << ",\"mode_switch_unload\":" << unload_ms
          << "},\"cases\":[" << cases.str() << ']';

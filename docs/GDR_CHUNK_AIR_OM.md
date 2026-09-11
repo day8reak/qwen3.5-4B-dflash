@@ -577,8 +577,8 @@ PY
 `startup_ms.mode_switch_unload`，均不计入模型循环时延。
 分组测量的设备温度、频率和其他任务负载可能与交错测量不同，比较性能时保留该协议区别。
 
-DFlash 组不加载 decode OM；零接受关闭 Draft 后，使用 verify 的 `valid_rows=1`
-继续生成。这会影响低接受率请求的时延，应查看实际 `stage_ms`。
+DFlash 组不加载 decode OM；即使连续零接受，也持续调用 Draft 和 verify，
+用 Target 补充 token 作为下一轮 anchor。实际时延需查看 `stage_ms` 和完整请求结果。
 `run-e2e-cpp` 同样支持此参数；直接 C++ 使用 `--model-kind chunk --mode paired --low-memory`。
 单模式和 msprof 已按模式选择所需 OM，不接收此配对测量参数。
 切换低显存模式不改变 AIR/OM 或 tensor ABI，已有匹配的四图 bundle 可以直接使用。
@@ -1170,13 +1170,20 @@ decode 或 paired。不同 OM 不会自动共享权重，设备显存要覆盖�
 
 状态语义与开销：Target verify 用本轮初始 recurrent state 做两次 GDR，第二次
 `effective_length=accepted+1`；C++ 核对接受数后统一发布第二遍状态，
-第一遍的 raw FP32 state 仅保留设备输出缓冲区。零接受后关闭 Draft，以
-已加载的 `target_decode` 执行后续单 token 生成。单模式 DFlash 和低显存 paired 的 DFlash 组只加载三个 OM，
-继续使用 verify 的 `valid_rows=1`，其物理图仍为 16 行。
-`speculation_disable_events` 和 `target_only_fallback_rounds` 记录关闭 Draft 及后续轮数；
-`stage_ms` 显示实际调用了 decode 还是 verify。两种后备路径都需要与 ordinary 检查
-token 等价。固定 64 行 Draft gear、非末尾 prompt 块的 Draft KV 初始化、每块 prefill
+第一遍的 raw FP32 state 仅保留设备输出缓冲区。零接受时仍执行第二遍 GDR，
+提交旧 anchor 的 1 行状态，并保留下一轮 Draft 所需的特征和 KV。
+本请求一直开启投机，直到 EOS 或输出预算耗尽；不因零接受转为 Target-only。
+单模式 DFlash 和低显存 paired 的 DFlash 组仍只加载三个 OM。
+`speculation_disable_events` 和 `target_only_fallback_rounds` 保留为兼容字段，当前均为 0。
+paired 报告和批量索引记录 `dflash_speculation_policy=always_on`，
+新 `summary.json` 的 protocol 也携带该值。持续投机仍须与 ordinary 检查 token 等价。
+固定 64 行 Draft gear、非末尾 prompt 块的 Draft KV 初始化、每块 prefill
 的 LM head，以及 Draft dense KV 和图边界状态复制，都可能增加开销，应按实际 msprof 数据评估。
+
+更新持续投机策略只需更新源码，并按第 10 步在新目录重编 C++ runner。
+已有 AIR/OM、确定性 Draft manifest 和模型权重可继续使用。
+将 `CPP_RUNNER` 指向新程序后，重新执行第 11 节的多 prompt 测试。
+Python rollback 和其 msprof accept-commit 阶段也保持 Draft 上下文，不再零接受即停用。
 
 ## 17. 失败定位
 

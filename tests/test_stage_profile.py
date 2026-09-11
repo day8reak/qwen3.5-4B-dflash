@@ -301,7 +301,8 @@ def test_zero_acceptance_commit_remains_outside_capture(setup_profiler, stage):
             eos_token_ids=[99], warmup=1, profiler=profiler,
         )
     assert result["result"]["accepted_draft_tokens"] == 0
-    assert events[events.index(("stop",)) + 1:][:2] == [("disable", False), ("commit", False, 0)]
+    assert events[events.index(("stop",)) + 1] == ("commit", False, 0)
+    assert not any(e[0] == "disable" for e in events)
 
 
 @pytest.mark.parametrize("stage", ["draft", "verify", "draft-verify"])
@@ -517,7 +518,8 @@ def test_zero_acceptance_commit_still_requires_second_chunk_gdr(setup_profiler):
     assert report["operator_rows_required"] is True
     assert report["captured_gdr_layer_calls"] == {"verify": 0, "commit": 2}
     captured = events[events.index(("start",)) + 1:events.index(("stop",))]
-    assert captured == [("disable", True), ("commit", True, 0), ("sync", True)]
+    assert captured == [("commit", True, 0), ("sync", True)]
+    assert not any(e[0] == "disable" for e in events)
 
 
 def test_projection_values_must_match_warmup(setup_profiler):

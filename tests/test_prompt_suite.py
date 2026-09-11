@@ -54,6 +54,7 @@ def test_batch_reuses_models_resets_prompts_and_preserves_parity(
     index = json.loads(output.read_text())
     assert index["status"] == "PASS" and index["fake_acl"] is True
     assert index["models_reused_across_prompts"] is True
+    assert index["dflash_speculation_policy"] == "always_on"
     assert index["low_memory"] is low_memory
     assert [c["id"] for c in index["cases"]] == [p[0] for p in prompts]
     loaded = [json.loads(line) for line in workspace.read_text().splitlines()]
@@ -106,6 +107,33 @@ def test_one_failed_prompt_is_retained_and_next_prompt_runs(chunk_bundle, tmp_pa
     assert index["status"] == "FAIL"
     assert [c["status"] for c in index["cases"]] == ["FAIL", "PASS"]
     assert json.loads(Path(index["cases"][0]["report"]).read_text())["error"]
+    assert_cpp_resources_released(cleanup, proc.stderr)
+
+
+@pytest.mark.parametrize("low_memory", [False, True])
+def test_cpp_draft_recovers_after_two_zero_rounds(chunk_bundle, tmp_path, monkeypatch, low_memory):
+    monkeypatch.setenv("QWEN35_FAKE_REJECT_ANCHORS", "6,7")
+    monkeypatch.setenv("QWEN35_FAKE_ACCEPT", "15")
+    cleanup = tmp_path / "cleanup.json"
+    monkeypatch.setenv("QWEN35_FAKE_CLEANUP_LOG", str(cleanup))
+    command, output, _ = batch_command(chunk_bundle, tmp_path, [("recovery", [4, 5])], low_memory)
+    proc = subprocess.run(command, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    report = saved_cases(output)[0][1]
+    assert report["ordinary_parity"]["status"] == "PASS"
+    for measurement in report["dflash"]["measurements"]:
+        rounds = measurement["rounds"][1:]
+        assert [len(r["accepted_draft_token_ids"]) for r in rounds] == [0, 0, 15, 1]
+        assert all(r["stage"] == "target_verify" and r["proposed_token_ids"] for r in rounds)
+        assert measurement["counters"]["drafted_tokens"] == 46
+        assert measurement["counters"]["accepted_draft_tokens"] == 16
+        assert measurement["counters"]["speculation_disable_events"] == 0
+        assert measurement["counters"]["target_only_fallback_rounds"] == 0
+        assert len(measurement["stage_ms"]["draft"]) == 4
+        assert "target_decode" not in measurement["stage_ms"]
+        assert measurement["generated_token_ids"] == list(range(6, 26))
+    # The fake executor checks feature, Draft KV and Target state cursors at
+    # every graph input, so reaching round three also validates zero commits.
     assert_cpp_resources_released(cleanup, proc.stderr)
 
 

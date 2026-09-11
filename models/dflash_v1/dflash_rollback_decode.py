@@ -292,7 +292,6 @@ def dflash_rollback_greedy(
     generated = [bootstrap_token]
     committed = [*prompt, bootstrap_token]
     reached_eos = bootstrap_token in eos
-    speculation_enabled = True
     rounds.append(
         ReplayRound(
             committed_prefix_length=len(prompt),
@@ -307,25 +306,18 @@ def dflash_rollback_greedy(
     while len(generated) < maximum and not reached_eos:
         remaining = maximum - len(generated)
         prefix_length = len(committed)
-        if speculation_enabled:
-            proposal_limit = min(proposal_capacity, remaining)
-            raw_proposals = adapter.propose_rollback(
-                _input_ids(committed, device),
-                proposal_limit,
-            )
-            stats.draft_calls += 1
-            proposals = _normalize_proposals(
-                raw_proposals,
-                proposal_limit=proposal_limit,
-                eos_token_ids=eos,
-            )
-            stats.drafted_tokens += len(proposals)
-        else:
-            # Exact target-only continuation in the existing rollback session.
-            # A one-row verify consumes the current anchor and returns the next
-            # authoritative token without restarting or replaying history.
-            proposals = []
-            stats.target_only_fallback_rounds += 1
+        proposal_limit = min(proposal_capacity, remaining)
+        raw_proposals = adapter.propose_rollback(
+            _input_ids(committed, device),
+            proposal_limit,
+        )
+        stats.draft_calls += 1
+        proposals = _normalize_proposals(
+            raw_proposals,
+            proposal_limit=proposal_limit,
+            eos_token_ids=eos,
+        )
+        stats.drafted_tokens += len(proposals)
 
         block = [committed[-1], *proposals]
         try:
@@ -348,10 +340,8 @@ def dflash_rollback_greedy(
             accepted_count = (
                 len(proposals) if mismatch is None else mismatch
             )
-            if proposals and accepted_count == 0:
-                disable = getattr(adapter, "disable_speculation", None)
-                if callable(disable):
-                    disable()
+            # Keep Draft context maintenance active even when only the anchor
+            # is committed. The correction token anchors the next proposal.
             adapter.commit_rollback(accepted_count)
         except Exception:
             adapter.abort_rollback()
@@ -363,9 +353,6 @@ def dflash_rollback_greedy(
         stats.target_rows_read += len(block)
         stats.accepted_draft_tokens += accepted_count
         stats.rejected_draft_tokens += len(proposals) - accepted_count
-        if speculation_enabled and proposals and accepted_count == 0:
-            speculation_enabled = False
-            stats.speculation_disable_events += 1
 
         accepted = proposals[:accepted_count]
         emitted_this_round: list[int] = []
@@ -410,7 +397,7 @@ def dflash_rollback_greedy(
                     "emitted_tokens": len(emitted_this_round),
                     "generated_tokens": len(generated),
                     "target_rows": len(block),
-                    "speculation_enabled_next_round": speculation_enabled,
+                    "speculation_enabled_next_round": True,
                 },
             )
 

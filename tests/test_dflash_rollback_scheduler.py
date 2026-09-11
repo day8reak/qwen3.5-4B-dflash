@@ -86,9 +86,9 @@ class FailingVerifyAdapter(BoundaryAdapter):
 
 
 class ZeroAcceptanceAdapter:
-    """Target stream that rejects the first Draft token and then continues S=1."""
+    """Target stream with controllable rejection and explicit committed inputs."""
 
-    def __init__(self) -> None:
+    def __init__(self, accepted_by_round=()) -> None:
         self.target_rows = [10, 11, 12, 13, 99]
         self.ordinary_index = 0
         self.rollback_index = 1
@@ -96,6 +96,10 @@ class ZeroAcceptanceAdapter:
         self.verify_shapes: list[tuple[int, int]] = []
         self.propose_calls = 0
         self.disable_calls = 0
+        self.accepted_by_round = accepted_by_round
+        self.committed_inputs = []
+        self.pending_block = None
+        self.commits = []
 
     def begin_ordinary(self, prompt_ids: torch.Tensor) -> torch.Tensor:
         del prompt_ids
@@ -108,7 +112,7 @@ class ZeroAcceptanceAdapter:
         return logits([self.target_rows[self.ordinary_index]])
 
     def begin_rollback(self, prompt_ids: torch.Tensor) -> torch.Tensor:
-        del prompt_ids
+        self.committed_inputs = prompt_ids[0].tolist()
         self.rollback_index = 1
         return logits([self.target_rows[0]])
 
@@ -117,25 +121,36 @@ class ZeroAcceptanceAdapter:
         prefix_ids: torch.Tensor,
         proposal_limit: int,
     ) -> torch.Tensor:
-        del prefix_ids
+        assert prefix_ids[0, :-1].tolist() == self.committed_inputs
+        assert self.pending_block is None
+        accepted = (self.accepted_by_round[self.propose_calls]
+                    if self.propose_calls < len(self.accepted_by_round) else 0)
         self.propose_calls += 1
-        return torch.full((1, proposal_limit), 77, dtype=torch.long)
+        return torch.tensor([[self.target_rows[min(self.rollback_index + i, len(self.target_rows) - 1)]
+                              if i < accepted else 77 for i in range(proposal_limit)]])
 
     def verify_rollback(self, block_ids: torch.Tensor) -> torch.Tensor:
         rows = int(block_ids.shape[1])
         self.pending_rows = rows
+        self.pending_block = block_ids[0].tolist()
         self.verify_shapes.append(tuple(block_ids.shape))
-        return logits(self.target_rows[self.rollback_index : self.rollback_index + rows])
+        return logits([self.target_rows[min(self.rollback_index + i, len(self.target_rows) - 1)]
+                       for i in range(rows)])
 
     def disable_speculation(self) -> None:
         self.disable_calls += 1
 
     def commit_rollback(self, accepted_draft_tokens: int) -> None:
+        assert self.pending_block is not None and accepted_draft_tokens < self.pending_rows
+        self.committed_inputs.extend(self.pending_block[:accepted_draft_tokens + 1])
+        self.commits.append(accepted_draft_tokens)
+        self.pending_block = None
         self.rollback_index += accepted_draft_tokens + 1
         self.pending_rows = 0
 
     def abort_rollback(self) -> None:
         self.pending_rows = 0
+        self.pending_block = None
 
 
 def check_acceptance_boundary(accepted: int, proposal_count: int) -> None:
@@ -212,6 +227,12 @@ def main() -> None:
     assert failing.abort_calls == 1
     assert failing.pending_block is None
 
+    test_repeated_zero_acceptance_keeps_drafting_until_eos()
+    test_acceptance_recovers_after_consecutive_zero_rounds()
+    print("PASS: rollback scheduler accepted=0..K, zero-accept continuation and correction/bonus alignment")
+
+
+def test_repeated_zero_acceptance_keeps_drafting_until_eos():
     zero_accept = ZeroAcceptanceAdapter()
     ordinary_zero_accept = ordinary_incremental_greedy(
         zero_accept,
@@ -229,12 +250,33 @@ def main() -> None:
     assert rollback_zero_accept.generated_token_ids == (
         ordinary_zero_accept.generated_token_ids
     )
-    assert zero_accept.propose_calls == 1
-    assert zero_accept.disable_calls == 1
-    assert zero_accept.verify_shapes == [(1, 4), (1, 1), (1, 1), (1, 1)]
-    assert rollback_zero_accept.stats.speculation_disable_events == 1
-    assert rollback_zero_accept.stats.target_only_fallback_rounds == 3
-    print("PASS: rollback scheduler accepted=0..K and correction/bonus alignment")
+    assert zero_accept.propose_calls == 4
+    assert zero_accept.disable_calls == 0
+    assert zero_accept.verify_shapes == [(1, 4), (1, 4), (1, 3), (1, 2)]
+    assert zero_accept.commits == [0, 0, 0, 0]
+    assert zero_accept.committed_inputs == [1, 10, 11, 12, 13]  # EOS is the last emitted anchor.
+    assert rollback_zero_accept.stats.speculation_disable_events == 0
+    assert rollback_zero_accept.stats.target_only_fallback_rounds == 0
+    assert rollback_zero_accept.stats.drafted_tokens == 9
+    assert rollback_zero_accept.reached_eos
+
+
+def test_acceptance_recovers_after_consecutive_zero_rounds():
+    adapter = ZeroAcceptanceAdapter(accepted_by_round=[0, 0, 2, 3])
+    adapter.target_rows = list(range(10, 30)) + [99]
+    progress = []
+    ordinary = ordinary_incremental_greedy(adapter, [1], max_new_tokens=12, eos_token_ids=[99])
+    result = dflash_rollback_greedy(
+        adapter, [1], max_new_tokens=12, block_size=4, eos_token_ids=[99],
+        progress_callback=lambda event, data: progress.append(data))
+    assert result.generated_token_ids == ordinary.generated_token_ids
+    assert adapter.commits == [0, 0, 2, 3, 0, 0]
+    assert adapter.disable_calls == 0 and adapter.propose_calls == 6
+    assert adapter.committed_inputs == [1, *range(10, 21)]
+    assert all(item["speculation_enabled_next_round"] for item in progress)
+    assert result.stats.accepted_draft_tokens == 5
+    assert result.stats.speculation_disable_events == result.stats.target_only_fallback_rounds == 0
+    assert not result.reached_eos
 
 
 if __name__ == "__main__":

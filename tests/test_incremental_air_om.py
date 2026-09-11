@@ -1087,6 +1087,7 @@ def test_cpp_four_om_roundtrip_with_fake_acl(
     assert result["ordinary_parity"]["token_id_mismatches"] == 0
     assert result["abi"]["graph_count"] == 4
     assert result["protocol"]["low_memory"] is low_memory
+    assert result["protocol"]["dflash_speculation_policy"] == "always_on"
     assert result["protocol"]["max_resident_models"] == (3 if low_memory else 4)
     assert result["protocol"]["order"] == (
         "ordinary then DFlash with model unload between modes" if low_memory
@@ -1110,14 +1111,17 @@ def test_cpp_four_om_roundtrip_with_fake_acl(
     else:
         assert result["startup_ms"]["mode_switch_unload"] == 0
     for row in result["dflash"]["measurements"]:
-        assert ("target_decode" in row["stage_ms"]) == (accepted == 0 and not low_memory)
+        assert "target_decode" not in row["stage_ms"]
         assert "target_verify" in row["stage_ms"]
-        assert row["counters"]["speculation_disable_events"] == (accepted == 0)
+        assert row["counters"]["speculation_disable_events"] == 0
+        assert row["counters"]["target_only_fallback_rounds"] == 0
+        assert all(r["proposed_token_ids"] for r in row["rounds"][1:])
         if accepted == 0:
-            assert len(row["stage_ms"]["target_verify"]) == (39 if low_memory else 1)
-            if not low_memory:
-                assert len(row["stage_ms"]["target_decode"]) == 38
-            assert row["counters"]["target_only_fallback_rounds"] == 38
+            assert len(row["stage_ms"]["target_verify"]) == 39
+            # One additional Draft call primes KV for the first 64 prompt rows.
+            assert len(row["stage_ms"]["draft"]) == 40
+            assert row["counters"]["drafted_tokens"] == sum(min(15, n) for n in range(1, 40))
+            assert row["counters"]["accepted_draft_tokens"] == 0
     assert result["protocol"]["round_trace_enabled"] is True
     for mode in ("ordinary", "dflash"):
         for row in result[mode]["measurements"]:
@@ -1318,7 +1322,9 @@ def test_pure_dflash_does_not_load_or_require_decode_om(
     for row in report["benchmark"]["measurements"]:
         assert "target_decode" not in row["stage_ms"]
         assert len(row["stage_ms"]["target_verify"]) == 31
-        assert row["counters"]["target_only_fallback_rounds"] == 30
+        assert len(row["stage_ms"]["draft"]) == 31
+        assert row["counters"]["target_only_fallback_rounds"] == 0
+        assert row["counters"]["speculation_disable_events"] == 0
         assert "rounds" not in row
 
 

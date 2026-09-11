@@ -74,11 +74,11 @@ STAGE_SCOPES = {
         "excludes Target LM head (inside verify) and prefill anchor Top1"
     ),
     "accept-commit": (
-        "one acceptance comparison, zero-accept speculation disable and adapter "
+        "one acceptance comparison and adapter "
         "commit: second original chunk GDR pass from saved round-start state with "
         "effective_length=accepted+1 (also when accepted=0), conv state selection, "
         "persistent-state dtype conversion and logical KV commit, plus next-round "
-        "feature projection when speculation remains enabled; excludes Target Top1"
+        "feature projection including zero acceptance; excludes Target Top1"
     ),
     "decode-round": (
         "one complete first Draft/verify transaction: prefix tensor, Draft, verify "
@@ -275,8 +275,6 @@ def profile_one_stage(
                         (i for i, token in enumerate(proposals) if token != target_tokens[i]),
                         len(proposals),
                     )
-                    if accepted == 0:
-                        adapter.disable_speculation()
                     adapter.commit_rollback(accepted)
         except Exception:
             adapter.abort_rollback()

@@ -354,6 +354,7 @@ def run(args):
     summary = {"schema_version": 1, "status": "PASS" if ok else "FAIL_OR_INCOMPLETE",
         "cases": rows, "aggregate": aggregate(rows), "protocol": {
             "warmup": 3, "repetitions": 10, "low_memory": args.low_memory,
+            "dflash_speculation_policy": raw.get("dflash_speculation_policy", "not_recorded"),
             "models_reused_across_prompts": raw.get("models_reused_across_prompts"), "order": raw.get("order")},
         "startup_ms": raw.get("startup_ms"), "process_wall_seconds": process_wall_seconds,
         "request": str(root / "request.json"), "runner_index": str(index), "runner_exit_code": exit_code,
