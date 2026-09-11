@@ -668,8 +668,24 @@ token、EOS 和停止原因一致。每次生成前重置请求缓存；一条�
 相同的 tokenizer；文字打印到标准输出，原报告保持原样。旧版本 parity 失败只保留一句
 错误时，可从同目录的 `.ordinary.json` 恢复普通输出，丢失的 DFlash token 无法还原。
 
-更新这项报告功能只需第 10 步重编 C++ runner，使用新的 build/report 路径；现有 OM 可复用。
-在上面的多 prompt 命令后追加 `--prompt-id zh_explain`，即可先重跑一条并生成完整两边文字。
+只查看已有八条结果的接受率，不需要 tokenizer、重编 runner、重建 OM 或重新跑推理：
+
+```bash
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/decode_outputs.py" \
+  --report "$PROMPT_SUITE_DIR/runner-batch.json" --acceptance-only
+```
+
+可以追加 `--prompt-id zh_explain` 只看一条。脚本显示每条的已接受/已提出数量和比例，
+以及按候选总量加权的总体比例；统计范围是保存的正式测量，不含 warmup。
+普通文字查看命令也会先打印这张表。新采集的 `summary.json` 会在各条目中记录
+`observed_acceptance`，`summary.md` 同时显示这张观察表。
+它包含 parity 失败样本，表示**当前 verify 接受了多少候选**，不能证明与普通模型一致，
+也不能证明加速。原有通过样本汇总保持原口径；全失败时该汇总的计数为 0，
+不代表实际没有提出或接受候选。没有候选时比例为 N/A；旧报告没有计数时也明确标为未记录。
+
+若还在使用未保存完整失败结果的旧 runner，才需要第 10 步重编 C++ runner，
+使用新的 build/report 路径；现有 OM 可复用。在多 prompt 命令后追加
+`--prompt-id zh_explain`，即可先重跑一条并生成完整两边文字。
 输出预算、EOS、精度和 3+10 检查保持相同。`summary.json` 也保留首分歧附近的文字和 token IDs；
 中文 token 可能只含部分 UTF-8 字节，应结合邻近完整文本判断，不能把单个 token 的解码等同于一个字。
 

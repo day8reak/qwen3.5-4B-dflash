@@ -110,6 +110,64 @@ def render_outputs(rows):
     return "\n".join(lines) + "\n"
 
 
+def observed_acceptance(report):
+    """Read current-verifier acceptance, independently of the pair's PASS/FAIL."""
+    draft = report.get("dflash")
+    standalone = report.get("benchmark", report)
+    if draft is None and standalone.get("generation_mode", "").startswith("dflash"):
+        draft = standalone
+    if not isinstance(draft, dict):
+        return {"available": False}
+    measurements = draft.get("measurements")
+    if measurements:
+        # WriteBenchmark stores only measured calls here, not the warmup calls.
+        counters = [m["counters"] for m in measurements]
+        source = "measurements"
+    elif isinstance(draft.get("totals"), dict):
+        counters = [draft["totals"]]
+        source = "totals"
+    else:
+        return {"available": False}
+    for count in counters:
+        proposed, accepted = count["drafted_tokens"], count["accepted_draft_tokens"]
+        if (type(proposed) is not int or type(accepted) is not int
+                or not 0 <= accepted <= proposed):
+            raise ValueError("invalid saved DFlash acceptance counters")
+    proposed = sum(c["drafted_tokens"] for c in counters)
+    accepted = sum(c["accepted_draft_tokens"] for c in counters)
+    return {"available": True, "source": source,
+            "drafted_tokens": proposed, "accepted_draft_tokens": accepted,
+            "acceptance_rate": accepted / proposed if proposed else None,
+            "scope": "current verify decisions; measured repetitions only, warmups excluded"}
+
+
+def render_acceptance(rows):
+    """Display failed runs too, without admitting them into validated statistics."""
+    lines = ["Observed DFlash acceptance (current verify):", "",
+             "| Prompt | Status | Accepted / proposed | Acceptance |",
+             "|---|---|---:|---:|"]
+    available = []
+    for row in rows:
+        stats = row.get("observed_acceptance", {})
+        if stats.get("available"):
+            available.append(stats)
+            ratio = stats["acceptance_rate"]
+            rate = f"{ratio:.2%}" if ratio is not None else "N/A (no proposals)"
+            counts = f'{stats["accepted_draft_tokens"]} / {stats["drafted_tokens"]}'
+        else:
+            counts, rate = "—", "N/A (not recorded)"
+        lines.append(f"| {row.get('id', 'report')} | {row.get('status', 'UNKNOWN')} | {counts} | {rate} |")
+    proposed = sum(s["drafted_tokens"] for s in available)
+    accepted = sum(s["accepted_draft_tokens"] for s in available)
+    rate = f"{accepted / proposed:.2%}" if proposed else "N/A"
+    lines += ["", f"Observed weighted acceptance: {rate}; accepted={accepted}, proposed={proposed}; "
+              f"reports with counters={len(available)}/{len(rows)}.",
+              "Counts sum measured repetitions and exclude warmups.",
+              "FAIL remains FAIL. These are current verify decisions, including failed parity runs; "
+              "they do not establish ordinary parity or speedup."]
+    return "\n".join(lines) + "\n"
+
+
 def summarize_prompt(report):
     ordinary, draft = report["ordinary"], report["dflash"]
     measurements = draft["measurements"]
@@ -172,6 +230,8 @@ def markdown(summary):
         lines += ["Each passing prompt passed token/EOS parity and the existing 3+10 repeatability gates."]
     else:
         lines += ["No prompt has passed the complete checks; no validated acceptance or speedup is available."]
+    if any(r.get("observed_acceptance", {}).get("available") for r in summary["cases"]):
+        lines += ["", render_acceptance(summary["cases"]).rstrip()]
     for row in summary["cases"]:
         if row.get("error"):
             lines += ["", f"- {row['id']} ({row.get('failure_stage', 'report_validation')}): "
@@ -268,7 +328,8 @@ def run(args):
             if path != (Path(str(index) + ".cases") / (prompt["id"] + ".json")).resolve():
                 raise ValueError("unexpected case report path")
             report = json.loads(path.read_text())
-            row.update(raw_report=str(path), decoded_outputs=decode_outputs(report, tokenizer))
+            row.update(raw_report=str(path), decoded_outputs=decode_outputs(report, tokenizer),
+                       observed_acceptance=observed_acceptance(report))
             if case["status"] != "PASS":
                 # Failed parity reports retain both mode measurements. They
                 # are diagnostic output, never feed them into PASS statistics.

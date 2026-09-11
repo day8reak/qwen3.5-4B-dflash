@@ -206,6 +206,17 @@ def test_stable_parity_failure_keeps_both_outputs_and_locates_first_different_ro
     assert report["formal_latency_evidence"] is False
     assert report["dflash_speedup_over_ordinary_model_total_median"] is None
     assert report["ordinary_parity"]["token_id_mismatches"] > 0
+    observed = suite.observed_acceptance(report)
+    assert observed["available"] and 0 < observed["acceptance_rate"] < 1
+    assert observed["accepted_draft_tokens"] == report["dflash"]["totals"]["accepted_draft_tokens"]
+    assert observed["drafted_tokens"] == report["dflash"]["totals"]["drafted_tokens"]
+    failed_row = dict(id="p", status="FAIL", observed_acceptance=observed)
+    failed_totals = suite.aggregate([failed_row])
+    assert failed_totals["weighted_acceptance_rate"] is None
+    assert failed_totals["drafted_tokens"] == 0
+    displayed = suite.markdown(dict(cases=[failed_row], aggregate=failed_totals))
+    assert "Observed DFlash acceptance" in displayed
+    assert f"{observed['acceptance_rate']:.2%}" in displayed
     for mode in ("ordinary", "dflash"):
         assert report[mode]["status"] == "PASS"  # Within-mode repeatability only.
         assert len(report[mode]["measurements"]) == 10
@@ -321,3 +332,65 @@ def test_decode_cli_selects_failed_batch_case_without_inference(tmp_path, monkey
     assert "=== b | FAIL ===" in output and "=== a" not in output
     assert "Prompt:\n你好" in output and "<think>你好世界" in output and "<think>你好！" in output
     assert all(p.read_bytes() == content for p, content in before.items())
+
+
+def test_acceptance_only_cli_weights_failed_cases_without_tokenizer(tmp_path):
+    import sys
+
+    directory = tmp_path / "runner-batch.json.cases"
+    directory.mkdir()
+    index = tmp_path / "runner-batch.json"
+    cases = []
+    for name, proposed, accepted in (("a", 10, 9), ("b", 90, 9)):
+        path = directory / (name + ".json")
+        # Deliberately omit tokenizer/model files and generation text.
+        path.write_text(json.dumps({"status": "FAIL", "dflash": {
+            "warmup": 3, "repetitions": 1,
+            "measurements": [{"counters": {"drafted_tokens": proposed,
+                                          "accepted_draft_tokens": accepted}}],
+            "acceptance_rate": 1.0}}))  # Recompute from counters, not this stale value.
+        cases.append(dict(id=name, status="FAIL", report=str(path)))
+    index.write_text(json.dumps(dict(status="FAIL", cases=cases)))
+    before = {p: p.read_bytes() for p in (index, *directory.glob("*.json"))}
+    command = [sys.executable, "-I", "-B", str(Path(suite.REPO) / "tools/decode_outputs.py"),
+               "--report", str(index), "--acceptance-only"]
+    # -S ensures this path has no site packages (torch, transformers, etc.).
+    command.insert(1, "-S")
+    proc = subprocess.run(command, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "| a | FAIL | 9 / 10 | 90.00% |" in proc.stdout
+    assert "| b | FAIL | 9 / 90 | 10.00% |" in proc.stdout
+    assert "Observed weighted acceptance: 18.00%" in proc.stdout
+    assert "exclude warmups" in proc.stdout and "FAIL remains FAIL" in proc.stdout
+    selected = subprocess.run(command + ["--prompt-id", "b"], capture_output=True, text=True)
+    assert selected.returncode == 0, selected.stderr
+    assert "| a |" not in selected.stdout
+    assert "Observed weighted acceptance: 10.00%" in selected.stdout
+    assert all(p.read_bytes() == content for p, content in before.items())
+
+
+def test_observed_acceptance_missing_and_empty_are_not_zero_acceptance():
+    empty = suite.observed_acceptance({"dflash": {"totals": {
+        "drafted_tokens": 0, "accepted_draft_tokens": 0}}})
+    missing = suite.observed_acceptance({"status": "NOT_RUN"})
+    rejected = suite.observed_acceptance({"benchmark": {
+        "generation_mode": "dflash", "totals": {"drafted_tokens": 15, "accepted_draft_tokens": 0}}})
+    assert empty["available"] and empty["acceptance_rate"] is None
+    assert not missing["available"]
+    assert rejected["available"] and rejected["acceptance_rate"] == 0
+    output = suite.render_acceptance([
+        dict(id="empty", status="FAIL", observed_acceptance=empty),
+        dict(id="missing", status="NOT_RUN", observed_acceptance=missing),
+        dict(id="rejected", status="FAIL", observed_acceptance=rejected)])
+    assert "N/A (no proposals)" in output and "N/A (not recorded)" in output
+    assert "| rejected | FAIL | 0 / 15 | 0.00% |" in output
+    assert "reports with counters=2/3" in output
+    assert not suite.observed_acceptance({"generation_mode": "ordinary-greedy",
+        "totals": {"drafted_tokens": 15, "accepted_draft_tokens": 15}})["available"]
+
+
+@pytest.mark.parametrize("proposed,accepted", [(1, 2), (1, -1), (-1, 0), (1, True), (1.0, 1)])
+def test_observed_acceptance_rejects_invalid_counters(proposed, accepted):
+    with pytest.raises(ValueError, match="invalid saved"):
+        suite.observed_acceptance({"dflash": {"totals": {
+            "drafted_tokens": proposed, "accepted_draft_tokens": accepted}}})

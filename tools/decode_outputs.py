@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print saved ordinary/DFlash output text; does not load OMs or run inference."""
+"""Print saved ordinary/DFlash text and acceptance; does not run inference."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,7 @@ import sys
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO / "framework/python"), str(REPO)]
 
-from tools.benchmark_prompts import decode_outputs, render_outputs
+from tools.benchmark_prompts import decode_outputs, observed_acceptance, render_acceptance, render_outputs
 
 
 def saved_cases(path, prompt_ids=None):
@@ -53,21 +53,30 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True,
                         help="paired report, *.ordinary.json, runner-batch.json, or prompt-suite directory")
-    parser.add_argument("--model-dir", type=Path, required=True, help="the same tokenizer used for generation")
+    parser.add_argument("--model-dir", type=Path, help="the same tokenizer used for generation; needed for text")
     parser.add_argument("--prompt-id", action="append", help="decode only these batch IDs; repeatable")
+    parser.add_argument("--acceptance-only", action="store_true",
+                        help="show saved acceptance counters for all selected cases, including FAIL; no tokenizer needed")
     args = parser.parse_args()
+    if not args.acceptance_only and args.model_dir is None:
+        parser.error("--model-dir is required for text decoding; use --acceptance-only for counters")
     try:
-        from qwen35_dflash.ascend310p.workflow import load_tokenizer
-
         cases = saved_cases(args.report, args.prompt_id)
-        tokenizer, _ = load_tokenizer(model_dir=args.model_dir)
         rows = [{"id": name, "status": value.get("status", "UNKNOWN"),
-                 "prompt": tokenizer.decode(value["prompt_token_ids"], skip_special_tokens=False)
-                           if value.get("prompt_token_ids") else None,
-                 "error": value.get("error"),
-                 "first_difference": value.get("ordinary_parity", {}).get("first_difference"),
-                 "decoded_outputs": decode_outputs(value, tokenizer)} for name, value in cases]
-        print(render_outputs(rows), end="")
+                 "observed_acceptance": observed_acceptance(value)} for name, value in cases]
+        if not args.acceptance_only:
+            from qwen35_dflash.ascend310p.workflow import load_tokenizer
+
+            tokenizer, _ = load_tokenizer(model_dir=args.model_dir)
+            for row, (_, value) in zip(rows, cases):
+                row.update(prompt=tokenizer.decode(value["prompt_token_ids"], skip_special_tokens=False)
+                                  if value.get("prompt_token_ids") else None,
+                           error=value.get("error"),
+                           first_difference=value.get("ordinary_parity", {}).get("first_difference"),
+                           decoded_outputs=decode_outputs(value, tokenizer))
+        print(render_acceptance(rows), end="")
+        if not args.acceptance_only:
+            print("\n" + render_outputs(rows), end="")
         return 0  # Decoding succeeded; this does not change the saved parity status.
     except (OSError, ValueError, KeyError, RuntimeError) as error:
         parser.exit(2, f"decode-outputs: {error}\n")
