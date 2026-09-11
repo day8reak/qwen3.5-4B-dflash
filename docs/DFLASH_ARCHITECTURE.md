@@ -4,10 +4,16 @@ DFlash 让一个较小的 **Draft** 一次提出多个候选，再让 **Target**
 一轮接受多个 token，就能减少逐 token 调用大模型的次数。是否更快，取决于这些 token
 节省的普通 decode 时间，能否覆盖 Draft、verify 和状态提交的开销。
 
-本文对应 `feature/gdr-chunk-verify` 的增量实现：文本生成、batch=1、strict greedy，
+本文对应 `feature/gdr-chunk-verify` 的增量实现：文本生成、batch=1、greedy，
 每轮最多 15 个候选。重点介绍 W8A8 Target＋FP16 Draft 的 OM/C++ 路径，
 并说明它与 Python NPU 路径的对应关系。操作命令见
 [AIR/OM/C++ 部署手册](GDR_CHUNK_AIR_OM.md)和 [Python NPU 手册](DFLASH_RUN_AND_VALIDATE.md)。
+
+当前运行命令和 8 条 prompt 的实测表见
+[当前版本使用与结果](DFLASH_CURRENT_USAGE_AND_RESULTS.md)：
+128-token 测试整体加速 1.50075×，候选接受率 20.69%。
+本轮显式允许输出差异，各模式各自通过 3+10；不代表与普通模型逐 token 相同或任务质量等价。
+默认严格对照与显式 `--allow-output-differences` 的实验汇总分别保留结果。
 
 ## 1. 先看整体：普通模式用两张 OM，DFlash 用三张
 
@@ -100,7 +106,8 @@ Target Top1      [A,      B, C, …, …]
 当前 C++ 和 Python 调度会持续投机，直到 EOS 或输出预算耗尽。
 某轮 `a=0` 时，只提交旧 anchor 对应的 1 行状态；Target 的补充 token
 作为下一轮 anchor，更新 Draft 上下文后再次提出候选。连续多轮零接受也不会关闭 Draft。
-接受率与速度要重新测量；持续开启不代表一定更快，也不取消与普通模型的 token 一致性检查。
+持续开启不保证每条请求都更快；当前 zh_plan 仅 0.75×，其余 7 条为 1.34～2.55×。
+输出对照始终记录；显式允许差异时仍要求两种模式各自重复稳定。
 
 ## 3. Target 和 Draft 内部是什么结构
 
@@ -157,8 +164,11 @@ flowchart TB
 
 当前 OM 编译默认给 Draft 加 `--deterministic=1`，用于消除已复现的 FC 重复计算漂移。
 它不改变上述结构、权重或 FP16 输入类型；Target 的编译默认保持原样。
-FC 单图开启后已在设备上重复稳定，完整 Draft 的稳定性、接受率和速度仍需单独验证。
-部署手册的多 prompt 测试会一次汇总 8 类请求，逐条比较普通与 DFlash 的最终输出及速度。
+已报告的 FC native/OM 单图 det0 均为 19/20 次变化，det1 均为 0/20；
+两种模式使用不同开关，具体位置、设置和复现命令见
+[确定性与漂移](DFLASH_CURRENT_USAGE_AND_RESULTS.md#61-deterministic-开关与已定位的精度漂移)。
+当前 8 条 prompt 的完整生成各模式重复性已通过，跨模式输出仍不同。
+单图重复稳定不能替代完整模型验证，也不能确定其具体底层 kernel。
 
 Draft 持久 KV 只保存已提交 Target 特征的投影结果。MASK block 的临时 K/V 不跨轮保留。
 不足 15 个候选时，所有层都会屏蔽多余 block key，包括最后的非因果层，
@@ -230,18 +240,16 @@ DFlash 本轮耗时 = Draft 时间 + Verify 时间（已含两遍 GDR 和 commit
 DFlash 本轮耗时 < 对应普通耗时，才有加速。
 ```
 
-下面仅为算例，**不是设备实测**：单 token decode 为 40 ms，一轮接受 7 个候选。
-
-| 情况 | Draft | Verify，含 commit | 一轮约耗时，暂忽略主机开销 | 对应 8 次普通 decode | 结果 |
-|---|---:|---:|---:|---:|---|
-| 验证较快 | 30 ms | 70 ms | 100 ms | 320 ms | 约 3.2 倍 |
-| 验证较慢 | 30 ms | 700 ms | 730 ms | 320 ms | 约 0.44 倍，即更慢 |
+当前实测中，translate 平均每轮输出 6.68 token，128-token 模型循环中位数
+由普通的 4421.45 ms 降至 1734.48 ms，约 2.55×；
+zh_plan 每轮只有 1.92 token，由 4412.11 ms 增至 5893.52 ms，约 0.75×。
+完整结果和统计口径见 [实测表](DFLASH_CURRENT_USAGE_AND_RESULTS.md#4-现有多-prompt-结果)。
 
 接受率相同也可能有完全不同的速度。需要一起查看：
 
 | 指标 | 回答的问题 |
 |---|---|
-| 接受率 `accepted / drafted` | Draft 猜得有多准 |
+| 接受率 `accepted / drafted` | 多少候选进入连续接受前缀；不是所有位置的独立预测准确率 |
 | 每轮实际输出数、verify 次数 | 减少了多少 Target 调用 |
 | Draft / verify / 普通 decode 时延 | 每轮代价是否划算 |
 | prefill＋decode 总时延 | 整次生成是否更快 |
@@ -251,7 +259,11 @@ DFlash 本轮耗时 < 对应普通耗时，才有加速。
 可能涉及整块缓存复制。短输出请求还会被 prefill 等共同开销限制收益。
 
 最终 token 一致性和逐轮候选一致性分别检查。Draft 精度、有效候选预算不同，都可能改变
-候选和接受率；判断实现是否正确，仍以同配置 ordinary Target 的 token、EOS 和停止原因为准。
+候选和接受率。严格模式以同配置 ordinary Target 的 token、EOS 和停止原因为准；
+用户显式允许跨模式差异的实验可以报告各自输出的速度，但不据此判断质量等价。
+当前 summary 没有各图的分项数组；不能把全程约 34.5 ms/token 写成纯 decode 时延，
+也不能猜测 Draft/Verify 的拆分。原始报告字段及提取命令见
+[分项计时](DFLASH_CURRENT_USAGE_AND_RESULTS.md#43-不重新跑模型提取已有分项计时)。
 
 ## 6. 自定义算子与计算精度
 

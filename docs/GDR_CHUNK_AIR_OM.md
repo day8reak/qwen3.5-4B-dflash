@@ -1,7 +1,12 @@
 # Ascend 310P：从模型到 AIR、OM、C++ 运行和 msprof
 
 按本文顺序完成环境准备、输入检查、模型导出、转换、C++ 执行和性能采集。
-支持 batch=1、strict greedy、W8A8 Target＋FP16 Draft。
+支持 batch=1、greedy、W8A8 Target＋FP16 Draft，默认做严格输出对照。
+
+已有部署时可从 [当前版本运行命令与结果](DFLASH_CURRENT_USAGE_AND_RESULTS.md)开始：
+该文档汇总最新 8 条 prompt 的加速、接受率、时延提取和 FC 确定性问题。
+显式允许输出差异的实验使用 `benchmark_prompts.py --allow-output-differences`，
+不改变本手册的默认严格验证步骤。
 
 模型结构、逐轮接受示例、状态提交和加速条件见
 [DFlash 结构与生成流程](DFLASH_ARCHITECTURE.md)。
@@ -9,7 +14,7 @@
 | OM | 物理输入 | 职责 |
 |---|---:|---|
 | `target_prefill.om` | 64 行，有效 1..64 | prompt 分块、末行 Top1、Target 特征和状态 |
-| `target_decode.om` | 1 行 | 普通 greedy decode；已加载时也供 DFlash 关闭草稿后使用 |
+| `target_decode.om` | 1 行 | 普通 greedy decode；当前 DFlash 持续投机，不切换到此图 |
 | `target_verify.om` | 16 行，有效 1..16 | verify、Top1、接受判断、第二次 GDR 和 committed state |
 | `draft.om` | 64 行特征＋16 行 block | 特征投影、Draft KV 追加、一次 1..15 token proposal |
 
@@ -25,8 +30,9 @@ verify 包含状态提交计算，没有独立 commit OM。
 24 份 discard 输出各为 FP32 `[1,32,128,128]`，合计 48 MiB，
 C++ 不将其拷回 CPU，也不在下一轮读取。OM 数量保持不变。
 
-设备适配状态：代码和主机模拟测试已具备；真实 TorchAir/ATC、AscendCL、token 精度和性能
-必须在目标设备完成验证，不能把模拟测试当作设备结果。
+设备适配状态：已收到用户设备上的多 prompt 报告，当前近似配置各模式重复稳定，
+跨模式输出仍不同；具体数字和证据范围见结果文档。新的产物仍需在设备上验证，
+不能把主机模拟测试当作设备结果。
 
 ## 1. 准备源码和目录
 
@@ -415,6 +421,11 @@ Draft 的 FP16 选择通过图中显式 Cast 实现。也支持显式传入 `--p
 增量套件的 `draft` 图默认额外使用 `--deterministic=1`，三个 Target 图的默认参数不变。
 这是根据同一份 FC AIR 的设备对照加入的：关闭时 native/OM 均有 19/20 次输出变化，
 开启后两条路径均为 0/20，且有效输出逐位相同。完整 Draft 仍需重放、普通生成对照和重新测速。
+漂移发生在 Draft 的 `fc.weight` 上下文投影；native 对照通过
+`torch.use_deterministic_algorithms(..., warn_only=False)` 控制，
+OM 通过 ATC 编译参数控制，两者不会互相修改。
+详细样例、证据限制、现有部署检查和复现命令见
+[deterministic 与 FC 漂移](DFLASH_CURRENT_USAGE_AND_RESULTS.md#61-deterministic-开关与已定位的精度漂移)。
 各图实际命令保存在 `graphs[].atc_command`，额外参数保存在 `compiler.graph_extra_args`。
 显式 `--atc-arg=--deterministic=0` 可用于对照实验；该公共参数会传给所有待编译图。
 
@@ -743,6 +754,9 @@ prompt 加输出预算超出 OM 的固定上下文容量时提前报错，可减
 这项测试直接测模型循环，不套 msprof；算子分析仍使用第 14 步的独立采集入口。
 
 ## 12. 检查 token 一致性和时延范围
+
+本节是严格正确性对照。当前用户允许差异的实验结果不标记为此项通过；
+可按第 11 节的显式汇总策略查看速度，保留各自重复性检查及真实的输出差异。
 
 将 NPU ordinary、NPU DFlash、OM ordinary 和 OM DFlash 四者作精确比较：
 

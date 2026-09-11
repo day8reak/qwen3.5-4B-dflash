@@ -140,7 +140,7 @@
     "contract_file": "config/npu_benchmark_v1.json",
     "contract_sha256": "b5fdd64b1eaea44b3f53452bc260cf62de53ca38b1fcd8699bf4f9e358d99c76",
     "documentation_file": "docs/DFLASH_RUN_AND_VALIDATE.md",
-    "documentation_sha256": "d6766fcf39a58535b3f15bab016cbd8f5ab0530126b546ecf9a3cfc56f3d4194",
+    "documentation_sha256": "213e2c61e3f839e91da1a3d9acb3da38d5bcbec1ae425442345742a2d4065ba8",
     "policy": "strict-greedy gate before timing; original main inference.py and both rollback modes use an equal 32-token budget; quantized ordinary and DFlash use the exact same original YAML and resolved artifacts; rollback ordinary remains the scheduler-control baseline; rollback prefill uses block-aligned real-token chunks and rollback verify/accepted+1 commit uses two original-GDR chunk calls; separate ordinary/dflash processes; synchronized unprofiled 3+10 baseline; cumulative counters separated from resettable session state; copied-source content identity without VCS metadata; msprof diagnostic only with MSTX disabled by default and explicit opt-in; no CPU fallback; native msprof dynamic CLI single-stage and all-stage diagnostics with one loaded application, independent fresh-state warmups and one acknowledged window per stage; verify collects the first original chunk GDR pass, accept-commit includes the mandatory accepted+1 second GDR pass even at zero acceptance, and decode-round collects both; per-window GDR verify/commit layer counters and nonempty operator exports are required; separate raw directories and synchronized timing CSV; no pyACL and no formal latency or strict-greedy accuracy claim from stage diagnostics; ordinary Python and C++ prefill/decode/all windows; C++ DFlash prefill/draft/fused-verify/all windows; native C++ socket barriers and standard-library Python controller; actual graph-call counts checked; no device-performance claim from host fixtures; shared per-stage operator type/task reports grouped by input/output dtype, device/model and original CSV; general OM profiling entry prepares a fresh mode-specific plan from the selected deployment manifest"
   },
   "incremental_om_framework": {
@@ -149,7 +149,7 @@
     "files": [
       {
         "source_file": "README.md",
-        "source_sha256": "a2e13f939b8524ed8e54d1768519379f9bd368e3cb34eb81702f075a898c3487"
+        "source_sha256": "4c9ab6dea51230162d7c6bb5dd89796817741eaaebef28da7183fdb0243ada55"
       },
       {
         "source_file": "config/gdr_chunk_air_om_factory.example.json",
@@ -157,11 +157,11 @@
       },
       {
         "source_file": "docs/DFLASH_ARCHITECTURE.md",
-        "source_sha256": "25c7f61d676178d5e0bfbac05e04fb243fcaf79a2994dcbd300e867a351cc1f8"
+        "source_sha256": "a9333a6b94d4286de25a73a1fdd43ab4601fb19b9ecbcda57f15049e91e121ab"
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "d1dcf34342caaeef26c0b654cf44c8c71e56c23329523801e4a9f6b72dda86a4"
+        "source_sha256": "51266bea007e947ee05e624bfea0df64252a4d161ae00297d2da582bfaca5f7a"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -498,6 +498,10 @@
       {
         "source_file": "tests/test_prompt_analysis.py",
         "source_sha256": "4c575fd69c17bfcb46fe45792458a387aeb6e7e664fb0a91223d54a487e54169"
+      },
+      {
+        "source_file": "docs/DFLASH_CURRENT_USAGE_AND_RESULTS.md",
+        "source_sha256": "e85f0d453b1d1653732a07cd44e881b10ce347b3868a76880d9fc21e688e9a29"
       }
     ]
   }

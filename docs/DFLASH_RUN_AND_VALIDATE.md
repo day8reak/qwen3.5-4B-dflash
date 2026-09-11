@@ -3,6 +3,9 @@
 本文按顺序运行 Qwen3.5-4B ordinary/DFlash，并采集单次 prefill、decode 或 Draft/verify。
 支持 batch=1、strict greedy，Target 可选 FP16/W8A8，Draft 运行时为 FP16。
 C++ OM 的完整部署步骤见 [AIR → OM → C++ 操作手册](GDR_CHUNK_AIR_OM.md)。
+本轮正在使用的 OM/C++ 命令、8 条 prompt 的性能及 deterministic/FC 漂移说明见
+[当前版本运行命令与结果](DFLASH_CURRENT_USAGE_AND_RESULTS.md)。
+其中的允许输出差异选项属于 OM prompt 汇总工具，不改变本文 Python NPU 的严格对照。
 
 ## 1. 准备源码和目录
 

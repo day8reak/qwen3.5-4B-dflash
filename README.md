@@ -1,10 +1,16 @@
 # Qwen3.5-4B DFlash
 
 在 Ascend 310P 上运行 Qwen3.5-4B ordinary greedy 和 DFlash speculative decoding，
-支持 batch=1、strict greedy、FP16 Target 或 W8A8 Target。Draft 使用官方
+支持 batch=1、greedy、FP16 Target 或 W8A8 Target。Draft 使用官方
 Qwen3.5-4B-DFlash checkpoint，以 FP16 执行。
 
-先看 [DFlash 结构与生成流程](docs/DFLASH_ARCHITECTURE.md)：从整体流程和逐轮例子，
+已有 OM 时，从 [当前版本运行命令与结果](docs/DFLASH_CURRENT_USAGE_AND_RESULTS.md)开始：
+包含多 prompt 一次测试、允许输出差异、离线汇总、decode/Draft/Verify 计时提取，
+以及 deterministic 开关和 FC 漂移的定位结果。
+当前 8 条、每条 128 token 的设备报告显示整体 1.50075× 加速、20.69% 候选接受率；
+7 条更快，1 条变慢，各模式重复稳定，跨模式输出不同，任务质量未评估。
+
+再看 [DFlash 结构与生成流程](docs/DFLASH_ARCHITECTURE.md)：从整体流程和逐轮例子，
 理解 Target/Draft、三张 DFlash OM、状态提交，以及获得加速的条件。
 
 ## 1. 选择运行方式
@@ -60,13 +66,17 @@ ordinary Target 是 strict-greedy 正确性对照；token IDs、EOS 和停止原
 性能比较使用相同 prompt token、精度、输出 token 和同步边界，保留 3 次预热与 10 次测量。
 msprof 算子累计时间用于定位热点，不能直接替代整段生成时延。
 
-AIR/OM/C++ 已有代码与主机模拟测试；真实 TorchAir/ATC、AscendCL 执行、token 精度和
-Ascend 310P 性能仍需目标机验证。主机测试不提供真实 OM 产物或设备加速结论。
+上述为默认严格模式。当前允许输出差异的速度实验使用
+`benchmark_prompts.py --allow-output-differences`：
+输出对照仍如实记录，满足各自 3+10 和执行检查时标为 `PASS_WITH_DIFFERENCES`。
+该结果比较各模式自己的输出，不代表质量等价或严格正确性通过。
+当前文档中的设备数据来自用户提供的报告；主机模拟测试不提供设备加速结论。
 
 ## 6. 参考资料
 
 | 文档 | 内容 |
 |---|---|
+| [当前版本运行命令与结果](docs/DFLASH_CURRENT_USAGE_AND_RESULTS.md) | 运行/重编起点、8 条 prompt 增益、时延口径、分项提取、确定性漂移与待定位问题 |
 | [DFlash 结构与生成流程](docs/DFLASH_ARCHITECTURE.md) | 整体流程、逐轮 token 与缓存、两遍 GDR、加速条件、算子精度、显存和采集范围 |
 | [自定义算子](docs/DFLASH_OPERATORS.md) | 必需 ABI、Tensor 实现与性能候选 |
 | [AIR/OM/C++ 接口](docs/QUANT_AIR_OM_FRAMEWORK.md) | factory、manifest、tensor ABI、CLI 与计时范围 |
