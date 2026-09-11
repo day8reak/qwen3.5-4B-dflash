@@ -1,0 +1,32 @@
+{
+  "abi": "qwen35-dflash-mtp-v1",
+  "verify_gdr": "mtp",
+  "status": "host-contract-tested-awaiting-real-torchair-atc-and-device",
+  "factory": "qwen35_dflash.ascend310p.quant_factory:create_quant_incremental_graphs",
+  "required_graphs": ["target_prefill", "target_verify", "draft"],
+  "optional_ordinary_graph": "target_decode",
+  "maximum_graph_count": 4,
+  "batch_size": 1,
+  "physical_rows": {"target_prefill": 64, "target_decode": 1, "target_verify": 16, "draft_context": 64, "draft_noise": 16},
+  "precision": "Target W8A8; Draft FP16; committed GDN recurrent FP32; conv and KV FP16",
+  "ordinary_state_policy": "original Chunk prefill/decode rounds recurrent state to FP16, stored in FP32 buffers shared across graph roles",
+  "verify_policy": "one MTP call per GDN layer; Target Top1 and prefix acceptance; gather conv/recurrent slot a after anchor plus a accepted proposals",
+  "mtp_operator": {
+    "torch_op": "npu::npu_gated_delta_rule_mtp",
+    "ge_type": "GatedDeltaRuleMTP",
+    "inputs": ["query", "key", "value", "g", "beta", "initial_state", "accepted_tokens"],
+    "outputs": ["core_attn", "last_recurrent_state"],
+    "attrs": {"chunk_size": 64, "output_final_state": true, "use_qk_l2norm_in_kernel": true},
+    "initial_state": "FP32[1,16,32,128,128], seeded per layer from committed scalar state",
+    "accepted_tokens": "INT8[1] zero selects initial slot; not the current acceptance count",
+    "effective_length_input": false
+  },
+  "verify_state_output_policy": "internal_fp32_bank_gather_accepted_slot",
+  "verify_discard_states": [],
+  "verify_output_count": 67,
+  "valid_rows": "INT16[1] restricts mask, acceptance and selected state; MTP computes all 16 physical rows",
+  "capsules": "two internal banks per GDN layer: conv FP16 and recurrent FP32",
+  "target_gates": ["MTP named GE ABI and Meta", "one MTP GE node per GDN layer in Verify", "no second Chunk GDR in Verify", "ordinary FP16 rounding preserved", "zero/partial/full acceptance and rejection recovery", "K changes and page boundaries", "3+10 real device and requested output-comparison policy"],
+  "not_changed": ["ordinary prefill/decode operators", "checkpoint and quantization", "Draft default deterministic compilation", "always-on speculation", "default strict greedy gates"],
+  "reference": {"repository": "day8reak/qwen3.5-4B-dflash", "branch": "framework/quant-air-om", "commit": "631c86fc0c4e053817f0786ab8067b5565638d50"}
+}

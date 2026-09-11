@@ -380,6 +380,7 @@ def collect_results(args, prompts, raw, index, plan_hash, batch_hash, eos, exit_
             validate_cpp_runner_report(report, prompt_token_ids=prompt["prompt_token_ids"],
                 om_sha256=plan_hash, device_id=args.device_id, max_new_tokens=args.max_new_tokens,
                 max_draft_tokens=args.max_draft_tokens, chunk_abi=True, low_memory=args.low_memory,
+                verify_gdr=getattr(args, "verify_gdr", None),
                 allow_output_differences=allow_differences)
             if report["eos_token_ids"] != eos or report["protocol"].get("round_trace_enabled") is not True:
                 raise ValueError("EOS or trace settings differ")
@@ -411,7 +412,8 @@ def collect_results(args, prompts, raw, index, plan_hash, batch_hash, eos, exit_
             "warmup": 3, "repetitions": 10, "low_memory": args.low_memory,
             "output_comparison": "allow_output_differences" if allow_differences else "strict",
             "dflash_speculation_policy": raw.get("dflash_speculation_policy", "not_recorded"),
-            "models_reused_across_prompts": raw.get("models_reused_across_prompts"), "order": raw.get("order")},
+            "models_reused_across_prompts": raw.get("models_reused_across_prompts"), "order": raw.get("order"),
+            "verify_gdr": getattr(args, "verify_gdr", None)},
         "startup_ms": raw.get("startup_ms"), "runner_index": str(index), "runner_exit_code": exit_code,
         "ordinary_parity": "FAIL" if parity_failed else "PASS" if ok else "FAIL_OR_INCOMPLETE",
         "quality_evaluation": "NOT_RUN", "formal_latency_evidence": bool(ok and not differences),
@@ -467,6 +469,11 @@ def summarize_existing(args):
     stored = argparse.Namespace(device_id=int(argument("--device-id")),
         max_new_tokens=int(argument("--max-new-tokens")), max_draft_tokens=int(argument("--max-draft-tokens")),
         low_memory="--low-memory" in command, allow_output_differences=args.allow_output_differences)
+    from qwen35_dflash.ascend310p.incremental_plan import require_verify_gdr
+    stored.verify_gdr = require_verify_gdr(
+        {"abi": plan.read_text().splitlines()[0]}, getattr(args, "verify_gdr", None))
+    if request.get("verify_gdr", stored.verify_gdr) != stored.verify_gdr:
+        raise ValueError("saved verification route differs from the hashed plan")
     eos = [int(t) for t in argument("--eos-token-ids").split(",")]
     if (stored.max_new_tokens != request["max_new_tokens"] or stored.max_draft_tokens != request["max_draft_tokens"]
             or eos != request["eos_token_ids"]):
@@ -514,7 +521,10 @@ def run(args):
         raise RuntimeError("rebuild the C++ runner: --prompt-batch support is required")
     root = require_run_output(Path(tempfile.mkdtemp(prefix="prompt-suite-", dir=run_dir)))
     print(f"Output: {root}", flush=True)
-    plan, deployment, contract = write_incremental_plan(manifest, root / "chunk-plan.txt")
+    plan, deployment, contract = write_incremental_plan(
+        manifest, root / "chunk-plan.txt", verify_gdr=getattr(args, "verify_gdr", None))
+    from qwen35_dflash.ascend310p.incremental_plan import verify_gdr_route
+    args.verify_gdr = verify_gdr_route(contract)
     tokenizer, tokenizer_source = load_tokenizer(model_dir=args.model_dir)
     eos = args.eos_token_id or [248044]
     if any(token < 0 or token >= contract["vocab_size"] for token in eos):
@@ -539,6 +549,7 @@ def run(args):
     if args.low_memory:
         command.append("--low-memory")
     request = {"schema_version": 1, "prompts": prompts, "chat": args.chat, "eos_token_ids": eos,
+        "verify_gdr": args.verify_gdr, "incremental_abi": contract["abi"],
         "allow_output_differences": getattr(args, "allow_output_differences", False),
         "max_new_tokens": args.max_new_tokens, "max_draft_tokens": args.max_draft_tokens,
         "runtime_identity": identity, "tokenizer_source": tokenizer_source,
@@ -563,6 +574,8 @@ def main():
     parser.add_argument("--run-dir", type=Path, default=os.environ.get("AI_RUN_DIR"), required=not os.environ.get("AI_RUN_DIR"))
     parser.add_argument("--runner", type=Path, default=os.environ.get("CPP_RUNNER"))
     parser.add_argument("--deployment-manifest", type=Path)
+    parser.add_argument("--verify-gdr", choices=("chunk", "mtp"),
+                        help="require the selected compiled route; omitted: read manifest")
     parser.add_argument("--runner-config", type=Path)
     parser.add_argument("--model-dir", type=Path, help="required for inference; optional for decoding saved outputs")
     parser.add_argument("--prompts", type=Path, help="optional JSON list; defaults to eight varied prompts")

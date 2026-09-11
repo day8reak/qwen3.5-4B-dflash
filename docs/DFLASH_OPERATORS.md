@@ -2,6 +2,9 @@
 
 本文描述 Python NPU strict-greedy rollback 的算子依赖、Tensor 实现和性能候选。AIR/OM/C++
 的融合 verify/commit 与显式 I/O 见 [框架接口](QUANT_AIR_OM_FRAMEWORK.md)。
+增量 OM 新增可选 GDR MTP 路径；它的 FP32 bank、注册接口和
+`--verify-gdr` 命令见 [两条验证路径](GDR_VERIFY_ROUTES.md)。以下 Python eager
+rollback 的依赖结论仍按 Chunk 路径描述。
 
 下面区分当前 rollback 能否运行、去掉生产 golden 还缺什么、性能优化可能
 需要什么。只有实测热点才进入优化算子开发；sampling、streaming、batch 和 transaction 所有权

@@ -22,6 +22,7 @@ struct ChunkGraph {
   std::vector<TensorSpec> inputs, outputs;
 };
 struct ChunkPlan {
+  std::string abi = "qwen35-dflash-chunk-v3";
   std::size_t capacity = 0;
   std::int64_t vocabulary = 0;
   std::map<std::string, ChunkGraph> graphs;
@@ -33,6 +34,7 @@ bool IsVerifyDiscardState(const std::string& name);
 // The same scheduler is exercised by host fixtures and the real AscendCL path.
 class ChunkExecutor : public GraphExecutor {
  public:
+  virtual std::string abi_id() const { return "qwen35-dflash-chunk-v3"; }
   std::size_t draft_width() const noexcept override { return 15; }
   const GraphOutputs& Execute(const std::vector<std::int64_t>&,
                               std::int64_t) override;
@@ -78,6 +80,7 @@ class AclChunkExecutor final : public ChunkExecutor {
       const std::filesystem::path& output_directory,
       const std::filesystem::path& input_directory = {});
   std::size_t sequence_length() const noexcept override;
+  std::string abi_id() const override;
   std::int64_t vocabulary_size() const noexcept override;
   void Reset(std::int64_t) override;
   void Abort() noexcept override;

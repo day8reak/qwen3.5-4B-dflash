@@ -72,6 +72,8 @@ def parser(default_stage="all") -> argparse.ArgumentParser:
     result.add_argument("--device-id", type=int, default=0)
     result.add_argument("--max-new-tokens", type=int, default=32)
     result.add_argument("--max-draft-tokens", type=int, default=15)
+    result.add_argument("--verify-gdr", choices=("chunk", "mtp"),
+                        help="require this route in the compiled deployment")
     result.add_argument("--profile-warmup", type=int, default=1)
     result.add_argument("--profile-audit-draft-inputs", action="store_true",
                         help="For DFlash draft/verify/all, hash Draft stage or verify-preparation "
@@ -125,6 +127,7 @@ def run_profile(args: argparse.Namespace) -> Path:
     print(f"Output: {output}\nMode/stage: {mode}/{stage}\nPrompt source: {prompt_source}\nEOS IDs: {eos}", flush=True)
     request = {
         "profile_mode": mode, "profile_stage": stage,
+        "verify_gdr_requested": getattr(args, "verify_gdr", None),
         "stages": list(available) if stage == "all" else [stage],
         "deployment_manifest": {"path": str(manifest), "sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()},
         "runner": {"path": str(runner), "sha256": hashlib.sha256(runner.read_bytes()).hexdigest()},
@@ -139,7 +142,8 @@ def run_profile(args: argparse.Namespace) -> Path:
     subprocess.run([
         sys.executable, "-B", "-m", "qwen35_dflash.ascend310p", "prepare-chunk-plan",
         "--deployment-manifest", str(manifest), "--mode", mode, "--output", str(plan),
-    ], check=True, env=environment, cwd=REPOSITORY)
+    ] + (["--verify-gdr", args.verify_gdr] if getattr(args, "verify_gdr", None) else []),
+        check=True, env=environment, cwd=REPOSITORY)
     digest = hashlib.sha256(plan.read_bytes()).hexdigest()
     print("Loading selected OMs once. Each stage gets fresh-state warmup and one capture window; "
           "prefill includes all prompt chunks. Model loading can take several minutes.", flush=True)

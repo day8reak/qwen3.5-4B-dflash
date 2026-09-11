@@ -21,13 +21,13 @@ double Ms(Clock::time_point start) {
       .count();
 }
 
-void ValidateVerifyDiscardOutputs(const ChunkGraph& graph) {
+void ValidateVerifyDiscardOutputs(const ChunkGraph& graph, bool mtp) {
   std::vector<TensorSpec> expected;
   for (const auto& spec : graph.inputs) {
     Require(!IsVerifyDiscardState(spec.name),
             "verify discard state must never be an OM input");
     const std::string suffix = "_recurrent";
-    if (graph.name == "target_verify" && spec.name.size() > suffix.size() + 1 &&
+    if (!mtp && graph.name == "target_verify" && spec.name.size() > suffix.size() + 1 &&
         spec.name[0] == 't' && spec.name[1] >= '0' && spec.name[1] <= '9' &&
         spec.name.compare(spec.name.size() - suffix.size(), suffix.size(), suffix) == 0)
       expected.push_back({"verify_discard_" + spec.name, "float32", spec.shape});
@@ -36,7 +36,7 @@ void ValidateVerifyDiscardOutputs(const ChunkGraph& graph) {
       graph.outputs.begin(), graph.outputs.end(),
       [](const auto& spec) { return IsVerifyDiscardState(spec.name); }));
   Require(count == expected.size() &&
-              (graph.name != "target_verify" || count > 0),
+              (mtp || graph.name != "target_verify" || count > 0),
           "verify discard output count differs from recurrent layer count");
   // Discard buffers follow all committed states, in the same linear-layer order.
   for (std::size_t i = 0; i < expected.size(); ++i) {
@@ -72,7 +72,8 @@ ChunkPlan ReadChunkPlan(const std::filesystem::path& path,
   std::ifstream input(path);
   std::string word;
   ChunkPlan result;
-  Require(static_cast<bool>(input >> word) && word == "qwen35-dflash-chunk-v3",
+  Require(static_cast<bool>(input >> result.abi) &&
+              (result.abi == "qwen35-dflash-chunk-v3" || result.abi == "qwen35-dflash-mtp-v1"),
           "invalid chunk plan ABI; regenerate AIR/OM and rebuild the C++ runner");
   Require(static_cast<bool>(input >> word >> result.capacity >>
                             result.vocabulary) &&
@@ -115,7 +116,18 @@ ChunkPlan ReadChunkPlan(const std::filesystem::path& path,
     }
     Require(word == "end" && !graph.inputs.empty() && !graph.outputs.empty(),
             "incomplete graph plan");
-    ValidateVerifyDiscardOutputs(graph);
+    ValidateVerifyDiscardOutputs(graph, result.abi == "qwen35-dflash-mtp-v1");
+    if (result.abi == "qwen35-dflash-mtp-v1") {
+      auto validate_recurrent = [](const auto& specs) {
+        for (const auto& spec : specs) {
+          if (spec.name.size() >= 10 &&
+              spec.name.compare(spec.name.size() - 10, 10, "_recurrent") == 0)
+            Require(spec.dtype == "float32", "MTP committed recurrent state must be FP32");
+        }
+      };
+      validate_recurrent(graph.inputs);
+      validate_recurrent(graph.outputs);
+    }
     result.graphs.emplace(graph.name, std::move(graph));
   }
   Require(word == "done" && result.graphs.count("target_prefill") &&

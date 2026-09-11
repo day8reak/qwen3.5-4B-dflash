@@ -1,5 +1,9 @@
 # Qwen3.5-4B DFlash：结构、生成流程与加速原理
 
+本文主体描述默认 Chunk 两遍路径。新增的 `--verify-gdr mtp` 复用 GDR MTP
+逐行状态 bank，并在接受数确定后 Gather 提交；详见
+[Chunk / MTP 流程对照与运行命令](GDR_VERIFY_ROUTES.md)。
+
 DFlash 让一个较小的 **Draft** 一次提出多个候选，再让 **Target** 一次验证整段。
 一轮接受多个 token，就能减少逐 token 调用大模型的次数。是否更快，取决于这些 token
 节省的普通 decode 时间，能否覆盖 Draft、verify 和状态提交的开销。

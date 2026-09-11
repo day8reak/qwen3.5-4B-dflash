@@ -287,6 +287,9 @@ class AclChunkExecutor::Impl {
       : plan(ReadChunkPlan(path, mode)), plan_path(path), plan_sha256(Sha256File(path)),
         device_id(device), share_workspace(share_workspace) {
     Require(device >= 0, "negative device ID");
+    std::cerr << "[chunk-runtime] verify_gdr="
+              << (plan.abi == "qwen35-dflash-mtp-v1" ? "mtp" : "chunk")
+              << " abi=" << plan.abi << '\n';
     try {
       LogProcessIdentity();
       Check(aclInit(nullptr), "aclInit");
@@ -1105,6 +1108,8 @@ std::size_t AclChunkExecutor::sequence_length() const noexcept {
 std::int64_t AclChunkExecutor::vocabulary_size() const noexcept {
   return impl_->plan.vocabulary;
 }
+
+std::string AclChunkExecutor::abi_id() const { return impl_->plan.abi; }
 void AclChunkExecutor::Reset(std::int64_t pad) { impl_->Reset(pad); }
 void AclChunkExecutor::Abort() noexcept {
   impl_->invalid = true;

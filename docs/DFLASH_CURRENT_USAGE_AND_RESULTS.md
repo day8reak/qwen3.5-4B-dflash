@@ -5,6 +5,9 @@
 已有 OM 时直接执行下面的运行命令；首次部署按
 [完整部署手册](GDR_CHUNK_AIR_OM.md)准备环境、量化输入和模型产物。
 模型内部细节见 [DFlash 流程和架构](DFLASH_ARCHITECTURE.md)。
+新增 `--verify-gdr chunk|mtp` 可选择两遍 Chunk 或 GDR MTP，见
+[验证路径切换命令](GDR_VERIFY_ROUTES.md)。本页现有实测结果均为 Chunk；
+MTP 的精度、接受率和时延待设备对照。
 
 当前 8 条 prompt、每条生成 128 token 的结果：7 条加速，1 条变慢；
 按全部正式测量的总时间计算，整体 **1.50075×**，吞吐增加 **50.07%**，
@@ -68,7 +71,8 @@ source "$CANN_ROOT/set_env.sh"
 export PYTHONPATH="$REPO_ROOT/framework/python:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-本文档更新不改变模型计算，无需重建 AIR、OM 或 runner。
+沿用 Chunk v3 bundle 时无需重建 AIR/OM。新增 MTP 路径需要新 bundle 和支持 MTP ABI 的 runner，
+按 [切换手册](GDR_VERIFY_ROUTES.md)执行。
 若 runner 仍是“零接受后关闭投机”的旧版本，需按第 3 节重编 runner。
 
 ### 2.2 一次测试全部 8 条 prompt

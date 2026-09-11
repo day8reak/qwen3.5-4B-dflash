@@ -133,7 +133,7 @@ def write_saved_suite(root, report=None):
     report = report or saved_report()
     root.mkdir()
     plan = root / "chunk-plan.txt"
-    plan.write_text("synthetic plan; no model execution\n")
+    plan.write_text("qwen35-dflash-chunk-v3\nsynthetic plan; no model execution\n")
     batch = root / "prompts.txt"
     batch.write_text('QWEN35_PROMPT_BATCH_V1\np "4,5"\n')
     report["model"]["sha256"] = sha256_file(plan)

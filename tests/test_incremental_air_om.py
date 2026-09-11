@@ -225,7 +225,23 @@ def cache_update_reference(cache, updates, target_block, offset):
     return result
 
 
-def specs(include_ordinary_decode=True, cache_update=None):
+def mtp_gdr(query, key, value, g, beta, initial_state, accepted_tokens, **kwargs):
+    """CPU recurrence oracle for the MTP bank ABI, never a production fallback."""
+    del kwargs
+    assert accepted_tokens.dtype == torch.int8
+    state = initial_state[torch.arange(query.shape[0]), accepted_tokens.long()]
+    q, k, v = F.normalize(query.float(), dim=-1), F.normalize(key.float(), dim=-1), value.float()
+    outputs, bank = [], []
+    for i in range(query.shape[1]):
+        state = state * g[:, i].exp()[..., None, None]
+        residual = v[:, i] - (k[:, i, :, None, :] @ state).squeeze(-2)
+        state = state + k[:, i, :, :, None] * (residual * beta[:, i, :, None])[..., None, :]
+        bank.append(state)
+        outputs.append((q[:, i, :, None, :] @ state).squeeze(-2))
+    return torch.stack(outputs, dim=1).half(), torch.stack(bank, dim=1)
+
+
+def specs(include_ordinary_decode=True, cache_update=None, verify_gdr="chunk"):
     torch.manual_seed(42)
     target, draft = TinyTarget().eval(), draft_model()
     return incremental_graph_specs(
@@ -238,6 +254,7 @@ def specs(include_ordinary_decode=True, cache_update=None):
         rotary=rotary,
         cache_update=cache_update,
         include_ordinary_decode=include_ordinary_decode,
+        verify_gdr=verify_gdr, gdr_mtp=mtp_gdr if verify_gdr == "mtp" else None,
     )
 
 
@@ -894,12 +911,12 @@ def test_draft_graph_exports_with_dynamic_context_length():
 
 
 @pytest.fixture
-def chunk_bundle(tmp_path, monkeypatch):
+def chunk_bundle(tmp_path, monkeypatch, request):
     from qwen35_dflash.ascend310p.exporter import export_air_bundle
     from qwen35_dflash.ascend310p.compiler import compile_air_bundle
 
     monkeypatch.setenv("AI_RUN_DIR", str(tmp_path))
-    values = specs()
+    values = specs(verify_gdr=getattr(request, "param", "chunk"))
     by_name = {s.name: s for s in values}
 
     class FakeTorchAir:
@@ -1051,6 +1068,7 @@ def test_cpp_reports_actual_om_descriptors_before_execute(
 
 @pytest.mark.parametrize("accepted,eos", [(0, []), (3, []), (15, []), (15, [7])])
 @pytest.mark.parametrize("low_memory", [False, True])
+@pytest.mark.parametrize("chunk_bundle", ["chunk", "mtp"], indirect=True)
 def test_cpp_four_om_roundtrip_with_fake_acl(
     chunk_bundle, tmp_path, monkeypatch, accepted, eos, low_memory
 ):

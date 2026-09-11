@@ -6,6 +6,7 @@
   "receiver_models_dir": "/ABSOLUTE/PATH/qwen35-runtime/models",
   "max_sequence_length": 512,
   "include_ordinary_decode": true,
+  "verify_gdr": "chunk",
   "dtype": "float16",
   "device": "npu:0",
   "adn_rms_norm_ge_op_type": "AdnRmsNorm"

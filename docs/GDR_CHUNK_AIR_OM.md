@@ -1,5 +1,8 @@
 # Ascend 310P：从模型到 AIR、OM、C++ 运行和 msprof
 
+本手册默认使用 Chunk 两遍验证。新增的 `--verify-gdr mtp` 导出 GDR MTP
+版本，切换、依赖和重编要求见 [GDR 验证路径](GDR_VERIFY_ROUTES.md)。
+
 按本文顺序完成环境准备、输入检查、模型导出、转换、C++ 执行和性能采集。
 支持 batch=1、greedy、W8A8 Target＋FP16 Draft，默认做严格输出对照。
 

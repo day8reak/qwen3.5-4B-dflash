@@ -1,9 +1,9 @@
-"""Functional, explicit-state AIR graphs for the two-pass chunk-GDR route.
+"""Functional, explicit-state AIR graphs with selectable GDR verification.
 
 No Python bridge/cache object survives an invocation. Verify computes acceptance
-and executes both GDR passes in the same OM. Committed cache states and separate
-discard-only first-pass FP32 states cross the OM boundary. Commit capsules
-remain graph intermediates; first-pass states never become cache inputs.
+and commits inside one OM: Chunk recomputes the accepted prefix, while MTP gathers
+its FP32 per-row state bank. Chunk also retains raw first-pass discard outputs.
+Capsules and MTP banks remain internal; only selected states become cache inputs.
 """
 
 from __future__ import annotations
@@ -17,8 +17,9 @@ import torch.nn.functional as F
 
 from .contracts import AirGraphSpec, CustomOpExportSpec
 from .incremental_plan import (
-    ABI, ATTENTION_EXPORT_POLICY, DRAFT_LENGTH_POLICY,
-    VERIFY_STATE_OUTPUT_POLICY, verify_discard_descriptors,
+    ABI, MTP_ABI, ATTENTION_EXPORT_POLICY, DRAFT_LENGTH_POLICY,
+    VERIFY_STATE_OUTPUT_POLICY, MTP_STATE_OUTPUT_POLICY, VERIFY_GDR_ROUTES,
+    verify_discard_descriptors,
 )
 
 CHUNK_ABI = ABI
@@ -204,9 +205,10 @@ class AirTargetAttention(nn.Module):
 
 
 class AirGdn(nn.Module):
-    def __init__(self, base: nn.Module, operation: Callable):
+    def __init__(self, base: nn.Module, operation: Callable, *, mtp: bool = False):
         super().__init__()
         self.base, self.operation = base, operation
+        self.mtp = mtp
 
     def forward(self, x, conv, recurrent, valid_rows):
         base = self.base
@@ -234,27 +236,46 @@ class AirGdn(nn.Module):
             base.in_proj_a(x).float() + base.dt_bias
         )
         initial = recurrent.float()
-        output, final = self.operation(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            effective_length=valid_rows,
-            chunk_size=1 if rows == 1 else 64,
-            initial_state=initial,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-        )
+        if self.mtp:
+            # The graph boundary carries an already committed scalar state.
+            # Seed the input bank, then select slot 0 with INT8 zero. accepted_tokens is
+            # NOT this round's acceptance count, which is only known at the head.
+            initial_bank = initial.unsqueeze(1).repeat(1, rows, 1, 1, 1)
+            selected_slot = torch.zeros(batch, dtype=torch.int8, device=x.device)
+            output, recurrent_bank = self.operation(
+                query, key, value, g, beta, initial_bank, selected_slot,
+                chunk_size=64, output_final_state=True, use_qk_l2norm_in_kernel=True,
+            )
+            if recurrent_bank.dtype != torch.float32 or recurrent_bank.shape != initial_bank.shape:
+                raise ValueError("GDR MTP must return a full FP32 state bank")
+            final = prefix_state(recurrent_bank, valid_rows)
+            committed_final = final
+            capsule = (bank, recurrent_bank)
+        else:
+            output, final = self.operation(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                effective_length=valid_rows,
+                chunk_size=1 if rows == 1 else 64,
+                initial_state=initial,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            # Ordinary prefill/decode keep their original FP16 cache rounding,
+            # including in an MTP bundle whose shared state storage is FP32.
+            committed_final = final.to(torch.float16).to(recurrent.dtype)
+            capsule = (query, key, value, g, beta, initial, bank)
         z = base.in_proj_z(x).reshape(-1, base.head_v_dim)
         output = base.norm(output.reshape(-1, base.head_v_dim), z).reshape(
             batch, rows, -1
         )
-        capsule = (query, key, value, g, beta, initial, bank)
         return (
             base.out_proj(output),
             prefix_state(bank, valid_rows),
-            final.to(recurrent.dtype),
+            committed_final.to(recurrent.dtype),
             capsule,
             final,
         )
@@ -272,6 +293,8 @@ class TargetRowsGraph(nn.Module):
         attention: Callable,
         rotary: Callable,
         cache_update: Callable | None = None,
+        verify_gdr: str = "chunk",
+        gdr_mtp: Callable | None = None,
     ):
         super().__init__()
         model = target.dflash_execution_model
@@ -286,10 +309,15 @@ class TargetRowsGraph(nn.Module):
         if not isinstance(self.head, nn.Module):
             raise TypeError("incremental Target requires execution-model lm_head")
         self.rows, self.verify, self.feature_layers = rows, verify, feature_layers
+        if verify_gdr not in VERIFY_GDR_ROUTES:
+            raise ValueError("verify_gdr must be chunk or mtp")
+        self.mtp = verify and verify_gdr == "mtp"
+        if self.mtp and not callable(gdr_mtp):
+            raise ValueError("mtp verification requires GDR MTP; no fallback is permitted")
         self.cache_capacity = target.kv_cache_max_len
         self.blocks = nn.ModuleList(
             [
-                AirGdn(layer.linear_attn, gdr)
+                AirGdn(layer.linear_attn, gdr_mtp if self.mtp else gdr, mtp=self.mtp)
                 if layer.block_type == "linear_attention"
                 else AirTargetAttention(
                     layer.self_attn, attention, rotary,
@@ -301,7 +329,8 @@ class TargetRowsGraph(nn.Module):
         self.linear_indices = tuple(
             i for i, block in enumerate(self.blocks) if isinstance(block, AirGdn)
         )
-        self.commit = TargetCommitGraph(gdr, len(self.linear_indices))
+        self.commit = (MtpCommitGraph(len(self.linear_indices)) if self.mtp
+                       else TargetCommitGraph(gdr, len(self.linear_indices)))
 
     def forward(self, input_ids, start_position, valid_rows, *state):
         positions = start_position + torch.arange(
@@ -330,7 +359,8 @@ class TargetRowsGraph(nn.Module):
                     # Keep the native FP32 output live at the OM boundary so
                     # GE gives both first-pass GDR outputs real storage.
                     # This state includes unaccepted proposals: never commit it.
-                    verify_discard.append(raw_final)
+                    if not self.mtp:
+                        verify_discard.append(raw_final)
             else:
                 mixed, key, value = block(
                     normalized,
@@ -372,6 +402,22 @@ class TargetRowsGraph(nn.Module):
                 features = F.pad(features, (0, 0, 0, 64 - self.rows))
             feature_output = (features,)
         return (top1, *acceptance_output, *feature_output, *next_state, *verify_discard)
+
+
+class MtpCommitGraph(nn.Module):
+    """Select slot a after processing anchor + a accepted proposals."""
+
+    def __init__(self, layers: int):
+        super().__init__()
+        self.layers = layers
+
+    def forward(self, committed_rows, *capsules):
+        result = []
+        for index in range(self.layers):
+            conv_bank, recurrent_bank = capsules[2 * index : 2 * index + 2]
+            result.extend((prefix_state(conv_bank, committed_rows),
+                           prefix_state(recurrent_bank, committed_rows)))
+        return tuple(result)
 
 
 class TargetCommitGraph(nn.Module):
@@ -569,12 +615,23 @@ def incremental_graph_specs(
     cache_update: Callable | None = None,
     custom_ops: tuple[CustomOpExportSpec, ...] = (),
     include_ordinary_decode: bool = True,
+    verify_gdr: str = "chunk",
+    gdr_mtp: Callable | None = None,
 ):
     """Build static graphs, with shapes derived from the loaded models."""
+    if verify_gdr not in VERIFY_GDR_ROUTES:
+        raise ValueError("verify_gdr must be chunk or mtp")
+    if verify_gdr == "mtp" and not callable(gdr_mtp):
+        raise ValueError("mtp verification requires GDR MTP; no fallback is permitted")
     device = target.requested_device
     state = tuple(t for pair in target._fresh_hybrid_cache(batch_size=1) for t in pair)
     names, gdn_names, kv_names, capsules, capsule_names = [], [], [], [], []
     layers = target.dflash_execution_model.language_model.layers
+    if verify_gdr == "mtp":
+        state = tuple(
+            tensor.float() if i % 2 == 1 and layers[i // 2].block_type == "linear_attention"
+            else tensor for i, tensor in enumerate(state)
+        )
     for index, layer in enumerate(layers):
         linear = layer.block_type == "linear_attention"
         pair = [
@@ -592,7 +649,7 @@ def incremental_graph_specs(
                 tuple(state[2 * index + 1].shape),
                 (1, 16, base.conv_dim, base.conv_kernel_size),
             )
-            for suffix, shape, dtype in zip(
+            capsule_layout = list(zip(
                 ("q", "k", "v", "g", "beta", "initial", "conv_bank"),
                 shapes,
                 (
@@ -604,7 +661,13 @@ def incremental_graph_specs(
                     torch.float32,
                     torch.float16,
                 ),
-            ):
+            ))
+            if verify_gdr == "mtp":
+                capsule_layout = [
+                    ("conv_bank", (1, 16, base.conv_dim, base.conv_kernel_size), torch.float16),
+                    ("recurrent_bank", (1, 16, *state[2 * index + 1].shape[1:]), torch.float32),
+                ]
+            for suffix, shape, dtype in capsule_layout:
                 capsule_names.append(f"c{index}_{suffix}")
                 # Shape documentation only: capsules are internal graph values.
                 capsules.append(torch.empty(shape, dtype=dtype, device="meta"))
@@ -627,7 +690,8 @@ def incremental_graph_specs(
         for _ in draft_names
     )
     contract = {
-        "abi": CHUNK_ABI,
+        "abi": CHUNK_ABI if verify_gdr == "chunk" else MTP_ABI,
+        "verify_gdr": verify_gdr,
         "capacity": capacity,
         "cache_capacity": target.kv_cache_max_len,
         "block_size": 16,
@@ -639,8 +703,10 @@ def incremental_graph_specs(
         "capsules": [tensor_spec(n, t) for n, t in zip(capsule_names, capsules)],
         "vocab_size": draft.config.vocab_size,
         "feature_width": draft.config.feature_size,
-        "state_policy": "in-graph-acceptance-two-pass-gdr-atomic-fp16-state-output",
-        "verify_state_output_policy": VERIFY_STATE_OUTPUT_POLICY,
+        "state_policy": ("in-graph-acceptance-two-pass-gdr-atomic-fp16-state-output"
+                         if verify_gdr == "chunk" else "in-graph-mtp-bank-select-fp32-recurrent"),
+        "verify_state_output_policy": (VERIFY_STATE_OUTPUT_POLICY if verify_gdr == "chunk"
+                                       else MTP_STATE_OUTPUT_POLICY),
         "attention_export": ATTENTION_EXPORT_POLICY,
         "draft_length_policy": DRAFT_LENGTH_POLICY,
         "single_row_policy": "ordinary_decode1_chunk1; speculative_fallback_verify16_valid1",
@@ -726,6 +792,8 @@ def incremental_graph_specs(
             attention=attention,
             rotary=rotary,
             cache_update=cache_update,
+            verify_gdr=verify_gdr,
+            gdr_mtp=gdr_mtp,
         )
         # Every layer calls input/post norm, plus GDN gated norm or attention
         # Q/K norms; all gears also call the final norm (105 for the 4B Target).
@@ -735,7 +803,11 @@ def incremental_graph_specs(
             if op.torch_op == "npu::adn_rms_norm" else
             replace(op, minimum_occurrences=len(kv_names) * (1 if rows == 64 else rows))
             if cache_update is not None and op.ge_op_type == "CacheUpdate"
+            else replace(op, minimum_occurrences=len(gdn_names) // 2)
+            if op.torch_op == "npu::npu_gated_delta_rule_mtp"
             else op for op in custom_ops
+            if not (op.torch_op == "npu::npu_gated_delta_rule_mtp" and not (verify and verify_gdr == "mtp"))
+            and not (op.torch_op == "npu::npu_chunk_gated_delta_rule" and verify and verify_gdr == "mtp")
         )
         add(
             name,

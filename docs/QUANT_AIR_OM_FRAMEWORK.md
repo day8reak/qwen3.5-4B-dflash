@@ -190,7 +190,9 @@ Draft 的 GQA 在新插入的 group 维使用 `repeat/Tile`，head 顺序为
 `[h0,h0,...,h1,h1,...]`，不重复整个 head 序列。
 Draft 的 RMSNorm 使用同一个自定义前端，其余计算使用 Tensor 算子。
 完整前缀工厂按其实际缓存路径声明算子依赖。
-本分支的 verify 和 commit 都使用 `ChunkGatedDeltaRule`，不依赖 `GatedDeltaRuleMTP`。
+默认 Chunk 路径的 verify 和 commit 都使用 `ChunkGatedDeltaRule`。
+增量工厂可用 `--verify-gdr mtp` 改为一次 `GatedDeltaRuleMTP` 加图内状态选择；
+MTP 依赖、独立 ABI 和切换命令见 [验证路径手册](GDR_VERIFY_ROUTES.md)。
 
 卷积状态窗口使用静态切片加 `stack`，不调用 TorchAir 尚未实现 GE converter 的
 `aten.unfold.default`。卷积宽度 K=4 时只构造四个移位切片，得到
@@ -201,7 +203,8 @@ verify 接受长度在图内以整数计算：有效 proposal 范围是 `valid_r
 将范围内的 mismatch 转为 INT32，经过 `Cumsum` 后，以累计 mismatch 为 0 的有效行
 形成连续接受前缀，最后用 INT32 `ReduceSum` 计数并转回 `INT64[1] accepted_count`。
 该路径不调用 `amin`、`min(dim=...)` 或 `cumprod`。零接受、全接受及短块 padding
-均使用同一规则；第二次 GDR 仍以 `INT16[1](accepted_count+1)` 提交 anchor 和接受前缀。
+均使用同一规则；Chunk 第二次 GDR 以 `INT16[1](accepted_count+1)` 提交 anchor 和接受前缀，
+MTP 则以 accepted_count 选择已经计算的逐行 state bank。
 主机回归覆盖全部 32768 种 proposal 匹配模式和 1～16 的有效行数，并检查捕获图中的
 INT32 scan/reduction 及缓存、head 复制的 Tensor 算子。
 
@@ -359,7 +362,8 @@ OM 命令使用 `tools/profile_om.py --profile-mode ordinary|dflash --profile-st
 `--` 之前，之后跟 C++ runner 命令。
 
 每个阶段从同一个 prompt 重建状态，窗口外完成预热。`all` 复用一个应用进程，
-逐阶段各开一次独立窗口。C++ verify 的窗口包含两遍 GDR、Top1 和接受/提交计算。
+逐阶段各开一次独立窗口。C++ verify 的窗口包含所选 GDR 路径、Top1 和接受/提交计算：
+Chunk 为两遍 GDR，MTP 为一次 GDR MTP 加 bank Gather。
 
 Python NPU 支持更细的投影、输入准备、Top1、接受/提交和联合窗口，完整范围见
 [Python NPU 手册](DFLASH_RUN_AND_VALIDATE.md)。两个后端均由 msprof 动态 PID CLI 控制，

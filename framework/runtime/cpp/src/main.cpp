@@ -600,7 +600,9 @@ void WriteReport(
          << JsonEscape(std::filesystem::absolute(arguments.model).string())
          << "\",\"sha256\":\"" << arguments.model_sha256 << "\"},";
   if (arguments.model_kind == "chunk") {
-    output << "\"abi\":{\"id\":\"qwen35-dflash-chunk-v3\",\"graph_count\":4,\"sequence_length\":";
+    output << "\"abi\":{\"id\":\""
+           << JsonEscape(dynamic_cast<const qwen35::dflash::ChunkExecutor&>(executor).abi_id())
+           << "\",\"graph_count\":4,\"sequence_length\":";
   } else {
     output << "\"abi\":{\"input_names\":[\"input_ids\",\"attention_mask\"],"
          << "\"output_names\":[\"target_top1\",\"draft_top1\"],"

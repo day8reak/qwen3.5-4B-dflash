@@ -43,6 +43,13 @@ def _config(path: Path | None) -> dict[str, Any]:
     return {} if path is None else load_json_object(path)
 
 
+def _factory_config(args):
+    config = _config(args.factory_config)
+    if getattr(args, "verify_gdr", None) is not None:
+        config["verify_gdr"] = args.verify_gdr
+    return config
+
+
 def _print(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
@@ -50,7 +57,7 @@ def _print(payload: dict[str, Any]) -> None:
 def command_export(args: argparse.Namespace) -> int:
     payload = export_air_bundle(
         args.factory,
-        _config(args.factory_config),
+        _factory_config(args),
         args.bundle_dir,
     )
     _print(payload)
@@ -80,7 +87,7 @@ def command_build(args: argparse.Namespace) -> int:
     exact_soc_version = validate_soc_version(args.soc_version)
     exported = export_air_bundle(
         args.factory,
-        _config(args.factory_config),
+        _factory_config(args),
         args.bundle_dir,
     )
     payload = compile_air_bundle(
@@ -107,8 +114,12 @@ def command_build_cpp(args: argparse.Namespace) -> int:
 def command_chunk_plan(args: argparse.Namespace) -> int:
     from .incremental_plan import write_incremental_plan
     from .utils import sha256_file
-    path, _, contract = write_incremental_plan(args.deployment_manifest, args.output, mode=args.mode)
-    _print({"plan": str(path), "sha256": sha256_file(path), "mode": args.mode, "abi": contract["abi"]})
+    path, _, contract = write_incremental_plan(
+        args.deployment_manifest, args.output, mode=args.mode,
+        verify_gdr=getattr(args, "verify_gdr", None))
+    from .incremental_plan import verify_gdr_route
+    _print({"plan": str(path), "sha256": sha256_file(path), "mode": args.mode,
+            "abi": contract["abi"], "verify_gdr": verify_gdr_route(contract)})
     return 0
 
 
@@ -247,6 +258,7 @@ def command_infer_cpp(args: argparse.Namespace) -> int:
         log_output=log_output,
         trace_rounds=getattr(args, "trace_rounds", False),
         low_memory=getattr(args, "low_memory", False),
+        verify_gdr=getattr(args, "verify_gdr", None),
     )
     payload["control_plane"]["target_preflight"] = file_record(
         preflight_log, relative_to=run_root
@@ -350,11 +362,15 @@ def build_parser() -> argparse.ArgumentParser:
     chunk_plan.add_argument("--deployment-manifest", type=Path, required=True)
     chunk_plan.add_argument("--output", type=Path, required=True)
     chunk_plan.add_argument("--mode", choices=("paired", "ordinary", "dflash"), default="paired")
+    chunk_plan.add_argument("--verify-gdr", choices=("chunk", "mtp"),
+                            help="require this route in the compiled deployment")
     chunk_plan.set_defaults(handler=command_chunk_plan)
 
     export = subparsers.add_parser("export-air", help="export factory graphs to AIR")
     export.add_argument("--factory", required=True, help="module:function graph factory")
     export.add_argument("--factory-config", type=Path)
+    export.add_argument("--verify-gdr", choices=("chunk", "mtp"),
+                        help="incremental verifier; overrides factory config (default: chunk)")
     export.add_argument("--bundle-dir", type=Path, required=True)
     export.set_defaults(handler=command_export)
 
@@ -376,6 +392,8 @@ def build_parser() -> argparse.ArgumentParser:
     build = subparsers.add_parser("build-om", help="export AIR and compile every graph")
     build.add_argument("--factory", required=True, help="module:function graph factory")
     build.add_argument("--factory-config", type=Path)
+    build.add_argument("--verify-gdr", choices=("chunk", "mtp"),
+                       help="incremental verifier; overrides factory config (default: chunk)")
     build.add_argument("--bundle-dir", type=Path, required=True)
     _add_atc_arguments(build)
     build.set_defaults(handler=command_build)
@@ -438,6 +456,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="run paired ordinary/DFlash prompt generation in the C++ ACL hot path",
     )
     infer_cpp.add_argument("--deployment-manifest", type=Path, required=True)
+    infer_cpp.add_argument("--verify-gdr", choices=("chunk", "mtp"),
+                           help="require the selected compiled route; omitted: read manifest")
     infer_cpp.add_argument("--runner", type=Path, required=True)
     infer_cpp.add_argument("--runner-config", type=Path, required=True)
     infer_cpp.add_argument("--model-dir", type=Path, required=True)

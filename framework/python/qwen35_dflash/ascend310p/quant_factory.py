@@ -43,10 +43,13 @@ from .custom_op_export import (
     NPU_QUANT_MATMUL_DEFAULT_GE_OP_TYPE,
     NPU_CHUNK_GATED_DELTA_RULE_TORCH_OP,
     NPU_CHUNK_GATED_DELTA_RULE_DEFAULT_GE_OP_TYPE,
+    NPU_GATED_DELTA_RULE_MTP_TORCH_OP,
+    NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE,
     NPU_SCATTER_ND_UPDATE_TORCH_OP,
     NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
     prepare_custom_op_export,
     validate_gdr_ge_prototype_environment,
+    validate_gdr_mtp_ge_prototype_environment,
     validate_adn_attention_ge_prototype_environment,
 )
 from .integrated import (
@@ -415,6 +418,9 @@ def _target_custom_op_exports(
     config: Mapping[str, Any], *, incremental: bool, qlinear_count: int = 1,
 ) -> tuple[CustomOpExportSpec, ...]:
     """Declare operators actually retained by each Target graph."""
+    route = config.get("verify_gdr", "chunk")
+    if route not in {"chunk", "mtp"} or (not incremental and route != "chunk"):
+        raise ValueError("verify_gdr must be chunk or mtp; mtp requires the incremental factory")
     rms_type = str(config.get("adn_rms_norm_ge_op_type", ADN_RMS_NORM_DEFAULT_GE_OP_TYPE))
     if rms_type not in {"RmsNorm", "AdnRmsNorm"}:
         raise ValueError("adn_rms_norm_ge_op_type must be RmsNorm or AdnRmsNorm")
@@ -428,6 +434,9 @@ def _target_custom_op_exports(
         CustomOpExportSpec(ADN_FUSED_INFER_ATTENTION_TORCH_OP, ADN_FUSED_INFER_ATTENTION_DEFAULT_GE_OP_TYPE),
         CustomOpExportSpec(FUNCTIONAL_NPU_CACHE_UPDATE_TORCH_OP, NPU_CACHE_UPDATE_DEFAULT_GE_OP_TYPE),
     ]
+    if route == "mtp":
+        operators.append(CustomOpExportSpec(
+            NPU_GATED_DELTA_RULE_MTP_TORCH_OP, NPU_GATED_DELTA_RULE_MTP_DEFAULT_GE_OP_TYPE))
     if not incremental:
         operators.extend((
             CustomOpExportSpec(NPU_SCATTER_ND_UPDATE_TORCH_OP, NPU_SCATTER_ND_UPDATE_DEFAULT_GE_OP_TYPE,
@@ -461,7 +470,8 @@ def _prepare_quant_export(config: Mapping[str, Any], torchair_module: Any,
         "ge_prototypes": [
             validate_gdr_ge_prototype_environment(),
             validate_adn_attention_ge_prototype_environment(),
-        ],
+        ] + ([validate_gdr_mtp_ge_prototype_environment()]
+             if incremental and config.get("verify_gdr", "chunk") == "mtp" else []),
     }
 
 
@@ -554,6 +564,13 @@ def create_quant_recompute_graph(
     )
     missing = [name for name in required_operations
                if not callable(getattr(npu_module, name, None))]
+    gdr_mtp = None
+    if _incremental and config.get("verify_gdr", "chunk") == "mtp":
+        gdr_mtp = getattr(npu_module, "npu_gated_delta_rule_mtp", None)
+        if not callable(gdr_mtp):
+            gdr_mtp = getattr(torch.ops.npu, "npu_gated_delta_rule_mtp", None)
+        if not callable(gdr_mtp):
+            missing.append("npu_gated_delta_rule_mtp")
     if missing:
         raise RuntimeError("quant AIR export needs receiver NPU operations: " + ", ".join(missing))
 
@@ -665,16 +682,21 @@ def create_quant_recompute_graph(
         from .incremental import incremental_graph_specs
 
         metadata.update({
-            "factory_id": "qwen3.5-4b-quant-w8a8-dflash-chunk-v3",
+            "factory_id": ("qwen3.5-4b-quant-w8a8-dflash-mtp-v1"
+                           if config.get("verify_gdr", "chunk") == "mtp"
+                           else "qwen3.5-4b-quant-w8a8-dflash-chunk-v3"),
+            "verify_gdr": config.get("verify_gdr", "chunk"),
             "gdr_effective_length_contract": "INT16[1] explicit call-local valid rows",
             "claim_boundary": "Explicit-state candidate; real TorchAir/ATC and device parity gates required.",
             "target_rollback_audit": dict(target.dflash_rollback_audit),
+            "target_rollback_audit_scope": "loader/eager bridge; functional OM route is incremental_contract.verify_gdr",
             "target_lm_head_source": "dflash_execution_model.lm_head",
         })
         return incremental_graph_specs(target, draft, capacity=max_sequence_length,
             metadata=metadata, gdr=torch_npu.npu_chunk_gated_delta_rule,
             attention=torch_npu.adn_fused_infer_attention, rotary=apply_rotary_pos_emb,
             cache_update=_incremental_cache_update,
+            verify_gdr=config.get("verify_gdr", "chunk"), gdr_mtp=gdr_mtp,
             custom_ops=custom_op_exports, include_ordinary_decode=include_ordinary_decode)
     enable_padded_draft_context(draft)
     target_adapter = QuantFullPrefixExportTarget(target).eval()

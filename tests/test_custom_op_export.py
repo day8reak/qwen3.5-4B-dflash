@@ -64,7 +64,7 @@ def test_rms_named_input_matches_selected_ge_type(ge_type, input_name):
     assert ta.ge.calls[-1][2]["inputs"] == {input_name: x, "gamma": gamma}
 
 
-def _quant_incremental_specs(monkeypatch):
+def _quant_incremental_specs(monkeypatch, verify_gdr="chunk"):
     from test_incremental_air_om import TinyTarget, draft_model, rotary
     from qwen35_dflash.ascend310p.incremental import incremental_graph_specs
 
@@ -100,7 +100,7 @@ def _quant_incremental_specs(monkeypatch):
         torch.ones(64, dtype=torch.float32), 0)
     assert isinstance(target.get_output_embeddings(), nn.Linear)
     assert _enable_target_quant_matmul_export_mode(target) == 14
-    contracts = _target_custom_op_exports({}, incremental=True, qlinear_count=14)
+    contracts = _target_custom_op_exports({"verify_gdr": verify_gdr}, incremental=True, qlinear_count=14)
     metadata = {
         "custom_op_export_contracts": [
             {"torch_target": op.torch_target, "ge_op_type": op.ge_op_type,
@@ -114,11 +114,13 @@ def _quant_incremental_specs(monkeypatch):
         gdr=operations["npu_chunk_gated_delta_rule"],
         attention=operations["adn_fused_infer_attention"], rotary=rotary,
         cache_update=_incremental_cache_update,
-        custom_ops=contracts, include_ordinary_decode=True)
+        custom_ops=contracts, include_ordinary_decode=True,
+        verify_gdr=verify_gdr, gdr_mtp=operations["npu_gated_delta_rule_mtp"] if verify_gdr == "mtp" else None)
 
 
-def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, monkeypatch):
-    specs = _quant_incremental_specs(monkeypatch)
+@pytest.mark.parametrize("verify_gdr", ["chunk", "mtp"])
+def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, monkeypatch, verify_gdr):
+    specs = _quant_incremental_specs(monkeypatch, verify_gdr)
 
     class CaptureTorchAir(_FakeTorchAir):
         def __init__(self):
@@ -209,7 +211,15 @@ def test_four_incremental_graphs_capture_and_audit_every_custom_op(tmp_path, mon
             assert rms["minimum_occurrences"] == rms["ge_node_occurrences"] == 8
             cache_audit = next(item for item in audit if item["ge_op_type"] == "CacheUpdate")
             assert cache_audit["minimum_occurrences"] == expected_writes
-            assert len(calls) == (2 if name == "target_verify" else 1)
+            is_mtp = name == "target_verify" and verify_gdr == "mtp"
+            assert len(calls) == (0 if is_mtp else 2 if name == "target_verify" else 1)
+            mtp_calls = [n for n in nodes if str(n.target) == "npu.npu_gated_delta_rule_mtp.default"]
+            assert len(mtp_calls) == int(is_mtp)
+            if is_mtp:
+                assert mtp_calls[0].args[5].meta["val"].dtype == torch.float32
+                assert mtp_calls[0].args[6].meta["val"].dtype == torch.int8
+                assert mtp_calls[0].args[5].meta["val"].shape == (1, 16, 1, 16, 16)
+                assert not graph["metadata"]["incremental_contract"]["verify_discard_states"]
             rows = 1 if name == "target_decode" else 16 if name == "target_verify" else 64
             assert all(node.args[0].meta["val"].shape[1] == rows for node in calls)
             assert graph["standard_op_overrides"][0]["ge_node_occurrences"] == 1
@@ -289,6 +299,11 @@ def test_compiler_rejects_missing_softplus_evidence():
 _TEST_OPERATOR_LIBRARIES: list[torch.library.Library] = []
 
 _TARGET_TEST_SCHEMAS = {
+    "npu_gated_delta_rule_mtp": (
+        "npu_gated_delta_rule_mtp(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
+        "Tensor initial_state, Tensor accepted_tokens, int chunk_size=64, "
+        "bool output_final_state=True, bool use_qk_l2norm_in_kernel=True) -> (Tensor, Tensor)"
+    ),
     "adn_fused_infer_attention": (
         "adn_fused_infer_attention("
         "Tensor query, Tensor[] key, Tensor[] value, *, "

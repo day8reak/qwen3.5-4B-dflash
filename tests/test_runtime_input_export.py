@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from rms_norm_test_support import adn_rms_norm_cpu  # noqa: F401
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "framework/python"))
@@ -409,7 +410,10 @@ def test_static_audit_must_match_chunk_tensor_contract(field):
         _validated_runtime_input_abi(graph, required=True)
 
 
-def test_all_chunk_exports_normalize_actual_dynamo_input_order(tmp_path, monkeypatch):
+@pytest.mark.parametrize("verify_gdr", ["chunk", "mtp"])
+def test_incremental_exports_normalize_actual_dynamo_input_order(
+    tmp_path, monkeypatch, adn_rms_norm_cpu, verify_gdr,
+):
     """Real Dynamo capture + host serializer fixture; no AIR/device claim."""
     import json
     from test_incremental_air_om import specs
@@ -418,7 +422,7 @@ def test_all_chunk_exports_normalize_actual_dynamo_input_order(tmp_path, monkeyp
 
     monkeypatch.setenv("AI_RUN_DIR", str(tmp_path))
     torchair = ModuleType("torchair")
-    values = specs()
+    values = specs(verify_gdr=verify_gdr)
     by_name = {spec.name: spec for spec in values}
     raw_orders = {}
 
@@ -449,7 +453,7 @@ def test_all_chunk_exports_normalize_actual_dynamo_input_order(tmp_path, monkeyp
                 consumer = _Op("consumer", "Add", inputs=tuple(n.name + ":0" for n in nodes))
                 consumer_edges = tuple(consumer.input)
                 graph = _Graph([*nodes, consumer])
-                if export_name == "target_verify":
+                if export_name == "target_verify" and verify_gdr == "chunk":
                     # Synthetic GE nodes for the serializer fixture. Actual
                     # opaque-op torch.export output liveness has its own test.
                     discard_graph = _discard_graph()

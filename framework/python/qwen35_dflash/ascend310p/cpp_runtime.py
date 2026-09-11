@@ -299,6 +299,7 @@ def validate_cpp_runner_report(
     max_new_tokens: int,
     max_draft_tokens: int,
     chunk_abi: bool = False,
+    verify_gdr: str | None = None,
     low_memory: bool = False,
     allow_output_differences: bool = False,
 ) -> None:
@@ -335,8 +336,14 @@ def validate_cpp_runner_report(
     ):
         raise RuntimeError("C++ runner low-memory protocol differs")
     abi = report.get("abi", {})
-    if chunk_abi and (abi.get("id") != "qwen35-dflash-chunk-v3" or abi.get("graph_count") != 4):
-        raise RuntimeError("C++ runner incremental ABI differs")
+    if chunk_abi:
+        from .incremental_plan import require_verify_gdr
+        try:
+            require_verify_gdr({"abi": abi.get("id")}, verify_gdr)
+        except ValueError as error:
+            raise RuntimeError("C++ runner incremental ABI differs: " + str(error)) from error
+        if abi.get("graph_count") != 4:
+            raise RuntimeError("C++ runner incremental graph count differs")
     if not chunk_abi and abi.get("input_names") != ["input_ids", "attention_mask"]:
         raise RuntimeError("C++ runner input ABI differs")
     if not chunk_abi and abi.get("output_names") != ["target_top1", "draft_top1"]:
@@ -399,6 +406,7 @@ def run_cpp_pair(
     log_output: str | Path,
     trace_rounds: bool = False,
     low_memory: bool = False,
+    verify_gdr: str | None = None,
     execute: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     """Run paired ordinary/DFlash generation entirely inside one C++ process."""
@@ -418,9 +426,13 @@ def run_cpp_pair(
     if chunk:
         from .incremental_plan import write_incremental_plan
         om_path, deployment, contract = write_incremental_plan(
-            deployment_manifest, Path(raw_output).with_suffix(".chunk-plan.txt"))
-        graph = {"name": "qwen35-dflash-chunk-v3", "om": file_record(om_path, relative_to=om_path.parent)}
+            deployment_manifest, Path(raw_output).with_suffix(".chunk-plan.txt"), verify_gdr=verify_gdr)
+        from .incremental_plan import verify_gdr_route
+        verify_gdr = verify_gdr_route(contract)
+        graph = {"name": contract["abi"], "om": file_record(om_path, relative_to=om_path.parent)}
     else:
+        if verify_gdr is not None:
+            raise ValueError("--verify-gdr requires an incremental OM bundle")
         om_path, deployment, graph = _resolve_integrated_om(
             deployment_manifest, graph_name=identity["graph_name"])
     om_record = dict(graph["om"])
@@ -490,6 +502,7 @@ def run_cpp_pair(
         max_new_tokens=max_new_tokens,
         max_draft_tokens=max_draft_tokens,
         chunk_abi=chunk,
+        verify_gdr=verify_gdr,
         low_memory=low_memory,
     )
     run_root = Path(os.environ["AI_RUN_DIR"]).expanduser().resolve()

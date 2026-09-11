@@ -8,11 +8,31 @@ from pathlib import Path
 from .utils import contained_path, load_json_object, require_run_output, sha256_file
 
 ABI = "qwen35-dflash-chunk-v3"
+MTP_ABI = "qwen35-dflash-mtp-v1"
+VERIFY_GDR_ROUTES = ("chunk", "mtp")
 ATTENTION_EXPORT_POLICY = "receiver_adn_all_seq_lengths_q_static_capacity_causal_mask"
 DRAFT_LENGTH_POLICY = "anchor_plus_runtime_K_masked_in_every_attention_layer"
 VERIFY_STATE_OUTPUT_POLICY = "raw_fp32_device_only_discard_first_pass_commit_second_pass"
+MTP_STATE_OUTPUT_POLICY = "internal_fp32_bank_gather_accepted_slot"
 ROLES = ("target_prefill", "target_decode", "target_verify", "draft")
 DTYPES = {"int64": 8, "int16": 2, "float16": 2, "float32": 4}
+
+
+def verify_gdr_route(contract):
+    route = {ABI: "chunk", MTP_ABI: "mtp"}.get(contract.get("abi"))
+    if route is None or contract.get("verify_gdr", route) != route:
+        raise ValueError("unsupported or inconsistent verification route/ABI")
+    return route
+
+
+def require_verify_gdr(contract, requested=None):
+    route = verify_gdr_route(contract)
+    if requested is not None and requested != route:
+        raise ValueError(
+            f"requested verify_gdr={requested}, but deployment contains {route}; "
+            "select the matching manifest or export/compile a new bundle"
+        )
+    return route
 
 
 def descriptor(name, dtype, shape):
@@ -21,6 +41,8 @@ def descriptor(name, dtype, shape):
 
 def verify_discard_descriptors(c):
     """Raw first-pass GDR outputs, ordered by linear layer, never cache state."""
+    if verify_gdr_route(c) == "mtp":
+        return []
     states = {s["name"]: s for s in c["target_states"]}
     return [
         descriptor("verify_discard_" + name, "float32", states[name]["shape"])
@@ -113,7 +135,8 @@ def validate_incremental_bundle(graphs):
             "incremental bundle needs prefill, verify, draft and optional ordinary decode (four graphs at most)"
         )
     c = candidates[0]["metadata"]["incremental_contract"]
-    if c.get("abi") != ABI or c.get("block_size") != 16 or c.get("prefill_rows") != 64:
+    route = verify_gdr_route(c)
+    if c.get("block_size") != 16 or c.get("prefill_rows") != 64:
         raise ValueError("unsupported incremental ABI; regenerate AIR/OM and rebuild the C++ runner")
     if c.get("draft_length_policy") != DRAFT_LENGTH_POLICY:
         raise ValueError("incremental Draft requires runtime proposal_count in every layer")
@@ -154,13 +177,21 @@ def validate_incremental_bundle(graphs):
         or set(gdn) | set(kv) != names
     ):
         raise ValueError("state partition is inconsistent")
-    if len(c["capsules"]) != len(gdn) // 2 * 7:
+    if len(c["capsules"]) != len(gdn) // 2 * (7 if route == "chunk" else 2):
         raise ValueError("GDR capsule count differs from linear layer count")
+    if route == "mtp":
+        states = {t["name"]: t for t in c["target_states"]}
+        if any(states[n]["dtype"] != "float32" for n in gdn[1::2]):
+            raise ValueError("MTP requires committed recurrent state in FP32")
+    output_policy = VERIFY_STATE_OUTPUT_POLICY if route == "chunk" else MTP_STATE_OUTPUT_POLICY
     if (
-        c.get("verify_state_output_policy") != VERIFY_STATE_OUTPUT_POLICY
+        c.get("verify_state_output_policy") != output_policy
         or c.get("verify_discard_states") != verify_discard_descriptors(c)
     ):
-        raise ValueError("verify requires separate raw FP32 first-pass discard outputs")
+        raise ValueError(
+            "verify requires separate raw FP32 first-pass discard outputs" if route == "chunk"
+            else "MTP verify requires internal FP32 bank selection without discard outputs"
+        )
     expected = expected_signatures(c)
     for graph in graphs:
         if graph["metadata"]["incremental_contract"] != c:
@@ -179,7 +210,7 @@ def validate_incremental_bundle(graphs):
     return c
 
 
-def write_incremental_plan(deployment_manifest, output, *, mode="paired"):
+def write_incremental_plan(deployment_manifest, output, *, mode="paired", verify_gdr=None):
     if mode not in {"paired", "ordinary", "dflash"}:
         raise ValueError("mode must be paired, ordinary or dflash")
     path = Path(deployment_manifest).resolve()
@@ -193,6 +224,7 @@ def write_incremental_plan(deployment_manifest, output, *, mode="paired"):
     c = validate_incremental_bundle(graphs)
     if c is None:
         raise ValueError("deployment is not an incremental chunk bundle")
+    require_verify_gdr(c, verify_gdr)
     if mode != "dflash" and not any(g["name"] == "target_decode" for g in graphs):
         raise ValueError("ordinary/paired mode requires an exported target_decode OM")
     record = manifest["air_manifest"]
@@ -204,7 +236,7 @@ def write_incremental_plan(deployment_manifest, output, *, mode="paired"):
     output = require_run_output(output)
     if output.exists():
         raise FileExistsError(output)
-    lines = [ABI, f"capacity {c['capacity']} {c['vocab_size']}"]
+    lines = [c["abi"], f"capacity {c['capacity']} {c['vocab_size']}"]
     for name in ROLES:
         if name == "target_decode" and mode == "dflash":
             continue
