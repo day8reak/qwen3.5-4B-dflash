@@ -161,7 +161,7 @@
       },
       {
         "source_file": "docs/GDR_CHUNK_AIR_OM.md",
-        "source_sha256": "fa9893a4307546f3e31f75fccd17f9938e7fd117f31e879bf12c46dfbab0588a"
+        "source_sha256": "d1dcf34342caaeef26c0b654cf44c8c71e56c23329523801e4a9f6b72dda86a4"
       },
       {
         "source_file": "docs/QUANT_AIR_OM_FRAMEWORK.md",
@@ -221,7 +221,7 @@
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/cpp_runtime.py",
-        "source_sha256": "b01df3bce273e5ae625d68ab370fd02ea88fdeea008d7c8af89a5f0bba163e07"
+        "source_sha256": "ae05a7a9faaebc8385b0db565d994efea6b3ecb8f48363ac4952308789f63fde"
       },
       {
         "source_file": "framework/python/qwen35_dflash/ascend310p/custom_op_export.py",
@@ -481,11 +481,11 @@
       },
       {
         "source_file": "tools/benchmark_prompts.py",
-        "source_sha256": "e420af1c14248ae4edb4d6313be2f70071b2f0fea9c5d19e21cfdb5adbab39d1"
+        "source_sha256": "01184b4dce6dce66929dffa9bd6a795d016f438d71f15993246d656dbbfbecdc"
       },
       {
         "source_file": "tests/test_prompt_suite.py",
-        "source_sha256": "c426f1a9955e9cd84973f86761694527151392c8ee4b948b5fe7d04787f358f6"
+        "source_sha256": "7f44e6b82aeb306d4dc49a45a039a94346de91307f7e17742a27b538e60d8588"
       },
       {
         "source_file": "tests/test_draft_compile_determinism.py",
@@ -494,6 +494,10 @@
       {
         "source_file": "tools/decode_outputs.py",
         "source_sha256": "bffe0c14dbbd2c51ae345987e7e4a197c59b677ba11f7aea39d143fb42939d6d"
+      },
+      {
+        "source_file": "tests/test_prompt_analysis.py",
+        "source_sha256": "4c575fd69c17bfcb46fe45792458a387aeb6e7e664fb0a91223d54a487e54169"
       }
     ]
   }

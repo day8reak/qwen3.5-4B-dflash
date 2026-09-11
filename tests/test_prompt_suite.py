@@ -261,6 +261,10 @@ def test_stable_parity_failure_keeps_both_outputs_and_locates_first_different_ro
     with pytest.raises(RuntimeError, match="passing known report"):
         validate_cpp_runner_report(report, prompt_token_ids=[4, 5], om_sha256=sha256_file(plan),
             device_id=0, max_new_tokens=20, max_draft_tokens=15, chunk_abi=True, low_memory=low_memory)
+    validate_cpp_runner_report(report, prompt_token_ids=[4, 5], om_sha256=sha256_file(plan),
+        device_id=0, max_new_tokens=20, max_draft_tokens=15, chunk_abi=True, low_memory=low_memory,
+        allow_output_differences=True)
+    assert suite.summarize_prompt(report)["acceptance_by_position"]
     assert_cpp_resources_released(cleanup, proc.stderr)
     # The single-prompt entry must preserve the same failure and still exit 1.
     single = tmp_path / "single-failed.json"

@@ -624,6 +624,40 @@ cat "$AI_RUN_DIR/log/cpp-paired-cpp-runner.log"
 token、EOS 和停止原因一致。每次生成前重置请求缓存；一条失败会记录原因并继续其余条目。
 普通生成本身的稳定性和两种模式的精确一致性检查沿用原 runner，不放宽阈值。
 
+如果本次实验允许普通模型与 DFlash 输出不同，在上述命令后加
+`--allow-output-differences`。它仅改变汇总的输出对照要求：两种模式仍各自需要通过
+3 次预热、10 次正式测量的重复性检查，设备身份、运行成功、EOS 合法性、输入/模型
+身份和完整 trace 仍被检查。只有跨模式输出差异的条目标为 `PASS_WITH_DIFFERENCES`，
+显示接受率和速度；`ordinary_parity` 仍如实记录 `FAIL`，文本质量记为未评估。
+C++ 原始日志仍可能打印 parity FAIL；Python 汇总按显式选择的策略判断。
+加载失败、执行错误或不稳定结果不会因此获得统计资格。默认不加此参数仍使用严格对照。
+
+已有完整 batch 不用重跑，可以在新的目录重新汇总。只需更新 Python 源码，不需要重编
+runner 或重新导出 OM；以下 `SAVED_BATCH` 指向要分析的 `runner-batch.json`：
+
+```bash
+"$MODEL_PYTHON" -B "$REPO_ROOT/tools/benchmark_prompts.py" \
+  --run-dir "$AI_RUN_DIR" --summarize-existing "$SAVED_BATCH" \
+  --allow-output-differences
+```
+
+命令读取 batch 同目录的 `request.json`、`chunk-plan.txt`、`prompts.txt` 和 case 报告，
+校验保存的 plan/batch hash，使用原请求的生成长度和设备 ID；不加载模型、不执行 runner。
+新结果写入 `prompt-summary-*`，原报告不改写。可另加 `--model-dir "$TARGET_DIR"`
+重新解码文本；不加则无需 tokenizer 或模型文件。汇总保留原始 case hash 和原始 FAIL 状态。
+
+新的汇总还按同一次运行内的生成位置分段，例如 `[0,32)`、`[32,64)`、`[64,96)`、
+`[96,128)`。每段显示接受率、零接受轮次比例、平均候选数和每轮产出。
+统计把一整轮归到该轮第一个输出 token 所在的区间，跨区间的轮次不拆分；仅包含正式
+测量的投机轮次，缺少轮次的区间不解释成零接受。应使用同一次长生成的分段结果判断
+后程是否下降，不能直接相减两次独立的 32/128-token 报告：末尾候选数、分块和生成路径
+都可能不同。`draft_token_share_of_output` 则表示最终输出中来自已接受草稿的比例，
+与“接受数/候选数”不同。
+
+允许输出差异时，`speedup` 比较两种模式各自输出的模型循环时延；若 EOS 长度不同，
+工作量也不同。JSON 同时保留普通/DFlash 的生成长度、停止原因、tok/s 和
+`throughput_speedup`，供这类近似实验比较。该策略不宣称两种输出的任务质量等价。
+
 整批只启动一个 C++ 进程：去掉 `--low-memory` 时四图加载一次，逐 prompt 交错跑两种模式；
 加上时先跑完全部普通 prompt，再统一卸载、加载 DFlash 所需三图，跑完全部 DFlash prompt。
 两种协议都复用加载的模型。低显存模式的分组顺序可能受温度和外部负载变化影响，报告会明确记录。

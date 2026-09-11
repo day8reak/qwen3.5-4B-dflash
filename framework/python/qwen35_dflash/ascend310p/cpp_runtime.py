@@ -300,8 +300,14 @@ def validate_cpp_runner_report(
     max_draft_tokens: int,
     chunk_abi: bool = False,
     low_memory: bool = False,
+    allow_output_differences: bool = False,
 ) -> None:
-    if report.get("status") != "PASS" or report.get("runner_id") != CPP_RUNNER_ID:
+    allowed_parity_failure = (
+        allow_output_differences
+        and report.get("status") == "FAIL"
+        and report.get("failure_stage") == "ordinary_dflash_parity"
+    )
+    if (report.get("status") != "PASS" and not allowed_parity_failure) or report.get("runner_id") != CPP_RUNNER_ID:
         raise RuntimeError("C++ ACL runner did not produce a passing known report")
     if report.get("cpu_fallback") is not False:
         raise RuntimeError("C++ target report indicates CPU fallback")
@@ -347,6 +353,23 @@ def validate_cpp_runner_report(
     _validate_mode_report(
         "DFlash", dflash, generation_mode="dflash-strict-greedy"
     )
+    if allow_output_differences:
+        # This policy accepts only cross-mode numerical/output differences.
+        # Both independent 3+10 runs and all identity checks above still apply.
+        expected, actual = ordinary["stable_generated_token_ids"], dflash["stable_generated_token_ids"]
+        mismatches = sum(
+            i >= len(expected) or i >= len(actual) or expected[i] != actual[i]
+            for i in range(max(len(expected), len(actual)))
+        )
+        eos_mismatches = int(ordinary["stable_stop_reason"] != dflash["stable_stop_reason"])
+        parity_status = "FAIL" if mismatches or eos_mismatches else "PASS"
+        parity = report.get("ordinary_parity", {})
+        if (report.get("status") != parity_status
+                or parity.get("status") != parity_status
+                or parity.get("token_id_mismatches") != mismatches
+                or parity.get("eos_mismatches") != eos_mismatches):
+            raise RuntimeError("C++ runner parity metadata disagrees with saved outputs")
+        return
     if ordinary.get("stable_generated_token_ids") != dflash.get(
         "stable_generated_token_ids"
     ):
